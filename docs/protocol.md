@@ -572,7 +572,7 @@ Session codes travel in `error` frames, HTTP codes in the 7.1 error body. Oversi
 - **No per-file connections.** Default concurrency is 4 file `PUT`s plus the bundle; more streams do not help on Wi-Fi.
 - **I/O:** hash in chunk-sized buffers, write each hash with its chunk, preallocate `.part` files, batch session frames per TLS write. Linux kTLS with `sendfile` MAY be used.
 - **Windows firewall:** the program-scoped rule allows any remote address, so VPN peers work; mutual TLS with pinning is the access control.
-- **Phase 1 gate:** if tuned HTTP/2 is over about 10% slower than raw framing on the same TLS socket, a `playdrop/2` ALPN moves bulk data to raw framing and keeps these JSON shapes.
+- **Phase 1 gate (measured 2026-10-08):** tuned HTTP/2 ran about 27% slower than raw framing over the same TLS socket on loopback (about 2,080 vs 2,845 MiB/s). Both exceed any Wi-Fi link by more than an order of magnitude, so HTTP/2 stays for v1. The real question is CPU cost per byte on a phone, which loopback does not measure. Phase 3 measures it on Android; if it costs noticeable battery, a `playdrop/2` ALPN moves bulk data to raw framing and keeps these JSON shapes.
 
 ---
 

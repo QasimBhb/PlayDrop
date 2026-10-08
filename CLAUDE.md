@@ -21,6 +21,18 @@ UI native per platform. Build fully agentic. Next: Phase 2 desktop daemon.
 anti-pattern list, the build phases, and the list of unverified claims. Do not re-research anything
 that PLAN.md already cites. Do not restate its content here.
 
+**One phase per session.** Each phase is built in its own session, on its own branch, and ends
+with a handoff document at `docs/phases/phase-N-<name>.md` (status, module map, public API,
+decisions made, open TODOs, kickoff brief for the next phase). Starting a new phase: read
+`PLAN.md`, `docs/protocol.md`, `docs/threat-model.md`, then the latest `docs/phases/` file, then
+only the code the kickoff brief points at. Do not re-read the whole codebase. Finishing a phase:
+write the next handoff file before the final commit.
+
+Working pattern that has held up: the main session lays down skeletons and pre-adds every
+dependency, then spawns parallel Opus agents confined to disjoint directories with no `Cargo.toml`
+edits, each with unit tests and a clippy-clean bar, then one integration agent wires them and runs
+the phase gates. Agents never commit; the user says "commit".
+
 `.cursor/plans/implementation-plan.md` belongs to a parallel Cursor session. Treat its facts as
 unverified unless PLAN.md cites them; the "Conflicts and unverified claims" section of PLAN.md lists
 the ones that failed verification. Do not edit or delete Cursor's files.
@@ -53,12 +65,14 @@ PLAN.md under "Architecture" and "Decisions".
 Phases are in PLAN.md "Build phases". Phase 0 is done: `docs/product.md` (scope), `docs/protocol.md`
 (normative wire spec, port 42187, wins on wire behaviour), `docs/threat-model.md` (SR-1 to SR-34,
 each tagged with the phase that must satisfy it), `LICENSE`, `THIRD_PARTY.md`. Phase 1 is done:
-gates A-E in `crates/playdrop-core/tests/phase1_gates.rs`. Loopback numbers (release): 500 MiB
+gates A, B, D, E are tests in `crates/playdrop-core/tests/phase1_gates.rs`; gate C is the manual
+`playdrop bench` run described under Commands. Loopback numbers (release): 500 MiB
 resume at ~405 MiB/s, 5,000 small files at 0.88x of one big file, HTTP/2 ~2,080 MiB/s vs raw
 framing ~2,845 MiB/s (h2 about 27% slower; kept for v1, `playdrop/2` reserved for raw bulk if
 phone CPU measurements in Phase 3 demand it). Open TODOs are tagged with their SR in the code
-(`grep -rn "TODO(SR-" crates/`). Next is Phase 2: `playdropd` daemon, tray, notifications, Slint
-window, Windows installer. Every PR must say which SRs it satisfies.
+(`grep -rn "TODO" crates/`). Handoff for the next session: `docs/phases/phase-1-core.md`. Next is
+Phase 2: `playdropd` daemon, tray, notifications, Slint window, Windows installer. Every PR must
+say which SRs it satisfies.
 
 ## Commands
 
