@@ -48,10 +48,11 @@ PLAN.md under "Architecture" and "Decisions".
 
 ## Build order and where we are
 
-Phases are in PLAN.md "Build phases". Phase 0 remaining items: pick the port and multicast group,
-write `docs/protocol.md` (SAS, frame format, versioning) and `docs/threat-model.md`, add `LICENSE`
-and `THIRD_PARTY.md`. Then Phase 1: Cargo workspace, `playdrop-core`, `playdrop-cli`, resumable
-500 MB transfer between two processes, HTTP/2 vs raw framing benchmark in week one.
+Phases are in PLAN.md "Build phases". Phase 0 is done: `docs/product.md` (scope), `docs/protocol.md`
+(normative wire spec, port 42187, wins on wire behaviour), `docs/threat-model.md` (SR-1 to SR-34,
+each tagged with the phase that must satisfy it), `LICENSE`, `THIRD_PARTY.md`. Next is Phase 1:
+Cargo workspace, `playdrop-core`, `playdrop-cli`, resumable 500 MB transfer between two processes,
+HTTP/2 vs raw framing benchmark in week one. Every Phase 1 PR must say which SRs it satisfies.
 
 ## Commands
 

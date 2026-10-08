@@ -459,9 +459,9 @@ Licence (GPL-3.0-or-later), interop (none), companion slice (see v1 list), UI la
 
 | Decision | Options | Recommended default |
 |---|---|---|
-| Port and multicast group | Any port outside 1714-1764 and 53317; any group except 224.0.0.167 | Pick one fixed port with a documented override, and check it against the IANA registry and common apps. mDNS service `_playdrop._tcp`. |
-| Name | PlayDrop or rename | PlayDrop, unless the user says otherwise |
-| SAS algorithm | Our own design | Specify hash, digit count and input order in `docs/protocol.md` |
+| Port and multicast group | Decided 2026-10-08 | TCP 42187 (TLS 1.3 + HTTP/2), UDP 42187 beacon, group 239.255.42.187 (organization-local scope), mDNS `_playdrop._tcp`. 42187 is unassigned at IANA as of 2026-10-08 and outside both incumbents' ranges. Override via config. |
+| Name | PlayDrop | Confirmed by the repo name `QasimBhb/PlayDrop` |
+| SAS algorithm | Decided in `docs/protocol.md` | 6 decimal digits from BLAKE3 over both Device IDs, both public keys and the pairing nonce; 30 s timeout |
 | Windows packaging | Classic / MSIX / both | Classic first; MSIX only if notification mirroring is ever added |
 | Reuse plan for external code | Which LocalSend and KDE Connect pieces to port | Decide per piece in Phase 1 and later. Candidates: LocalSend's Rust HTTP sender tuning, KDE Connect's MPRIS and mousepad plugin logic. Every reused file keeps its original copyright header and an SPDX tag. |
 
