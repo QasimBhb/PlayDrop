@@ -1,0 +1,46 @@
+[package]
+name = "playdrop-core"
+description = "PlayDrop core: identity, discovery, pairing, TLS, session plane and transfer engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+blake3 = "1.8.7"
+bytes = "1.12.1"
+data-encoding = "2.11.1"
+directories = "6.0.0"
+ed25519-dalek = { version = "3.0.0", features = ["rand_core", "pkcs8"] }
+futures-util = "0.3.34"
+h2 = "0.4.20"
+hmac = "0.13.0"
+http = "1.5.0"
+if-addrs = "0.15.0"
+mdns-sd = "0.21.5"
+rand = "0.10.3"
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rustix = { version = "1.1.5", features = ["fs"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+rustls-pki-types = "1.15.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+socket2 = { version = "0.6.5", features = ["all"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "fs", "io-util", "sync", "time", "macros", "signal"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
+tracing = "0.1.44"
+unicode-normalization = "0.1.25"
+x509-parser = "0.18.1"
+zeroize = "1.9.1"
+
+[dev-dependencies]
+proptest = "1.11.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["test-util"] }
+tracing-subscriber = "0.3.23"

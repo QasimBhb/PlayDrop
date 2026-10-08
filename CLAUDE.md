@@ -9,8 +9,10 @@ always-on companion link (ping, clipboard, battery, media, later notifications a
 LocalSend's fast, account-free file drop, and adds resume and steady speed for thousands of small files.
 Targets: Android, iOS, Windows, Linux (Pop!_OS COSMIC first, Ubuntu GNOME second). Speed is the top priority.
 
-State: research and planning done, Phase 0 mostly closed on 2026-10-08 (see "User requirements" in
-PLAN.md). No code yet. Licence is GPL-3.0-or-later. UI is native per platform. Build is fully agentic.
+State: Phase 1 core complete on 2026-10-08. Rust workspace with `playdrop-core` (identity, pin store,
+TLS, session plane, pairing, transfer engine, discovery, HTTP/2 net layer, host runtime) and
+`playdrop-cli`. 176 tests, clippy clean, all five Phase 1 gates pass. Licence GPL-3.0-or-later.
+UI native per platform. Build fully agentic. Next: Phase 2 desktop daemon.
 
 ## Read first
 
@@ -50,13 +52,29 @@ PLAN.md under "Architecture" and "Decisions".
 
 Phases are in PLAN.md "Build phases". Phase 0 is done: `docs/product.md` (scope), `docs/protocol.md`
 (normative wire spec, port 42187, wins on wire behaviour), `docs/threat-model.md` (SR-1 to SR-34,
-each tagged with the phase that must satisfy it), `LICENSE`, `THIRD_PARTY.md`. Next is Phase 1:
-Cargo workspace, `playdrop-core`, `playdrop-cli`, resumable 500 MB transfer between two processes,
-HTTP/2 vs raw framing benchmark in week one. Every Phase 1 PR must say which SRs it satisfies.
+each tagged with the phase that must satisfy it), `LICENSE`, `THIRD_PARTY.md`. Phase 1 is done:
+gates A-E in `crates/playdrop-core/tests/phase1_gates.rs`. Loopback numbers (release): 500 MiB
+resume at ~405 MiB/s, 5,000 small files at 0.88x of one big file, HTTP/2 ~2,080 MiB/s vs raw
+framing ~2,845 MiB/s (h2 about 27% slower; kept for v1, `playdrop/2` reserved for raw bulk if
+phone CPU measurements in Phase 3 demand it). Open TODOs are tagged with their SR in the code
+(`grep -rn "TODO(SR-" crates/`). Next is Phase 2: `playdropd` daemon, tray, notifications, Slint
+window, Windows installer. Every PR must say which SRs it satisfies.
 
 ## Commands
 
-None yet. When the Cargo workspace exists, record build, test, single-test and bench commands here.
+Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
+
+- Build: `cargo build --workspace` (release: `cargo build --release`)
+- Test all: `cargo test --workspace` (gates print their numbers with `-- --nocapture`; use `--release` for real throughput)
+- One module or test: `cargo test -p playdrop-core transfer::` or `cargo test -p playdrop-core --test phase1_gates gate_a`
+- Lint and format: `cargo clippy --workspace --all-targets` (zero warnings), `cargo fmt --all`
+- Debug logs in tests: `PD_LOG=1 cargo test ...`; in the CLI: `RUST_LOG=playdrop_core=debug`
+- Two hosts for a manual transfer, one per terminal:
+  `cargo run -p playdrop-cli -- host --data-dir /tmp/pd-a --receive-dir /tmp/pd-a-in --port 42187 --name alpha`
+  `cargo run -p playdrop-cli -- host --data-dir /tmp/pd-b --receive-dir /tmp/pd-b-in --port 42188 --name bravo`
+  then type `pair` in bravo, `pair 127.0.0.1:42188` in alpha, `y` in both, `peers`, and `send <short-id> <path>` (`help` lists all stdin commands)
+- Benchmark (release): `target/release/playdrop bench --role server --addr 127.0.0.1:42200 --mode h2` in one terminal, `target/release/playdrop bench --role client --addr 127.0.0.1:42200 --mode h2 --size 1GiB --runs 3` in another; repeat with `--mode raw`; compare with `iperf3 -s` and `iperf3 -c 127.0.0.1 -t 5`
+- LAN discovery test (needs a real interface with multicast): `cargo test -p playdrop-core --test phase1_gates -- --ignored`
 
 ## Writing and git rules
 

@@ -1,0 +1,28 @@
+[package]
+name = "playdrop-cli"
+description = "PlayDrop command line: run a host, pair, send, and benchmark"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "playdrop"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+blake3 = "1.8.7"
+bytes = "1.12.1"
+clap = { version = "4.6.7", features = ["derive"] }
+futures-util = "0.3.34"
+h2 = "0.4.20"
+http = "1.5.0"
+playdrop-core = { path = "../playdrop-core" }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "signal", "fs", "io-std", "io-util", "net", "time", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

@@ -584,3 +584,17 @@ Session codes travel in `error` frames, HTTP codes in the 7.1 error body. Oversi
 | SR-4 | "Add device" beacons also carry `port` | Needed for the port override; the port is visible in every TCP connection and the mDNS SRV record anyway |
 | SR-21 | A changed source **size** cancels with `source_changed` instead of restarting at 0 | The size was accepted and checked against free space, so it needs a new offer. Mtime, inode and prefix changes restart at 0 as SR-21 says |
 | SR-14 | A frame lacking its grant is dropped, but one `forbidden` error per type per connection MAY be sent | Lets the sender hide the feature and say why (PLAN.md anti-pattern 18) |
+
+### 11.1 Implementation notes (Phase 1 code)
+
+Where the Phase 1 code (`crates/playdrop-core`) differs from or settles a gap in this document. Each is open for review before the core API freeze.
+
+- **Requests flow only from the dialler (3.1, 3.3, 7).** HTTP/2 lets only the client open streams, so a host sends requests only on a connection it dialled. A pair may hold two connections, one dialled by each side. The session stream lives on one of them: the one dialled by the lower Device ID when both carry one. A second session on a non-preferred connection gets `409 conflict` and that connection stays open for requests; a preferred one replaces the live session, whose stream is ended without closing its connection. A newer connection from the same dialler replaces the older one.
+- **Ending a session stream does not close its connection (5.1)**, because the connection may still carry requests (bullet above). Protocol errors still close it.
+- **No `duplicate_connection` debug data (3.3).** The `h2` crate cannot attach GOAWAY debug data; the server sends GOAWAY `NO_ERROR` and the client simply closes the socket.
+- **Equal keep-alive intervals (3.4):** the dialler pings.
+- **No `transfer` frame for an expired offer (5.13, 7.3):** its state has no `expired` value; `GET` reports `expired`.
+- **`PUT` on an offer that is not accepted (7.1):** pending gets `409 conflict`, declined gets `403 declined`, expired `410 expired`, cancelled `410 cancelled`.
+- **Sender persistence (7.6) is receiver-only for now:** a restarted receiver resumes; a restarted sender re-offers.
+- **"Removed by peer" (5.4)** is reported to the UI but not yet stored in the pin.
+- **Benchmark (section 10, last bullet):** on loopback, tuned HTTP/2 measured about 25 to 30% below raw framing on the same TLS socket. Not acted on; the Phase 1 review decides.
