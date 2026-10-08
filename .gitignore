@@ -1,0 +1,22 @@
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Build output (placeholders, refine once stack chosen)
+target/
+build/
+node_modules/
+.dart_tool/
+
+# AI tool config and agent persona bundles (local only)
+.cursor/
+.opencode/
+.github/agents/
+.claude/agents/
+.claude/settings.local.json
