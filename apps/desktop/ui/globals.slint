@@ -1,0 +1,105 @@
+// Shared state between the Rust controller and the screens. Each global belongs to one
+// screen; Rust sets the `in` properties and handles the callbacks (`src/screens/`).
+
+import { ConnPhase, DeviceRow, CandidateRow, TransferRow, DiagSection } from "types.slint";
+
+// Which tab is showing.
+export global Nav {
+    in-out property <int> page: 0;
+}
+
+// Connection to the daemon (not-connected screen).
+export global ConnState {
+    in property <ConnPhase> phase: ConnPhase.connecting;
+    in property <string> message;
+    in property <bool> starting;
+    callback start-daemon();
+    callback retry();
+}
+
+// One-line feedback at the bottom of the window.
+export global NoticeState {
+    in property <string> text;
+    in property <bool> error;
+    callback dismiss();
+}
+
+// Devices screen.
+export global DevicesState {
+    in property <[DeviceRow]> rows;
+    in-out property <int> selected: -1;
+    callback send-files(string);
+    callback send-folder(string);
+    callback ping(string);
+    // Device ID and the text read from the local clipboard.
+    callback send-clipboard(string, string);
+    callback rename(string, string);
+    // Device ID, grant name, new value.
+    callback set-grant(string, string, bool);
+    callback unpair(string);
+}
+
+// Add device screen, the pairing prompt and the QR code.
+export global PairingState {
+    in property <bool> window-open;
+    in property <string> remaining;
+    in property <string> blocked-reason;
+    in property <[CandidateRow]> candidates;
+    in property <string> status;
+    in property <bool> status-error;
+    in property <bool> prompt-visible;
+    in property <bool> prompt-is-sas;
+    in property <string> prompt-sas;
+    in property <string> prompt-name;
+    in property <string> prompt-short-id;
+    in property <bool> qr-visible;
+    in property <bool> qr-ready;
+    in property <string> qr-uri;
+    in property <image> qr-image;
+    in property <string> qr-warning;
+    callback open-window();
+    callback close-window();
+    callback pair-with(string);
+    callback respond(bool);
+    callback show-qr();
+    callback hide-qr();
+}
+
+// Transfers screen.
+export global TransfersState {
+    in property <[TransferRow]> rows;
+    in property <int> pending-offers;
+    callback respond(string, bool);
+    callback cancel(string);
+    callback open(string);
+    callback show-in-folder(string);
+    callback clear-finished();
+}
+
+// Settings screen.
+export global SettingsState {
+    in property <string> receive-dir;
+    in property <string> device-name;
+    in property <bool> clipboard-sync;
+    in property <bool> clipboard-watch-supported: true;
+    in property <bool> autostart;
+    in property <bool> notifications;
+    in property <string> short-id;
+    in property <string> device-id;
+    in property <string> about;
+    callback choose-receive-dir();
+    callback set-device-name(string);
+    callback set-clipboard-sync(bool);
+    callback set-autostart(bool);
+    callback set-notifications(bool);
+}
+
+// Diagnostics screen.
+export global DiagnosticsState {
+    in property <bool> loading;
+    in property <string> error;
+    in property <[string]> summary;
+    in property <[DiagSection]> sections;
+    callback refresh();
+    callback network-changed();
+}

@@ -1,0 +1,66 @@
+// Data shapes the Rust side fills in. Rust builds them in `src/model.rs` from the IPC
+// contract; the screens only display them.
+
+// Where the window stands with the daemon.
+export enum ConnPhase {
+    connecting,
+    not-running,
+    failed,
+    connected,
+}
+
+// One paired device on the Devices screen.
+export struct DeviceRow {
+    // Hex Device ID, used as the peer query for every request.
+    id: string,
+    label: string,
+    // Shown beside the label so a renamed device stays recognisable (SR-8).
+    short-id: string,
+    // "Online", "Offline", "Asleep", "Idle" or "Locked".
+    state: string,
+    online: bool,
+    // Empty when unknown.
+    battery: string,
+    paired: string,
+    last-seen: string,
+    // Last discovery problem, empty when none.
+    note: string,
+    grant-files: bool,
+    grant-clipboard-in: bool,
+    grant-clipboard-out: bool,
+    grant-find: bool,
+    grant-input: bool,
+    grant-media: bool,
+}
+
+// A device seen in its own "Add device" window.
+export struct CandidateRow {
+    name: string,
+    device-type: string,
+    addr: string,
+}
+
+// One transfer, either direction.
+export struct TransferRow {
+    id: string,
+    receive: bool,
+    title: string,
+    files: string,
+    // "offered", "active", "complete", "failed" or "cancelled".
+    state: string,
+    status-text: string,
+    progress: float,
+    show-progress: bool,
+    detail: string,
+    can-respond: bool,
+    can-cancel: bool,
+    can-open: bool,
+    can-show: bool,
+}
+
+// One block of the Diagnostics screen.
+export struct DiagSection {
+    title: string,
+    lines: [string],
+    ok: bool,
+}

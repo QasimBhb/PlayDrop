@@ -1,0 +1,6 @@
+# ufw application profile for PlayDrop. Installing it changes nothing.
+# To open the port: sudo ufw allow PlayDrop
+[PlayDrop]
+title=PlayDrop
+description=Phone-to-computer link and local file drop (TLS on TCP, discovery on UDP)
+ports=42187/tcp|42187/udp

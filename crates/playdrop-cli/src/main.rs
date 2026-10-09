@@ -36,6 +36,8 @@ enum Command {
     ///   y | n                         answer the pairing prompt
     ///   send <peer> <path>...         send files or folders (peer: short ID or label)
     ///   accept <id> | decline <id>    answer an incoming offer
+    ///   cancel <id>                   cancel a transfer in either direction
+    ///   transfers                     list running and recent transfers
     ///   grants <peer> [+g|-g]...      show or change grants (files, clipboardIn,
     ///                                 clipboardOut, input, media, find)
     ///   ping <peer> [message]         ping a peer

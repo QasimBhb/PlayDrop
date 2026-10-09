@@ -362,6 +362,7 @@ fn on_end(inner: &Arc<Inner>, sess: &Arc<Session>) {
     sess.conn.release_session();
     if inner.registry.uninstall(sess) {
         let id = sess.peer();
+        inner.persist_last_seen(id);
         inner.emit(HostEvent::PeerOffline {
             peer: id.to_hex(),
             short_id: id.short_id(),
@@ -386,7 +387,13 @@ async fn handle_inbound(
             }
             Ok(())
         }
-        Inbound::Frame(env) => handle_frame(inner, sess, env).await,
+        Inbound::Frame(env) => {
+            // Any frame from a paired device counts as seen (SR-8).
+            if sess.conn.is_trusted() {
+                inner.touch_peer(sess.peer());
+            }
+            handle_frame(inner, sess, env).await
+        }
     }
 }
 
@@ -454,6 +461,14 @@ async fn handle_frame(
             start: f.action == crate::session::types::FindAction::Start,
         }),
         Frame::Clipboard(c) => {
+            // The hash feeds echo prevention, so it must describe the text it came with:
+            // a mismatch is a protocol error and the frame is dropped (protocol.md 5.7).
+            if let Some(text) = &c.text {
+                if crate::session::types::clipboard_text_hash(text) != c.hash {
+                    tracing::debug!(peer = %short(&peer), "clipboard hash does not match its text; dropped");
+                    return Ok(());
+                }
+            }
             // Echo prevention (protocol.md 5.7): remember what we applied.
             lock(&inner.clipboard_echo).last_applied = Some(c.hash.clone());
             inner.emit(HostEvent::Clipboard {
@@ -559,6 +574,8 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
         }),
         Placement::Replace => {}
     }
+    inner.touch_peer(peer);
+    inner.persist_last_seen(peer);
     if let Some(old) = old {
         tracing::debug!(peer = %short(&peer), "session moved to the preferred connection (3.3)");
         old.end();

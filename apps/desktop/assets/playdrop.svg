@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>PlayDrop</title>
+  <rect width="64" height="64" rx="14" fill="#2f6fed"/>
+  <path d="M32 12 L45.6 34.6 A14 14 0 1 1 18.4 34.6 Z" fill="#ffffff"/>
+</svg>

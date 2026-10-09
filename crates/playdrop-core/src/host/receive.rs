@@ -13,8 +13,9 @@ use h2::RecvStream;
 use http::{HeaderMap, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 
-use super::events::{HostEvent, TransferDirection};
-use super::{lock, Inner};
+use super::events::{FileRoot, HostEvent, OfferedFile, TransferDirection, OFFER_FILES_MAX};
+use super::transfers::{TransferSnapshot, TransferStatus};
+use super::{lock, Inner, TransferEnd};
 use crate::identity::{secure_fs, DeviceId};
 use crate::net::connection::short;
 use crate::net::{
@@ -329,10 +330,16 @@ async fn offer_inner(
                 deadline: Instant::now() + OFFER_TTL,
             }
         };
+        let status = if grants.files {
+            TransferStatus::Active
+        } else {
+            TransferStatus::Offered
+        };
         map.insert(
             id.clone(),
             Incoming::new(peer, Arc::clone(&manifest), state),
         );
+        lock(&inner.transfers).begin(snapshot_of(&peer, &manifest, status));
     }
     if !grants.files {
         let expires_at = match lock(&inner.incoming).get(&id).map(|e| &e.state) {
@@ -343,7 +350,16 @@ async fn offer_inner(
             id: id.clone(),
             peer: peer.to_hex(),
             short_id: peer.short_id(),
-            files: manifest.files.len(),
+            files: manifest
+                .files
+                .iter()
+                .take(OFFER_FILES_MAX)
+                .map(|f| OfferedFile {
+                    path: f.path.join("/"),
+                    size: f.size,
+                })
+                .collect(),
+            file_count: manifest.files.len(),
             total_bytes: manifest.total_bytes,
             note: manifest.note.clone(),
         });
@@ -357,12 +373,33 @@ async fn offer_inner(
         Ok(rx) => Ok(OfferReply::Created(accepted_body(&rx))),
         Err(e) => {
             lock(&inner.incoming).remove(&id);
+            inner.transfer_ended(
+                &id,
+                &peer,
+                TransferDirection::Receive,
+                TransferEnd::Failed(format!("could not accept: {e}")),
+            );
             Err(HttpError::from(e))
         }
     }
 }
 
-/// Accepts a manifest into staging and records its owner (protocol.md 7.3, SR-13).
+/// A fresh book entry for an incoming manifest.
+fn snapshot_of(peer: &DeviceId, manifest: &Manifest, status: TransferStatus) -> TransferSnapshot {
+    TransferSnapshot::new(
+        &manifest.id,
+        peer,
+        TransferDirection::Receive,
+        status,
+        manifest.total_bytes,
+        manifest.files.len(),
+        manifest.note.clone(),
+    )
+}
+
+/// Accepts a manifest into staging and records its owner (protocol.md 7.3, SR-13). If the
+/// user cancelled while staging was being created, the new staging is removed again and
+/// [`Error::Cancelled`] is returned.
 async fn accept_now(
     inner: &Arc<Inner>,
     id: &str,
@@ -377,9 +414,21 @@ async fn accept_now(
     )
     .await?;
     write_owner(inner, id, owner).await?;
-    if let Some(e) = lock(&inner.incoming).get_mut(id) {
-        e.state = OfferState::Accepted(rx.clone());
-        e.started = Instant::now();
+    let cancelled = {
+        let mut map = lock(&inner.incoming);
+        match map.get_mut(id) {
+            Some(e) if matches!(e.state, OfferState::Accepting) => {
+                e.state = OfferState::Accepted(rx.clone());
+                e.started = Instant::now();
+                false
+            }
+            _ => true,
+        }
+    };
+    if cancelled {
+        let _ = rx.cancel().await;
+        remove_owner(inner, id);
+        return Err(Error::Cancelled);
     }
     tracing::debug!(peer = %short(&owner), files = manifest.files.len(), "transfer accepted");
     Ok(rx)
@@ -593,26 +642,35 @@ fn report_if_done(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver) {
         (e.owner, e.started)
     };
     remove_owner(inner, id);
-    match state {
+    let end = match state {
         TransferState::Complete => {
             let st = rx.state();
-            inner.emit(HostEvent::TransferComplete {
-                id: id.to_owned(),
-                peer: owner.to_hex(),
-                direction: TransferDirection::Receive,
+            let manifest = rx.manifest();
+            let roots = manifest
+                .files
+                .iter()
+                .zip(&st.files)
+                .map(|(f, v)| FileRoot {
+                    path: f.path.join("/"),
+                    size: f.size,
+                    root: (!f.in_bundle && f.size > 0)
+                        .then(|| v.root.clone())
+                        .flatten(),
+                })
+                .collect();
+            TransferEnd::Complete {
                 bytes: st.total_bytes,
                 elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-                roots: Vec::new(),
+                roots,
                 bundle_root: st.bundle.and_then(|b| b.root),
-            });
+                saved: rx.saved_paths(),
+                folder: Some(rx.receive_root().to_path_buf()),
+            }
         }
-        _ => inner.emit(HostEvent::TransferFailed {
-            id: id.to_owned(),
-            peer: owner.to_hex(),
-            direction: TransferDirection::Receive,
-            reason: format!("transfer {state:?}").to_lowercase(),
-        }),
-    }
+        TransferState::Cancelled => TransferEnd::Cancelled("transfer cancelled".into()),
+        _ => TransferEnd::Failed(format!("transfer {state:?}").to_lowercase()),
+    };
+    inner.transfer_ended(id, &owner, TransferDirection::Receive, end);
 }
 
 /// `GET /v1/transfers/{id}` (protocol.md 7.5).
@@ -691,13 +749,61 @@ pub(crate) async fn cancel(
             .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
             .take(32)
             .collect();
-        inner.emit(HostEvent::TransferFailed {
-            id,
-            peer: peer.to_hex(),
-            direction: TransferDirection::Receive,
-            reason: format!("cancelled by sender ({safe_reason})"),
-        });
+        inner.transfer_ended(
+            &id,
+            &peer,
+            TransferDirection::Receive,
+            TransferEnd::Cancelled(format!("cancelled by sender ({safe_reason})")),
+        );
     }
+}
+
+/// Cancels an incoming transfer at the local user's request (protocol.md 7.5): deletes
+/// every `.part`, makes later `PUT`s fail with `410 cancelled`, and pushes a `transfer`
+/// frame with state `cancelled`, reason `user`, so the sender stops (5.13). A pending
+/// offer is withdrawn the same way.
+pub(crate) async fn cancel_local(inner: &Arc<Inner>, id: &str) -> Result<()> {
+    let (owner, rx) = {
+        let mut map = lock(&inner.incoming);
+        let e = map.get_mut(id).ok_or(Error::NotFound)?;
+        if e.reported {
+            return Err(Error::NotFound);
+        }
+        let rx = match &e.state {
+            OfferState::Accepted(rx) => {
+                if matches!(
+                    rx.transfer_state(),
+                    TransferState::Complete | TransferState::Failed | TransferState::Cancelled
+                ) {
+                    return Err(Error::NotFound);
+                }
+                Some(rx.clone())
+            }
+            OfferState::Pending { .. } | OfferState::Accepting => {
+                e.state = OfferState::Cancelled;
+                None
+            }
+            OfferState::Declined | OfferState::Expired | OfferState::Cancelled => {
+                return Err(Error::NotFound)
+            }
+        };
+        e.reported = true;
+        (e.owner, rx)
+    };
+    if let Some(rx) = &rx {
+        if let Err(e) = rx.cancel().await {
+            tracing::debug!(error = %e, "cancel cleanup failed");
+        }
+    }
+    remove_owner(inner, id);
+    send_decision(inner, owner, id, FrameState::Cancelled, Some("user"));
+    inner.transfer_ended(
+        id,
+        &owner,
+        TransferDirection::Receive,
+        TransferEnd::Cancelled("cancelled by you".into()),
+    );
+    Ok(())
 }
 
 /// The user's decision on a pending offer (protocol.md 7.3); the sender learns it from a
@@ -718,16 +824,41 @@ pub(crate) async fn respond_offer(inner: &Arc<Inner>, id: &str, accept: bool) ->
     };
     let state = if accept {
         match accept_now(inner, id, owner, &manifest).await {
-            Ok(_) => FrameState::Accepted,
+            Ok(_) => {
+                lock(&inner.transfers).set_state(
+                    id,
+                    TransferDirection::Receive,
+                    TransferStatus::Active,
+                );
+                FrameState::Accepted
+            }
+            // Cancelled by the user while staging was created: already reported.
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(e) => {
                 if let Some(en) = lock(&inner.incoming).get_mut(id) {
                     en.state = OfferState::Cancelled;
+                    en.reported = true;
                 }
                 send_decision(inner, owner, id, FrameState::Failed, Some("error"));
+                inner.transfer_ended(
+                    id,
+                    &owner,
+                    TransferDirection::Receive,
+                    TransferEnd::Failed(format!("could not accept: {e}")),
+                );
                 return Err(e);
             }
         }
     } else {
+        if let Some(en) = lock(&inner.incoming).get_mut(id) {
+            en.reported = true;
+        }
+        inner.transfer_ended(
+            id,
+            &owner,
+            TransferDirection::Receive,
+            TransferEnd::Cancelled("declined".into()),
+        );
         FrameState::Declined
     };
     send_decision(inner, owner, id, state, None);
@@ -789,8 +920,12 @@ pub(crate) async fn load_persisted(inner: &Arc<Inner>) {
                 ) =>
             {
                 let manifest = Arc::new(rx.manifest().clone());
+                let bytes = rx.state().bytes_verified;
+                let mut snap = snapshot_of(&owner, &manifest, TransferStatus::Active);
+                snap.bytes = bytes;
+                lock(&inner.transfers).begin(snap);
                 let mut e = Incoming::new(owner, manifest, OfferState::Accepted(rx));
-                e.last = (Instant::now(), 0);
+                e.last = (Instant::now(), bytes);
                 lock(&inner.incoming).insert(id, e);
             }
             Ok(rx) => {
@@ -817,6 +952,14 @@ pub(crate) async fn drop_peer(inner: &Arc<Inner>, peer: &DeviceId) {
         ids.into_iter()
             .filter_map(|id| {
                 map.remove(&id).map(|e| {
+                    if !e.reported {
+                        lock(&inner.transfers).finish(
+                            &id,
+                            TransferDirection::Receive,
+                            TransferStatus::Cancelled,
+                            Some("device unpaired".into()),
+                        );
+                    }
                     let rx = match e.state {
                         OfferState::Accepted(rx) => Some(rx),
                         _ => None,
@@ -849,6 +992,7 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                 match &e.state {
                     OfferState::Pending { deadline, .. } if now >= *deadline => {
                         e.state = OfferState::Expired;
+                        e.reported = true;
                         expired.push((id.clone(), e.owner));
                     }
                     OfferState::Accepted(rx) if !e.reported => {
@@ -862,40 +1006,51 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                             )] // display rate only
                             let rate = (bytes.saturating_sub(e.last.1) as f64 / dt) as u64;
                             e.last = (now, bytes);
-                            progress.push(HostEvent::TransferProgress {
-                                id: id.clone(),
-                                peer: e.owner.to_hex(),
-                                direction: TransferDirection::Receive,
+                            progress.push((
+                                id.clone(),
+                                e.owner,
                                 bytes,
-                                total: e.manifest.total_bytes,
-                                bytes_per_sec: rate,
-                            });
+                                e.manifest.total_bytes,
+                                rate,
+                            ));
                         }
                     }
                     _ => {}
                 }
             }
         }
-        for ev in progress {
-            inner.emit(ev);
+        for (id, owner, bytes, total, rate) in progress {
+            inner.transfer_progress(&id, &owner, TransferDirection::Receive, bytes, total, rate);
         }
         for (id, owner) in expired {
-            inner.emit(HostEvent::TransferFailed {
-                id,
-                peer: owner.to_hex(),
-                direction: TransferDirection::Receive,
-                reason: "offer expired".into(),
-            });
+            inner.transfer_ended(
+                &id,
+                &owner,
+                TransferDirection::Receive,
+                TransferEnd::Failed("offer expired".into()),
+            );
         }
         if last_cleanup.is_none_or(|t| now.duration_since(t) >= CLEANUP_EVERY) {
             last_cleanup = Some(now);
             match cleanup_idle(&inner.receive_dir, IDLE_TIMEOUT).await {
                 Ok(ids) => {
-                    let mut map: std::sync::MutexGuard<'_, HashMap<String, Incoming>> =
-                        lock(&inner.incoming);
-                    for id in ids {
-                        map.remove(&id);
+                    let gone: Vec<(String, Incoming)> = {
+                        let mut map: std::sync::MutexGuard<'_, HashMap<String, Incoming>> =
+                            lock(&inner.incoming);
+                        ids.into_iter()
+                            .filter_map(|id| map.remove(&id).map(|e| (id, e)))
+                            .collect()
+                    };
+                    for (id, e) in gone {
                         remove_owner(&inner, &id);
+                        if !e.reported {
+                            inner.transfer_ended(
+                                &id,
+                                &e.owner,
+                                TransferDirection::Receive,
+                                TransferEnd::Failed("no data for 24 hours; removed".into()),
+                            );
+                        }
                     }
                 }
                 Err(e) => tracing::debug!(error = %e, "idle cleanup failed"),

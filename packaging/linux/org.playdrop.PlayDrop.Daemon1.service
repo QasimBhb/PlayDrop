@@ -1,0 +1,13 @@
+# D-Bus session service for the PlayDrop daemon (docs/ipc.md section 2).
+# Installed to /usr/share/dbus-1/services. A UI call to org.playdrop.PlayDrop.Daemon1
+# starts the daemon when it is not already running.
+#
+# SystemdService: when the session runs a systemd user manager (Pop!_OS and
+# Ubuntu 24.04 do), the bus asks systemd to start playdropd.service instead of
+# spawning Exec directly, so the daemon gets Restart=on-failure and journald
+# logging. The unit only has to be installed, not enabled. Without systemd the
+# bus falls back to Exec.
+[D-BUS Service]
+Name=org.playdrop.PlayDrop.Daemon1
+Exec=/usr/bin/playdropd
+SystemdService=playdropd.service

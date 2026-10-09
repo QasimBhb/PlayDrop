@@ -1,0 +1,96 @@
+// PlayDrop desktop window. A thin client of playdropd: every screen reads a global that
+// the Rust controller fills from the IPC, and every action is a callback into Rust.
+
+import { TabWidget, Button, Palette } from "std-widgets.slint";
+import { ConnPhase } from "types.slint";
+import { Nav, ConnState, NoticeState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState } from "globals.slint";
+import { ConnectionScreen } from "connection.slint";
+import { DevicesPage } from "devices.slint";
+import { AddDevicePage } from "add-device.slint";
+import { TransfersPage } from "transfers.slint";
+import { SettingsPage } from "settings.slint";
+import { DiagnosticsPage } from "diagnostics.slint";
+import { PairingDialog, QrDialog } from "pairing.slint";
+
+export { ConnPhase, Nav, ConnState, NoticeState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState }
+
+component NoticeBar inherits Rectangle {
+    background: NoticeState.error ? #c42b1c : Palette.accent-background;
+    accessible-role: text;
+    accessible-label: NoticeState.text;
+    HorizontalLayout {
+        padding: 8px;
+        padding-left: 16px;
+        spacing: 8px;
+        Text {
+            text: NoticeState.text;
+            color: NoticeState.error ? #ffffff : Palette.accent-foreground;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Button {
+            text: "Dismiss";
+            clicked => {
+                NoticeState.dismiss();
+            }
+        }
+    }
+}
+
+export component App inherits Window {
+    in property <image> app-icon;
+
+    title: "PlayDrop";
+    icon: root.app-icon;
+    min-width: 480px;
+    min-height: 360px;
+    preferred-width: 720px;
+    preferred-height: 600px;
+    background: Palette.background;
+
+    if ConnState.phase != ConnPhase.connected: ConnectionScreen { }
+
+    if ConnState.phase == ConnPhase.connected: VerticalLayout {
+        TabWidget {
+            current-index <=> Nav.page;
+            changed current-index => {
+                if self.current-index == 4 {
+                    DiagnosticsState.refresh();
+                }
+            }
+
+            Tab {
+                title: "Devices";
+                DevicesPage { }
+            }
+
+            Tab {
+                title: "Add device";
+                AddDevicePage { }
+            }
+
+            Tab {
+                title: TransfersState.pending-offers > 0 ? "Transfers (" + TransfersState.pending-offers + ")" : "Transfers";
+                TransfersPage { }
+            }
+
+            Tab {
+                title: "Settings";
+                SettingsPage { }
+            }
+
+            Tab {
+                title: "Diagnostics";
+                DiagnosticsPage { }
+            }
+        }
+
+        if NoticeState.text != "": NoticeBar { }
+    }
+
+    if PairingState.prompt-visible: PairingDialog { }
+
+    if PairingState.qr-visible: QrDialog { }
+}

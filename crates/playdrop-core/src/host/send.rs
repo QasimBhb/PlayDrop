@@ -4,7 +4,7 @@
 //! disconnect from the receiver's verified offsets (7.6, SR-21).
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,9 +15,10 @@ use serde::Serialize;
 use tokio::io::AsyncRead;
 use tokio::sync::watch;
 
-use super::events::{FileRoot, HostEvent, TransferDirection};
+use super::events::{FileRoot, TransferDirection};
 use super::receive::{CHUNK_SIZE_HEADER, ROOT_TRAILER, TOKEN_HEADER};
-use super::{connect, lock, Inner};
+use super::transfers::{TransferSnapshot, TransferStatus};
+use super::{connect, lock, Inner, TransferEnd};
 use crate::constants::DEFAULT_CHUNK_SIZE;
 use crate::identity::DeviceId;
 use crate::net::connection::short;
@@ -59,7 +60,7 @@ pub(crate) struct Outgoing {
 }
 
 /// What a finished send reports.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 pub struct TransferSummary {
     /// Transfer ID.
     pub id: String,
@@ -135,6 +136,30 @@ struct Job {
     chunk_size: AtomicU32,
     cancel: watch::Receiver<bool>,
     decision: watch::Receiver<Option<FrameState>>,
+    /// Set when the receiver reported the transfer cancelled (a `410 cancelled`, a
+    /// `cancelled` state or a `transfer` frame), so the end is reported as a cancel.
+    remote_cancelled: AtomicBool,
+}
+
+impl Job {
+    /// How a failed run is reported: a cancel by either side, or a failure.
+    fn end_for(&self, reason: String) -> TransferEnd {
+        if *self.cancel.borrow() {
+            TransferEnd::Cancelled("cancelled by you".into())
+        } else if matches!(*self.decision.borrow(), Some(FrameState::Declined)) {
+            TransferEnd::Cancelled("declined by the receiver".into())
+        } else if self.remote_cancelled.load(Ordering::Acquire)
+            || matches!(*self.decision.borrow(), Some(FrameState::Cancelled))
+        {
+            TransferEnd::Cancelled("cancelled by the receiver".into())
+        } else {
+            TransferEnd::Failed(reason)
+        }
+    }
+
+    fn mark_remote_cancel(&self) {
+        self.remote_cancelled.store(true, Ordering::Release);
+    }
 }
 
 /// Builds the manifest for `paths` and starts sending to `peer`.
@@ -153,6 +178,15 @@ pub(crate) async fn start(
     let (manifest, sources) = b.build()?;
     let id = manifest.id.clone();
     let total = manifest.total_bytes;
+    lock(&inner.transfers).begin(TransferSnapshot::new(
+        &id,
+        &peer,
+        TransferDirection::Send,
+        TransferStatus::Offered,
+        total,
+        manifest.files.len(),
+        manifest.note.clone(),
+    ));
     let (decision_tx, decision_rx) = watch::channel(None);
     let cancel = Arc::new(watch::Sender::new(false));
     lock(&inner.outgoing).insert(
@@ -174,6 +208,7 @@ pub(crate) async fn start(
         chunk_size: AtomicU32::new(DEFAULT_CHUNK_SIZE),
         cancel: cancel.subscribe(),
         decision: decision_rx,
+        remote_cancelled: AtomicBool::new(false),
     });
     let (done_tx, done_rx) = watch::channel(None);
     let i2 = Arc::clone(inner);
@@ -185,23 +220,18 @@ pub(crate) async fn start(
             () = ticker => Err("progress ticker ended".into()),
         };
         lock(&i2.outgoing).remove(&id2);
-        match &outcome {
-            Ok(s) => i2.emit(HostEvent::TransferComplete {
-                id: s.id.clone(),
-                peer: s.peer.clone(),
-                direction: TransferDirection::Send,
+        let end = match &outcome {
+            Ok(s) => TransferEnd::Complete {
                 bytes: s.bytes,
                 elapsed_ms: s.elapsed_ms,
                 roots: s.roots.clone(),
                 bundle_root: s.bundle_root.clone(),
-            }),
-            Err(reason) => i2.emit(HostEvent::TransferFailed {
-                id: id2.clone(),
-                peer: peer.to_hex(),
-                direction: TransferDirection::Send,
-                reason: reason.clone(),
-            }),
-        }
+                saved: Vec::new(),
+                folder: None,
+            },
+            Err(reason) => job.end_for(reason.clone()),
+        };
+        i2.transfer_ended(&id2, &peer, TransferDirection::Send, end);
         done_tx.send_replace(Some(outcome));
     });
     Ok(TransferHandle {
@@ -227,14 +257,14 @@ async fn progress_ticker(job: Arc<Job>) {
         )] // display rate only
         let rate = (bytes.saturating_sub(last.1) as f64 / dt) as u64;
         last = (now, bytes);
-        job.inner.emit(HostEvent::TransferProgress {
-            id: job.manifest.id.clone(),
-            peer: job.peer.to_hex(),
-            direction: TransferDirection::Send,
-            bytes: bytes.min(job.manifest.total_bytes),
-            total: job.manifest.total_bytes,
-            bytes_per_sec: rate,
-        });
+        job.inner.transfer_progress(
+            &job.manifest.id,
+            &job.peer,
+            TransferDirection::Send,
+            bytes.min(job.manifest.total_bytes),
+            job.manifest.total_bytes,
+            rate,
+        );
     }
 }
 
@@ -244,6 +274,17 @@ pub(crate) fn on_transfer_frame(inner: &Inner, peer: DeviceId, tf: &TransferFram
     let map = lock(&inner.outgoing);
     if let Some(o) = map.get(&tf.id).filter(|o| o.peer == peer) {
         o.decision.send_replace(Some(tf.state.clone()));
+    }
+}
+
+/// Cancels the send with this ID, if one is running; same as [`TransferHandle::cancel`].
+pub(crate) fn cancel(inner: &Inner, id: &str) -> bool {
+    match lock(&inner.outgoing).get(id) {
+        Some(o) => {
+            o.cancel.send_replace(true);
+            true
+        }
+        None => false,
     }
 }
 
@@ -430,6 +471,7 @@ async fn attempt(
         if !accepted {
             wait_decision(job).await.map_err(Step::Fatal)?;
         }
+        lock(&job.inner.transfers).set_state(&id, TransferDirection::Send, TransferStatus::Active);
     }
     let view = get_state(conn, &id).await?;
     match view.state {
@@ -438,10 +480,13 @@ async fn attempt(
             wait_decision(job).await.map_err(Step::Fatal)?;
             return Ok(None);
         }
-        TransferState::Declined
-        | TransferState::Cancelled
-        | TransferState::Failed
-        | TransferState::Expired => {
+        TransferState::Cancelled => {
+            job.mark_remote_cancel();
+            return Err(Step::Fatal(
+                "receiver reports the transfer cancelled".into(),
+            ));
+        }
+        TransferState::Declined | TransferState::Failed | TransferState::Expired => {
             return Err(Step::Fatal(format!(
                 "receiver reports the transfer {}",
                 format!("{:?}", view.state).to_lowercase()
@@ -599,6 +644,9 @@ async fn stream_target(
                 return TargetOutcome::Failed(format!("{target:?}: {s} {code} {msg}"));
             }
             PutResult::Refused(s, code, msg) => {
+                if code == ErrorCode::Cancelled {
+                    job.mark_remote_cancel();
+                }
                 return TargetOutcome::Fatal(format!("{target:?}: {s} {code} {msg}"));
             }
             PutResult::Conn(e) => return TargetOutcome::Conn(e),
@@ -669,7 +717,7 @@ async fn put_once(
                     )
                 }
             };
-            let r = put_body(conn, req, &mut enc, size, &job.sent).await;
+            let r = put_body(conn, req, &mut enc, size, &job.sent, &job.cancel).await;
             if let Some(s) = job.sender.lock().await.as_mut() {
                 s.record_hashes(fid, enc.into_hashes());
             }
@@ -693,7 +741,7 @@ async fn put_once(
                     )
                 }
             };
-            let r = put_body(conn, req, &mut enc, size, &job.sent).await;
+            let r = put_body(conn, req, &mut enc, size, &job.sent, &job.cancel).await;
             if let Some(s) = job.sender.lock().await.as_mut() {
                 s.record_bundle_hashes(enc.into_hashes());
             }
@@ -703,13 +751,15 @@ async fn put_once(
 }
 
 /// Sends the chunk records and the `pd-root` trailer while reading the response, so a
-/// `422` that arrives mid-body stops the upload (protocol.md 7.4).
+/// `422` that arrives mid-body stops the upload (protocol.md 7.4). A local cancel resets
+/// the stream at the next chunk, so a large file stops at once instead of at its end.
 async fn put_body<R: AsyncRead + Unpin + Send>(
     conn: &Connection,
     req: Request<()>,
     enc: &mut ChunkEncoder<R>,
     size: u64,
     sent: &AtomicU64,
+    cancel: &watch::Receiver<bool>,
 ) -> PutResult {
     let (resp, mut upload) = match conn.request(req, false).await {
         Ok(v) => v,
@@ -717,6 +767,10 @@ async fn put_body<R: AsyncRead + Unpin + Send>(
     };
     let body = async {
         while let Some(rec) = enc.next().await {
+            if *cancel.borrow() {
+                upload.send_reset(h2::Reason::CANCEL);
+                return Err("cancelled".to_owned());
+            }
             let rec = rec.map_err(|e| e.to_string())?;
             let n = rec.len().saturating_sub(HASH_LEN) as u64;
             send_all(&mut upload, rec, false)

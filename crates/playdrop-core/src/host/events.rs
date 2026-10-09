@@ -2,15 +2,17 @@
 //!
 //! Some events carry text that must reach the user's screen but never a log: the SAS and
 //! clipboard contents (SR-32). Those fields are [`Secret`], whose `Debug` is redacted, so a
-//! stray `{:?}` in a log line cannot leak them. `Serialize` keeps the value, for the UI.
+//! stray `{:?}` in a log line cannot leak them. `Serialize` and `Deserialize` keep the
+//! value, so a UI process can decode events received over IPC.
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// A value shown to the user but never logged (SR-32).
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret<T>(pub T);
 
@@ -21,7 +23,7 @@ impl<T> fmt::Debug for Secret<T> {
 }
 
 /// Which side of a transfer this host is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferDirection {
     /// We send.
@@ -31,7 +33,7 @@ pub enum TransferDirection {
 }
 
 /// A discovery path, for "tell the user which layer failed" (PLAN.md, discovery).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveryPath {
     /// mDNS `_playdrop._tcp` (protocol.md 8.1).
@@ -43,7 +45,7 @@ pub enum DiscoveryPath {
 }
 
 /// What a pairing prompt asks the user (protocol.md 6.2, 6.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PairingPromptKind {
     /// Compare this six-digit SAS with the other screen, then accept or reject (6.2).
@@ -55,8 +57,22 @@ pub enum PairingPromptKind {
     ScannerConfirm,
 }
 
-/// One file's verified root, reported when a send completes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+/// Most entries [`HostEvent::TransferOffer`] lists in `files`. *Choice:* 1,000 names is
+/// more than any prompt shows, and keeps the event small enough for IPC.
+pub const OFFER_FILES_MAX: usize = 1_000;
+
+/// One file of an offer, for the accept prompt (gap 10).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OfferedFile {
+    /// Manifest path for display, components joined with `/` (protocol.md 7.2). Already
+    /// validated, but still untrusted text from the peer: show it, never use it as a path.
+    pub path: String,
+    /// Size in bytes.
+    pub size: u64,
+}
+
+/// One file's verified root, reported when a transfer completes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileRoot {
     /// Manifest path, components joined with `/`.
     pub path: String,
@@ -67,7 +83,7 @@ pub struct FileRoot {
 }
 
 /// Everything the host tells its UI. Peers are named by Device ID (hex) and Short ID.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum HostEvent {
@@ -156,8 +172,12 @@ pub enum HostEvent {
         peer: String,
         /// Short ID.
         short_id: String,
-        /// Number of files.
-        files: usize,
+        /// Offered files in manifest order, for the prompt (gap 10). Capped at
+        /// [`OFFER_FILES_MAX`] entries so a 100,000-file offer does not become a multi-MB
+        /// event; `file_count` is always the full count.
+        files: Vec<OfferedFile>,
+        /// Number of files in the manifest.
+        file_count: usize,
         /// Total bytes.
         total_bytes: u64,
         /// Sender's note.
@@ -190,10 +210,19 @@ pub enum HostEvent {
         bytes: u64,
         /// Wall time in milliseconds.
         elapsed_ms: u64,
-        /// Per-file roots (sender side).
+        /// Per-file roots in manifest order, both sides. Bundled and empty files have no
+        /// root of their own (protocol.md 7.7).
         roots: Vec<FileRoot>,
         /// Bundle root, when a bundle was sent.
         bundle_root: Option<String>,
+        /// Receive side: final path of every received file in manifest order, after any
+        /// " (n)" collision rename (SR-18), for "Open". Empty on the send side.
+        #[serde(default)]
+        saved: Vec<PathBuf>,
+        /// Receive side: the receive root the files were written beneath, for "Show in
+        /// folder". `None` on the send side.
+        #[serde(default)]
+        folder: Option<PathBuf>,
     },
     /// A transfer failed or was cancelled.
     TransferFailed {
@@ -267,4 +296,75 @@ pub enum HostEvent {
         /// What went wrong on it.
         failure: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A UI process decodes what the daemon encodes (IPC), and secrets never reach `Debug`
+    /// (SR-32).
+    #[test]
+    fn events_round_trip_and_secrets_stay_redacted() {
+        let events = vec![
+            HostEvent::PairingPrompt {
+                peer: "ab".repeat(32),
+                short_id: "k3qd-7f2m-xa9p-41bc".into(),
+                name: "Phone".into(),
+                prompt: PairingPromptKind::Sas {
+                    sas: Secret("123456".into()),
+                },
+            },
+            HostEvent::Clipboard {
+                peer: "ab".repeat(32),
+                text: Secret(Some("hunter2".into())),
+                sensitive: true,
+            },
+            HostEvent::TransferOffer {
+                id: "t".into(),
+                peer: "ab".repeat(32),
+                short_id: "s".into(),
+                files: vec![OfferedFile {
+                    path: "Docs/a.pdf".into(),
+                    size: 3,
+                }],
+                file_count: 1,
+                total_bytes: 3,
+                note: None,
+            },
+            HostEvent::TransferComplete {
+                id: "t".into(),
+                peer: "ab".repeat(32),
+                direction: TransferDirection::Receive,
+                bytes: 3,
+                elapsed_ms: 1,
+                roots: vec![FileRoot {
+                    path: "Docs/a.pdf".into(),
+                    size: 3,
+                    root: None,
+                }],
+                bundle_root: Some("00".into()),
+                saved: vec![PathBuf::from("/home/u/Downloads/Docs/a.pdf")],
+                folder: Some(PathBuf::from("/home/u/Downloads")),
+            },
+            HostEvent::DiscoveryDiagnostic {
+                peer: "ab".repeat(32),
+                short_id: "s".into(),
+                path: DiscoveryPath::LastKnown,
+                failure: "refused".into(),
+            },
+        ];
+        for ev in events {
+            let json = serde_json::to_string(&ev).unwrap();
+            let back: HostEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ev, "{json}");
+            let dbg = format!("{ev:?}");
+            assert!(!dbg.contains("123456") && !dbg.contains("hunter2"), "{dbg}");
+        }
+        let json = r#"{"event":"clipboard","peer":"p","text":"x","sensitive":false}"#;
+        let HostEvent::Clipboard { text, .. } = serde_json::from_str(json).unwrap() else {
+            panic!("wrong variant");
+        };
+        assert_eq!(text.0.as_deref(), Some("x"));
+    }
 }

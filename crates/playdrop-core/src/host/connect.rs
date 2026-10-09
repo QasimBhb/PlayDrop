@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+use super::diagnostics::DialFailure;
 use super::events::{DiscoveryPath, HostEvent};
 use super::registry::Placement;
 use super::{lock, session, Inner};
@@ -57,18 +58,24 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
     }
     let pin = inner.pins.get(&peer).ok_or(Error::NotPaired)?;
     let mut addrs = pin.last_known.clone();
+    let mut path = DiscoveryPath::LastKnown;
     if let Some(r) = lock(&inner.reach).get(&peer) {
         for a in &r.discovered {
             if !addrs.contains(a) {
                 addrs.push(*a);
+                path = r.last_via.unwrap_or(DiscoveryPath::LastKnown);
             }
         }
+    }
+    if addrs.is_empty() {
+        record_failure(inner, peer, path, "no address known yet".into());
+        return Err(Error::NotFound);
     }
     let config = tls::build_client_config(&inner.identity, pin.spki_hash);
     let conn = match dial(&addrs, &DialOptions::new(config, Some(pin.spki_hash))).await {
         Ok(c) => c,
         Err(e) => {
-            lock(&inner.reach).entry(peer).or_default().last_dial_error = Some(e.to_string());
+            record_failure(inner, peer, path, e.to_string());
             return Err(e.into());
         }
     };
@@ -87,6 +94,18 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
     }
     try_open_session(inner, &conn);
     Ok(conn)
+}
+
+/// Remembers a failed dial for the 10 s report and [`Host::diagnose`](super::Host::diagnose).
+fn record_failure(inner: &Inner, peer: DeviceId, path: DiscoveryPath, failure: String) {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default();
+    let mut reach = lock(&inner.reach);
+    let r = reach.entry(peer).or_default();
+    r.last_dial_error = Some(failure.clone());
+    r.last_failure = Some(DialFailure { path, failure, at });
 }
 
 /// Opens a session on `conn` unless a preferred one is live (protocol.md 3.3).
@@ -117,7 +136,10 @@ pub(crate) async fn ensure_session(inner: &Arc<Inner>, peer: DeviceId) -> Result
 }
 
 /// Dials every pinned peer without a session at start and then every 5 s, at most once
-/// per peer per 5 s (protocol.md 3.2, 8.3 rule 1).
+/// per peer per 5 s (protocol.md 3.2, 8.3 rule 1). [`Host::network_changed`] wakes it
+/// early.
+///
+/// [`Host::network_changed`]: super::Host::network_changed
 pub(crate) async fn dial_loop(inner: Arc<Inner>) {
     loop {
         let ids: Vec<DeviceId> = inner.pins.read().iter().map(|p| p.device_id).collect();
@@ -136,7 +158,10 @@ pub(crate) async fn dial_loop(inner: Arc<Inner>) {
                 });
             }
         }
-        tokio::time::sleep(RETRY).await;
+        tokio::select! {
+            () = tokio::time::sleep(RETRY) => {}
+            () = inner.dial_nudge.notified() => {}
+        }
     }
 }
 
@@ -161,6 +186,10 @@ pub(crate) async fn discovery_events(inner: Arc<Inner>, mut rx: mpsc::Receiver<D
                         Via::Mdns => r.mdns = true,
                         Via::Beacon => r.beacon = true,
                     }
+                    r.last_via = Some(match via {
+                        Via::Mdns => DiscoveryPath::Mdns,
+                        Via::Beacon => DiscoveryPath::Beacon,
+                    });
                     if !r.discovered.contains(&addr) {
                         r.discovered.insert(0, addr);
                         r.discovered.truncate(MAX_DISCOVERED);

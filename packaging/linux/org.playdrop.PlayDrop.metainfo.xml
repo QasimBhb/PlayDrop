@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- SPDX-License-Identifier: CC0-1.0 -->
+<component type="desktop-application">
+  <id>org.playdrop.PlayDrop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>PlayDrop</name>
+  <summary>Send files and share the clipboard with your phone</summary>
+  <developer id="io.github.qasimbhb">
+    <name>PlayDrop contributors</name>
+  </developer>
+  <description>
+    <p>
+      PlayDrop links your phone and this computer over your local network. It
+      sends files in either direction without an account or a cloud service,
+      and resumes interrupted transfers where they stopped, including folders
+      with thousands of small files.
+    </p>
+    <p>
+      A small background service keeps the computer reachable while the window
+      is closed. Devices pair once by comparing a short code, and every
+      connection after that is encrypted and checked against the paired key.
+    </p>
+    <p>
+      PlayDrop is early software. The desktop service, the window and
+      computer-to-computer transfers work today; the phone apps are still being
+      built.
+    </p>
+  </description>
+  <launchable type="desktop-id">org.playdrop.PlayDrop.desktop</launchable>
+  <icon type="stock">org.playdrop.PlayDrop</icon>
+  <url type="homepage">https://github.com/QasimBhb/PlayDrop</url>
+  <url type="bugtracker">https://github.com/QasimBhb/PlayDrop/issues</url>
+  <url type="vcs-browser">https://github.com/QasimBhb/PlayDrop</url>
+  <categories>
+    <category>Network</category>
+    <category>Utility</category>
+  </categories>
+  <keywords>
+    <keyword>phone</keyword>
+    <keyword>transfer</keyword>
+    <keyword>clipboard</keyword>
+    <keyword>share</keyword>
+  </keywords>
+  <provides>
+    <binary>playdrop-desktop</binary>
+    <binary>playdropd</binary>
+    <dbus type="user">org.playdrop.PlayDrop.Daemon1</dbus>
+  </provides>
+  <requires>
+    <internet>offline-only</internet>
+  </requires>
+  <supports>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-08" type="development">
+      <description>
+        <p>First desktop build: background service, tray, window and local file transfers.</p>
+      </description>
+    </release>
+  </releases>
+</component>

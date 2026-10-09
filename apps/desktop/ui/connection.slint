@@ -1,0 +1,52 @@
+// Shown instead of the screens while the daemon is not reachable.
+
+import { Button, Spinner, Palette } from "std-widgets.slint";
+import { ConnPhase } from "types.slint";
+import { ConnState } from "globals.slint";
+import { Label, Heading } from "widgets.slint";
+
+export component ConnectionScreen inherits Rectangle {
+    VerticalLayout {
+        alignment: center;
+        padding: 24px;
+        spacing: 14px;
+
+        Heading {
+            text: ConnState.phase == ConnPhase.connecting ? "Connecting to PlayDrop..." : ConnState.phase == ConnPhase.not-running ? "PlayDrop daemon is not running" : "Cannot reach the PlayDrop daemon";
+            horizontal-alignment: center;
+        }
+
+        if ConnState.message != "": Label {
+            text: ConnState.message;
+            horizontal-alignment: center;
+        }
+
+        if ConnState.phase == ConnPhase.connecting || ConnState.starting: HorizontalLayout {
+            alignment: center;
+            Spinner {
+                indeterminate: true;
+                width: 32px;
+                height: 32px;
+            }
+        }
+
+        HorizontalLayout {
+            alignment: center;
+            spacing: 8px;
+            if ConnState.phase == ConnPhase.not-running: Button {
+                text: ConnState.starting ? "Starting..." : "Start";
+                primary: true;
+                enabled: !ConnState.starting;
+                clicked => {
+                    ConnState.start-daemon();
+                }
+            }
+            if ConnState.phase != ConnPhase.connecting && !ConnState.starting: Button {
+                text: "Try again";
+                clicked => {
+                    ConnState.retry();
+                }
+            }
+        }
+    }
+}

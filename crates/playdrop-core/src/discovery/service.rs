@@ -95,6 +95,29 @@ impl DiscoveryConfig {
     }
 }
 
+/// Health of the discovery carriers, for an on-demand diagnostic (PLAN.md: tell the user
+/// which layer failed). Times are monotonic, from [`tokio::time::Instant`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveryStatus {
+    /// The beacon sender and receiver run.
+    pub beacon_enabled: bool,
+    /// Interface addresses on which the beacon group was joined.
+    pub beacon_joined: Vec<Ipv4Addr>,
+    /// Interface addresses on which joining the group failed, with the OS error.
+    pub beacon_join_failed: Vec<(Ipv4Addr, String)>,
+    /// When the last advert from another device (any tag, paired or not) arrived by
+    /// beacon. `None` since start means no beacon from anyone was heard.
+    pub last_beacon: Option<Instant>,
+    /// mDNS registration and browsing run.
+    pub mdns_enabled: bool,
+    /// The current mDNS record is registered.
+    pub mdns_registered: bool,
+    /// Why the last registration failed, if it did.
+    pub mdns_error: Option<String>,
+    /// When the last advert from another device arrived by mDNS.
+    pub last_mdns: Option<Instant>,
+}
+
 /// State shared by all discovery tasks.
 pub(crate) struct Shared {
     pub(crate) group: SocketAddrV4,
@@ -108,6 +131,7 @@ pub(crate) struct Shared {
     interfaces: RwLock<Vec<Ipv4Interface>>,
     processor: Mutex<Processor>,
     pub(crate) own: OwnNonces,
+    pub(crate) status: Mutex<DiscoveryStatus>,
     events: mpsc::Sender<DiscoveryEvent>,
     pub(crate) refresh: watch::Sender<u64>,
     pub(crate) burst: watch::Sender<u64>,
@@ -138,8 +162,17 @@ impl Shared {
         }
     }
 
-    /// Runs one parsed advert through the shared processor.
+    /// Runs one parsed advert through the shared processor. Adverts from other devices are
+    /// noted per carrier first, so the diagnostic can tell "multicast blocked" from "no
+    /// paired device around".
     pub(crate) fn handle(&self, input: Inbound<'_>, now: Instant) -> Option<DiscoveryEvent> {
+        if !self.own.contains(&input.advert.n) {
+            let mut st = self.status();
+            match input.via {
+                super::Via::Beacon => st.last_beacon = Some(now),
+                super::Via::Mdns => st.last_mdns = Some(now),
+            }
+        }
         let interfaces = read(&self.interfaces);
         let ctx = Context {
             keys: self.keys.as_ref(),
@@ -155,6 +188,11 @@ impl Shared {
         if self.events.try_send(event).is_err() {
             tracing::debug!("discovery event dropped: channel full or closed");
         }
+    }
+
+    /// The carrier health record.
+    pub(crate) fn status(&self) -> std::sync::MutexGuard<'_, DiscoveryStatus> {
+        lock(&self.status)
     }
 
     /// Current usable interfaces.
@@ -221,6 +259,11 @@ impl Discovery {
             interfaces: RwLock::new(Vec::new()),
             processor: Mutex::new(Processor::new()),
             own: OwnNonces::default(),
+            status: Mutex::new(DiscoveryStatus {
+                beacon_enabled: config.beacon,
+                mdns_enabled: config.mdns,
+                ..DiscoveryStatus::default()
+            }),
             events: tx,
             refresh: watch::Sender::new(0),
             burst: watch::Sender::new(0),
@@ -316,6 +359,17 @@ impl Discovery {
         lock(&self.shared.processor).peers_changed();
     }
 
+    /// Carrier health: group membership, mDNS registration and when another device was
+    /// last heard on each carrier.
+    pub fn status(&self) -> DiscoveryStatus {
+        self.shared.status().clone()
+    }
+
+    /// The usable interfaces discovery currently runs on (protocol.md 8.1).
+    pub fn interfaces(&self) -> Vec<Ipv4Interface> {
+        self.shared.interfaces()
+    }
+
     /// Unpaired devices currently in the "Add device" list (protocol.md 8.3 rule 3).
     pub fn add_device_list(&self) -> Vec<(SocketAddr, AddDeviceEntry)> {
         lock(&self.shared.processor).add_device_entries(Instant::now())
@@ -374,4 +428,61 @@ fn read<T>(l: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::tag::DeviceIdString;
+    use crate::discovery::{StaticInterfaces, Via};
+
+    struct NoPeers;
+    impl PeerKeys for NoPeers {
+        fn announce_keys(&self) -> Vec<(DeviceIdString, [u8; 32])> {
+            Vec::new()
+        }
+    }
+
+    fn inbound(advert: &Advert, src: std::net::IpAddr, via: Via) -> Inbound<'_> {
+        Inbound {
+            advert,
+            src,
+            scope_id: 0,
+            via,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_notes_foreign_adverts_per_carrier_but_not_our_own() {
+        let mut c = DiscoveryConfig::new([1; 32], 42188, Arc::new(StaticInterfaces::default()));
+        c.beacon = false;
+        c.mdns = false;
+        let (d, _rx) =
+            Discovery::start(c, Arc::new(NoPeers), Arc::new(AtomicBool::new(false))).unwrap();
+        let st = d.status();
+        assert!(!st.beacon_enabled && !st.mdns_enabled);
+        assert_eq!(st.last_beacon, None);
+
+        let own = [7u8; NONCE_LEN];
+        d.shared.own.record(own);
+        let mine = d.shared.advert(own);
+        let src = std::net::IpAddr::V4(Ipv4Addr::new(192, 168, 1, 9));
+        d.shared
+            .handle(inbound(&mine, src, Via::Beacon), Instant::now());
+        assert_eq!(d.status().last_beacon, None, "own adverts do not count");
+
+        let theirs = Advert {
+            n: [9; NONCE_LEN],
+            ..mine
+        };
+        d.shared
+            .handle(inbound(&theirs, src, Via::Beacon), Instant::now());
+        let st = d.status();
+        assert!(st.last_beacon.is_some());
+        assert_eq!(st.last_mdns, None);
+        d.shared
+            .handle(inbound(&theirs, src, Via::Mdns), Instant::now());
+        assert!(d.status().last_mdns.is_some());
+        d.stop().await;
+    }
 }

@@ -1,0 +1,41 @@
+# systemd user unit for the PlayDrop daemon. Installed to
+# /usr/lib/systemd/user and NOT enabled by the package.
+#
+# Two ways to start the daemon at login - pick one, not both:
+#
+#   1. XDG autostart (the default): /etc/xdg/autostart/org.playdrop.Daemon.desktop
+#      runs playdropd when the desktop session starts. Nothing to do.
+#
+#   2. This unit: `systemctl --user enable --now playdropd.service`, then hide
+#      the autostart entry so it does not start a second copy:
+#        mkdir -p ~/.config/autostart
+#        printf '[Desktop Entry]\nHidden=true\n' > ~/.config/autostart/org.playdrop.Daemon.desktop
+#      Some users prefer this because D-Bus activation and autostart can fail
+#      silently on some desktops, and systemd restarts the daemon if it crashes.
+#
+# Running both is harmless but noisy: the daemon owns org.playdrop.PlayDrop.Daemon1 as
+# its single-instance lock, so the second copy exits with "another PlayDrop
+# daemon is already running" and systemd records a failed start.
+#
+# Even when this unit is not enabled, D-Bus activation uses it (see
+# SystemdService= in org.playdrop.PlayDrop.Daemon1.service), which is why it is
+# Type=dbus with the bus name below.
+#
+# WantedBy=default.target rather than graphical-session.target because not
+# every desktop (COSMIC in particular) is known to activate the latter. The
+# clipboard and tray need WAYLAND_DISPLAY in the user manager environment; GNOME
+# and COSMIC import it at login, and the daemon must tolerate it appearing late.
+
+[Unit]
+Description=PlayDrop background service (phone link and file drop)
+Documentation=https://github.com/QasimBhb/PlayDrop
+
+[Service]
+Type=dbus
+BusName=org.playdrop.PlayDrop.Daemon1
+ExecStart=/usr/bin/playdropd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

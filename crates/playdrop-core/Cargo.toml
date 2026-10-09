@@ -13,6 +13,7 @@ workspace = true
 base64 = "0.23.1"
 blake3 = "1.8.7"
 bytes = "1.12.1"
+cap-std = "4.0.3"
 data-encoding = "2.11.1"
 directories = "6.0.0"
 ed25519-dalek = { version = "3.0.0", features = ["rand_core", "pkcs8"] }

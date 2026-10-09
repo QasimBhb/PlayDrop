@@ -1,0 +1,338 @@
+// Devices (home): every paired device with one-click send, ping, clipboard, grants,
+// rename and unpair.
+
+import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
+import { DeviceRow } from "types.slint";
+import { DevicesState, Nav } from "globals.slint";
+import { Label, Muted, Heading, Card, Chip, Toggle, Dialog } from "widgets.slint";
+
+component DeviceCard inherits Card {
+    in property <DeviceRow> device;
+    in property <bool> expanded;
+    callback select();
+    callback ask-rename();
+    callback ask-unpair();
+    callback send-clipboard();
+
+    border-width: root.expanded ? 2px : 1px;
+    border-color: root.expanded ? Palette.accent-background : Palette.border;
+    accessible-role: list-item;
+    accessible-label: root.device.label + ", " + root.device.state;
+
+    TouchArea {
+        clicked => {
+            root.select();
+        }
+    }
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Label {
+                text: root.device.label;
+                font-size: 15px;
+                font-weight: 600;
+                wrap: no-wrap;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+
+            Muted {
+                text: root.device.short-id;
+                font-family: "monospace";
+                wrap: no-wrap;
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Chip {
+                text: root.device.state;
+                good: root.device.online;
+            }
+
+            if root.device.battery != "": Muted {
+                text: "Battery " + root.device.battery;
+            }
+        }
+
+        Muted {
+            text: "Paired " + root.device.paired + " · Last seen " + root.device.last-seen;
+        }
+
+        if root.device.note != "": Muted {
+            text: root.device.note;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: start;
+            Button {
+                text: "Send files...";
+                primary: true;
+                clicked => {
+                    DevicesState.send-files(root.device.id);
+                }
+            }
+
+            Button {
+                text: "Send folder...";
+                clicked => {
+                    DevicesState.send-folder(root.device.id);
+                }
+            }
+
+            Button {
+                text: "Ping";
+                enabled: root.device.online;
+                clicked => {
+                    DevicesState.ping(root.device.id);
+                }
+            }
+
+            Button {
+                text: root.expanded ? "Less" : "More";
+                clicked => {
+                    root.select();
+                }
+            }
+        }
+
+        if root.expanded: VerticalLayout {
+            spacing: 8px;
+            HorizontalLayout {
+                spacing: 6px;
+                alignment: start;
+                Button {
+                    text: "Send clipboard";
+                    enabled: root.device.online;
+                    clicked => {
+                        root.send-clipboard();
+                    }
+                }
+
+                Button {
+                    text: "Rename...";
+                    clicked => {
+                        root.ask-rename();
+                    }
+                }
+
+                Button {
+                    text: "Unpair...";
+                    clicked => {
+                        root.ask-unpair();
+                    }
+                }
+            }
+
+            Label {
+                text: "Allow this device to";
+                font-weight: 600;
+            }
+
+            Toggle {
+                text: "Send files without asking";
+                checked: root.device.grant-files;
+                toggled(on) => {
+                    DevicesState.set-grant(root.device.id, "files", on);
+                }
+            }
+
+            Toggle {
+                text: "Put text on this computer's clipboard";
+                checked: root.device.grant-clipboard-in;
+                toggled(on) => {
+                    DevicesState.set-grant(root.device.id, "clipboard_in", on);
+                }
+            }
+
+            Toggle {
+                text: "Receive this computer's clipboard";
+                checked: root.device.grant-clipboard-out;
+                toggled(on) => {
+                    DevicesState.set-grant(root.device.id, "clipboard_out", on);
+                }
+            }
+
+            Toggle {
+                text: "Ring this computer (find)";
+                checked: root.device.grant-find;
+                toggled(on) => {
+                    DevicesState.set-grant(root.device.id, "find", on);
+                }
+            }
+
+            Toggle {
+                text: "Remote input (later)";
+                checked: root.device.grant-input;
+                enabled: false;
+            }
+
+            Toggle {
+                text: "Media control (later)";
+                checked: root.device.grant-media;
+                enabled: false;
+            }
+        }
+    }
+}
+
+export component DevicesPage inherits Rectangle {
+    property <int> dialog-index: -1;
+    property <bool> rename-open;
+    property <bool> unpair-open;
+    property <DeviceRow> dialog-row: root.dialog-index >= 0 && root.dialog-index < DevicesState.rows.length ? DevicesState.rows[root.dialog-index] : { };
+
+    // Reads the local clipboard through Slint's own clipboard access: paste into a
+    // hidden text field, then hand the text to Rust.
+    clipboard-reader := TextInput {
+        visible: false;
+        width: 0px;
+        height: 0px;
+        single-line: false;
+    }
+
+    function read-clipboard() -> string {
+        clipboard-reader.text = "";
+        clipboard-reader.paste();
+        return clipboard-reader.text;
+    }
+
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Heading {
+            text: "Devices";
+        }
+
+        if DevicesState.rows.length == 0: VerticalLayout {
+            spacing: 8px;
+            Label {
+                text: "No paired devices yet.";
+            }
+
+            Muted {
+                text: "Open PlayDrop on your phone, then pair it from Add device.";
+            }
+
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Add device";
+                    primary: true;
+                    clicked => {
+                        Nav.page = 1;
+                    }
+                }
+            }
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 10px;
+                alignment: start;
+                for row[i] in DevicesState.rows: DeviceCard {
+                    device: row;
+                    expanded: DevicesState.selected == i;
+                    select => {
+                        DevicesState.selected = DevicesState.selected == i ? -1 : i;
+                    }
+                    ask-rename => {
+                        root.dialog-index = i;
+                        root.rename-open = true;
+                    }
+                    ask-unpair => {
+                        root.dialog-index = i;
+                        root.unpair-open = true;
+                    }
+                    send-clipboard => {
+                        DevicesState.send-clipboard(row.id, root.read-clipboard());
+                    }
+                }
+            }
+        }
+    }
+
+    if root.rename-open: Dialog {
+        Heading {
+            text: "Rename " + root.dialog-row.label;
+        }
+
+        Muted {
+            text: "The name is only used on this computer. The device cannot change it.";
+        }
+
+        name := LineEdit {
+            text: root.dialog-row.label;
+            placeholder-text: "Device name";
+            accepted(text) => {
+                DevicesState.rename(root.dialog-row.id, text);
+                root.rename-open = false;
+            }
+            init => {
+                self.focus();
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Button {
+                text: "Cancel";
+                clicked => {
+                    root.rename-open = false;
+                }
+            }
+
+            Button {
+                text: "Rename";
+                primary: true;
+                clicked => {
+                    DevicesState.rename(root.dialog-row.id, name.text);
+                    root.rename-open = false;
+                }
+            }
+        }
+    }
+
+    if root.unpair-open: Dialog {
+        Heading {
+            text: "Unpair " + root.dialog-row.label + "?";
+        }
+
+        Label {
+            text: "It will need to pair again before it can send or receive anything.";
+        }
+
+        Muted {
+            text: "Short ID " + root.dialog-row.short-id;
+            font-family: "monospace";
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: end;
+            Button {
+                text: "Cancel";
+                clicked => {
+                    root.unpair-open = false;
+                }
+            }
+
+            Button {
+                text: "Unpair";
+                clicked => {
+                    DevicesState.unpair(root.dialog-row.id);
+                    root.unpair-open = false;
+                }
+            }
+        }
+    }
+}

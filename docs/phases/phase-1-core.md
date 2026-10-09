@@ -193,6 +193,8 @@ Peers are hex Device IDs. `Secret<T>` serialises the value but prints `(redacted
 
 ### 3.6 Gaps for Phase 2
 
+*Phase 2 closed items 1 to 8 and 10 and the SR-18 `openat2` TODO; see `phase-2-desktop.md` section 3. Items 9 and 11 remain.* Original text follows.
+
 None of these exist. Close the first six before the daemon tasks start (they change the core API, so one agent does them, serially).
 
 1. **Received file paths.** Receive-side `TransferComplete` has empty `roots` and no destination paths, though `transfer::receiver` computes each `dest` in `finalize`. "Open" and "Show in folder" need them (PLAN.md UX). Add e.g. `saved: Vec<PathBuf>` and the folder.

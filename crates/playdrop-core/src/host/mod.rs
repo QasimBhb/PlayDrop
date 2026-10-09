@@ -10,12 +10,17 @@
 //! - [`session`]: the session stream, frame handlers and grants (5, SR-13, SR-14, SR-16).
 //! - [`pairing`]: driving `session::PairingSession` for both roles and methods (6).
 //! - [`receive`] and [`send`]: the transfer plane (7).
+//! - [`transfers`]: snapshots of live and recent transfers for late UIs.
 //! - [`router`]: request routing for the server (7.1).
-//! - [`connect`]: last-known dial, discovery wiring and diagnostics (3.2, 8).
+//! - [`connect`]: last-known dial, discovery wiring and the 10 s report (3.2, 8).
+//! - [`diagnostics`]: the on-demand report for the daemon's diagnostics screen.
 //! - [`platform`]: free space and interface adapters.
+//! - [`lock`](mod@lock): the host-supplied desktop lock state (SR-6).
 
 mod connect;
+pub mod diagnostics;
 pub mod events;
+pub mod lock;
 mod pairing;
 mod pins;
 pub mod platform;
@@ -24,6 +29,7 @@ mod registry;
 mod router;
 mod send;
 mod session;
+mod transfers;
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -35,10 +41,17 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
-pub use events::{
-    DiscoveryPath, FileRoot, HostEvent, PairingPromptKind, Secret, TransferDirection,
+pub use diagnostics::{
+    Diagnostics, DialFailure, InterfaceInfo, JoinFailure, MdnsStatus, MulticastStatus,
+    PeerDiagnostic,
 };
+pub use events::{
+    DiscoveryPath, FileRoot, HostEvent, OfferedFile, PairingPromptKind, Secret, TransferDirection,
+    OFFER_FILES_MAX,
+};
+pub use lock::{AlwaysUnlocked, LockFlag, LockState};
 pub use send::{TransferHandle, TransferSummary};
+pub use transfers::{TransferSnapshot, TransferStatus, KEEP_FINISHED, KEEP_FOR};
 
 use crate::discovery::{BeaconSchedule, DialLimiter, Discovery, DiscoveryConfig, InterfaceSource};
 use crate::identity::{DeviceId, DeviceIdentity};
@@ -55,7 +68,8 @@ use pins::Pins;
 use registry::Registry;
 
 /// Keep-alive profile announced in `hello.keepAlive` (protocol.md 3.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum KeepAliveProfile {
     /// PING every 60 s.
     #[default]
@@ -96,6 +110,9 @@ pub struct HostConfig {
     /// Run mDNS and the beacon (protocol.md 8). Off in loopback tests, which rely on
     /// last-known dial.
     pub discovery: bool,
+    /// Whether the desktop is locked; pairing is refused while it is (SR-6). Defaults to
+    /// [`AlwaysUnlocked`]; a daemon supplies logind `LockedHint` or `WTS_SESSION_LOCK`.
+    pub lock_state: Box<dyn LockState>,
 }
 
 impl HostConfig {
@@ -116,6 +133,7 @@ impl HostConfig {
             interfaces: Box::new(platform::SystemInterfaces),
             bind_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             discovery: true,
+            lock_state: Box::new(AlwaysUnlocked),
         }
     }
 }
@@ -133,7 +151,7 @@ impl std::fmt::Debug for HostConfig {
 }
 
 /// A paired peer as the UI lists it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PeerSummary {
     /// Device ID.
     pub device_id: String,
@@ -149,11 +167,15 @@ pub struct PeerSummary {
     pub last_known: Vec<SocketAddr>,
     /// When pairing completed, Unix seconds.
     pub paired_at: u64,
+    /// When this peer last sent a session hello or frame, Unix seconds; `None` if never
+    /// (SR-8). Persisted in the pin at session start and end, so it survives a restart.
+    #[serde(default)]
+    pub last_seen: Option<u64>,
 }
 
 /// A device seen in "Add device" mode (protocol.md 8.3 rule 1): listed, never dialled
 /// until the user picks it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddDeviceCandidate {
     /// Sanitised advertised name.
     pub name: String,
@@ -163,13 +185,31 @@ pub struct AddDeviceCandidate {
     pub addr: SocketAddr,
 }
 
-/// Per-peer reachability notes for the 10 s discovery diagnostic.
+/// What [`Host::push_clipboard`] did with one clipboard change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ClipboardPush {
+    /// Peers the clip was sent to.
+    pub sent_to: Vec<DeviceId>,
+    /// True if nothing was sent because the text equals the last clip applied from a peer
+    /// or the last one sent (protocol.md 5.7 echo rule).
+    pub skipped_echo: bool,
+    /// Peers with the `clipboardOut` grant but no session right now.
+    pub skipped_offline: usize,
+    /// Paired peers without the `clipboardOut` grant.
+    pub skipped_no_grant: usize,
+}
+
+/// Per-peer reachability notes for the 10 s report and [`Host::diagnose`].
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Reach {
     mdns: bool,
     beacon: bool,
+    /// The carrier that most recently supplied a discovered address.
+    last_via: Option<DiscoveryPath>,
     discovered: Vec<SocketAddr>,
     last_dial_error: Option<String>,
+    /// The most recent failed dial, kept until the next one fails.
+    last_failure: Option<diagnostics::DialFailure>,
 }
 
 /// Shared state of a running host.
@@ -194,16 +234,42 @@ pub(crate) struct Inner {
     pub(crate) pairing: Mutex<Option<pairing::ActivePairing>>,
     pub(crate) incoming: Mutex<HashMap<String, receive::Incoming>>,
     pub(crate) outgoing: Mutex<HashMap<String, send::Outgoing>>,
+    pub(crate) transfers: Mutex<transfers::TransferBook>,
     pub(crate) discovery: Mutex<Option<Discovery>>,
     pub(crate) dial_limiter: Mutex<DialLimiter>,
     pub(crate) dial_locks: Mutex<HashMap<DeviceId, Arc<tokio::sync::Mutex<()>>>>,
+    /// Wakes the last-known dial loop early (OS network change).
+    pub(crate) dial_nudge: tokio::sync::Notify,
     pub(crate) reach: Mutex<HashMap<DeviceId, Reach>>,
     pub(crate) clipboard_echo: Mutex<ClipboardEcho>,
+    /// Unix seconds of the last hello or frame per paired peer, updated on every frame.
+    /// The pin store holds the persisted copy (written at session start and end only, so
+    /// a busy session does not rewrite `pins.json` per frame).
+    pub(crate) last_seen: Mutex<HashMap<DeviceId, u64>>,
     pub(crate) free_space: Arc<dyn FreeSpace>,
     pub(crate) interfaces: Arc<dyn InterfaceSource>,
+    pub(crate) lock_state: Box<dyn LockState>,
     shutdown: watch::Sender<bool>,
     task_guard: Arc<()>,
     server_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+/// How a transfer ended, for [`Inner::transfer_ended`].
+#[derive(Debug)]
+pub(crate) enum TransferEnd {
+    /// Every file verified or skipped.
+    Complete {
+        bytes: u64,
+        elapsed_ms: u64,
+        roots: Vec<FileRoot>,
+        bundle_root: Option<String>,
+        saved: Vec<PathBuf>,
+        folder: Option<PathBuf>,
+    },
+    /// Failed, with the reason shown to the user (SR-22 wording).
+    Failed(String),
+    /// Cancelled or declined by either side, with the reason.
+    Cancelled(String),
 }
 
 /// Hashes for clipboard echo prevention (protocol.md 5.7).
@@ -219,13 +285,144 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// Refuses clipboard text that does not fit inline (protocol.md 5.7).
+fn check_clipboard_size(text: &str) -> Result<()> {
+    // TODO(SR-24): text over 32 KiB goes as a blob (protocol.md 5.15), Phase 2/3.
+    if text.len() > crate::session::types::CLIPBOARD_INLINE_MAX {
+        return Err(Error::TooLarge(
+            "clipboard text over 32 KiB needs blobs".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// An inline text `clipboard` frame (protocol.md 5.7).
+fn clipboard_frame(text: &str, hash: String, sensitive: bool) -> Frame {
+    Frame::Clipboard(Clipboard {
+        kind: ClipboardKind::Text,
+        mime: "text/plain;charset=utf-8".into(),
+        hash,
+        text: Some(text.to_owned()),
+        blob: None,
+        sensitive,
+    })
+}
+
+/// Now as Unix seconds; 0 if the clock is before 1970.
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or_default()
+}
+
 impl Inner {
+    /// Records that a paired peer was heard from just now (memory only).
+    pub(crate) fn touch_peer(&self, peer: DeviceId) {
+        lock(&self.last_seen).insert(peer, unix_now());
+    }
+
+    /// Writes the in-memory last-seen time of `peer` to its pin, in the background.
+    pub(crate) fn persist_last_seen(self: &Arc<Self>, peer: DeviceId) {
+        let Some(at) = lock(&self.last_seen).get(&peer).copied() else {
+            return;
+        };
+        let me = Arc::clone(self);
+        self.spawn(async move {
+            if let Err(e) = me.pins.update(move |s| s.set_last_seen(&peer, at)).await {
+                tracing::debug!(error = %e, "last-seen time not stored");
+            }
+        });
+    }
+
+    /// True if a clip with this hash was the last one applied from a peer or the last one
+    /// sent (protocol.md 5.7 echo rule).
+    pub(crate) fn is_clipboard_echo(&self, hash: &str) -> bool {
+        let echo = lock(&self.clipboard_echo);
+        echo.last_applied.as_deref() == Some(hash) || echo.last_sent.as_deref() == Some(hash)
+    }
+
     /// Queues an event for the UI. If the UI is not reading, events are dropped rather
     /// than queued without bound.
     pub(crate) fn emit(&self, ev: HostEvent) {
         if self.events.try_send(ev).is_err() {
             tracing::debug!("host event dropped: channel full or closed");
         }
+    }
+
+    /// Records transfer progress in the book and reports it to the UI.
+    pub(crate) fn transfer_progress(
+        &self,
+        id: &str,
+        peer: &DeviceId,
+        direction: TransferDirection,
+        bytes: u64,
+        total: u64,
+        bytes_per_sec: u64,
+    ) {
+        lock(&self.transfers).progress(id, direction, bytes, bytes_per_sec);
+        self.emit(HostEvent::TransferProgress {
+            id: id.to_owned(),
+            peer: peer.to_hex(),
+            direction,
+            bytes,
+            total,
+            bytes_per_sec,
+        });
+    }
+
+    /// Ends a transfer: moves its snapshot to the finished list and emits
+    /// [`HostEvent::TransferComplete`] or [`HostEvent::TransferFailed`]. Keeping both in one
+    /// place means [`Host::transfers`] and the event stream never disagree.
+    pub(crate) fn transfer_ended(
+        &self,
+        id: &str,
+        peer: &DeviceId,
+        direction: TransferDirection,
+        end: TransferEnd,
+    ) {
+        let (status, note, saved, folder) = match &end {
+            TransferEnd::Complete { saved, folder, .. } => (
+                TransferStatus::Complete,
+                None,
+                saved.clone(),
+                folder.clone(),
+            ),
+            TransferEnd::Failed(r) => (TransferStatus::Failed, Some(r.clone()), Vec::new(), None),
+            TransferEnd::Cancelled(r) => {
+                (TransferStatus::Cancelled, Some(r.clone()), Vec::new(), None)
+            }
+        };
+        lock(&self.transfers).finish_with_files(id, direction, status, note, saved, folder);
+        let ev = match end {
+            TransferEnd::Complete {
+                bytes,
+                elapsed_ms,
+                roots,
+                bundle_root,
+                saved,
+                folder,
+            } => HostEvent::TransferComplete {
+                id: id.to_owned(),
+                peer: peer.to_hex(),
+                direction,
+                bytes,
+                elapsed_ms,
+                roots,
+                bundle_root,
+                saved,
+                folder,
+            },
+            TransferEnd::Failed(reason) | TransferEnd::Cancelled(reason) => {
+                HostEvent::TransferFailed {
+                    id: id.to_owned(),
+                    peer: peer.to_hex(),
+                    direction,
+                    reason,
+                }
+            }
+        };
+        self.emit(ev);
     }
 
     /// Spawns a task that ends at shutdown.
@@ -353,13 +550,17 @@ impl Host {
             pairing: Mutex::new(None),
             incoming: Mutex::new(HashMap::new()),
             outgoing: Mutex::new(HashMap::new()),
+            transfers: Mutex::new(transfers::TransferBook::default()),
             discovery: Mutex::new(None),
             dial_limiter: Mutex::new(DialLimiter::new()),
             dial_locks: Mutex::new(HashMap::new()),
+            dial_nudge: tokio::sync::Notify::new(),
             reach: Mutex::new(HashMap::new()),
             clipboard_echo: Mutex::new(ClipboardEcho::default()),
+            last_seen: Mutex::new(HashMap::new()),
             free_space: Arc::new(platform::VolumeSpace),
             interfaces: Arc::clone(&interfaces),
+            lock_state: config.lock_state,
             shutdown: watch::Sender::new(false),
             task_guard: Arc::new(()),
             server_task: Mutex::new(None),
@@ -421,9 +622,36 @@ impl Host {
 
     /// Stops everything: the server, every connection, discovery and all tasks. Unfinished
     /// transfers stay on disk and resume after the next start (protocol.md 7.6).
-    pub async fn shutdown(self) {
-        let inner = self.inner;
-        inner.shutdown.send_replace(true);
+    ///
+    /// Takes `&self`, so a daemon can share the host as `Arc<Host>` with its IPC tasks.
+    /// Idempotent: only the first call does the work; later or concurrent calls return at
+    /// once. After it returns, the other methods fail or do nothing; drop the host.
+    pub async fn shutdown(&self) {
+        let inner = &self.inner;
+        if inner.shutdown.send_replace(true) {
+            return;
+        }
+        // Background last-seen writes stop with the tasks; write the newest times now so
+        // the device list shows them after a restart (SR-8).
+        let seen: Vec<(DeviceId, u64)> = lock(&inner.last_seen)
+            .iter()
+            .map(|(id, at)| (*id, *at))
+            .collect();
+        if !seen.is_empty() {
+            let stored = inner
+                .pins
+                .update(move |s| {
+                    for (id, at) in &seen {
+                        // A peer unpaired meanwhile has no pin to update.
+                        let _ = s.set_last_seen(id, *at);
+                    }
+                    Ok(())
+                })
+                .await;
+            if let Err(e) = stored {
+                tracing::debug!(error = %e, "last-seen times not stored at shutdown");
+            }
+        }
         for c in inner.registry.all_connections() {
             c.close(CloseReason::Shutdown);
         }
@@ -473,6 +701,10 @@ impl Host {
                 grants: p.grants,
                 last_known: p.last_known.clone(),
                 paired_at: p.paired_at,
+                last_seen: lock(&self.inner.last_seen)
+                    .get(&p.device_id)
+                    .copied()
+                    .max(p.last_seen),
             })
             .collect()
     }
@@ -538,6 +770,7 @@ impl Host {
 
     /// Opens the "Add device" window for 120 s (protocol.md 6.1, SR-6). While open, this
     /// host advertises `name` and accepts unpinned certificates in unpaired mode.
+    /// [`Error::Locked`] while [`HostConfig::lock_state`] reports the desktop locked.
     pub fn open_add_device_window(&self) -> Result<()> {
         pairing::open_window(&self.inner)
     }
@@ -573,7 +806,8 @@ impl Host {
     /// Starts SAS pairing as the initiator with the device at `addr`, picked by the user
     /// from the "Add device" list or typed in (protocol.md 6.1, 6.2). Opens the local
     /// window if needed. Progress arrives as [`HostEvent::PairingPrompt`], then
-    /// [`HostEvent::Paired`] or [`HostEvent::PairingFailed`].
+    /// [`HostEvent::Paired`] or [`HostEvent::PairingFailed`]. [`Error::Locked`] while the
+    /// desktop is locked (SR-6).
     pub async fn pair_with(&self, addr: SocketAddr) -> Result<()> {
         pairing::pair_with(&self.inner, addr).await
     }
@@ -585,12 +819,14 @@ impl Host {
     }
 
     /// Opens the window and returns a QR pairing URI valid for 120 s (protocol.md 6.3,
-    /// SR-9). The URI holds a one-time secret: show it, never log it.
+    /// SR-9). The URI holds a one-time secret: show it, never log it. [`Error::Locked`]
+    /// while the desktop is locked (SR-6).
     pub fn show_qr(&self) -> Result<String> {
         pairing::show_qr(&self.inner)
     }
 
-    /// Pairs by a scanned QR URI as the scanner (protocol.md 6.3).
+    /// Pairs by a scanned QR URI as the scanner (protocol.md 6.3). [`Error::Locked`] while
+    /// the desktop is locked (SR-6).
     pub async fn scan_qr(&self, uri: &str) -> Result<()> {
         pairing::scan_qr(&self.inner, uri).await
     }
@@ -599,6 +835,30 @@ impl Host {
     /// it, streams up to 4 files plus the bundle concurrently, and resumes after drops.
     pub async fn send(&self, peer: &DeviceId, paths: Vec<PathBuf>) -> Result<TransferHandle> {
         send::start(&self.inner, *peer, paths).await
+    }
+
+    /// Cancels a transfer by ID, in either direction (protocol.md 7.5).
+    ///
+    /// - Outgoing: same as [`TransferHandle::cancel`]; the send stops mid-file, sends
+    ///   `DELETE /v1/transfers/{id}` with reason `user`, and the receiver deletes its
+    ///   `.part` files.
+    /// - Incoming: deletes every `.part`, answers later `PUT`s with `410 cancelled`, and
+    ///   pushes a `transfer` frame with state `cancelled`, reason `user` (5.13), so the
+    ///   sender stops. A pending offer is withdrawn the same way.
+    ///
+    /// [`Error::NotFound`] if no live transfer has this ID.
+    pub async fn cancel_transfer(&self, id: &str) -> Result<()> {
+        if send::cancel(&self.inner, id) {
+            return Ok(());
+        }
+        receive::cancel_local(&self.inner, id).await
+    }
+
+    /// Live transfers in both directions plus recently finished ones (the last
+    /// [`KEEP_FINISHED`], none older than [`KEEP_FOR`]), oldest first, so a UI that
+    /// connects late can rebuild its view.
+    pub fn transfers(&self) -> Vec<TransferSnapshot> {
+        lock(&self.inner.transfers).list()
     }
 
     /// The user's answer to a [`HostEvent::TransferOffer`] (protocol.md 7.3, 5.13).
@@ -613,40 +873,89 @@ impl Host {
         Ok(())
     }
 
-    /// Pushes clipboard text to a peer (protocol.md 5.7): needs the `clipboardOut` grant,
+    /// Pushes clipboard text to one peer (protocol.md 5.7): needs the `clipboardOut` grant,
     /// and is skipped when it would echo the last clip applied from a peer or the last one
-    /// sent. Returns whether it was sent.
+    /// sent. Returns whether it was sent. A push that fails (too large, no session) is not
+    /// remembered, so retrying the same text works. Most callers want
+    /// [`Host::push_clipboard`], which sends to every eligible peer.
     pub fn send_clipboard(&self, peer: &DeviceId, text: &str, sensitive: bool) -> Result<bool> {
         let pin = self.inner.pins.get(peer).ok_or(Error::NotPaired)?;
         if !pin.grants.clipboard_out {
             return Err(Error::Forbidden("clipboardOut grant is off"));
         }
+        check_clipboard_size(text)?;
         let hash = crate::session::types::clipboard_text_hash(text);
-        {
-            let mut echo = lock(&self.inner.clipboard_echo);
-            if echo.last_applied.as_deref() == Some(&hash)
-                || echo.last_sent.as_deref() == Some(&hash)
-            {
-                return Ok(false);
-            }
-            echo.last_sent = Some(hash.clone());
-        }
-        // TODO(SR-24): text over 32 KiB goes as a blob (protocol.md 5.15), Phase 2/3.
-        if text.len() > crate::session::types::CLIPBOARD_INLINE_MAX {
-            return Err(Error::TooLarge(
-                "clipboard text over 32 KiB needs blobs".into(),
-            ));
+        if self.inner.is_clipboard_echo(&hash) {
+            return Ok(false);
         }
         let s = self.inner.registry.session(peer).ok_or(Error::NotFound)?;
-        s.send(Frame::Clipboard(Clipboard {
-            kind: ClipboardKind::Text,
-            mime: "text/plain;charset=utf-8".into(),
-            hash,
-            text: Some(text.to_owned()),
-            blob: None,
-            sensitive,
-        }));
+        s.send(clipboard_frame(text, hash.clone(), sensitive));
+        lock(&self.inner.clipboard_echo).last_sent = Some(hash);
         Ok(true)
+    }
+
+    /// Pushes a local clipboard change to every online peer with the `clipboardOut` grant
+    /// (protocol.md 5.7, SR-24), applying the echo rule once for all of them: text equal to
+    /// the last clip applied from a peer or the last one sent goes nowhere. Text over
+    /// 32 KiB returns [`Error::TooLarge`] until blobs exist (5.15). The text is remembered
+    /// as sent only if at least one peer got it, so a clip copied while every peer was
+    /// offline is pushed again on the next change notification.
+    pub fn push_clipboard(&self, text: &str, sensitive: bool) -> Result<ClipboardPush> {
+        check_clipboard_size(text)?;
+        let hash = crate::session::types::clipboard_text_hash(text);
+        let mut out = ClipboardPush::default();
+        if self.inner.is_clipboard_echo(&hash) {
+            out.skipped_echo = true;
+            return Ok(out);
+        }
+        let targets: Vec<(DeviceId, bool)> = self
+            .inner
+            .pins
+            .read()
+            .iter()
+            .map(|p| (p.device_id, p.grants.clipboard_out))
+            .collect();
+        for (id, granted) in targets {
+            if !granted {
+                out.skipped_no_grant += 1;
+                continue;
+            }
+            match self.inner.registry.session(&id) {
+                Some(s) => {
+                    s.send(clipboard_frame(text, hash.clone(), sensitive));
+                    out.sent_to.push(id);
+                }
+                None => out.skipped_offline += 1,
+            }
+        }
+        if !out.sent_to.is_empty() {
+            lock(&self.inner.clipboard_echo).last_sent = Some(hash);
+        }
+        Ok(out)
+    }
+
+    /// A diagnostic snapshot on demand: own address and port, whether the listener is up,
+    /// the interfaces, both discovery carriers (group joined, beacon heard in the last
+    /// 60 s, mDNS registered, any mDNS peer seen) and every paired peer with its most recent
+    /// dial failure.
+    ///
+    /// A firewall blocking inbound TCP cannot be seen from inside the host: it looks the
+    /// same as nobody dialling. The daemon runs its own loopback-versus-LAN probe with
+    /// `port`, `bind_ok` and `interfaces` (see the [`diagnostics`] module docs); multicast
+    /// blocked reads as groups joined but no beacon heard while a peer is on the subnet.
+    pub fn diagnose(&self) -> Diagnostics {
+        diagnostics::build(&self.inner)
+    }
+
+    /// Tells the host the OS reported a network change (Wi-Fi switch, cable, VPN): re-reads
+    /// interfaces, rejoins the beacon group, sends a fresh beacon burst and rotates the
+    /// mDNS record (protocol.md 8.1, SR-4), and runs the last-known dial round now instead
+    /// of at the next 5 s tick (still at most one dial per peer per 5 s, 8.3 rule 1).
+    pub fn network_changed(&self) {
+        if let Some(d) = lock(&self.inner.discovery).as_ref() {
+            d.network_changed();
+        }
+        self.inner.dial_nudge.notify_one();
     }
 
     /// Dials a paired peer now if no session is up, using its last-known addresses.

@@ -28,6 +28,12 @@ pub enum Error {
     #[error("forbidden: {0}")]
     Forbidden(&'static str),
 
+    /// The desktop is locked, so "Add device" (and every pairing call that opens it) is
+    /// refused (SR-6). Local only; never sent on the wire. Not [`Error::Forbidden`],
+    /// which means a peer lacks a grant: here the local user must unlock first.
+    #[error("the desktop is locked; unlock it to add a device")]
+    Locked,
+
     /// Malformed input (wire code `bad_request`).
     #[error("bad request: {0}")]
     BadRequest(String),

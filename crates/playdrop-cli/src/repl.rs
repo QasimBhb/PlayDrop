@@ -93,10 +93,7 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         }
     }
     printer.abort();
-    match Arc::try_unwrap(host) {
-        Ok(h) => h.shutdown().await,
-        Err(_) => println!("transfers still running; stopping anyway"),
-    }
+    host.shutdown().await;
     Ok(())
 }
 
@@ -143,7 +140,8 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
     match (w[0].as_str(), w.len()) {
         ("help", _) => println!(
             "commands: peers | pair | pair <ip:port> | pair --qr | pair --scan <uri> | list | y | n | \
-             send <peer> <path>... | accept <id> | decline <id> | grants <peer> [+g|-g]... | \
+             send <peer> <path>... | accept <id> | decline <id> | cancel <id> | transfers | \
+             grants <peer> [+g|-g]... | \
              ping <peer> [msg] | clip <peer> <text> | unpair <peer> | quit"
         ),
         ("peers", _) => {
@@ -201,6 +199,28 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
         }
         ("accept" | "decline", 2) => {
             host.respond_offer(&w[1], w[0] == "accept").await?;
+        }
+        ("cancel", 2) => host.cancel_transfer(&w[1]).await?,
+        ("transfers", _) => {
+            let list = host.transfers();
+            if json {
+                println!("{}", serde_json::to_string(&list).unwrap_or_default());
+            } else if list.is_empty() {
+                println!("no transfers");
+            }
+            for t in list.iter().filter(|_| !json) {
+                println!(
+                    "{}  {:?} {:<9} {} / {} bytes  {} file(s)  {}{}",
+                    t.id,
+                    t.direction,
+                    format!("{:?}", t.state).to_lowercase(),
+                    t.bytes,
+                    t.total,
+                    t.file_count,
+                    t.short_id,
+                    t.note.as_deref().map(|n| format!("  ({n})")).unwrap_or_default()
+                );
+            }
         }
         ("grants", n) if n >= 2 => {
             let id = peer(host, &w[1])?;
@@ -308,6 +328,7 @@ async fn watch_send(mut handle: playdrop_core::host::TransferHandle, json: bool)
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "one match arm per event reads best")]
 fn print_event(ev: &HostEvent, json: bool) {
     if json {
         println!("{}", serde_json::to_string(ev).unwrap_or_default());
@@ -315,7 +336,12 @@ fn print_event(ev: &HostEvent, json: bool) {
     }
     let short = |hex: &str| hex.chars().take(8).collect::<String>();
     match ev {
-        HostEvent::PeerOnline { short_id, name, addr, .. } => {
+        HostEvent::PeerOnline {
+            short_id,
+            name,
+            addr,
+            ..
+        } => {
             println!("online: {name} ({short_id}) at {addr}");
         }
         HostEvent::PeerOffline { short_id, .. } => println!("offline: {short_id}"),
@@ -339,20 +365,33 @@ fn print_event(ev: &HostEvent, json: bool) {
             println!("{short_id} no longer has this device paired; pair again");
         }
         HostEvent::Unpaired { short_id, .. } => println!("unpaired {short_id}"),
-        HostEvent::AddDeviceSeen { name, device_type, addr } => {
+        HostEvent::AddDeviceSeen {
+            name,
+            device_type,
+            addr,
+        } => {
             println!("seen in Add device: {name} ({device_type}) at {addr}; `pair {addr}`");
         }
         HostEvent::TransferOffer {
             id,
             short_id,
             files,
+            file_count,
             total_bytes,
             note,
             ..
-        } => println!(
-            "offer {id} from {short_id}: {files} file(s), {total_bytes} bytes{}. `accept {id}` or `decline {id}`",
-            note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
-        ),
+        } => {
+            println!(
+                "offer {id} from {short_id}: {file_count} file(s), {total_bytes} bytes{}. `accept {id}` or `decline {id}`",
+                note.as_deref().map(|n| format!(" ({n})")).unwrap_or_default()
+            );
+            for f in files.iter().take(10) {
+                println!("  {}  ({} bytes)", f.path, f.size);
+            }
+            if *file_count > 10 {
+                println!("  ... and {} more", file_count - 10);
+            }
+        }
         HostEvent::TransferProgress {
             id,
             direction: TransferDirection::Receive,
@@ -376,32 +415,81 @@ fn print_event(ev: &HostEvent, json: bool) {
             direction: TransferDirection::Receive,
             bytes,
             elapsed_ms,
+            saved,
             ..
-        } => println!("received {} ({bytes} bytes in {elapsed_ms} ms)", &id[..8.min(id.len())]),
-        HostEvent::TransferFailed { id, direction, reason, .. } => {
+        } => {
+            println!(
+                "received {} ({bytes} bytes in {elapsed_ms} ms)",
+                &id[..8.min(id.len())]
+            );
+            for p in saved.iter().take(10) {
+                println!("  saved {}", p.display());
+            }
+            if saved.len() > 10 {
+                println!("  ... and {} more", saved.len() - 10);
+            }
+        }
+        HostEvent::TransferFailed {
+            id,
+            direction,
+            reason,
+            ..
+        } => {
             println!("{direction:?} {} failed: {reason}", &id[..8.min(id.len())]);
         }
-        HostEvent::Clipboard { peer, text, sensitive } => {
+        HostEvent::Clipboard {
+            peer,
+            text,
+            sensitive,
+        } => {
             if *sensitive {
                 println!("clipboard from {}: (sensitive, not shown)", short(peer));
             } else {
-                println!("clipboard from {}: {}", short(peer), text.0.as_deref().unwrap_or("(image)"));
+                println!(
+                    "clipboard from {}: {}",
+                    short(peer),
+                    text.0.as_deref().unwrap_or("(image)")
+                );
             }
         }
         HostEvent::Ping { peer, message } => println!(
             "ping from {}{}",
             short(peer),
-            message.as_deref().map(|m| format!(": {m}")).unwrap_or_default()
+            message
+                .as_deref()
+                .map(|m| format!(": {m}"))
+                .unwrap_or_default()
         ),
-        HostEvent::Find { peer, start } => println!("find from {} ({})", short(peer), if *start { "ring" } else { "stop" }),
-        HostEvent::Battery { peer, level, charging, .. } => {
-            println!("battery {}: {level}%{}", short(peer), if *charging { " charging" } else { "" });
+        HostEvent::Find { peer, start } => println!(
+            "find from {} ({})",
+            short(peer),
+            if *start { "ring" } else { "stop" }
+        ),
+        HostEvent::Battery {
+            peer,
+            level,
+            charging,
+            ..
+        } => {
+            println!(
+                "battery {}: {level}%{}",
+                short(peer),
+                if *charging { " charging" } else { "" }
+            );
         }
         HostEvent::Presence { peer, state } => println!("presence {}: {state}", short(peer)),
         HostEvent::Unsupported { peer, frame_type } => {
-            println!("{} sent `{frame_type}`, which this build does not handle yet", short(peer));
+            println!(
+                "{} sent `{frame_type}`, which this build does not handle yet",
+                short(peer)
+            );
         }
-        HostEvent::DiscoveryDiagnostic { short_id, path, failure, .. } => {
+        HostEvent::DiscoveryDiagnostic {
+            short_id,
+            path,
+            failure,
+            ..
+        } => {
             println!("cannot reach {short_id} via {path:?}: {failure}");
         }
         _ => {}

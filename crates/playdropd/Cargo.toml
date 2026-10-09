@@ -1,0 +1,74 @@
+[package]
+name = "playdropd"
+description = "PlayDrop desktop daemon: hosts the core, owns the socket, tray, notifications, clipboard sync and the local IPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "playdropd"
+path = "src/main.rs"
+
+# Same lint set as the workspace, except `unsafe_code` is `deny` rather than `forbid`:
+# Windows platform calls (clipboard format listener, session lock notifications, exclusive
+# process checks) need audited `unsafe` FFI under scoped `#[allow(unsafe_code)]` with SAFETY
+# comments. Linux builds contain no unsafe code.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[dependencies]
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+blake3 = "1.8.7"
+clap = { version = "4.6.7", features = ["derive"] }
+directories = "6.0.0"
+futures-util = "0.3.34"
+notify-rust = "4.18.2"
+open = "5.4.4"
+playdrop-core = { path = "../playdrop-core" }
+playdrop-ipc = { path = "../playdrop-ipc" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "fs", "io-util", "sync", "time", "macros", "signal", "process"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3.6", default-features = false, features = ["tokio"] }
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+wl-clipboard-rs = "0.9.4"
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.26.1"
+windows = { version = "0.62.2", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

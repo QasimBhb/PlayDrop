@@ -1,0 +1,88 @@
+# Flatpak manifest for PlayDrop. Build instructions: packaging/flatpak/README.md.
+#
+# One app holds both binaries, so the daemon (playdropd) and the window
+# (playdrop-desktop) run under the same app ID. The daemon's SR-26 check expects
+# callers whose /.flatpak-info names org.playdrop.PlayDrop.
+#
+# Runtime 25.08: freedesktop-sdk branches get about two years of updates, and
+# 24.08 reached end of life in August 2026, so new builds start on 25.08.
+app-id: org.playdrop.PlayDrop
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: playdrop-desktop
+
+# The daemon's IPC name, org.playdrop.PlayDrop.Daemon1, needs no --own-name or
+# --talk-name: Flatpak's default session bus policy lets an app own (and so talk
+# to) its own namespace, $FLATPAK_ID and every name under it
+# (docs.flatpak.org, "Sandbox Permissions").
+#
+# Keep this list exactly as it is. Every entry is here for a named reason; adding
+# --socket=session-bus is PLAN.md anti-pattern 16, and --filesystem=home is
+# replaced by the file chooser portal plus the one receive folder below.
+finish-args:
+  # LAN discovery (UDP 42187) and transfers (TCP 42187).
+  - --share=network
+  # Shared memory for X11 when the fallback below is used.
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  # GPU rendering for the Slint window (femtovg renderer).
+  - --device=dri
+  # Tray icon through StatusNotifierItem.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # "File received" and pairing notifications.
+  - --talk-name=org.freedesktop.Notifications
+  # Sleep and resume signals so the daemon re-announces after suspend.
+  # login1 lives on the system bus, hence system-talk-name.
+  - --system-talk-name=org.freedesktop.login1
+  # "Show in folder" after a transfer.
+  - --talk-name=org.freedesktop.FileManager1
+  # Receive folder. Files to send are picked through the file chooser portal.
+  - --filesystem=xdg-download/PlayDrop:create
+
+cleanup:
+  - /share/doc
+
+modules:
+  - name: playdrop
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        # cargo-sources.json writes a cargo config here that points every crate
+        # at the vendored copies, so the build never touches the network.
+        CARGO_HOME: /run/build/playdrop/cargo
+        CARGO_NET_OFFLINE: 'true'
+        RUSTFLAGS: --remap-path-prefix=/run/build/playdrop=.
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --locked -p playdropd -p playdrop-desktop
+      - install -Dm755 target/release/playdropd -t /app/bin/
+      - install -Dm755 target/release/playdrop-desktop -t /app/bin/
+      - install -Dm644 packaging/linux/org.playdrop.PlayDrop.desktop -t /app/share/applications/
+      - install -Dm644 packaging/linux/org.playdrop.PlayDrop.metainfo.xml -t /app/share/metainfo/
+      - install -Dm644 packaging/linux/icons/hicolor/scalable/apps/org.playdrop.PlayDrop.svg
+        -t /app/share/icons/hicolor/scalable/apps/
+      - install -Dm644 packaging/linux/icons/hicolor/symbolic/apps/org.playdrop.PlayDrop-symbolic.svg
+        -t /app/share/icons/hicolor/symbolic/apps/
+      # D-Bus activation file with the in-sandbox path. The bus name starts with
+      # the app ID, so Flatpak exports it to the host on install and rewrites
+      # Exec to `flatpak run --command=playdropd org.playdrop.PlayDrop`.
+      - sed 's|^Exec=.*|Exec=/app/bin/playdropd|; /^SystemdService=/d'
+        packaging/linux/org.playdrop.PlayDrop.Daemon1.service > org.playdrop.PlayDrop.Daemon1.service
+      - install -Dm644 org.playdrop.PlayDrop.Daemon1.service -t /app/share/dbus-1/services/
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - target
+          - packaging/flatpak/build-dir
+          - packaging/flatpak/.flatpak-builder
+          - packaging/deb/dist
+          - packaging/windows/dist
+      # Generated from Cargo.lock; see the README for the exact command.
+      - cargo-sources.json

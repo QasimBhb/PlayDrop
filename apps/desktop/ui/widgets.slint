@@ -1,0 +1,154 @@
+// Small building blocks shared by the screens.
+
+import { Palette } from "std-widgets.slint";
+
+// Body text in the theme's foreground colour.
+export component Label inherits Text {
+    color: Palette.foreground;
+    wrap: word-wrap;
+    vertical-alignment: center;
+}
+
+// Secondary text.
+export component Muted inherits Text {
+    color: Palette.foreground;
+    opacity: 0.72;
+    font-size: 12px;
+    wrap: word-wrap;
+    vertical-alignment: center;
+}
+
+// Screen title.
+export component Heading inherits Text {
+    color: Palette.foreground;
+    font-size: 18px;
+    font-weight: 600;
+    wrap: word-wrap;
+}
+
+// A bordered panel.
+export component Card inherits Rectangle {
+    background: Palette.alternate-background;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Palette.border;
+}
+
+// A small status pill.
+export component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> good;
+    border-radius: 9px;
+    background: root.good ? #2e7d32 : Palette.control-background;
+    border-width: 1px;
+    border-color: root.good ? #2e7d32 : Palette.border;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        Text {
+            text: root.text;
+            font-size: 11px;
+            color: root.good ? #ffffff : Palette.foreground;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// An on/off switch that never changes its own state: the owner sets `checked` from the
+// daemon's answer, so a refused change snaps back instead of lying.
+export component Toggle inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-label: root.text;
+    accessible-action-default => {
+        if root.enabled {
+            root.toggled(!root.checked);
+        }
+    }
+    forward-focus: focus;
+    min-height: 28px;
+
+    HorizontalLayout {
+        spacing: 12px;
+        Label {
+            text: root.text;
+            horizontal-stretch: 1;
+            opacity: root.enabled ? 1.0 : 0.5;
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 40px;
+                height: 20px;
+                border-radius: 10px;
+                background: root.checked ? Palette.accent-background : Palette.control-background;
+                border-width: focus.has-focus ? 2px : 1px;
+                border-color: focus.has-focus || root.checked ? Palette.accent-background : Palette.border;
+                opacity: root.enabled ? 1.0 : 0.4;
+                Rectangle {
+                    width: 14px;
+                    height: 14px;
+                    y: 3px;
+                    x: root.checked ? parent.width - self.width - 3px : 3px;
+                    border-radius: 7px;
+                    background: root.checked ? Palette.accent-foreground : Palette.foreground;
+                    animate x { duration: 120ms; }
+                }
+            }
+        }
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => {
+            focus.focus();
+            root.toggled(!root.checked);
+        }
+    }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if event.text == " " || event.text == Key.Return {
+                root.toggled(!root.checked);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// A modal dialog: dims the window, swallows clicks behind it and centres a card holding
+// the children.
+export component Dialog inherits Rectangle {
+    in property <length> card-width: 380px;
+    background: #00000099;
+
+    TouchArea { }
+
+    Rectangle {
+        width: min(root.card-width, root.width - 32px);
+        height: min(body.preferred-height, root.height - 32px);
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Palette.background;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Palette.border;
+        body := VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+            @children
+        }
+    }
+}
