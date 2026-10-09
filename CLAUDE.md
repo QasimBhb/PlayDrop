@@ -9,7 +9,7 @@ always-on companion link (ping, clipboard, battery, media, later notifications a
 LocalSend's fast, account-free file drop, and adds resume and steady speed for thousands of small files.
 Targets: Android, iOS, Windows, Linux (Pop!_OS COSMIC first, Ubuntu GNOME second). Speed is the top priority.
 
-State: Phase 2 desktop complete on 2026-10-08 (branch `phase-2-desktop`). Rust workspace with
+State: Phase 2 desktop complete on 2026-10-08 (merged to `main`). Rust workspace with
 `playdrop-core` (identity, pin store, TLS, session plane, pairing, transfer engine, discovery,
 HTTP/2 net layer, host runtime), `playdrop-cli`, `playdrop-ipc` (D-Bus and named pipe contract),
 `playdropd` (daemon: tray, notifications, clipboard sync, autostart, diagnostics) and
@@ -23,8 +23,8 @@ platform. Build fully agentic. Next: Phase 3 Android and session plane, after fr
 anti-pattern list, the build phases, and the list of unverified claims. Do not re-research anything
 that PLAN.md already cites. Do not restate its content here.
 
-**One phase per session.** Each phase is built in its own session, on its own branch, and ends
-with a handoff document at `docs/phases/phase-N-<name>.md` (status, module map, public API,
+**One phase per session.** Each phase is built in its own session, directly on `main` (solo
+project, no feature branches, no pull requests), and ends with a handoff document at `docs/phases/phase-N-<name>.md` (status, module map, public API,
 decisions made, open TODOs, kickoff brief for the next phase). Starting a new phase: read
 `PLAN.md`, `docs/protocol.md`, `docs/threat-model.md`, then the latest `docs/phases/` file, then
 only the code the kickoff brief points at. Do not re-read the whole codebase. Finishing a phase:
@@ -107,8 +107,9 @@ Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
 - Hyphen only. Never an em-dash, anywhere.
 - No AI attribution in commits, PRs, or comments.
 - Commit messages in plain language: what changed and why.
-- Never push. Hand the user the `git push` command for the current branch, plus a PR title and a
-  short bullet description.
+- Work on `main` only. No feature branches, no pull requests: the user is the only developer.
+- Never push. After a commit, hand the user `git push origin main` and a one-line summary of what
+  was committed. No PR title or description; this overrides the global PR rule for this repo.
 - Env values go into every checkout and worktree plus `.env.example`; confirm gitignore first.
 - Do not delete research material, plans or docs without asking. Research folders were wiped once
   by another tool and had to be recovered.
