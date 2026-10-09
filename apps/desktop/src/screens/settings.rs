@@ -1,4 +1,4 @@
-//! Settings screen: receive folder, device name, clipboard sync, autostart,
+//! Settings screen: receive folder, device name, clipboard sync and images, autostart,
 //! notifications, and this computer's identity.
 
 use playdrop_ipc::{Ok, Request, SettingsPatch};
@@ -39,6 +39,17 @@ pub(super) fn install(app: &App) {
             );
         });
     });
+    s.on_set_clipboard_images(|on| {
+        with(|c| {
+            patch(
+                c,
+                SettingsPatch {
+                    clipboard_images: Some(on),
+                    ..SettingsPatch::default()
+                },
+            );
+        });
+    });
     s.on_set_autostart(|on| {
         with(|c| {
             patch(
@@ -74,6 +85,7 @@ pub(super) fn refresh(c: &Controller) {
     s.set_receive_dir(set.receive_dir.display().to_string().into());
     s.set_device_name(set.device_name.as_str().into());
     s.set_clipboard_sync(set.clipboard_sync);
+    s.set_clipboard_images(set.clipboard_images);
     s.set_clipboard_watch_supported(set.clipboard_watch_supported);
     s.set_autostart(set.autostart);
     s.set_notifications(set.notifications);

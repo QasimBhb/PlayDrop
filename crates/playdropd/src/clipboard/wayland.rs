@@ -11,6 +11,10 @@
 //! thread enforces [`READ_TIMEOUT`] so an app that never closes its end cannot stall the
 //! watcher; if it times out, that reader thread lingers until the app closes the pipe.
 //!
+//! Images: a selection that offers no text type but offers `image/png` is read as an image
+//! (up to 16 MiB) when the caller's image switch is on. Text always wins over an image, so a
+//! rich copy from a browser (text plus a picture) syncs as text.
+//!
 //! Writing uses `wl_clipboard_rs::copy` with `foreground(false)`: the crate serves paste
 //! requests from its own thread until the compositor cancels the source. Every new selection
 //! (our next `apply`, or the user copying anything) cancels the previous source, so at most one
@@ -31,8 +35,8 @@ use wl_clipboard_rs::utils::{
 use wl_clipboard_rs::{copy, watch};
 
 use super::unsupported::{unsupported, NO_DATA_CONTROL, X11};
-use super::MAX_SYNC_BYTES;
-use super::{short_hash, size_verdict, text_hash, ClipboardSupport, LocalClip, SizeVerdict};
+use super::{short_hash, ClipContent, ClipboardSupport, LocalClip};
+use super::{IMAGE_MIME, MAX_IMAGE_BYTES, MAX_SYNC_BYTES};
 
 /// Backend name reported in diagnostics.
 const BACKEND: &str = "wl-data-control";
@@ -126,7 +130,10 @@ impl WatchHandle {
     }
 }
 
-pub(super) async fn spawn_watcher(raw: mpsc::Sender<LocalClip>) -> anyhow::Result<WatchHandle> {
+pub(super) async fn spawn_watcher(
+    raw: mpsc::Sender<LocalClip>,
+    images: Arc<AtomicBool>,
+) -> anyhow::Result<WatchHandle> {
     let (ready_tx, ready_rx) = oneshot::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -143,7 +150,7 @@ pub(super) async fn spawn_watcher(raw: mpsc::Sender<LocalClip>) -> anyhow::Resul
                     }
                 };
             let _ = ready_tx.send(Ok(watcher.cancel_handle()));
-            watch_loop(watcher, &raw, &thread_stop);
+            watch_loop(watcher, &raw, &thread_stop, &images);
         })
         .context("could not start the clipboard watcher thread")?;
     let cancel = ready_rx
@@ -153,7 +160,12 @@ pub(super) async fn spawn_watcher(raw: mpsc::Sender<LocalClip>) -> anyhow::Resul
     Ok(WatchHandle { cancel, stop })
 }
 
-fn watch_loop(mut watcher: watch::Watcher, raw: &mpsc::Sender<LocalClip>, stop: &AtomicBool) {
+fn watch_loop(
+    mut watcher: watch::Watcher,
+    raw: &mpsc::Sender<LocalClip>,
+    stop: &AtomicBool,
+    images: &AtomicBool,
+) {
     let mut initial = true;
     loop {
         let event = match watcher.next_event() {
@@ -178,14 +190,15 @@ fn watch_loop(mut watcher: watch::Watcher, raw: &mpsc::Sender<LocalClip>, stop: 
         else {
             continue;
         };
-        let Some(text) = read_change(&mime_types, &mut offer) else {
+        let images = images.load(Ordering::SeqCst);
+        let Some(content) = read_change(&mime_types, &mut offer, images) else {
             continue;
         };
         if stop.load(Ordering::SeqCst) {
             break;
         }
         let clip = LocalClip {
-            text,
+            content,
             sensitive: false,
         };
         if raw.blocking_send(clip).is_err() {
@@ -195,8 +208,69 @@ fn watch_loop(mut watcher: watch::Watcher, raw: &mpsc::Sender<LocalClip>, stop: 
     tracing::debug!("clipboard watcher thread exited");
 }
 
-/// Applies the SR-24 and size rules to one selection change and returns the text to report.
-fn read_change(mime_types: &[String], offer: &mut watch::Offer<'_>) -> Option<String> {
+/// What a selection offers that we sync, best first: text, then a PNG image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wanted {
+    Text(&'static str),
+    Image,
+}
+
+/// Picks what to read from the offered types. Text always wins; an image only when
+/// `images` is on.
+fn wanted(offered: &[String], images: bool) -> Option<Wanted> {
+    if let Some(mime) = select_text_mime(offered) {
+        return Some(Wanted::Text(mime));
+    }
+    (images && offered.iter().any(|m| mime_eq(m, IMAGE_MIME))).then_some(Wanted::Image)
+}
+
+impl Wanted {
+    fn mime(self) -> &'static str {
+        match self {
+            Self::Text(m) => m,
+            Self::Image => IMAGE_MIME,
+        }
+    }
+
+    fn limit(self) -> usize {
+        match self {
+            Self::Text(_) => MAX_SYNC_BYTES,
+            Self::Image => MAX_IMAGE_BYTES,
+        }
+    }
+
+    /// Turns the bytes read into a clip; `None` for an empty one.
+    fn content(self, bytes: Vec<u8>) -> Option<ClipContent> {
+        if bytes.is_empty() {
+            return None;
+        }
+        match self {
+            Self::Text(_) => {
+                let text = decode(bytes);
+                (!text.is_empty()).then_some(ClipContent::Text(text))
+            }
+            Self::Image => Some(ClipContent::Image {
+                mime: IMAGE_MIME.to_owned(),
+                bytes,
+            }),
+        }
+    }
+
+    /// The user-facing reason a clip over the cap is skipped.
+    fn too_large(self) -> &'static str {
+        match self {
+            Self::Text(_) => "clipboard text is larger than 1 MiB and is not synced",
+            Self::Image => "clipboard image is larger than 16 MiB and is not synced",
+        }
+    }
+}
+
+/// Applies the SR-24 and size rules to one selection change and returns the clip to report.
+fn read_change(
+    mime_types: &[String],
+    offer: &mut watch::Offer<'_>,
+    images: bool,
+) -> Option<ClipContent> {
     if offers_password_hint(mime_types) {
         // Fail closed: an unreadable hint counts as `secret`.
         let secret = offer
@@ -212,41 +286,37 @@ fn read_change(mime_types: &[String], offer: &mut watch::Offer<'_>) -> Option<St
             return None;
         }
     }
-    let mime = select_text_mime(mime_types)?;
-    let pipe = match offer.receive(mime) {
+    let want = wanted(mime_types, images)?;
+    let pipe = match offer.receive(want.mime()) {
         Ok(pipe) => pipe,
         Err(e) => {
-            tracing::debug!(error = %e, "could not receive clipboard text");
+            tracing::debug!(error = %e, "could not receive the clipboard data");
             return None;
         }
     };
-    match read_limited(pipe, MAX_SYNC_BYTES, READ_TIMEOUT) {
+    match read_limited(pipe, want.limit(), READ_TIMEOUT) {
         Ok(Limited::Data(bytes)) => {
-            let text = decode(bytes);
-            if text.is_empty() {
-                return None;
-            }
-            if size_verdict(text.len()) == SizeVerdict::NeedsBlob {
-                tracing::debug!(len = text.len(), "clipboard text over 32 KiB; core decides");
-            }
-            tracing::debug!(len = text.len(), hash = %short_hash(&text_hash(&text)), "clipboard changed");
-            Some(text)
+            let content = want.content(bytes)?;
+            tracing::debug!(
+                kind = content.kind(),
+                len = content.len(),
+                hash = %short_hash(&content.hash()),
+                "clipboard changed"
+            );
+            Some(content)
         }
         Ok(Limited::TooLarge) => {
-            tracing::debug!(
-                limit = MAX_SYNC_BYTES,
-                "clipboard text over 1 MiB; not synced"
-            );
+            tracing::debug!(limit = want.limit(), "{}", want.too_large());
             None
         }
         Err(e) => {
-            tracing::debug!(error = %e, "could not read clipboard text");
+            tracing::debug!(error = %e, "could not read the clipboard data");
             None
         }
     }
 }
 
-pub(super) fn read_current() -> anyhow::Result<Option<LocalClip>> {
+pub(super) fn read_current(images: bool) -> anyhow::Result<Option<LocalClip>> {
     let types =
         match paste::get_mime_types_ordered(paste::ClipboardType::Regular, Seat::Unspecified) {
             Ok(types) => types,
@@ -256,13 +326,13 @@ pub(super) fn read_current() -> anyhow::Result<Option<LocalClip>> {
             Err(e) => return Err(e).context("could not read the clipboard"),
         };
     let sensitive = offers_password_hint(&types) && read_hint_is_secret();
-    let Some(mime) = select_text_mime(&types) else {
+    let Some(want) = wanted(&types, images) else {
         return Ok(None);
     };
     let pipe = match paste::get_contents(
         paste::ClipboardType::Regular,
         Seat::Unspecified,
-        MimeType::Specific(mime),
+        MimeType::Specific(want.mime()),
     ) {
         Ok((pipe, _)) => pipe,
         Err(paste::Error::ClipboardEmpty | paste::Error::NoSeats | paste::Error::NoMimeType) => {
@@ -270,12 +340,11 @@ pub(super) fn read_current() -> anyhow::Result<Option<LocalClip>> {
         }
         Err(e) => return Err(e).context("could not read the clipboard"),
     };
-    match read_limited(pipe, MAX_SYNC_BYTES, READ_TIMEOUT)? {
-        Limited::Data(bytes) => {
-            let text = decode(bytes);
-            Ok((!text.is_empty()).then_some(LocalClip { text, sensitive }))
-        }
-        Limited::TooLarge => anyhow::bail!("clipboard text is larger than 1 MiB and is not synced"),
+    match read_limited(pipe, want.limit(), READ_TIMEOUT)? {
+        Limited::Data(bytes) => Ok(want
+            .content(bytes)
+            .map(|content| LocalClip { content, sensitive })),
+        Limited::TooLarge => anyhow::bail!(want.too_large()),
     }
 }
 
@@ -306,6 +375,22 @@ pub(super) fn apply(text: &str, sensitive: bool) -> anyhow::Result<()> {
         .copy(
             copy::Source::Bytes(text.as_bytes().into()),
             copy::MimeType::Text,
+        )
+        .context("could not write the clipboard")?;
+    Ok(())
+}
+
+pub(super) fn apply_image(bytes: &[u8], mime: &str, sensitive: bool) -> anyhow::Result<()> {
+    let mut options = copy::Options::new();
+    options
+        .clipboard(copy::ClipboardType::Regular)
+        .seat(copy::Seat::All)
+        .foreground(false)
+        .sensitive(sensitive);
+    options
+        .copy(
+            copy::Source::Bytes(bytes.into()),
+            copy::MimeType::Specific(mime.to_owned()),
         )
         .context("could not write the clipboard")?;
     Ok(())
@@ -420,6 +505,37 @@ mod tests {
             None
         );
         assert_eq!(select_text_mime(&[]), None);
+    }
+
+    #[test]
+    fn text_wins_over_an_image_and_images_obey_the_switch() {
+        let both = types(&["image/png", "text/plain;charset=utf-8"]);
+        assert_eq!(
+            wanted(&both, true),
+            Some(Wanted::Text("text/plain;charset=utf-8"))
+        );
+        let png = types(&["image/png", "image/bmp"]);
+        assert_eq!(wanted(&png, true), Some(Wanted::Image));
+        assert_eq!(wanted(&png, false), None);
+        assert_eq!(wanted(&types(&["image/jpeg"]), true), None);
+        assert_eq!(wanted(&types(&["IMAGE/PNG"]), true), Some(Wanted::Image));
+    }
+
+    #[test]
+    fn image_content_keeps_bytes_and_skips_empty() {
+        assert_eq!(Wanted::Image.content(Vec::new()), None);
+        assert_eq!(
+            Wanted::Image.content(vec![0x89, b'P']),
+            Some(ClipContent::Image {
+                mime: IMAGE_MIME.into(),
+                bytes: vec![0x89, b'P']
+            })
+        );
+        assert_eq!(Wanted::Image.limit(), MAX_IMAGE_BYTES);
+        assert_eq!(
+            Wanted::Text("UTF8_STRING").content(b"hi".to_vec()),
+            Some(ClipContent::Text("hi".into()))
+        );
     }
 
     #[test]

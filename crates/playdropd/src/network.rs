@@ -12,6 +12,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Changes closer together than this are reported once.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const DEBOUNCE: Duration = Duration::from_secs(1);
 
 /// Watches for network changes and sends one `()` per (debounced) change. Returns once the

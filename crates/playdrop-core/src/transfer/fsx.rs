@@ -113,6 +113,7 @@ fn refusal(parent: &Dir, name: &str, e: io::Error) -> Error {
 /// the final folder.
 pub(crate) fn safe_dir(root: &Dir, components: &[String], private: bool) -> Result<Dir> {
     let mut dir = root.try_clone()?;
+    #[cfg_attr(not(unix), allow(unused_mut, reason = "mode is set on Unix only"))]
     let mut builder = cap_std::fs::DirBuilder::new();
     #[cfg(unix)]
     if private {
@@ -142,6 +143,10 @@ pub(crate) fn open_own_dir(path: &Path) -> Result<Dir> {
 /// Makes a folder's entries durable (Unix `fsync`). A no-op elsewhere. `cap-std` may hold
 /// a folder as an `O_PATH` handle, which cannot be synced, so `.` is reopened readable
 /// first; that open is relative to the handle and resolves nothing else.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::unnecessary_wraps, reason = "a no-op off Unix, same signature")
+)]
 pub(crate) fn sync_dir_handle(dir: &Dir) -> Result<()> {
     #[cfg(unix)]
     {
@@ -308,6 +313,10 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Flushes a directory's entries (Unix). A no-op elsewhere, where directories cannot be
 /// opened as files through `std`.
+#[cfg_attr(
+    not(unix),
+    allow(clippy::unnecessary_wraps, reason = "a no-op off Unix, same signature")
+)]
 pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     {

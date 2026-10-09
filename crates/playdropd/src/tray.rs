@@ -54,6 +54,7 @@ pub struct TrayView {
 }
 
 /// The menu text of a device line.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn device_line(d: &TrayDevice) -> String {
     let state = match (d.online, d.seen_secs_ago) {
         (true, _) => "online".to_owned(),
@@ -67,6 +68,7 @@ pub fn device_line(d: &TrayDevice) -> String {
 }
 
 /// "just now", "5 min ago", "3 h ago", "2 days ago".
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn ago_text(secs: u64) -> String {
     match secs {
         0..=59 => "just now".to_owned(),
@@ -354,7 +356,7 @@ mod platform {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let spawned = std::thread::Builder::new()
             .name("playdropd-tray".into())
-            .spawn(move || run(commands, tx));
+            .spawn(move || run(&commands, tx));
         if let Err(e) = spawned {
             tracing::info!(error = %e, "no tray thread");
             return None;
@@ -367,14 +369,16 @@ mod platform {
 
     fn rgba(size: u32) -> Vec<u8> {
         icon_argb(size)
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[1], p[2], p[3], p[0]])
             .collect()
     }
 
     #[allow(unsafe_code)]
     fn run(
-        commands: mpsc::UnboundedSender<TrayCommand>,
+        commands: &mpsc::UnboundedSender<TrayCommand>,
         ready: tokio::sync::oneshot::Sender<Option<u32>>,
     ) {
         let menu = Menu::new();
@@ -417,32 +421,41 @@ mod platform {
             pause.id().clone(),
             quit.id().clone(),
         );
-        MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
-            let c = if e.id == ids.0 {
-                TrayCommand::AddDevice
-            } else if e.id == ids.1 {
-                TrayCommand::SendClipboard
-            } else if e.id == ids.2 {
-                TrayCommand::OpenWindow
-            } else if e.id == ids.3 {
-                // The check item flips itself before the event arrives.
-                TrayCommand::SetClipboardPaused(pause.is_checked())
-            } else if e.id == ids.4 {
-                TrayCommand::Quit
-            } else {
-                return;
-            };
-            let _ = commands.send(c);
-        }));
+        // Menu events are read on this thread, after each dispatched message, because the
+        // menu items are not `Send` and `pause.is_checked()` must run where they live.
+        let menu_events = MenuEvent::receiver();
         // SAFETY: GetCurrentThreadId has no preconditions.
         let _ = ready.send(Some(unsafe { GetCurrentThreadId() }));
         let mut msg = MSG::default();
-        // SAFETY: standard message pump on the thread that owns the tray window; `msg` is a
-        // valid, writable MSG for every call.
-        unsafe {
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+        loop {
+            // SAFETY: standard message pump on the thread that owns the tray window; `msg`
+            // is a valid, writable MSG for every call.
+            // GetMessageW returns 0 on WM_QUIT and -1 on error; both end the loop.
+            let more = unsafe { GetMessageW(&raw mut msg, None, 0, 0).0 > 0 };
+            if !more {
+                break;
+            }
+            // SAFETY: `msg` was filled by GetMessageW on this thread just above.
+            unsafe {
+                let _ = TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
+            }
+            while let Ok(e) = menu_events.try_recv() {
+                let c = if e.id == ids.0 {
+                    TrayCommand::AddDevice
+                } else if e.id == ids.1 {
+                    TrayCommand::SendClipboard
+                } else if e.id == ids.2 {
+                    TrayCommand::OpenWindow
+                } else if e.id == ids.3 {
+                    // The check item flips itself before the event arrives.
+                    TrayCommand::SetClipboardPaused(pause.is_checked())
+                } else if e.id == ids.4 {
+                    TrayCommand::Quit
+                } else {
+                    continue;
+                };
+                let _ = commands.send(c);
             }
         }
     }

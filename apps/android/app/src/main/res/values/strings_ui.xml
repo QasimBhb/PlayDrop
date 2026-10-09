@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Strings owned by the UI layer (screens under ui/ and qr/). Host strings live in strings.xml. -->
+<resources>
+    <!-- Common -->
+    <string name="ui_back">Back</string>
+    <string name="ui_cancel">Cancel</string>
+    <string name="ui_save">Save</string>
+    <string name="ui_start">Start</string>
+    <string name="ui_next">Next</string>
+    <string name="ui_allow">Allow</string>
+    <string name="ui_not_now">Not now</string>
+    <string name="ui_refresh">Refresh</string>
+    <string name="ui_yes">yes</string>
+    <string name="ui_no">no</string>
+    <string name="ui_percent">%1$d%%</string>
+    <string name="ui_service_not_running">Service not running. Devices cannot reach this phone.</string>
+
+    <!-- Bottom navigation -->
+    <string name="ui_tab_devices">Devices</string>
+    <string name="ui_tab_transfers">Transfers</string>
+    <string name="ui_tab_settings">Settings</string>
+
+    <!-- Relative time -->
+    <string name="ui_ago_just_now">just now</string>
+    <string name="ui_ago_never">never</string>
+    <plurals name="ui_ago_minutes">
+        <item quantity="one">%d min ago</item>
+        <item quantity="other">%d min ago</item>
+    </plurals>
+    <plurals name="ui_ago_hours">
+        <item quantity="one">%d hour ago</item>
+        <item quantity="other">%d hours ago</item>
+    </plurals>
+    <plurals name="ui_ago_days">
+        <item quantity="one">%d day ago</item>
+        <item quantity="other">%d days ago</item>
+    </plurals>
+
+    <!-- Errors (anti-pattern 18: every failure is said in words) -->
+    <string name="ui_err_not_paired">That device is not paired with this phone.</string>
+    <string name="ui_err_forbidden">The other device does not allow that.</string>
+    <string name="ui_err_locked">Not possible while the other device is locked. Unlock it and try again.</string>
+    <string name="ui_err_not_found">The device is not connected right now.</string>
+    <string name="ui_err_too_large">That is too large to send this way.</string>
+    <string name="ui_err_port_held">Port %1$d is used by another app. Pick another port in Settings.</string>
+    <string name="ui_err_insecure">PlayDrop\'s private files have unsafe permissions.</string>
+    <string name="ui_err_no_space">Not enough free space.</string>
+    <string name="ui_err_path_invalid">That file cannot be sent.</string>
+    <string name="ui_err_pair_rejected">Pairing was declined.</string>
+    <string name="ui_err_io">Network or file error: %1$s</string>
+    <string name="ui_err_other">Something went wrong: %1$s</string>
+    <string name="ui_err_not_running">PlayDrop is not running. Start it from the Devices tab.</string>
+    <string name="ui_err_start_failed">PlayDrop could not start: %1$s</string>
+
+    <!-- Devices -->
+    <string name="ui_devices_title">Devices</string>
+    <string name="ui_add_device">Add device</string>
+    <string name="ui_send_files">Send files</string>
+    <string name="ui_default_device">Default device</string>
+    <string name="ui_device_online">online</string>
+    <string name="ui_device_asleep">asleep</string>
+    <string name="ui_device_last_seen">last seen %1$s</string>
+    <string name="ui_device_removed_short">removed by the other device</string>
+    <string name="ui_devices_empty_title">No paired devices yet</string>
+    <string name="ui_devices_empty_body">Open PlayDrop on your computer, choose Add device on both, then check that both screens show the same six digits.</string>
+    <string name="ui_send_to_title">Send to</string>
+    <string name="ui_send_to_remember">Always send here with one tap</string>
+    <plurals name="ui_devices_sending">
+        <item quantity="one">Sending %1$d item to %2$s</item>
+        <item quantity="other">Sending %1$d items to %2$s</item>
+    </plurals>
+
+    <!-- Device detail -->
+    <string name="ui_detail_title">Device</string>
+    <string name="ui_detail_gone">This device is no longer paired.</string>
+    <string name="ui_detail_removed">The other device removed this phone. Pair again to use it.</string>
+    <string name="ui_detail_pair_again">Pair again</string>
+    <string name="ui_detail_paired_on">paired %1$s</string>
+    <string name="ui_detail_set_default">Set as default</string>
+    <string name="ui_detail_is_default">Default device: Send files goes here with one tap.</string>
+    <string name="ui_detail_default_set">Set as the default device</string>
+    <string name="ui_detail_ping">Ping</string>
+    <string name="ui_detail_ping_body">Shows a notification on the other device. The message is optional.</string>
+    <string name="ui_detail_ping_send">Send</string>
+    <string name="ui_detail_ping_sent">Ping sent</string>
+    <string name="ui_detail_find">Find</string>
+    <string name="ui_detail_find_stop">Stop ringing</string>
+    <string name="ui_detail_ringing">Ringing</string>
+    <string name="ui_detail_connect">Connect now</string>
+    <string name="ui_detail_rename">Rename</string>
+    <string name="ui_detail_rename_title">Rename device</string>
+    <string name="ui_detail_rename_body">The name is only used on this phone. The device cannot change it.</string>
+    <string name="ui_detail_addresses">Last-known addresses</string>
+    <string name="ui_detail_no_addresses">None yet</string>
+    <string name="ui_detail_unpair">Unpair</string>
+    <string name="ui_detail_unpair_title">Unpair %1$s?</string>
+    <string name="ui_detail_unpair_body">It will need to pair again before it can send or receive anything.</string>
+
+    <!-- Grants (SR-14) -->
+    <string name="ui_grants_title">Allow this device to</string>
+    <string name="ui_grant_files">Send files without asking</string>
+    <string name="ui_grant_files_body">When off, each transfer waits for you to accept it.</string>
+    <string name="ui_grant_clip_in">Put text on this phone\'s clipboard</string>
+    <string name="ui_grant_clip_in_body">Text copied on the device appears here, ready to paste.</string>
+    <string name="ui_grant_clip_out">Receive this phone\'s clipboard</string>
+    <string name="ui_grant_clip_out_body">Text you copy here is sent to the device.</string>
+    <string name="ui_grant_media">Control media</string>
+    <string name="ui_grant_media_body">Play, pause and skip what is playing on this phone.</string>
+    <string name="ui_grant_find">Ring this phone</string>
+    <string name="ui_grant_find_body">Rings at full volume, even on silent, so you can find it.</string>
+    <string name="ui_grant_input">Remote input</string>
+    <string name="ui_grant_input_body">Arrives in Phase 5.</string>
+
+    <!-- Add device -->
+    <string name="ui_add_tab_nearby">Nearby</string>
+    <string name="ui_add_tab_show_qr">Show QR</string>
+    <string name="ui_add_tab_scan_qr">Scan QR</string>
+    <string name="ui_add_intro">Choose Add device on the other device too. It shows up below; pick it, then check that both screens show the same six digits.</string>
+    <string name="ui_add_looking">Looking for devices, %1$s left</string>
+    <string name="ui_add_window_closed">Stopped looking.</string>
+    <string name="ui_add_look_again">Look again</string>
+    <string name="ui_add_none_yet">No devices yet. Make sure the other device is on the same Wi-Fi with Add device open.</string>
+    <string name="ui_add_pair">Pair</string>
+    <string name="ui_add_type_address">Or type its address</string>
+    <string name="ui_add_address_hint">192.168.1.20 or 192.168.1.20:42187</string>
+    <string name="ui_add_bad_address">That is not an address. Type it like 192.168.1.20 or 192.168.1.20:42187.</string>
+    <string name="ui_add_pairing">Pairing</string>
+    <string name="ui_add_pairing_with">Pairing with %1$s</string>
+    <string name="ui_add_paired">Paired with %1$s</string>
+    <string name="ui_add_pair_failed">Pairing failed: %1$s</string>
+    <string name="ui_add_camera_failed">The camera could not start.</string>
+    <string name="ui_removed_by_peer">%1$s removed this phone. Pair again to use it.</string>
+    <string name="ui_kind_computer">Computer</string>
+    <string name="ui_kind_laptop">Laptop</string>
+    <string name="ui_kind_phone">Phone</string>
+    <string name="ui_kind_tablet">Tablet</string>
+    <string name="ui_kind_other">Device</string>
+
+    <!-- QR (SR-9) -->
+    <string name="ui_qr_show_intro">Scan this code with the other device.</string>
+    <string name="ui_qr_content_description">Pairing QR code</string>
+    <string name="ui_qr_valid_for">Valid for %1$s</string>
+    <string name="ui_qr_warning">Works once, for two minutes. Anyone who sees this code can pair, so do not share it. Screenshots are blocked while it is shown.</string>
+    <string name="ui_qr_expired">The code expired.</string>
+    <string name="ui_qr_new">Show a new code</string>
+    <string name="ui_qr_scan_intro">Point the camera at the code the other device shows.</string>
+    <string name="ui_qr_camera_needed">Scanning needs the camera. PlayDrop uses it only on this screen.</string>
+    <string name="ui_qr_camera_denied">Camera access was denied. Allow it to scan, or use Nearby or Show QR instead.</string>
+    <string name="ui_qr_allow_camera">Allow camera</string>
+
+    <!-- Pairing prompt (SR-8) -->
+    <string name="ui_pair_sas_title">Pair with %1$s?</string>
+    <string name="ui_pair_sas_body">Accept only if the other screen shows the same six digits.</string>
+    <string name="ui_pair_confirm_title">Add %1$s (%2$s)?</string>
+    <string name="ui_pair_confirm_body">This device scanned the code on this phone.</string>
+    <string name="ui_pair_name">Name: %1$s</string>
+    <string name="ui_pair_accept">Pair</string>
+    <string name="ui_pair_reject">Reject</string>
+    <string name="ui_pair_add">Add</string>
+
+    <!-- Transfers -->
+    <string name="ui_transfers_title">Transfers</string>
+    <string name="ui_transfers_empty">Nothing sent or received yet. Files you send or receive show up here.</string>
+    <string name="ui_transfers_incoming">Incoming</string>
+    <string name="ui_transfers_outgoing">Outgoing</string>
+    <string name="ui_transfers_from">From %1$s</string>
+    <string name="ui_transfers_to">To %1$s</string>
+    <string name="ui_transfers_of">%1$s of %2$s</string>
+    <string name="ui_transfers_left">%1$s left</string>
+    <string name="ui_transfers_more">and %1$d more</string>
+    <string name="ui_transfers_accept">Accept</string>
+    <string name="ui_transfers_decline">Decline</string>
+    <string name="ui_transfers_open">Open</string>
+    <string name="ui_transfers_open_folder">Open folder</string>
+    <string name="ui_transfers_no_viewer">No app on this phone can open that.</string>
+    <string name="ui_transfers_risky">This file type could install or run code, so it opens in Downloads instead.</string>
+    <plurals name="ui_files">
+        <item quantity="one">%d file</item>
+        <item quantity="other">%d files</item>
+    </plurals>
+    <string name="ui_state_waiting_you">Waiting for you</string>
+    <string name="ui_state_waiting_peer">Waiting for the other device</string>
+    <string name="ui_state_done">Done</string>
+    <string name="ui_state_failed">Failed</string>
+    <string name="ui_state_cancelled">Cancelled</string>
+
+    <!-- Clipboard auto-push (SR-24) -->
+    <string name="ui_clip_sensitive">Clipboard not sent: marked sensitive</string>
+    <string name="ui_clip_too_large">Clipboard not sent: over 1 MiB of text</string>
+
+    <!-- Settings -->
+    <string name="ui_settings_title">Settings</string>
+    <string name="ui_settings_name">This phone\'s name</string>
+    <string name="ui_settings_name_hint">Other devices see this name. A change applies the next time PlayDrop starts.</string>
+    <string name="ui_settings_name_empty">The name cannot be empty.</string>
+    <string name="ui_settings_saved_restart">Saved. Applies the next time PlayDrop starts.</string>
+    <string name="ui_settings_default">Default device</string>
+    <string name="ui_settings_default_none">None chosen</string>
+    <string name="ui_settings_default_hint">Send files goes to this device with one tap.</string>
+    <string name="ui_settings_default_clear">Clear</string>
+    <string name="ui_settings_clipboard">Clipboard</string>
+    <string name="ui_settings_auto_clipboard">Send the clipboard automatically</string>
+    <string name="ui_settings_auto_clipboard_hint">While PlayDrop is open, text you copy goes to your devices. Android 10 and later do not let apps read the clipboard in the background, so elsewhere use Send clipboard from the notification or the share menu.</string>
+    <string name="ui_settings_background">Running in the background</string>
+    <string name="ui_settings_battery_title">Battery optimisation</string>
+    <string name="ui_settings_battery_body">Android may pause PlayDrop to save battery, so your computer cannot reach this phone until you open the app. Allowing PlayDrop to run unrestricted keeps it reachable. It uses very little battery while idle.</string>
+    <string name="ui_settings_battery_done">PlayDrop is allowed to run in the background.</string>
+    <string name="ui_settings_battery_button">Allow background use</string>
+    <string name="ui_settings_battery_unavailable">This phone has no battery optimisation screen.</string>
+    <string name="ui_settings_notifications">Notifications</string>
+    <string name="ui_settings_notifications_on">Allowed: received files, offers and pairing show up.</string>
+    <string name="ui_settings_notifications_off">Off: you will not see received files or incoming offers.</string>
+    <string name="ui_settings_network">Network</string>
+    <string name="ui_settings_port">Port</string>
+    <string name="ui_settings_port_hint">42187 unless something else uses it. A change applies the next time PlayDrop starts.</string>
+    <string name="ui_settings_port_invalid">Use a port between 1024 and 65535.</string>
+    <string name="ui_settings_port_reserved">That port belongs to KDE Connect or LocalSend. Pick another one.</string>
+    <string name="ui_settings_diagnostics_hint">Check why a device cannot be found</string>
+    <string name="ui_settings_about">About</string>
+    <string name="ui_settings_short_id">Short ID</string>
+    <string name="ui_settings_device_id">Device ID</string>
+    <string name="ui_settings_identity_unknown">Start PlayDrop to see this phone\'s ID.</string>
+    <string name="ui_settings_core_version">PlayDrop core %1$s</string>
+    <string name="ui_settings_licence">Free software under the GNU GPL, version 3 or later (GPL-3.0-or-later).</string>
+
+    <!-- Diagnostics -->
+    <string name="ui_diagnostics_title">Diagnostics</string>
+    <string name="ui_diag_running">Checking</string>
+    <string name="ui_diag_unavailable">No report. Start PlayDrop, then refresh.</string>
+    <string name="ui_diag_ok">OK</string>
+    <string name="ui_diag_problem">Problem</string>
+    <string name="ui_diag_listener">Listening</string>
+    <string name="ui_diag_listening_on">On %1$s</string>
+    <string name="ui_diag_not_listening">Not listening on port %1$d</string>
+    <string name="ui_diag_interfaces">Network interfaces</string>
+    <string name="ui_diag_no_interface">No usable network interface</string>
+    <string name="ui_diag_interface_line">%1$s mask %2$s (interface %3$d)</string>
+    <string name="ui_diag_multicast">Multicast beacon</string>
+    <string name="ui_diag_off">Turned off</string>
+    <string name="ui_diag_joined_on">Joined on %1$s</string>
+    <string name="ui_diag_join_failed">Join failed on %1$s</string>
+    <string name="ui_diag_beacon_ago">Beacon from another device %1$s ago</string>
+    <string name="ui_diag_no_beacon">No beacon from another device since start</string>
+    <string name="ui_diag_mdns">mDNS</string>
+    <string name="ui_diag_mdns_registered">This phone is registered</string>
+    <string name="ui_diag_mdns_not_registered">This phone is not registered</string>
+    <string name="ui_diag_error">Error: %1$s</string>
+    <string name="ui_diag_advert_ago">Advert from another device %1$s ago</string>
+    <string name="ui_diag_no_advert">No advert from another device since start</string>
+    <string name="ui_diag_peers">Paired devices</string>
+    <string name="ui_diag_offline">offline</string>
+    <string name="ui_diag_peer_line">%1$s (%2$s): %3$s; seen via mDNS %4$s, beacon %5$s</string>
+    <string name="ui_diag_peer_failure">Last failure via %1$s: %2$s</string>
+    <string name="ui_path_mdns">mDNS</string>
+    <string name="ui_path_beacon">multicast beacon</string>
+    <string name="ui_path_last_known">last-known address</string>
+    <string name="ui_issue_all_fine">All paths fine</string>
+    <string name="ui_issue_not_listening">PlayDrop is not listening on port %1$d: port blocked or used by another app. Restart PlayDrop or change the port.</string>
+    <string name="ui_issue_no_interface">No network interface is up. Turn on Wi-Fi.</string>
+    <string name="ui_issue_multicast_join">Multicast blocked on %1$s: %2$s</string>
+    <string name="ui_issue_multicast_blocked">Multicast blocked on %1$s: no beacon heard although %2$s is connected on this network</string>
+    <string name="ui_issue_discovery_off">Discovery is off: devices are found only at their last-known address</string>
+    <string name="ui_issue_mdns">mDNS failed: %1$s</string>
+    <string name="ui_issue_other_network">No interface on the same network as %1$s</string>
+    <string name="ui_issue_peer">%1$s not reached: %2$s failed (%3$s)</string>
+
+    <!-- Onboarding -->
+    <string name="ui_onboarding_1_title">Your phone and computer, together</string>
+    <string name="ui_onboarding_1_body">Send files to your computer in one tap, share the clipboard, ring a lost phone. Everything stays on your own network, with no account.</string>
+    <string name="ui_onboarding_2_title">Notifications</string>
+    <string name="ui_onboarding_2_body">PlayDrop tells you when files arrive and when a device wants to pair. It also keeps one quiet notification while it runs, so Android lets it stay reachable.</string>
+    <string name="ui_onboarding_3_title">Start PlayDrop</string>
+    <string name="ui_onboarding_3_body">PlayDrop runs quietly in the background so your devices can reach this phone. Next, pair your computer from the Devices tab.</string>
+    <string name="ui_onboarding_start">Start</string>
+    <string name="ui_onboarding_start_slow">PlayDrop is taking a while to start. Check the Devices tab.</string>
+</resources>

@@ -9,7 +9,12 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::session::types::MediaAction;
+pub use crate::transfer::DeliveredFile;
+
+use super::status::MediaState;
 
 /// A value shown to the user but never logged (SR-32).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +24,47 @@ pub struct Secret<T>(pub T);
 impl<T> fmt::Debug for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("(redacted)")
+    }
+}
+
+/// Bytes that travel through events and IPC as one standard base64 string (clipboard
+/// images, `docs/core-api.md` section 5). `Debug` shows only the length.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Base64Bytes(pub Vec<u8>);
+
+impl fmt::Debug for Base64Bytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Base64Bytes({} bytes)", self.0.len())
+    }
+}
+
+impl From<Base64Bytes> for Vec<u8> {
+    fn from(b: Base64Bytes) -> Self {
+        b.0
+    }
+}
+
+impl From<Vec<u8>> for Base64Bytes {
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
+}
+
+impl Serialize for Base64Bytes {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine as _;
+        s.serialize_str(&base64::engine::general_purpose::STANDARD.encode(&self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Base64Bytes {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use base64::Engine as _;
+        let s = String::deserialize(d)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(s.as_bytes())
+            .map(Base64Bytes)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -220,9 +266,14 @@ pub enum HostEvent {
         #[serde(default)]
         saved: Vec<PathBuf>,
         /// Receive side: the receive root the files were written beneath, for "Show in
-        /// folder". `None` on the send side.
+        /// folder". `None` on the send side and in `Staged` mode.
         #[serde(default)]
         folder: Option<PathBuf>,
+        /// Receive side, both modes: where every received file went, in manifest order
+        /// (the final path in `Directory` mode, the sink's string in `Staged` mode). Empty
+        /// on the send side (`docs/core-api.md` section 2).
+        #[serde(default)]
+        delivered: Vec<DeliveredFile>,
     },
     /// A transfer failed or was cancelled.
     TransferFailed {
@@ -235,14 +286,59 @@ pub enum HostEvent {
         /// Why, for the user ("failed integrity check from <label>", SR-22).
         reason: String,
     },
-    /// A clipboard push arrived and passed the `clipboardIn` grant (protocol.md 5.7).
+    /// A text clipboard push arrived and passed the `clipboardIn` grant (protocol.md 5.7).
+    /// Text over 32 KiB was fetched from the sender's blob (5.15) and verified first.
     Clipboard {
         /// Device ID.
         peer: String,
-        /// The text; `None` for an image blob. Never logged.
+        /// The text, always `Some` for text clips (the `Option` is kept for older UIs).
+        /// Never logged.
         text: Secret<Option<String>>,
         /// Marked sensitive by the sender (SR-24).
         sensitive: bool,
+    },
+    /// An image clipboard arrived through a verified blob and passed the `clipboardIn`
+    /// grant (protocol.md 5.7, 5.15).
+    ClipboardImage {
+        /// Device ID.
+        peer: String,
+        /// Image MIME type from the frame.
+        mime: String,
+        /// The image bytes, a base64 string on the wire. Never logged.
+        data: Secret<Base64Bytes>,
+        /// Marked sensitive by the sender (SR-24).
+        sensitive: bool,
+    },
+    /// A peer's media player state (protocol.md 5.9), with the `media` grant.
+    MediaState {
+        /// Device ID.
+        peer: String,
+        /// The player's state.
+        state: MediaState,
+    },
+    /// A peer asks this host to control one of its players (protocol.md 5.9), with the
+    /// `media` grant.
+    MediaCommand {
+        /// Device ID.
+        peer: String,
+        /// Target player ID.
+        player: String,
+        /// What to do.
+        action: MediaAction,
+        /// Seek position in ms or volume 0 to 100.
+        value: Option<u64>,
+    },
+    /// A peer holds outbox items for this host (protocol.md 5.11, 7.8); pull them with
+    /// `Host::pull_outbox`.
+    OutboxReady {
+        /// Device ID.
+        peer: String,
+        /// Items waiting.
+        count: u64,
+        /// Total bytes waiting.
+        bytes: u64,
+        /// Item IDs.
+        ids: Vec<String>,
     },
     /// A `ping` arrived (protocol.md 5.6).
     Ping {
@@ -276,8 +372,7 @@ pub enum HostEvent {
         /// `active`, `idle`, `locked` or `asleep`.
         state: String,
     },
-    /// A frame this build parses but does not act on yet (media and input are Phase 3/5,
-    /// outbox is Phase 3/4).
+    /// A frame this build parses but does not act on yet: `input` only (Phase 5).
     Unsupported {
         /// Device ID.
         peer: String,
@@ -346,6 +441,28 @@ mod tests {
                 bundle_root: Some("00".into()),
                 saved: vec![PathBuf::from("/home/u/Downloads/Docs/a.pdf")],
                 folder: Some(PathBuf::from("/home/u/Downloads")),
+                delivered: vec![DeliveredFile {
+                    path: "Docs/a.pdf".into(),
+                    location: "/home/u/Downloads/Docs/a.pdf".into(),
+                }],
+            },
+            HostEvent::ClipboardImage {
+                peer: "ab".repeat(32),
+                mime: "image/png".into(),
+                data: Secret(Base64Bytes(b"hunter2".to_vec())),
+                sensitive: false,
+            },
+            HostEvent::MediaCommand {
+                peer: "ab".repeat(32),
+                player: "spotify".into(),
+                action: MediaAction::Seek,
+                value: Some(90_000),
+            },
+            HostEvent::OutboxReady {
+                peer: "ab".repeat(32),
+                count: 1,
+                bytes: 10,
+                ids: vec!["c1".into()],
             },
             HostEvent::DiscoveryDiagnostic {
                 peer: "ab".repeat(32),
@@ -361,6 +478,8 @@ mod tests {
             let dbg = format!("{ev:?}");
             assert!(!dbg.contains("123456") && !dbg.contains("hunter2"), "{dbg}");
         }
+        let json = serde_json::to_value(Base64Bytes(vec![0, 1, 2, 255])).unwrap();
+        assert_eq!(json, "AAEC/w==");
         let json = r#"{"event":"clipboard","peer":"p","text":"x","sensitive":false}"#;
         let HostEvent::Clipboard { text, .. } = serde_json::from_str(json).unwrap() else {
             panic!("wrong variant");

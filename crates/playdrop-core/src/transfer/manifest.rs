@@ -8,6 +8,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
+use super::source::{SourceRef, StreamSource};
 use crate::constants::{DEFAULT_CHUNK_SIZE, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE};
 use crate::{Error, Result};
 
@@ -342,25 +343,36 @@ pub struct FileId {
 /// changed (protocol.md 7.6, SR-21). Never serialised to the wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceInfo {
-    /// Local path the bytes are read from.
-    pub local_path: PathBuf,
+    /// Where the bytes are read from: a local path or a host-supplied opener.
+    pub source: SourceRef,
     /// Size at offer time.
     pub size: u64,
-    /// Modification time at offer time, Unix ms.
+    /// Modification time at offer time, Unix ms. For a stream source with an unknown
+    /// mtime this is 0 and mtime is left out of the check (`docs/core-api.md` section 3).
     pub mtime_ms: i64,
     /// Device and inode, when the platform exposes them through `std`.
     pub file_id: Option<FileId>,
 }
 
 impl SourceInfo {
-    /// Captures size, mtime and file ID from metadata of a regular file.
+    /// Captures size, mtime and file ID from metadata of a regular file at `local_path`.
     pub fn from_metadata(local_path: PathBuf, meta: &std::fs::Metadata) -> Self {
+        Self::of(SourceRef::Path(local_path), meta)
+    }
+
+    /// Captures size, mtime and file ID of any source from its metadata.
+    pub fn of(source: SourceRef, meta: &std::fs::Metadata) -> Self {
         Self {
-            local_path,
+            source,
             size: meta.len(),
             mtime_ms: mtime_ms(meta),
             file_id: file_id(meta),
         }
+    }
+
+    /// The local path, for `Path` sources.
+    pub fn local_path(&self) -> Option<&Path> {
+        self.source.path()
     }
 }
 
@@ -378,7 +390,7 @@ pub fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
 
 #[cfg(unix)]
 #[allow(clippy::unnecessary_wraps)] // same signature as the non-Unix version, which has no ID
-fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
+pub(crate) fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
     use std::os::unix::fs::MetadataExt;
     Some(FileId {
         dev: meta.dev(),
@@ -387,7 +399,7 @@ fn file_id(meta: &std::fs::Metadata) -> Option<FileId> {
 }
 
 #[cfg(not(unix))]
-fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
+pub(crate) fn file_id(_meta: &std::fs::Metadata) -> Option<FileId> {
     // Windows file index needs an unstable std API or a winapi dependency.
     None
 }
@@ -456,6 +468,49 @@ impl ManifestBuilder {
                 path.display()
             )))
         }
+    }
+
+    /// Adds one file behind a host-supplied opener (`docs/core-api.md` section 3). Its
+    /// manifest path is `[name]`, which must pass the SR-17 component rules. The opener is
+    /// called once here, on a blocking thread, to check that it yields a regular file of the
+    /// declared size and to record its file ID for the SR-21 resume check. The recorded
+    /// mtime is the opened file's when `mtime_ms` is known and 0 otherwise, so the check
+    /// compares like with like; the manifest carries `mtime_ms` as given.
+    pub async fn add_stream(&mut self, src: StreamSource) -> Result<()> {
+        let name: String =
+            unicode_normalization::UnicodeNormalization::nfc(src.name.as_str()).collect();
+        validate_component(&name)?;
+        let opener = std::sync::Arc::clone(&src.opener);
+        let meta = tokio::task::spawn_blocking(move || opener.open()?.metadata())
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??;
+        if !meta.is_file() {
+            return Err(Error::BadRequest(format!(
+                "{name} does not open as a regular file"
+            )));
+        }
+        if meta.len() != src.size {
+            return Err(Error::BadRequest(format!(
+                "{name}: declared size {} differs from the opened file's {}",
+                src.size,
+                meta.len()
+            )));
+        }
+        let mut info = SourceInfo::of(SourceRef::Opener(src.opener), &meta);
+        if src.mtime_ms == 0 {
+            info.mtime_ms = 0;
+        }
+        let fid = u32::try_from(self.files.len()).unwrap_or(u32::MAX);
+        self.files.push(FileEntry {
+            fid,
+            path: vec![name],
+            size: src.size,
+            mtime: src.mtime_ms,
+            mime: src.mime,
+            in_bundle: src.size > 0 && src.size < self.bundle_threshold,
+        });
+        self.sources.push(info);
+        Ok(())
     }
 
     async fn walk_dir(&mut self, root: PathBuf, root_rel: Vec<String>) -> Result<()> {

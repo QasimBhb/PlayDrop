@@ -1,6 +1,6 @@
 # Local IPC between playdropd and its UIs
 
-Normative for Phase 2. The Rust contract lives in `crates/playdrop-ipc/src/lib.rs`; this
+Normative since Phase 2, extended in Phase 3 (section 1.1). The Rust contract lives in `crates/playdrop-ipc/src/lib.rs`; this
 file explains the transport rules and the security checks (threat-model SR-26, SR-27,
 SR-32) that every implementation must keep. PLAN.md "Architecture" fixes the split: the
 daemon owns the socket and the core; every UI is a client and never listens on the network.
@@ -24,6 +24,31 @@ Peer arguments are queries resolved by `Host::resolve_peer`: a hex Device ID, a 
 prefix (hyphens optional) or an exact label. An ambiguous query answers
 `ErrorCode::Ambiguous`.
 
+### 1.1 Requests and settings added in Phase 3
+
+Same envelope as every other request. `IPC_VERSION` stays 1: every addition is a new
+variant or a field with a default, which an older peer ignores or fills in.
+
+| Request (`op`) | Fields | Answer (`kind`) | Maps to |
+|---|---|---|---|
+| `queue_outbox` | `peer`, `paths` | `outbox_queued` `{id}` | `Host::queue_outbox` (protocol.md 7.8). Files travel like `send_files`: fds through `QueueOutboxFiles` on Linux, paths on Windows |
+| `outbox` | none | `outbox` `[OutboxItem]` | `Host::outbox`: items this daemon holds, oldest first |
+| `remove_outbox` | `id` | `done` | `Host::remove_outbox`; `not_found` for an unknown ID |
+| `pull_outbox` | `peer` | `outbox_pulled` `{ids}` | `Host::pull_outbox`; `offline` without a session. Progress arrives as receive-side transfer events |
+
+| Settings field | Default | Meaning |
+|---|---|---|
+| `clipboard_images` | `true` | Sync clipboard images (PNG, at most 16 MiB) both ways. Off: the watcher ignores images and received ones are not applied. Missing from an older daemon's answer reads as `true` |
+
+Clipboard caps the UI shows: text up to 1 MiB (over 32 KiB it travels as a blob,
+protocol.md 5.15), images up to 16 MiB.
+
+Host events new in Phase 3 pass through unchanged as `Event::Host`: `clipboard_image`
+(`data` is base64), `outbox_ready`, `media_state`, `media_command`. A UI ignores the ones it
+does not render; an event this build cannot decode is skipped, never fatal (section 1). Both
+transports drop a single event over `MAX_MESSAGE_BYTES` (4 MiB) with a warning, so a large
+`clipboard_image` reaches the daemon's clipboard but not the UIs.
+
 Requests are independent and may be issued concurrently. Events are broadcast to every
 connected client from the moment it connects; there is no replay. A UI that starts late
 rebuilds its view from `Status`, `Peers` and `Transfers` and then applies events.
@@ -39,6 +64,9 @@ rebuilds its view from `Status`, `Peers` and `Transfers` and then applies events
     (`O_PATH | O_DIRECTORY`). The daemon resolves each fd to a path by reading
     `/proc/self/fd/<n>`, refuses anything that is not a regular file or directory, and then
     calls `Host::send` with those paths. Paths are never accepted over the bus for sending.
+  - `QueueOutboxFiles(in s peer, in ah files) -> (out s response)`: the same descriptor
+    rules as `SendFiles`, then `Request::QueueOutbox`. A `queue_outbox` request with paths
+    through `Request` answers `BadRequest`, like a path-based `send_files`.
   - `Version() -> (out u ipc_version, out s daemon_version)`.
 - Signal `Event(s event)`: one JSON `Event`.
 - Owning the name is the single-instance check. A second daemon fails to own it and exits
@@ -83,7 +111,8 @@ Client-side checks before the first call:
   line, each at most `MAX_MESSAGE_BYTES`. The client's first line is
   `{"type": "hello", "ipc_version": 1}`; the daemon answers `welcome` or closes.
 - Requests carry a client-chosen `id`; responses echo it; events carry none.
-- `SendFiles` carries paths. The pipe's DACL plus the token check below are the boundary.
+- `SendFiles` and `QueueOutbox` carry paths. The pipe's DACL plus the token check below
+  are the boundary.
 
 Daemon-side check per connection: `GetNamedPipeClientProcessId` then open the process
 token and compare its user SID with the daemon's. Mismatch closes the pipe before the
@@ -107,6 +136,13 @@ Transports log request `op` names and error codes only. They never log request b
 - `SetSettings` with a new `receive_dir` or `device_name` restarts the host; the response
   says `restarted: true` and a `DaemonEvent::HostRestarted` follows. Transfers in flight
   resume on reconnect as in Phase 1.
+- Presence and battery: the daemon sets `locked` or `active` presence from the lock watcher
+  and reads this computer's battery every 10 s (pushing on change or every 60 s; a desktop
+  without a battery sends nothing). Peers' `presence` and `battery` arrive as host events;
+  the window keeps a peer that sent `asleep` shown as "Asleep" after it drops.
+- `find` from a peer rings: a critical, resident notification with the `phone-incoming-call`
+  sound, shown again every 3 s until the peer stops, the user dismisses it, or 60 s pass
+  (one reminder toast on Windows).
 - `Diagnose` returns the core view plus the daemon's port probe. The summary lines are
   ready to display and name the failed layer: "multicast blocked on <iface>", "port 42187
   blocked by the host firewall (ufw): run `sudo ufw allow 42187`", "no interface on the

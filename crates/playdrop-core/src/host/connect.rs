@@ -214,13 +214,36 @@ pub(crate) async fn discovery_events(inner: Arc<Inner>, mut rx: mpsc::Receiver<D
                 device_type,
                 addr,
                 ..
-            } => inner.emit(HostEvent::AddDeviceSeen {
-                name,
-                device_type,
-                addr,
-            }),
+            } => {
+                let new =
+                    first_sighting(&mut lock(&inner.add_device_seen), addr, &name, &device_type);
+                if new {
+                    inner.emit(HostEvent::AddDeviceSeen {
+                        name,
+                        device_type,
+                        addr,
+                    });
+                }
+            }
         }
     }
+}
+
+/// True the first time an address is seen in this "Add device" window, and again only
+/// when its name or type changed (`docs/core-api.md` section 5). The memory is cleared
+/// when the window closes.
+pub(crate) fn first_sighting(
+    seen: &mut std::collections::HashMap<std::net::SocketAddr, (String, String)>,
+    addr: std::net::SocketAddr,
+    name: &str,
+    device_type: &str,
+) -> bool {
+    let now = (name.to_owned(), device_type.to_owned());
+    if seen.get(&addr) == Some(&now) {
+        return false;
+    }
+    seen.insert(addr, now);
+    true
 }
 
 /// Ten seconds after start, names the discovery paths that produced nothing for each
@@ -270,5 +293,31 @@ pub(crate) async fn diagnostics(inner: Arc<Inner>) {
                 .unwrap_or_else(|| "dial did not complete".to_owned())
         };
         report(DiscoveryPath::LastKnown, last);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_device_seen_once_per_address_unless_changed() {
+        let mut seen = std::collections::HashMap::new();
+        let a: std::net::SocketAddr = "10.0.0.7:42187".parse().unwrap();
+        let b: std::net::SocketAddr = "10.0.0.8:42187".parse().unwrap();
+        assert!(first_sighting(&mut seen, a, "Pixel", "phone"));
+        assert!(!first_sighting(&mut seen, a, "Pixel", "phone"));
+        assert!(
+            first_sighting(&mut seen, b, "Pixel", "phone"),
+            "per address"
+        );
+        assert!(first_sighting(&mut seen, a, "Pixel 9", "phone"), "renamed");
+        assert!(
+            first_sighting(&mut seen, a, "Pixel 9", "tablet"),
+            "new type"
+        );
+        assert!(!first_sighting(&mut seen, a, "Pixel 9", "tablet"));
+        seen.clear(); // the window closed
+        assert!(first_sighting(&mut seen, a, "Pixel 9", "tablet"));
     }
 }

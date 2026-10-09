@@ -7,6 +7,10 @@
 //! watcher and tray. Shutdown, from a `Shutdown` request, the tray, SIGTERM or Ctrl-C:
 //! `DaemonEvent::ShuttingDown`, `Host::shutdown`, IPC server, tray.
 //!
+//! This computer's state for peers: the lock watcher also sets presence (`locked` or
+//! `active`, protocol.md 5.10) and a poller reads the battery (`battery.rs`, 5.8); both are
+//! applied again to a restarted host.
+//!
 //! Events: one task per host instance drains the core's `HostEvent` channel without pause
 //! (the core drops events when its 4,096 buffer fills) and republishes each as
 //! `Event::Host` on a broadcast channel. A broadcast send never waits, so a slow UI only
@@ -21,8 +25,11 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use futures_util::future::BoxFuture;
-use playdrop_core::host::{Host, HostConfig, HostEvent, LockFlag, LockState as _, PeerSummary};
+use playdrop_core::host::{
+    Host, HostConfig, HostEvent, LockFlag, LockState as _, PeerSummary, SendSource,
+};
 use playdrop_core::identity::DeviceId;
+use playdrop_core::session::types::PresenceState;
 use playdrop_core::Error as CoreError;
 use playdrop_ipc::server::{ServeError, Server};
 use playdrop_ipc::{
@@ -33,8 +40,9 @@ use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
 
 use crate::autostart::{self, Locations};
+use crate::battery;
 use crate::cli::Args;
-use crate::clipboard::{self, LocalClip};
+use crate::clipboard::{self, ClipContent, LocalClip};
 use crate::notify::Notifier;
 use crate::open::OpenError;
 use crate::settings::{self, Settings};
@@ -126,6 +134,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     let (net_tx, net_rx) = mpsc::channel(4);
     network::watch(net_tx).await;
+    let battery_task = spawn_battery_poll(Arc::downgrade(&daemon.shared));
 
     let (tray_tx, tray_rx) = mpsc::unbounded_channel();
     let tray = if args.no_tray {
@@ -141,6 +150,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
 
     event_loop(&daemon.shared, lock_rx, net_rx, tray_rx).await;
 
+    battery_task.abort();
     daemon.shutdown().await;
     if let Some(s) = server {
         s.shutdown().await;
@@ -193,6 +203,36 @@ fn spawn_tray_refresh(tray: Arc<Tray>, shared: Weak<Shared>) -> JoinHandle<()> {
             drop(s);
             tray.update(view).await;
             let _ = tokio::time::timeout(TRAY_TICK, dirty.notified()).await;
+        }
+    })
+}
+
+/// Reads this computer's battery every [`battery::POLL`] and hands changes to the host. Ends
+/// at once on a computer without a battery: nothing is ever sent for it.
+fn spawn_battery_poll(shared: Weak<Shared>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut last: Option<(battery::Reading, tokio::time::Instant)> = None;
+        loop {
+            let reading = tokio::task::spawn_blocking(battery::read)
+                .await
+                .ok()
+                .flatten();
+            match reading {
+                Some(r) => {
+                    let now = tokio::time::Instant::now();
+                    if battery::should_push(last, r, now) {
+                        let Some(s) = shared.upgrade() else { return };
+                        s.set_local_battery(r);
+                        last = Some((r, now));
+                    }
+                }
+                None if last.is_none() => {
+                    tracing::info!("no battery found; this computer reports none to peers");
+                    return;
+                }
+                None => {}
+            }
+            tokio::time::sleep(battery::POLL).await;
         }
     })
 }
@@ -318,7 +358,12 @@ struct Shared {
     clip_tx: mpsc::Sender<LocalClip>,
     watcher: tokio::sync::Mutex<Option<clipboard::Watcher>>,
     clipboard_paused: AtomicBool,
+    /// The `clipboard_images` setting, read by the watcher thread at each change.
+    clipboard_images: Arc<AtomicBool>,
+    /// Peers' battery levels, for the tray.
     battery: Mutex<HashMap<String, u8>>,
+    /// This computer's last battery reading, applied again to a restarted host.
+    local_battery: Mutex<Option<battery::Reading>>,
     tray_dirty: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
 }
@@ -328,6 +373,7 @@ impl Daemon {
     pub fn new(opts: Options) -> Self {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (clip_tx, clip_rx) = mpsc::channel(CLIP_QUEUE);
+        let images = opts.effective.clipboard_images;
         let shared = Arc::new(Shared {
             data_dir: opts.data_dir,
             bind_ip: opts.bind_ip,
@@ -347,7 +393,9 @@ impl Daemon {
             clip_tx,
             watcher: tokio::sync::Mutex::new(None),
             clipboard_paused: AtomicBool::new(false),
+            clipboard_images: Arc::new(AtomicBool::new(images)),
             battery: Mutex::new(HashMap::new()),
+            local_battery: Mutex::new(None),
             tray_dirty: Arc::new(Notify::new()),
             shutdown_tx: watch::Sender::new(false),
         });
@@ -400,7 +448,7 @@ impl Daemon {
 async fn local_clips(shared: Weak<Shared>, mut rx: mpsc::Receiver<LocalClip>) {
     while let Some(clip) = rx.recv().await {
         let Some(s) = shared.upgrade() else { return };
-        s.push_local_clip(&clip);
+        s.push_local_clip(clip);
     }
 }
 
@@ -409,7 +457,27 @@ async fn drain(shared: Weak<Shared>, mut rx: mpsc::Receiver<HostEvent>) {
     while let Some(ev) = rx.recv().await {
         let Some(s) = shared.upgrade() else { return };
         s.on_host_event(&ev);
-        let _ = s.events.send(Event::Host(ev));
+        let _ = s.events.send(Event::Host(for_clients(ev)));
+    }
+}
+
+/// Trims an event before it goes to UI clients. The daemon has already applied a clipboard
+/// image to the system clipboard; the bytes themselves would exceed the IPC event cap
+/// (4 MiB) and no UI renders them, so clients get the notice with an empty payload.
+fn for_clients(ev: HostEvent) -> HostEvent {
+    match ev {
+        HostEvent::ClipboardImage {
+            peer,
+            mime,
+            sensitive,
+            ..
+        } => HostEvent::ClipboardImage {
+            peer,
+            mime,
+            data: playdrop_core::host::Secret(playdrop_core::host::Base64Bytes::from(Vec::new())),
+            sensitive,
+        },
+        other => other,
     }
 }
 
@@ -450,6 +518,11 @@ impl Shared {
     /// Starts a host and its drain. Caller holds `lifecycle`.
     async fn start_with(self: &Arc<Self>, s: &Settings) -> Result<(), CoreError> {
         let (host, rx) = Host::start(self.host_config(s)).await?;
+        // A new host knows nothing of this computer yet: presence and battery again.
+        host.set_presence(presence_for(self.lock.is_locked()), None, None);
+        if let Some(r) = *lock_std(&self.local_battery) {
+            host.set_battery(r.level, r.charging, r.low);
+        }
         let task = tokio::spawn(drain(Arc::downgrade(self), rx));
         *self.host.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(host));
         *lock_std(&self.drain) = Some(task);
@@ -536,7 +609,26 @@ impl Shared {
                 sensitive,
             } => {
                 if let Some(t) = text.0.clone() {
-                    self.apply_clip(peer.clone(), t, *sensitive);
+                    self.apply_clip(peer.clone(), ClipContent::Text(t), *sensitive);
+                }
+            }
+            HostEvent::ClipboardImage {
+                peer,
+                mime,
+                data,
+                sensitive,
+            } => {
+                if self.clipboard_images.load(Ordering::SeqCst) {
+                    let content = ClipContent::Image {
+                        mime: mime.clone(),
+                        bytes: data.0 .0.clone(),
+                    };
+                    self.apply_clip(peer.clone(), content, *sensitive);
+                } else {
+                    tracing::debug!(
+                        peer = short_hex(peer),
+                        "clipboard image received while images are off; not applied"
+                    );
                 }
             }
             _ => {}
@@ -544,12 +636,18 @@ impl Shared {
     }
 
     /// Writes a received clip to the system clipboard off the event loop (SR-24: the
-    /// backend disables history and cloud sync for sensitive clips). The text is never
+    /// backend disables history and cloud sync for sensitive clips). The content is never
     /// logged or shown.
-    fn apply_clip(self: &Arc<Self>, peer: String, text: String, sensitive: bool) {
+    fn apply_clip(self: &Arc<Self>, peer: String, content: ClipContent, sensitive: bool) {
         let me = Arc::clone(self);
         tokio::spawn(async move {
-            let r = tokio::task::spawn_blocking(move || clipboard::apply(&text, sensitive)).await;
+            let r = tokio::task::spawn_blocking(move || match &content {
+                ClipContent::Text(text) => clipboard::apply(text, sensitive),
+                ClipContent::Image { mime, bytes } => {
+                    clipboard::apply_image(bytes, mime, sensitive)
+                }
+            })
+            .await;
             match r {
                 Ok(Ok(())) => me.emit(DaemonEvent::ClipboardApplied { peer, sensitive }),
                 Ok(Err(e)) => {
@@ -567,13 +665,18 @@ impl Shared {
         });
     }
 
-    /// A clip from the watcher: pushed unless sync is off or paused.
-    fn push_local_clip(&self, clip: &LocalClip) {
+    /// A clip from the watcher: pushed unless sync is off or paused, or it is an image and
+    /// images are off.
+    fn push_local_clip(&self, clip: LocalClip) {
         if self.clipboard_paused.load(Ordering::SeqCst) || !self.effective().clipboard_sync {
             return;
         }
+        let is_image = matches!(clip.content, ClipContent::Image { .. });
+        if is_image && !self.clipboard_images.load(Ordering::SeqCst) {
+            return;
+        }
         let Some(host) = self.host() else { return };
-        match host.push_clipboard(&clip.text, clip.sensitive) {
+        match push(&host, clip) {
             Ok(p) => {
                 if !p.sent_to.is_empty() {
                     self.emit(DaemonEvent::ClipboardPushed {
@@ -585,13 +688,28 @@ impl Shared {
         }
     }
 
+    /// Records this computer's battery and hands it to the host (protocol.md 5.8).
+    fn set_local_battery(&self, r: battery::Reading) {
+        tracing::debug!(
+            level = r.level,
+            charging = r.charging,
+            low = r.low,
+            "battery reading"
+        );
+        *lock_std(&self.local_battery) = Some(r);
+        if let Some(h) = self.host() {
+            h.set_battery(r.level, r.charging, r.low);
+        }
+    }
+
     /// Starts or stops the watcher to match the settings.
     async fn sync_clipboard_watcher(&self) {
         let want =
             self.watch_clipboard && self.clipboard_supported && self.effective().clipboard_sync;
         let mut w = self.watcher.lock().await;
         if want && w.is_none() {
-            match clipboard::Watcher::start(self.clip_tx.clone()).await {
+            let images = Arc::clone(&self.clipboard_images);
+            match clipboard::Watcher::start(self.clip_tx.clone(), images).await {
                 Ok(x) => *w = Some(x),
                 Err(e) => tracing::warn!(error = %e, "clipboard watcher did not start"),
             }
@@ -634,10 +752,11 @@ impl Shared {
 
     fn lock_changed(&self, locked: bool) {
         tracing::debug!(locked, "desktop lock state");
-        if locked {
-            if let Some(h) = self.host() {
+        if let Some(h) = self.host() {
+            if locked {
                 h.close_add_device_window();
             }
+            h.set_presence(presence_for(locked), None, None);
         }
         self.emit(DaemonEvent::LockChanged { locked });
     }
@@ -691,7 +810,8 @@ impl Shared {
     /// keeps it out of history) and a notification says so. *Choice*, documented for the
     /// window: the window's own send button is where a real prompt belongs.
     async fn send_clipboard_now(&self) {
-        let read = tokio::task::spawn_blocking(clipboard::read_current).await;
+        let images = self.clipboard_images.load(Ordering::SeqCst);
+        let read = tokio::task::spawn_blocking(move || clipboard::read_current(images)).await;
         let clip = match read {
             Ok(Ok(Some(c))) => c,
             Ok(Ok(None)) => {
@@ -709,12 +829,13 @@ impl Shared {
             }
         };
         let Some(host) = self.host() else { return };
-        match host.push_clipboard(&clip.text, clip.sensitive) {
+        let sensitive = clip.sensitive;
+        match push(&host, clip) {
             Ok(p) if !p.sent_to.is_empty() => {
                 self.emit(DaemonEvent::ClipboardPushed {
                     sent_to: p.sent_to.iter().map(DeviceId::to_hex).collect(),
                 });
-                if clip.sensitive {
+                if sensitive {
                     self.notifier.info(
                         "Clip from a password manager was sent as sensitive",
                         "The receiving device keeps it out of its clipboard history.",
@@ -724,6 +845,10 @@ impl Shared {
             Ok(p) if p.skipped_echo => {
                 self.notifier.info("Clipboard already sent", "");
             }
+            Ok(p) if p.skipped_unsupported > 0 => self.notifier.info(
+                "Clipboard not sent",
+                "The connected devices cannot receive clipboard images.",
+            ),
             Ok(_) => self.notifier.info(
                 "Clipboard not sent",
                 "No connected device has clipboard sharing turned on.",
@@ -788,6 +913,8 @@ impl Shared {
                 .await;
             }
         }
+        self.clipboard_images
+            .store(new.clipboard_images, Ordering::SeqCst);
         if changes.clipboard_sync {
             self.sync_clipboard_watcher().await;
         }
@@ -888,6 +1015,22 @@ impl Shared {
                     id: handle.id().to_owned(),
                 })
             }
+            Request::QueueOutbox { peer, paths } => {
+                let id = resolve(&host, &peer)?;
+                let sources = paths.into_iter().map(SendSource::Path).collect();
+                let item = host
+                    .queue_outbox(&id, sources, None)
+                    .await
+                    .map_err(map_core_error)?;
+                Ok(IpcOk::OutboxQueued { id: item })
+            }
+            Request::Outbox => Ok(IpcOk::Outbox(host.outbox())),
+            Request::RemoveOutbox { id } => done(host.remove_outbox(&id).await),
+            Request::PullOutbox { peer } => {
+                let id = resolve_online(&host, &peer)?;
+                let ids = host.pull_outbox(&id).await.map_err(map_core_error)?;
+                Ok(IpcOk::OutboxPulled { ids })
+            }
             Request::RespondOffer { id, accept } => done(host.respond_offer(&id, accept).await),
             Request::CancelTransfer { id } => done(host.cancel_transfer(&id).await),
             Request::Ping { peer, message } => {
@@ -951,6 +1094,26 @@ impl Shared {
                 "this daemon does not support that request",
             )),
         }
+    }
+}
+
+/// Pushes a local clip to every eligible peer: text as text (a blob over 32 KiB), an image
+/// as an image blob (protocol.md 5.7, 5.15).
+fn push(host: &Host, clip: LocalClip) -> Result<playdrop_core::host::ClipboardPush, CoreError> {
+    match clip.content {
+        ClipContent::Text(text) => host.push_clipboard(&text, clip.sensitive),
+        ClipContent::Image { mime, bytes } => {
+            host.push_clipboard_image(bytes, &mime, clip.sensitive)
+        }
+    }
+}
+
+/// The presence a lock state maps to (protocol.md 5.10).
+fn presence_for(locked: bool) -> PresenceState {
+    if locked {
+        PresenceState::Locked
+    } else {
+        PresenceState::Active
     }
 }
 
@@ -1056,6 +1219,7 @@ mod tests {
             device_name: "smoke".into(),
             port: 0,
             clipboard_sync: true,
+            clipboard_images: true,
             autostart: true,
             notifications: false,
             discovery: false,
@@ -1209,6 +1373,26 @@ mod tests {
         .unwrap_err();
         assert_eq!(e.code, ErrorCode::Forbidden);
 
+        // Outbox: empty list, unknown item, unknown peer.
+        assert_eq!(
+            call(&h, Request::Outbox).await.unwrap(),
+            IpcOk::Outbox(Vec::new())
+        );
+        let e = call(&h, Request::RemoveOutbox { id: "nope".into() })
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
+        let e = call(
+            &h,
+            Request::QueueOutbox {
+                peer: "zzzz".into(),
+                paths: vec![tmp.path().join("data")],
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
+
         // SR-6: locked refuses the add-device window with the documented message.
         d.shared.lock.set_locked(true);
         let e = call(&h, Request::OpenAddDeviceWindow).await.unwrap_err();
@@ -1263,6 +1447,7 @@ mod tests {
             last_known: vec![],
             paired_at: 0,
             last_seen: None,
+            removed_by_peer: false,
         };
         let peers = vec![
             p(&"ab".repeat(32), "k3qd-7f2m-xa9p-41bc", "Phone"),

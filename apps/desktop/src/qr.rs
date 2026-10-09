@@ -65,7 +65,7 @@ pub fn set_capture_excluded(window: &slint::Window, on: bool) -> Result<(), Stri
     set_capture_excluded_by_title(on)
 }
 
-/// Fallback for [`set_capture_excluded`]: finds the main window (title "PlayDrop") among
+/// Fallback for [`set_capture_excluded`]: finds the main window (title `PlayDrop`) among
 /// this process's top-level windows. Falls back to `WDA_MONITOR` (shows black in
 /// captures) on Windows versions older than 10 2004, which lack `WDA_EXCLUDEFROMCAPTURE`.
 #[cfg(windows)]

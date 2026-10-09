@@ -9,12 +9,15 @@ always-on companion link (ping, clipboard, battery, media, later notifications a
 LocalSend's fast, account-free file drop, and adds resume and steady speed for thousands of small files.
 Targets: Android, iOS, Windows, Linux (Pop!_OS COSMIC first, Ubuntu GNOME second). Speed is the top priority.
 
-State: Phase 2 desktop complete on 2026-10-08 (merged to `main`). Rust workspace with
+State: Phase 3 complete on 2026-10-09 (one commit on `main`). Rust workspace with
 `playdrop-core` (identity, pin store, TLS, session plane, pairing, transfer engine, discovery,
-HTTP/2 net layer, host runtime), `playdrop-cli`, `playdrop-ipc` (D-Bus and named pipe contract),
-`playdropd` (daemon: tray, notifications, clipboard sync, autostart, diagnostics) and
-`apps/desktop` (Slint window). 271 tests, clippy clean. Licence GPL-3.0-or-later. UI native per
-platform. Build fully agentic. Next: Phase 3 Android and session plane, after freezing the core API.
+HTTP/2 net layer, host runtime, blobs, outbox, sealed secrets), `playdrop-cli`, `playdrop-ipc`
+(D-Bus and named pipe contract), `playdropd` (daemon: tray, notifications, clipboard sync,
+autostart, diagnostics, battery and presence), `playdrop-ffi` (UniFFI surface, frozen in
+`docs/core-api.md`), `uniffi-bindgen`, `apps/desktop` (Slint window) and `apps/android`
+(Kotlin/Compose app hosting the core in a `connectedDevice` foreground service). 306 Rust tests
+plus 59 Android JUnit tests, clippy clean. Licence GPL-3.0-or-later. UI native per platform.
+Build fully agentic. Next: Phase 4 iOS (needs a Mac), see `docs/phases/phase-3-android.md`.
 
 ## Read first
 
@@ -68,17 +71,19 @@ Phases are in PLAN.md "Build phases". Phase 0 is done: `docs/product.md` (scope)
 (normative wire spec, port 42187, wins on wire behaviour), `docs/threat-model.md` (SR-1 to SR-34,
 each tagged with the phase that must satisfy it), `LICENSE`, `THIRD_PARTY.md`. Phase 1 is done:
 gates A, B, D, E are tests in `crates/playdrop-core/tests/phase1_gates.rs`; gate C is the manual
-`playdrop bench` run described under Commands. Loopback numbers (release): 500 MiB
-resume at ~405 MiB/s, 5,000 small files at 0.88x of one big file, HTTP/2 ~2,080 MiB/s vs raw
-framing ~2,845 MiB/s (h2 about 27% slower; kept for v1, `playdrop/2` reserved for raw bulk if
-phone CPU measurements in Phase 3 demand it). Phase 2 is done on Linux: `playdropd` over D-Bus
-(`org.playdrop.PlayDrop.Daemon1`, spec in `docs/ipc.md`), COSMIC receives with the window
-closed (200 MiB in 439 ms loopback), desktop copy reaches a peer in 2 to 5 ms, restart needs no
-re-pair, packaging for deb, Flatpak and Inno Setup written. Windows and Flatpak are written but
-never compiled or built. Open TODOs are tagged with their SR in the code
-(`grep -rn "TODO" crates/ apps/`). Handoff for the next session: `docs/phases/phase-2-desktop.md`.
-Next is Phase 3: freeze the core API, `playdrop-ffi` (UniFFI), Android `connectedDevice`
-service, share target, blobs and outbox. Every PR must say which SRs it satisfies.
+`playdrop bench` run described under Commands. Loopback numbers (release): 500 MiB resume at
+~405 MiB/s, 5,000 small files at 0.88x of one big file, HTTP/2 ~2,080 MiB/s vs raw framing
+~2,845 MiB/s (h2 about 27% slower; kept for v1, `playdrop/2` reserved for raw bulk). Phase 2 is
+done on Linux: `playdropd` over D-Bus (`org.playdrop.PlayDrop.Daemon1`, spec in `docs/ipc.md`),
+COSMIC receives with the window closed, desktop copy reaches a peer in 2 to 5 ms, restart needs
+no re-pair, packaging for deb, Flatpak and Inno Setup written. Windows type-checks on
+`x86_64-pc-windows-gnu` but has never been linked or run. Phase 3 is done: the core API is frozen
+in `docs/core-api.md` (SendSource, ReceiveSink, SecretStore, blobs, battery, presence, media,
+outbox), `playdrop-ffi` binds it with UniFFI, and the Android app pairs, receives a 400 MiB file
+while locked, reconnects 4 s after a Wi-Fi drop and stays reachable in Doze (measured on a Galaxy
+A54; details and the remaining manual checks in `docs/phases/phase-3-android.md`). Open TODOs are
+tagged with their SR in the code (`grep -rn "TODO" crates/ apps/`). Next is Phase 4: iOS
+(SwiftUI, share extension, outbox pull), which needs a Mac with Xcode.
 
 ## Commands
 
@@ -101,6 +106,8 @@ Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
   then type `pair` in bravo, `pair 127.0.0.1:42188` in alpha, `y` in both, `peers`, and `send <short-id> <path>` (`help` lists all stdin commands)
 - Benchmark (release): `target/release/playdrop bench --role server --addr 127.0.0.1:42200 --mode h2` in one terminal, `target/release/playdrop bench --role client --addr 127.0.0.1:42200 --mode h2 --size 1GiB --runs 3` in another; repeat with `--mode raw`; compare with `iperf3 -s` and `iperf3 -c 127.0.0.1 -t 5`
 - LAN discovery test (needs a real interface with multicast): `cargo test -p playdrop-core --test phase1_gates -- --ignored`
+- Android (from `apps/android`, Gradle 9.6, AGP 9.4.1, SDK platform 37.0, NDK 27.1, `cargo-ndk`): `./gradlew :app:compileDebugKotlin` (Kotlin check, regenerates the UniFFI bindings), `./gradlew :app:assembleDebug` or `assembleRelease` (Rust for arm64-v8a and x86_64 per `playdrop.rustAbis` in `gradle.properties`), `./gradlew :app:testDebugUnitTest`, `adb install -r app/build/outputs/apk/debug/app-debug.apk`, `adb logcat -s playdrop:*`. Bindings alone: `cargo build -p playdrop-ffi && cargo run -p uniffi-bindgen -- generate --library target/debug/libplaydrop_ffi.so --language kotlin --no-format --out-dir <dir>`
+- Windows type check without MinGW: point `CC_x86_64_pc_windows_gnu` at a script that writes empty object files and set `AR=ar`, then `cargo check --workspace --exclude playdrop-ffi --exclude uniffi-bindgen --target x86_64-pc-windows-gnu --all-targets`
 
 ## Writing and git rules
 

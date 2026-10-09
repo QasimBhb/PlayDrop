@@ -13,7 +13,7 @@ use crate::win::{
     current_user_sid, pipe_server_pid, process_image_path, process_user_sid, ERROR_FILE_NOT_FOUND,
     ERROR_PIPE_BUSY,
 };
-use crate::{Event, IpcError, Ok, Request, PIPE_PREFIX};
+use crate::{Event, FilesOp, IpcError, Ok, Request, PIPE_PREFIX};
 
 /// How often and how long to retry while every pipe instance is busy.
 const BUSY_RETRIES: u32 = 20;
@@ -79,12 +79,14 @@ impl Client {
     }
 
     /// Paths travel as is on Windows; the pipe's DACL and SID checks are the boundary.
-    pub(super) async fn send_files(&self, peer: &str, paths: &[PathBuf]) -> Result<Ok, IpcError> {
+    pub(super) async fn files(
+        &self,
+        op: FilesOp,
+        peer: &str,
+        paths: &[PathBuf],
+    ) -> Result<Ok, IpcError> {
         self.pipe
-            .request(&Request::SendFiles {
-                peer: peer.to_owned(),
-                paths: paths.to_vec(),
-            })
+            .request(&op.request(peer.to_owned(), paths.to_vec()))
             .await
     }
 

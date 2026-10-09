@@ -5,6 +5,7 @@
 //! `SubjectPublicKeyInfo`, so a new key is a new device (SR-10): nothing here migrates or
 //! replaces an existing key.
 
+pub mod sealing;
 pub(crate) mod secure_fs;
 
 use std::fmt;
@@ -317,10 +318,29 @@ impl DeviceIdentity {
     /// certificate without its key is an error: generating a new key would silently make
     /// this a new device (SR-10), so that decision is left to the user.
     pub fn load_or_create(dir: &Path) -> Result<Self> {
+        Self::load_or_create_sealed(dir, &None)
+    }
+
+    /// [`load_or_create`](Self::load_or_create) with `identity.key` sealed by `store`
+    /// (`docs/core-api.md` section 2a). A plain key file is read once and rewritten sealed;
+    /// a sealed one without a store fails with [`Error::Identity`]. Call it from a blocking
+    /// thread: the store may be foreign code.
+    pub fn load_or_create_sealed(dir: &Path, store: &sealing::Sealer) -> Result<Self> {
         secure_fs::ensure_private_dir(dir)?;
         let cert_path = dir.join(CERT_FILE);
         let key_path = dir.join(KEY_FILE);
-        let key = secure_fs::read_private(&key_path)?.map(SecretBytes);
+        let key = match secure_fs::read_private(&key_path)? {
+            Some(raw) => {
+                let (plain, was_plain) = sealing::unseal(store, raw, KEY_FILE)?;
+                let plain = SecretBytes(plain);
+                if was_plain && store.is_some() {
+                    let sealed = sealing::seal(store, &plain.0, KEY_FILE)?;
+                    secure_fs::write_private_atomic(&key_path, &sealed)?;
+                }
+                Some(plain)
+            }
+            None => None,
+        };
         let cert = secure_fs::read_private(&cert_path)?;
 
         match (cert, key) {
@@ -342,7 +362,9 @@ impl DeviceIdentity {
             ))),
             (None, None) => {
                 let identity = Self::generate()?;
-                let key_tmp = secure_fs::stage_private(&key_path, identity.private_key_der())?;
+                let key_file =
+                    SecretBytes(sealing::seal(store, identity.private_key_der(), KEY_FILE)?);
+                let key_tmp = secure_fs::stage_private(&key_path, &key_file.0)?;
                 let cert_tmp =
                     match secure_fs::stage_private(&cert_path, identity.certificate_der()) {
                         Ok(tmp) => tmp,

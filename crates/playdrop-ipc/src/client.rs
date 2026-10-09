@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use tokio_stream::wrappers::BroadcastStream;
 
-use crate::{ErrorCode, Event, IpcError, Ok, Request, MAX_SEND_ITEMS};
+use crate::{ErrorCode, Event, FilesOp, IpcError, Ok, Request, MAX_SEND_ITEMS};
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -38,7 +38,7 @@ use self::windows as imp;
 #[cfg(not(any(target_os = "linux", windows)))]
 mod imp {
     use super::{BroadcastStream, ClientOptions, ConnectError, Event, IpcError, Ok, PathBuf};
-    use crate::Request;
+    use crate::{FilesOp, Request};
 
     pub(super) struct Client;
 
@@ -54,8 +54,9 @@ mod imp {
         pub(super) async fn request(&self, _request: &Request) -> Result<Ok, IpcError> {
             unreachable!("a client cannot be constructed on this platform")
         }
-        pub(super) async fn send_files(
+        pub(super) async fn files(
             &self,
+            _op: FilesOp,
             _peer: &str,
             _paths: &[PathBuf],
         ) -> Result<Ok, IpcError> {
@@ -139,11 +140,13 @@ impl Client {
     /// Send one request and wait for its answer. A transport failure is reported as an
     /// [`IpcError`] with [`crate::ErrorCode::Internal`].
     ///
-    /// A [`Request::SendFiles`] is routed through [`Client::send_files`], so on Linux it
-    /// travels as file descriptors like any other send.
+    /// A [`Request::SendFiles`] or [`Request::QueueOutbox`] is routed through
+    /// [`Client::send_files`] or [`Client::queue_outbox`], so on Linux it travels as file
+    /// descriptors like any other send.
     pub async fn request(&self, request: Request) -> Result<Ok, IpcError> {
         match request {
             Request::SendFiles { peer, paths } => self.send_files(&peer, paths).await,
+            Request::QueueOutbox { peer, paths } => self.queue_outbox(&peer, paths).await,
             other => self.inner.request(&other).await,
         }
     }
@@ -153,6 +156,16 @@ impl Client {
     ///
     /// At most [`MAX_SEND_ITEMS`] items per call; more answer [`ErrorCode::TooLarge`].
     pub async fn send_files(&self, peer: &str, paths: Vec<PathBuf>) -> Result<Ok, IpcError> {
+        self.files(FilesOp::Send, peer, &paths).await
+    }
+
+    /// Queue files or folders for `peer` to pull later (protocol.md 7.8). Travels exactly
+    /// like [`Client::send_files`] and answers [`Ok::OutboxQueued`].
+    pub async fn queue_outbox(&self, peer: &str, paths: Vec<PathBuf>) -> Result<Ok, IpcError> {
+        self.files(FilesOp::QueueOutbox, peer, &paths).await
+    }
+
+    async fn files(&self, op: FilesOp, peer: &str, paths: &[PathBuf]) -> Result<Ok, IpcError> {
         if paths.is_empty() {
             return Err(IpcError::new(ErrorCode::BadRequest, "nothing to send"));
         }
@@ -162,7 +175,7 @@ impl Client {
                 format!("send at most {MAX_SEND_ITEMS} items at once, or their folder"),
             ));
         }
-        self.inner.send_files(peer, &paths).await
+        self.inner.files(op, peer, paths).await
     }
 
     /// Events from the daemon, from the moment of the call. A slow consumer that falls

@@ -81,6 +81,7 @@ export global SettingsState {
     in property <string> receive-dir;
     in property <string> device-name;
     in property <bool> clipboard-sync;
+    in property <bool> clipboard-images: true;
     in property <bool> clipboard-watch-supported: true;
     in property <bool> autostart;
     in property <bool> notifications;
@@ -90,6 +91,7 @@ export global SettingsState {
     callback choose-receive-dir();
     callback set-device-name(string);
     callback set-clipboard-sync(bool);
+    callback set-clipboard-images(bool);
     callback set-autostart(bool);
     callback set-notifications(bool);
 }

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _};
 use playdrop_core::host::{
-    Host, HostConfig, HostEvent, KeepAliveProfile, PairingPromptKind, TransferDirection,
+    Host, HostConfig, HostEvent, KeepAliveProfile, PairingPromptKind, SendSource, TransferDirection,
 };
 use playdrop_core::identity::DeviceId;
 use tokio::io::AsyncBufReadExt as _;
@@ -142,7 +142,8 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
             "commands: peers | pair | pair <ip:port> | pair --qr | pair --scan <uri> | list | y | n | \
              send <peer> <path>... | accept <id> | decline <id> | cancel <id> | transfers | \
              grants <peer> [+g|-g]... | \
-             ping <peer> [msg] | clip <peer> <text> | unpair <peer> | quit"
+             outbox <peer> <path>... | outbox | outbox rm <id> | pull <peer> | \
+             ping <peer> [msg] | find <peer> [stop] | clip <peer> <text> | unpair <peer> | quit"
         ),
         ("peers", _) => {
             let peers = host.peers();
@@ -196,6 +197,47 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
             let paths: Vec<PathBuf> = w[2..].iter().map(PathBuf::from).collect();
             let handle = host.send(&id, paths).await?;
             tokio::spawn(watch_send(handle, json));
+        }
+        ("outbox", 1) => {
+            let items = host.outbox();
+            if json {
+                println!("{}", serde_json::to_string(&items).unwrap_or_default());
+            } else if items.is_empty() {
+                println!("outbox is empty");
+            }
+            for i in items.iter().filter(|_| !json) {
+                println!(
+                    "{}  for {}  {} file(s), {} bytes{}",
+                    i.id,
+                    i.peer.chars().take(8).collect::<String>(),
+                    i.file_count,
+                    i.total_bytes,
+                    i.note.as_deref().map(|n| format!("  ({n})")).unwrap_or_default()
+                );
+            }
+        }
+        ("outbox", 3) if w[1] == "rm" => {
+            host.remove_outbox(&w[2]).await?;
+            println!("removed {}", w[2]);
+        }
+        ("outbox", n) if n >= 3 => {
+            let id = peer(host, &w[1])?;
+            let sources = w[2..]
+                .iter()
+                .map(|p| SendSource::Path(PathBuf::from(p)))
+                .collect();
+            let item = host.queue_outbox(&id, sources, None).await?;
+            println!("queued {item}; the device pulls it when it connects (`outbox` lists)");
+        }
+        ("pull", 2) => {
+            let id = peer(host, &w[1])?;
+            let ids = host.pull_outbox(&id).await?;
+            if ids.is_empty() {
+                println!("{} holds nothing for this device", w[1]);
+            }
+            for t in ids {
+                println!("pulling {t}");
+            }
         }
         ("accept" | "decline", 2) => {
             host.respond_offer(&w[1], w[0] == "accept").await?;
@@ -251,6 +293,8 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
             let msg = (n > 2).then(|| w[2..].join(" "));
             host.ping(&id, msg.as_deref())?;
         }
+        ("find", 2) => host.find(&peer(host, &w[1])?, true)?,
+        ("find", 3) if w[2] == "stop" => host.find(&peer(host, &w[1])?, false)?,
         ("clip", n) if n >= 3 => {
             let id = peer(host, &w[1])?;
             if !host.send_clipboard(&id, &w[2..].join(" "), false)? {
@@ -452,6 +496,24 @@ fn print_event(ev: &HostEvent, json: bool) {
                 );
             }
         }
+        HostEvent::ClipboardImage {
+            peer,
+            mime,
+            data,
+            sensitive,
+        } => println!(
+            "clipboard image from {}: {mime}, {} bytes{}",
+            short(peer),
+            data.0 .0.len(),
+            if *sensitive { " (sensitive)" } else { "" }
+        ),
+        HostEvent::OutboxReady {
+            peer, count, bytes, ..
+        } => println!(
+            "{} holds {count} item(s), {bytes} bytes for this device; `pull {}`",
+            short(peer),
+            short(peer)
+        ),
         HostEvent::Ping { peer, message } => println!(
             "ping from {}{}",
             short(peer),

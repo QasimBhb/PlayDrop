@@ -75,10 +75,19 @@ pub fn temp_root() -> tempfile::TempDir {
 /// Starts a host named `name` under `root`, on 127.0.0.1:`port` (0 picks one), with
 /// discovery off: these tests use last-known dial only.
 pub async fn start_host(root: &Path, name: &str, port: u16) -> TestHost {
+    start_host_with(root, name, port, |_| {}).await
+}
+
+/// [`start_host`] with a chance to adjust the configuration (receive target, stores).
+pub async fn start_host_with<F>(root: &Path, name: &str, port: u16, tweak: F) -> TestHost
+where
+    F: FnOnce(&mut HostConfig),
+{
     let data_dir = root.join(name).join("data");
     let recv_dir = root.join(name).join("recv");
     std::fs::create_dir_all(root.join(name)).unwrap();
     let mut cfg = HostConfig::new(&data_dir, &recv_dir, name);
+    tweak(&mut cfg);
     cfg.port = port;
     cfg.bind_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     cfg.discovery = false;

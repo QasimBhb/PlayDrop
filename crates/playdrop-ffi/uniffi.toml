@@ -1,0 +1,8 @@
+[bindings.kotlin]
+package_name = "org.playdrop.core"
+android = true
+generate_immutable_records = true
+kotlin_target_version = "2.4.21"
+
+[bindings.swift]
+module_name = "PlayDropCore"

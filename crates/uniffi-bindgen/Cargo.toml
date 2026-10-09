@@ -1,0 +1,18 @@
+[package]
+name = "uniffi-bindgen"
+description = "Generates the Kotlin and Swift bindings for playdrop-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/main.rs"
+
+[dependencies]
+uniffi = { version = "0.32.2", features = ["cli"] }

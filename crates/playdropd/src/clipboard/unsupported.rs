@@ -39,6 +39,9 @@ pub(super) fn error(support: &ClipboardSupport) -> anyhow::Error {
 
 #[cfg(not(any(target_os = "linux", windows)))]
 mod other {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
     use tokio::sync::mpsc;
 
     use super::super::{ClipboardSupport, LocalClip};
@@ -57,28 +60,36 @@ mod other {
 
     pub(in super::super) async fn spawn_watcher(
         _raw: mpsc::Sender<LocalClip>,
+        _images: Arc<AtomicBool>,
     ) -> anyhow::Result<WatchHandle> {
         anyhow::bail!(REASON)
     }
 
-    pub(in super::super) fn read_current() -> anyhow::Result<Option<LocalClip>> {
+    pub(in super::super) fn read_current(_images: bool) -> anyhow::Result<Option<LocalClip>> {
         anyhow::bail!(REASON)
     }
 
     pub(in super::super) fn apply(_text: &str, _sensitive: bool) -> anyhow::Result<()> {
         anyhow::bail!(REASON)
     }
+
+    pub(in super::super) fn apply_image(
+        _bytes: &[u8],
+        _mime: &str,
+        _sensitive: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(REASON)
+    }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-pub(super) use other::{apply, probe, read_current, spawn_watcher, WatchHandle};
+pub(super) use other::{apply, apply_image, probe, read_current, spawn_watcher, WatchHandle};
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn unsupported_always_has_a_reason() {
         let s = unsupported(NO_DATA_CONTROL);
         assert!(!s.supported);

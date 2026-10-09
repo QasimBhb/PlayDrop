@@ -15,12 +15,17 @@
 //! - [`connect`]: last-known dial, discovery wiring and the 10 s report (3.2, 8).
 //! - [`diagnostics`]: the on-demand report for the daemon's diagnostics screen.
 //! - [`platform`]: free space and interface adapters.
+//! - [`blobs`]: clipboard blobs, held and fetched (5.15, SR-24).
+//! - [`status`]: battery, presence and media pushed to peers (5.8 to 5.10).
+//! - [`outbox`]: items held for a peer that pulls them, and pulling (7.8).
 //! - [`lock`](mod@lock): the host-supplied desktop lock state (SR-6).
 
+mod blobs;
 mod connect;
 pub mod diagnostics;
 pub mod events;
 pub mod lock;
+mod outbox;
 mod pairing;
 mod pins;
 pub mod platform;
@@ -29,28 +34,33 @@ mod registry;
 mod router;
 mod send;
 mod session;
+mod status;
 mod transfers;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 
+pub use crate::identity::sealing::{SecretStore, SecretStoreError};
+pub use crate::transfer::{DeliverItem, ReceiveSink, SinkError, SourceOpener, StreamSource};
 pub use diagnostics::{
     Diagnostics, DialFailure, InterfaceInfo, JoinFailure, MdnsStatus, MulticastStatus,
     PeerDiagnostic,
 };
 pub use events::{
-    DiscoveryPath, FileRoot, HostEvent, OfferedFile, PairingPromptKind, Secret, TransferDirection,
-    OFFER_FILES_MAX,
+    Base64Bytes, DeliveredFile, DiscoveryPath, FileRoot, HostEvent, OfferedFile, PairingPromptKind,
+    Secret, TransferDirection, OFFER_FILES_MAX,
 };
 pub use lock::{AlwaysUnlocked, LockFlag, LockState};
-pub use send::{TransferHandle, TransferSummary};
+pub use outbox::OutboxItem;
+pub use send::{SendSource, TransferHandle, TransferSummary};
+pub use status::MediaState;
 pub use transfers::{TransferSnapshot, TransferStatus, KEEP_FINISHED, KEEP_FOR};
 
 use crate::discovery::{BeaconSchedule, DialLimiter, Discovery, DiscoveryConfig, InterfaceSource};
@@ -58,10 +68,13 @@ use crate::identity::{DeviceId, DeviceIdentity};
 use crate::net::connection::{short, CloseReason, DESKTOP_KEEPALIVE, MOBILE_KEEPALIVE};
 use crate::net::{Server, TlsAcceptor};
 use crate::pin_store::{Grants, PinStore, PIN_FILE};
-use crate::session::types::{Clipboard, ClipboardKind, DeviceType, Frame, Ping};
+use crate::session::types::{
+    Capability, Clipboard, ClipboardKind, DeviceType, Find, FindAction, Frame, MediaAction, Ping,
+    PresenceState,
+};
 use crate::session::{AddDeviceWindow, Limits, PairRequestLimiter, QrOffer};
 use crate::tls;
-use crate::transfer::FreeSpace;
+use crate::transfer::{FreeSpace, SinkBinding};
 use crate::{Error, Result};
 
 use pins::Pins;
@@ -88,12 +101,38 @@ impl KeepAliveProfile {
     }
 }
 
+/// Where received files go (`docs/core-api.md` section 2).
+#[derive(Debug, Clone)]
+pub enum ReceiveTarget {
+    /// Desktop: stage under `<dir>/.playdrop-partial/<id>/`, finalize by rename into
+    /// `<dir>`; created 0700 (SR-23).
+    Directory(PathBuf),
+    /// Mobile: stage and verify under `staging_dir` (a private directory the host owns),
+    /// then hand each verified file to `sink`.
+    Staged {
+        /// Private staging directory; free space is measured here.
+        staging_dir: PathBuf,
+        /// Gets every verified file.
+        sink: Arc<dyn ReceiveSink>,
+    },
+}
+
+impl ReceiveTarget {
+    /// The directory transfers are staged (and, for `Directory`, placed) beneath.
+    pub fn root(&self) -> &Path {
+        match self {
+            Self::Directory(d) => d,
+            Self::Staged { staging_dir, .. } => staging_dir,
+        }
+    }
+}
+
 /// How to start a [`Host`].
 pub struct HostConfig {
-    /// Identity, pins and transfer index; created 0700 (SR-28).
+    /// Identity, pins, transfer and outbox index; created 0700 (SR-28).
     pub data_dir: PathBuf,
-    /// Where received files land; created 0700 (SR-23).
-    pub receive_dir: PathBuf,
+    /// Where received files go.
+    pub receive: ReceiveTarget,
     /// TCP port (protocol.md section 1: 42187 unless overridden). 0 picks a free port,
     /// for tests only: last-known dial needs a stable port.
     pub port: u16,
@@ -113,6 +152,11 @@ pub struct HostConfig {
     /// Whether the desktop is locked; pairing is refused while it is (SR-6). Defaults to
     /// [`AlwaysUnlocked`]; a daemon supplies logind `LockedHint` or `WTS_SESSION_LOCK`.
     pub lock_state: Box<dyn LockState>,
+    /// Free space of the receive volume (SR-20). Defaults to [`platform::VolumeSpace`].
+    pub free_space: Arc<dyn FreeSpace>,
+    /// Seals `identity.key` and `pins.json` at rest (`docs/core-api.md` section 2a).
+    /// `None` keeps the 0600 files of the desktop.
+    pub secret_store: Option<Arc<dyn SecretStore>>,
 }
 
 impl HostConfig {
@@ -125,7 +169,7 @@ impl HostConfig {
     ) -> Self {
         Self {
             data_dir: data_dir.into(),
-            receive_dir: receive_dir.into(),
+            receive: ReceiveTarget::Directory(receive_dir.into()),
             port: crate::constants::TCP_PORT,
             device_name: device_name.into(),
             device_type: DeviceType::Desktop,
@@ -134,7 +178,28 @@ impl HostConfig {
             bind_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
             discovery: true,
             lock_state: Box::new(AlwaysUnlocked),
+            free_space: Arc::new(platform::VolumeSpace),
+            secret_store: None,
         }
+    }
+
+    /// A mobile configuration (`docs/core-api.md` section 1): device type phone, the
+    /// mobile keep-alive, discovery on, and received files staged under `staging_dir` and
+    /// handed to `sink`.
+    pub fn with_sink(
+        data_dir: impl Into<PathBuf>,
+        staging_dir: impl Into<PathBuf>,
+        sink: Arc<dyn ReceiveSink>,
+        device_name: impl Into<String>,
+    ) -> Self {
+        let mut c = Self::new(data_dir, PathBuf::new(), device_name);
+        c.receive = ReceiveTarget::Staged {
+            staging_dir: staging_dir.into(),
+            sink,
+        };
+        c.device_type = DeviceType::Phone;
+        c.keep_alive_profile = KeepAliveProfile::Mobile;
+        c
     }
 }
 
@@ -142,7 +207,8 @@ impl std::fmt::Debug for HostConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HostConfig")
             .field("data_dir", &self.data_dir)
-            .field("receive_dir", &self.receive_dir)
+            .field("receive", &self.receive)
+            .field("secret_store", &self.secret_store.is_some())
             .field("port", &self.port)
             .field("bind_ip", &self.bind_ip)
             .field("discovery", &self.discovery)
@@ -171,6 +237,10 @@ pub struct PeerSummary {
     /// (SR-8). Persisted in the pin at session start and end, so it survives a restart.
     #[serde(default)]
     pub last_seen: Option<u64>,
+    /// The peer no longer has us pinned (protocol.md 5.4); true until the next
+    /// successful pairing or unpair. Persisted in the pin.
+    #[serde(default)]
+    pub removed_by_peer: bool,
 }
 
 /// A device seen in "Add device" mode (protocol.md 8.3 rule 1): listed, never dialled
@@ -197,6 +267,10 @@ pub struct ClipboardPush {
     pub skipped_offline: usize,
     /// Paired peers without the `clipboardOut` grant.
     pub skipped_no_grant: usize,
+    /// Online peers that cannot take this clip: an image to a peer without
+    /// `clipboard.image`, or long text to one without `blobs`.
+    #[serde(default)]
+    pub skipped_unsupported: usize,
 }
 
 /// Per-peer reachability notes for the 10 s report and [`Host::diagnose`].
@@ -219,7 +293,7 @@ pub(crate) struct Inner {
     pub(crate) local_addr: SocketAddr,
     pub(crate) bind_ip: IpAddr,
     pub(crate) data_dir: PathBuf,
-    pub(crate) receive_dir: PathBuf,
+    pub(crate) receive: ReceiveTarget,
     pub(crate) device_name: String,
     pub(crate) device_type: DeviceType,
     pub(crate) keepalive: Duration,
@@ -247,6 +321,16 @@ pub(crate) struct Inner {
     /// a busy session does not rewrite `pins.json` per frame).
     pub(crate) last_seen: Mutex<HashMap<DeviceId, u64>>,
     pub(crate) free_space: Arc<dyn FreeSpace>,
+    /// Clipboard blobs this host serves (5.15).
+    pub(crate) blobs: Mutex<blobs::BlobStore>,
+    /// Remembered battery and presence, and the media and battery rate state.
+    pub(crate) status: Mutex<status::StatusState>,
+    /// Outbox items held for peers (7.8).
+    pub(crate) outbox: Mutex<HashMap<String, Arc<outbox::Held>>>,
+    /// Outbox items being pulled from peers right now.
+    pub(crate) pulling: Mutex<HashSet<String>>,
+    /// "Add device" adverts already reported in this window, by address (name, type).
+    pub(crate) add_device_seen: Mutex<HashMap<SocketAddr, (String, String)>>,
     pub(crate) interfaces: Arc<dyn InterfaceSource>,
     pub(crate) lock_state: Box<dyn LockState>,
     shutdown: watch::Sender<bool>,
@@ -265,6 +349,7 @@ pub(crate) enum TransferEnd {
         bundle_root: Option<String>,
         saved: Vec<PathBuf>,
         folder: Option<PathBuf>,
+        delivered: Vec<DeliveredFile>,
     },
     /// Failed, with the reason shown to the user (SR-22 wording).
     Failed(String),
@@ -285,12 +370,11 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Refuses clipboard text that does not fit inline (protocol.md 5.7).
+/// Refuses clipboard text over the 1 MiB sync limit (protocol.md 5.7, SR-24).
 fn check_clipboard_size(text: &str) -> Result<()> {
-    // TODO(SR-24): text over 32 KiB goes as a blob (protocol.md 5.15), Phase 2/3.
-    if text.len() > crate::session::types::CLIPBOARD_INLINE_MAX {
+    if text.len() > blobs::TEXT_BLOB_MAX {
         return Err(Error::TooLarge(
-            "clipboard text over 32 KiB needs blobs".into(),
+            "clipboard text over 1 MiB is not synced".into(),
         ));
     }
     Ok(())
@@ -306,6 +390,56 @@ fn clipboard_frame(text: &str, hash: String, sensitive: bool) -> Frame {
         blob: None,
         sensitive,
     })
+}
+
+/// Text for a clipboard frame: inline up to 32 KiB, else as a blob held for the peer
+/// (protocol.md 5.7, 5.15).
+#[derive(Debug, Clone)]
+enum ClipBody {
+    Inline(String),
+    Blob(bytes::Bytes),
+}
+
+impl ClipBody {
+    fn of(text: &str) -> Self {
+        if text.len() <= crate::session::types::CLIPBOARD_INLINE_MAX {
+            Self::Inline(text.to_owned())
+        } else {
+            Self::Blob(bytes::Bytes::from(blobs::normalize_newlines(text)))
+        }
+    }
+
+    /// The frame for `sess`, holding the blob for its peer. `None` when the peer cannot
+    /// fetch blobs.
+    fn frame_for(
+        &self,
+        inner: &Inner,
+        sess: &session::Session,
+        hash: &str,
+        sensitive: bool,
+    ) -> Option<Frame> {
+        match self {
+            Self::Inline(t) => Some(clipboard_frame(t, hash.to_owned(), sensitive)),
+            Self::Blob(bytes) => {
+                if !sess.peer_accepts(&Capability::Blobs) {
+                    return None;
+                }
+                let id = lock(&inner.blobs).put(
+                    bytes.clone(),
+                    "text/plain;charset=utf-8",
+                    sess.peer(),
+                    tokio::time::Instant::now(),
+                )?;
+                Some(Frame::Clipboard(blobs::blob_clipboard(
+                    ClipboardKind::Text,
+                    "text/plain;charset=utf-8",
+                    id,
+                    bytes.len(),
+                    sensitive,
+                )))
+            }
+        }
+    }
 }
 
 /// Now as Unix seconds; 0 if the clock is before 1970.
@@ -381,19 +515,36 @@ impl Inner {
         direction: TransferDirection,
         end: TransferEnd,
     ) {
-        let (status, note, saved, folder) = match &end {
-            TransferEnd::Complete { saved, folder, .. } => (
+        let (status, note, saved, folder, delivered) = match &end {
+            TransferEnd::Complete {
+                saved,
+                folder,
+                delivered,
+                ..
+            } => (
                 TransferStatus::Complete,
                 None,
                 saved.clone(),
                 folder.clone(),
+                delivered.clone(),
             ),
-            TransferEnd::Failed(r) => (TransferStatus::Failed, Some(r.clone()), Vec::new(), None),
-            TransferEnd::Cancelled(r) => {
-                (TransferStatus::Cancelled, Some(r.clone()), Vec::new(), None)
-            }
+            TransferEnd::Failed(r) => (
+                TransferStatus::Failed,
+                Some(r.clone()),
+                Vec::new(),
+                None,
+                Vec::new(),
+            ),
+            TransferEnd::Cancelled(r) => (
+                TransferStatus::Cancelled,
+                Some(r.clone()),
+                Vec::new(),
+                None,
+                Vec::new(),
+            ),
         };
-        lock(&self.transfers).finish_with_files(id, direction, status, note, saved, folder);
+        lock(&self.transfers)
+            .finish_with_files(id, direction, status, note, saved, folder, delivered);
         let ev = match end {
             TransferEnd::Complete {
                 bytes,
@@ -402,6 +553,7 @@ impl Inner {
                 bundle_root,
                 saved,
                 folder,
+                delivered,
             } => HostEvent::TransferComplete {
                 id: id.to_owned(),
                 peer: peer.to_hex(),
@@ -412,6 +564,7 @@ impl Inner {
                 bundle_root,
                 saved,
                 folder,
+                delivered,
             },
             TransferEnd::Failed(reason) | TransferEnd::Cancelled(reason) => {
                 HostEvent::TransferFailed {
@@ -478,10 +631,28 @@ impl Inner {
             .map_or_else(|| id.short_id(), |p| p.label.clone())
     }
 
-    /// Closes the "Add device" window (success, user, or expiry).
+    /// Closes the "Add device" window (success, user, or expiry) and forgets the adverts
+    /// reported in it, so the next window reports each device again.
     pub(crate) fn close_window(&self) {
         lock(&self.window).close();
         self.window_flag.store(false, Ordering::SeqCst);
+        lock(&self.add_device_seen).clear();
+    }
+
+    /// The directory transfers are staged beneath (`docs/core-api.md` section 2).
+    pub(crate) fn receive_root(&self) -> &Path {
+        self.receive.root()
+    }
+
+    /// The sink binding for a transfer from `owner` in `Staged` mode.
+    pub(crate) fn sink_binding(&self, owner: &DeviceId) -> Option<SinkBinding> {
+        match &self.receive {
+            ReceiveTarget::Directory(_) => None,
+            ReceiveTarget::Staged { sink, .. } => Some(SinkBinding {
+                sink: Arc::clone(sink),
+                peer: owner.to_hex(),
+            }),
+        }
     }
 }
 
@@ -510,13 +681,17 @@ impl Host {
         let data_dir = config.data_dir.clone();
         let identity = {
             let dir = data_dir.clone();
-            tokio::task::spawn_blocking(move || DeviceIdentity::load_or_create(&dir))
-                .await
-                .map_err(|e| Error::Io(std::io::Error::other(e)))??
+            let sealer = config.secret_store.clone();
+            tokio::task::spawn_blocking(move || {
+                DeviceIdentity::load_or_create_sealed(&dir, &sealer)
+            })
+            .await
+            .map_err(|e| Error::Io(std::io::Error::other(e)))??
         };
         let store = {
             let path = data_dir.join(PIN_FILE);
-            tokio::task::spawn_blocking(move || PinStore::open(path))
+            let sealer = config.secret_store.clone();
+            tokio::task::spawn_blocking(move || PinStore::open_sealed(path, sealer))
                 .await
                 .map_err(|e| Error::Io(std::io::Error::other(e)))??
         };
@@ -534,7 +709,7 @@ impl Host {
             local_addr,
             bind_ip: config.bind_ip,
             data_dir,
-            receive_dir: config.receive_dir,
+            receive: config.receive,
             device_name: crate::session::sanitize_name(&config.device_name),
             device_type: config.device_type,
             keepalive: config.keep_alive_profile.interval(),
@@ -558,7 +733,12 @@ impl Host {
             reach: Mutex::new(HashMap::new()),
             clipboard_echo: Mutex::new(ClipboardEcho::default()),
             last_seen: Mutex::new(HashMap::new()),
-            free_space: Arc::new(platform::VolumeSpace),
+            free_space: config.free_space,
+            blobs: Mutex::new(blobs::BlobStore::default()),
+            status: Mutex::new(status::StatusState::default()),
+            outbox: Mutex::new(HashMap::new()),
+            pulling: Mutex::new(HashSet::new()),
+            add_device_seen: Mutex::new(HashMap::new()),
             interfaces: Arc::clone(&interfaces),
             lock_state: config.lock_state,
             shutdown: watch::Sender::new(false),
@@ -583,6 +763,7 @@ impl Host {
         *lock(&inner.server_task) = Some(server_task);
 
         receive::load_persisted(&inner).await;
+        outbox::load_persisted(&inner).await;
 
         if inner.discovery_on {
             let key = inner.pins.read().local_announce_key().key;
@@ -610,6 +791,7 @@ impl Host {
         inner.spawn(connect::dial_loop(Arc::clone(&inner)));
         inner.spawn(connect::diagnostics(Arc::clone(&inner)));
         inner.spawn(receive::maintenance(Arc::clone(&inner)));
+        inner.spawn(outbox::maintenance(Arc::clone(&inner)));
 
         inner.emit(HostEvent::Listening {
             addr: local_addr,
@@ -705,6 +887,7 @@ impl Host {
                     .get(&p.device_id)
                     .copied()
                     .max(p.last_seen),
+                removed_by_peer: p.removed_by_peer,
             })
             .collect()
     }
@@ -834,7 +1017,21 @@ impl Host {
     /// Sends files and folders to a paired peer (protocol.md 7): builds the manifest, offers
     /// it, streams up to 4 files plus the bundle concurrently, and resumes after drops.
     pub async fn send(&self, peer: &DeviceId, paths: Vec<PathBuf>) -> Result<TransferHandle> {
-        send::start(&self.inner, *peer, paths).await
+        let sources = paths.into_iter().map(SendSource::Path).collect();
+        self.send_sources(peer, sources, None).await
+    }
+
+    /// Sends paths and host-supplied streams with an optional note (`docs/core-api.md`
+    /// section 3, protocol.md 7). A stream's opener is called on a blocking thread at offer
+    /// time, once per `PUT` and once per bundle member; an opener error fails the offer (at
+    /// offer time) or the stream (later) with its `io::Error` text.
+    pub async fn send_sources(
+        &self,
+        peer: &DeviceId,
+        sources: Vec<SendSource>,
+        note: Option<String>,
+    ) -> Result<TransferHandle> {
+        send::start(&self.inner, *peer, sources, note).await
     }
 
     /// Cancels a transfer by ID, in either direction (protocol.md 7.5).
@@ -873,11 +1070,26 @@ impl Host {
         Ok(())
     }
 
+    /// Rings (`start`) or silences a peer (protocol.md 5.6). [`Error::NotFound`] without a
+    /// session.
+    pub fn find(&self, peer: &DeviceId, start: bool) -> Result<()> {
+        let s = self.inner.registry.session(peer).ok_or(Error::NotFound)?;
+        s.send(Frame::Find(Find {
+            action: if start {
+                FindAction::Start
+            } else {
+                FindAction::Stop
+            },
+        }));
+        Ok(())
+    }
+
     /// Pushes clipboard text to one peer (protocol.md 5.7): needs the `clipboardOut` grant,
     /// and is skipped when it would echo the last clip applied from a peer or the last one
-    /// sent. Returns whether it was sent. A push that fails (too large, no session) is not
-    /// remembered, so retrying the same text works. Most callers want
-    /// [`Host::push_clipboard`], which sends to every eligible peer.
+    /// sent. Returns whether it was sent. Text over 32 KiB goes as a blob (5.15) the peer
+    /// fetches within 5 minutes; over 1 MiB is [`Error::TooLarge`] (SR-24). A push that
+    /// fails (too large, no session) is not remembered, so retrying the same text works.
+    /// Most callers want [`Host::push_clipboard`], which sends to every eligible peer.
     pub fn send_clipboard(&self, peer: &DeviceId, text: &str, sensitive: bool) -> Result<bool> {
         let pin = self.inner.pins.get(peer).ok_or(Error::NotPaired)?;
         if !pin.grants.clipboard_out {
@@ -889,7 +1101,10 @@ impl Host {
             return Ok(false);
         }
         let s = self.inner.registry.session(peer).ok_or(Error::NotFound)?;
-        s.send(clipboard_frame(text, hash.clone(), sensitive));
+        let frame = ClipBody::of(text)
+            .frame_for(&self.inner, &s, &hash, sensitive)
+            .ok_or_else(|| Error::TooLarge("the device cannot fetch text over 32 KiB".into()))?;
+        s.send(frame);
         lock(&self.inner.clipboard_echo).last_sent = Some(hash);
         Ok(true)
     }
@@ -897,16 +1112,65 @@ impl Host {
     /// Pushes a local clipboard change to every online peer with the `clipboardOut` grant
     /// (protocol.md 5.7, SR-24), applying the echo rule once for all of them: text equal to
     /// the last clip applied from a peer or the last one sent goes nowhere. Text over
-    /// 32 KiB returns [`Error::TooLarge`] until blobs exist (5.15). The text is remembered
-    /// as sent only if at least one peer got it, so a clip copied while every peer was
-    /// offline is pushed again on the next change notification.
+    /// 32 KiB goes as a blob (5.15); over 1 MiB returns [`Error::TooLarge`]. The text is
+    /// remembered as sent only if at least one peer got it, so a clip copied while every
+    /// peer was offline is pushed again on the next change notification.
     pub fn push_clipboard(&self, text: &str, sensitive: bool) -> Result<ClipboardPush> {
         check_clipboard_size(text)?;
         let hash = crate::session::types::clipboard_text_hash(text);
+        let body = ClipBody::of(text);
+        Ok(self.push_clip(&hash, |s| body.frame_for(&self.inner, s, &hash, sensitive)))
+    }
+
+    /// Pushes a clipboard image (at most 16 MiB) to every online peer with the
+    /// `clipboardOut` grant and the `clipboard.image` capability, as a blob each fetches
+    /// and verifies (protocol.md 5.7, 5.15). Same echo rule as text; peers without the
+    /// capability are counted in [`ClipboardPush::skipped_unsupported`].
+    pub fn push_clipboard_image(
+        &self,
+        bytes: Vec<u8>,
+        mime: &str,
+        sensitive: bool,
+    ) -> Result<ClipboardPush> {
+        if bytes.len() > blobs::IMAGE_BLOB_MAX {
+            return Err(Error::TooLarge("clipboard image over 16 MiB".into()));
+        }
+        if !mime.starts_with("image/") || http::HeaderValue::from_str(mime).is_err() {
+            return Err(Error::BadRequest("not an image MIME type".into()));
+        }
+        let hash = blobs::blob_id(&bytes);
+        let bytes = bytes::Bytes::from(bytes);
+        let inner = &self.inner;
+        Ok(self.push_clip(&hash, |s| {
+            if !(s.peer_accepts(&Capability::ClipboardImage) && s.peer_accepts(&Capability::Blobs))
+            {
+                return None;
+            }
+            let id = lock(&inner.blobs).put(
+                bytes.clone(),
+                mime,
+                s.peer(),
+                tokio::time::Instant::now(),
+            )?;
+            Some(Frame::Clipboard(blobs::blob_clipboard(
+                ClipboardKind::Image,
+                mime,
+                id,
+                bytes.len(),
+                sensitive,
+            )))
+        }))
+    }
+
+    /// The fan-out shared by text and image pushes (protocol.md 5.7 echo rule).
+    fn push_clip<F>(&self, hash: &str, mut frame_for: F) -> ClipboardPush
+    where
+        F: FnMut(&session::Session) -> Option<Frame>,
+    {
         let mut out = ClipboardPush::default();
-        if self.inner.is_clipboard_echo(&hash) {
+        if self.inner.is_clipboard_echo(hash) {
             out.skipped_echo = true;
-            return Ok(out);
+            return out;
         }
         let targets: Vec<(DeviceId, bool)> = self
             .inner
@@ -921,17 +1185,86 @@ impl Host {
                 continue;
             }
             match self.inner.registry.session(&id) {
-                Some(s) => {
-                    s.send(clipboard_frame(text, hash.clone(), sensitive));
-                    out.sent_to.push(id);
-                }
+                Some(s) => match frame_for(&s) {
+                    Some(f) => {
+                        s.send(f);
+                        out.sent_to.push(id);
+                    }
+                    None => out.skipped_unsupported += 1,
+                },
                 None => out.skipped_offline += 1,
             }
         }
         if !out.sent_to.is_empty() {
-            lock(&self.inner.clipboard_echo).last_sent = Some(hash);
+            lock(&self.inner.clipboard_echo).last_sent = Some(hash.to_owned());
         }
-        Ok(out)
+        out
+    }
+
+    /// Remembers this device's battery and pushes it to every online peer now and at each
+    /// session start, at most once per 60 s per peer unless `charging` or `low` changed
+    /// (protocol.md 5.8).
+    pub fn set_battery(&self, level: u8, charging: bool, low: bool) {
+        status::set_battery(&self.inner, level, charging, low);
+    }
+
+    /// Remembers this device's presence and pushes it to every online peer now and at
+    /// each session start (protocol.md 5.10).
+    pub fn set_presence(
+        &self,
+        state: PresenceState,
+        reason: Option<String>,
+        expect_back_ms: Option<u64>,
+    ) {
+        status::set_presence(&self.inner, state, reason, expect_back_ms);
+    }
+
+    /// Asks a peer to control one of its players (protocol.md 5.9). Needs a session
+    /// ([`Error::NotFound`]) and the peer's `media.control` capability
+    /// ([`Error::Forbidden`]); the peer applies it only with its `media` grant for us.
+    pub fn send_media_command(
+        &self,
+        peer: &DeviceId,
+        player: &str,
+        action: MediaAction,
+        value: Option<u64>,
+    ) -> Result<()> {
+        status::send_media_command(&self.inner, peer, player, action, value)
+    }
+
+    /// Pushes a local player's state to every online peer with the `media` grant,
+    /// coalesced to 2 frames per second per player (protocol.md 5.9).
+    pub fn push_media_state(&self, state: MediaState) {
+        status::push_media_state(&self.inner, state);
+    }
+
+    /// Queues files for `peer` to pull (protocol.md 7.8) and returns the item ID. Sends
+    /// `outbox_ready` now if the peer is online and at every session start while the item
+    /// waits. Items made only of paths survive a restart; items with streams do not.
+    pub async fn queue_outbox(
+        &self,
+        peer: &DeviceId,
+        sources: Vec<SendSource>,
+        note: Option<String>,
+    ) -> Result<String> {
+        outbox::queue(&self.inner, *peer, sources, note).await
+    }
+
+    /// Items this host holds for peers, oldest first.
+    pub fn outbox(&self) -> Vec<OutboxItem> {
+        outbox::list(&self.inner)
+    }
+
+    /// Removes a held item. [`Error::NotFound`] if unknown.
+    pub async fn remove_outbox(&self, id: &str) -> Result<()> {
+        outbox::remove(&self.inner, id).await
+    }
+
+    /// Pulls every item `peer` holds for us (protocol.md 7.8) and returns the transfer IDs
+    /// being pulled. Each is an incoming transfer: the `files` grant decides acceptance,
+    /// and progress and completion arrive as receive-side transfer events.
+    pub async fn pull_outbox(&self, peer: &DeviceId) -> Result<Vec<String>> {
+        outbox::pull(&self.inner, *peer).await
     }
 
     /// A diagnostic snapshot on demand: own address and port, whether the listener is up,

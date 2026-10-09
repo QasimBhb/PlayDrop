@@ -13,8 +13,9 @@ use crate::ipc::post;
 use crate::model::{self, clipboard_sent_text};
 use crate::{App, DevicesState};
 
-/// Largest clipboard text sent inline (protocol.md 5.7).
-const CLIPBOARD_MAX: usize = 32 * 1024;
+/// Largest clipboard text the daemon sends (SR-24: 1 MiB; over 32 KiB it travels as a blob,
+/// protocol.md 5.15).
+const CLIPBOARD_MAX: usize = 1024 * 1024;
 
 /// winit reports a multi-file drop as one `DroppedFile` per file, back to back. Files
 /// arriving within this window are sent as one transfer.
@@ -202,7 +203,7 @@ fn send_clipboard(c: &Controller, peer: &str, text: &str) {
     }
     if text.len() > CLIPBOARD_MAX {
         c.notice(
-            "The clipboard text is larger than 32 KiB. Send it as a file instead.",
+            "The clipboard text is larger than 1 MiB. Send it as a file instead.",
             true,
         );
         return;

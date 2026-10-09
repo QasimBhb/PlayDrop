@@ -479,6 +479,7 @@ mod tests {
                 receive_dir: "/tmp/in".into(),
                 device_name: "alpha".into(),
                 clipboard_sync: false,
+                clipboard_images: true,
                 clipboard_watch_supported: true,
                 autostart: false,
                 notifications: true,

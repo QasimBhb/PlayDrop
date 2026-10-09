@@ -1,5 +1,5 @@
 //! Windows backend: `AddClipboardFormatListener` on a message-only window, `CF_UNICODETEXT`,
-//! and the SR-24 exclusion formats.
+//! the registered `PNG` format for images, and the SR-24 exclusion formats.
 //!
 //! UNTESTED: written against the `windows` 0.62 API but never compiled or run, because this
 //! workspace is developed on Linux. Check it on Windows 11 (Phase 2 task f, the Bitwarden test)
@@ -10,6 +10,11 @@
 //!   `CanIncludeInClipboardHistory` = 0, or `CanUploadToCloudClipboard` = 0.
 //! - [`read_current`] reports the same marks as `sensitive`.
 //! - [`apply`] with `sensitive` writes all three marks next to the text.
+//!
+//! Images use the registered `PNG` clipboard format, which browsers, Office, Paint and the
+//! Snipping Tool write and read alongside `CF_DIB`. Without an image crate there is no
+//! `CF_DIB` conversion: a clip that only has `CF_DIB` is not synced, and an applied image is
+//! offered as `PNG` only.
 //!
 //! The clipboard is opened with no owner window, as `arboard` and `clipboard-win` do; nothing
 //! is delay-rendered, so no owner messages are needed.
@@ -38,7 +43,10 @@ use ::windows::Win32::UI::WindowsAndMessaging::{
     WINDOW_STYLE, WM_APP, WM_CLIPBOARDUPDATE, WM_QUIT, WNDCLASSW,
 };
 
-use super::{short_hash, text_hash, ClipboardSupport, LocalClip, MAX_SYNC_BYTES};
+use super::{
+    short_hash, ClipContent, ClipboardSupport, LocalClip, IMAGE_MIME, MAX_IMAGE_BYTES,
+    MAX_SYNC_BYTES,
+};
 
 const BACKEND: &str = "clipboard-format-listener";
 /// `CF_UNICODETEXT` (the constant lives behind the `Win32_System_Ole` feature, not enabled).
@@ -55,11 +63,12 @@ pub(super) fn probe() -> ClipboardSupport {
     }
 }
 
-/// Registered ids of the SR-24 marker formats (0 when registration failed).
+/// Registered ids of the SR-24 marker formats and `PNG` (0 when registration failed).
 struct Formats {
     exclude: u32,
     history: u32,
     cloud: u32,
+    png: u32,
 }
 
 #[allow(unsafe_code)]
@@ -74,6 +83,7 @@ fn formats() -> &'static Formats {
                 )),
                 history: RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory")),
                 cloud: RegisterClipboardFormatW(w!("CanUploadToCloudClipboard")),
+                png: RegisterClipboardFormatW(w!("PNG")),
             }
         }
     })
@@ -194,16 +204,74 @@ fn read_text(_open: &OpenGuard) -> TextRead {
     }
 }
 
-pub(super) fn read_current() -> anyhow::Result<Option<LocalClip>> {
-    let open = OpenGuard::open()?;
-    let sensitive = clip_is_marked(&open);
-    match read_text(&open) {
-        TextRead::None => Ok(None),
-        TextRead::Text(text) => Ok(Some(LocalClip { text, sensitive })),
+enum ImageRead {
+    None,
+    Png(Vec<u8>),
+    TooLarge,
+}
+
+/// Reads the registered `PNG` format, at most [`MAX_IMAGE_BYTES`].
+#[allow(unsafe_code)]
+fn read_png(_open: &OpenGuard) -> ImageRead {
+    let format = formats().png;
+    if format == 0 {
+        return ImageRead::None;
+    }
+    // SAFETY: the clipboard is open. The handle is system-owned and valid until the clipboard
+    // closes. We lock it, copy at most GlobalSize bytes out, and unlock.
+    unsafe {
+        if IsClipboardFormatAvailable(format).is_err() {
+            return ImageRead::None;
+        }
+        let Ok(handle) = GetClipboardData(format) else {
+            return ImageRead::None;
+        };
+        let hglobal = HGLOBAL(handle.0);
+        let size = GlobalSize(hglobal);
+        if size == 0 {
+            return ImageRead::None;
+        }
+        if size > MAX_IMAGE_BYTES {
+            return ImageRead::TooLarge;
+        }
+        let ptr = GlobalLock(hglobal).cast::<u8>().cast_const();
+        if ptr.is_null() {
+            return ImageRead::None;
+        }
+        let bytes = std::slice::from_raw_parts(ptr, size).to_vec();
+        let _ = GlobalUnlock(hglobal);
+        ImageRead::Png(bytes)
+    }
+}
+
+/// Reads text, or a PNG image when there is no text and `images` is on.
+fn read_content(open: &OpenGuard, images: bool) -> anyhow::Result<Option<ClipContent>> {
+    match read_text(open) {
+        TextRead::Text(text) => return Ok(Some(ClipContent::Text(text))),
         TextRead::TooLarge => {
             anyhow::bail!("clipboard text is larger than 1 MiB and is not synced")
         }
+        TextRead::None => {}
     }
+    if !images {
+        return Ok(None);
+    }
+    match read_png(open) {
+        ImageRead::None => Ok(None),
+        ImageRead::Png(bytes) => Ok(Some(ClipContent::Image {
+            mime: IMAGE_MIME.to_owned(),
+            bytes,
+        })),
+        ImageRead::TooLarge => {
+            anyhow::bail!("clipboard image is larger than 16 MiB and is not synced")
+        }
+    }
+}
+
+pub(super) fn read_current(images: bool) -> anyhow::Result<Option<LocalClip>> {
+    let open = OpenGuard::open()?;
+    let sensitive = clip_is_marked(&open);
+    Ok(read_content(&open, images)?.map(|content| LocalClip { content, sensitive }))
 }
 
 /// Copies `data` into a movable global block and hands it to the clipboard.
@@ -241,13 +309,35 @@ pub(super) fn apply(text: &str, sensitive: bool) -> anyhow::Result<()> {
         .collect();
     set_data(&open, CF_UNICODETEXT, &bytes)?;
     if sensitive {
-        // SR-24: keep it out of clipboard history, cloud clipboard and other monitors.
-        let f = formats();
-        for format in [f.exclude, f.history, f.cloud] {
-            if format != 0 {
-                set_data(&open, format, &0u32.to_ne_bytes())?;
-            }
+        set_sensitive_marks(&open)?;
+    }
+    Ok(())
+}
+
+/// SR-24: keeps the clip out of clipboard history, cloud clipboard and other monitors.
+fn set_sensitive_marks(open: &OpenGuard) -> anyhow::Result<()> {
+    let f = formats();
+    for format in [f.exclude, f.history, f.cloud] {
+        if format != 0 {
+            set_data(open, format, &0u32.to_ne_bytes())?;
         }
+    }
+    Ok(())
+}
+
+#[allow(unsafe_code)]
+pub(super) fn apply_image(bytes: &[u8], mime: &str, sensitive: bool) -> anyhow::Result<()> {
+    if mime != IMAGE_MIME {
+        anyhow::bail!("only PNG images can be put on the Windows clipboard");
+    }
+    let png = formats().png;
+    anyhow::ensure!(png != 0, "the PNG clipboard format is not available");
+    let open = OpenGuard::open()?;
+    // SAFETY: the clipboard is open on this thread.
+    unsafe { EmptyClipboard() }.context("could not clear the clipboard")?;
+    set_data(&open, png, bytes)?;
+    if sensitive {
+        set_sensitive_marks(&open)?;
     }
     Ok(())
 }
@@ -269,13 +359,16 @@ impl WatchHandle {
     }
 }
 
-pub(super) async fn spawn_watcher(raw: mpsc::Sender<LocalClip>) -> anyhow::Result<WatchHandle> {
+pub(super) async fn spawn_watcher(
+    raw: mpsc::Sender<LocalClip>,
+    images: Arc<AtomicBool>,
+) -> anyhow::Result<WatchHandle> {
     let (ready_tx, ready_rx) = oneshot::channel();
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
     std::thread::Builder::new()
         .name("pd-clip-watch".into())
-        .spawn(move || listener_thread(&raw, &thread_stop, ready_tx))
+        .spawn(move || listener_thread(&raw, &thread_stop, &images, ready_tx))
         .context("could not start the clipboard watcher thread")?;
     let thread_id = ready_rx
         .await
@@ -310,7 +403,7 @@ fn create_listener_window() -> anyhow::Result<HWND> {
             ..Default::default()
         };
         // SAFETY: `class` is fully initialised and its strings are static.
-        unsafe { RegisterClassW(&class) != 0 }
+        unsafe { RegisterClassW(&raw const class) != 0 }
     });
     anyhow::ensure!(registered, "could not register the clipboard window class");
     // SAFETY: the class is registered above; HWND_MESSAGE makes a message-only window with no
@@ -339,6 +432,7 @@ fn create_listener_window() -> anyhow::Result<HWND> {
 fn listener_thread(
     raw: &mpsc::Sender<LocalClip>,
     stop: &AtomicBool,
+    images: &AtomicBool,
     ready: oneshot::Sender<anyhow::Result<u32>>,
 ) {
     let hwnd = match create_listener_window() {
@@ -361,7 +455,7 @@ fn listener_thread(
     let mut msg = MSG::default();
     loop {
         // SAFETY: `msg` is a valid out-pointer for the duration of the call.
-        let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
+        let got = unsafe { GetMessageW(&raw mut msg, None, 0, 0) };
         if got.0 == 0 || got.0 == -1 {
             break; // WM_QUIT, or an error
         }
@@ -369,9 +463,9 @@ fn listener_thread(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            if let Some(text) = read_change() {
+            if let Some(content) = read_change(images.load(Ordering::SeqCst)) {
                 let clip = LocalClip {
-                    text,
+                    content,
                     sensitive: false,
                 };
                 if raw.blocking_send(clip).is_err() {
@@ -382,8 +476,8 @@ fn listener_thread(
         }
         // SAFETY: `msg` was filled by GetMessageW above.
         unsafe {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+            let _ = TranslateMessage(&raw const msg);
+            DispatchMessageW(&raw const msg);
         }
     }
     // SAFETY: `hwnd` is still our window on this thread.
@@ -394,8 +488,8 @@ fn listener_thread(
     tracing::debug!("clipboard watcher thread exited");
 }
 
-/// Applies the SR-24 and size rules to one change and returns the text to report.
-fn read_change() -> Option<String> {
+/// Applies the SR-24 and size rules to one change and returns the clip to report.
+fn read_change(images: bool) -> Option<ClipContent> {
     let open = match OpenGuard::open() {
         Ok(open) => open,
         Err(e) => {
@@ -407,18 +501,20 @@ fn read_change() -> Option<String> {
         tracing::debug!("clipboard change carries an exclusion format; not synced");
         return None;
     }
-    match read_text(&open) {
-        TextRead::None => None,
-        TextRead::TooLarge => {
+    match read_content(&open, images) {
+        Ok(Some(content)) => {
             tracing::debug!(
-                limit = MAX_SYNC_BYTES,
-                "clipboard text over 1 MiB; not synced"
+                kind = content.kind(),
+                len = content.len(),
+                hash = %short_hash(&content.hash()),
+                "clipboard changed"
             );
-            None
+            Some(content)
         }
-        TextRead::Text(text) => {
-            tracing::debug!(len = text.len(), hash = %short_hash(&text_hash(&text)), "clipboard changed");
-            Some(text)
+        Ok(None) => None,
+        Err(e) => {
+            tracing::debug!(error = %e, "clipboard change not synced");
+            None
         }
     }
 }

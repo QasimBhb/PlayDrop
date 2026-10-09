@@ -32,7 +32,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use playdrop_core::host::{
-    AddDeviceCandidate, Diagnostics, HostEvent, PeerSummary, TransferSnapshot,
+    AddDeviceCandidate, Diagnostics, HostEvent, OutboxItem, PeerSummary, TransferSnapshot,
 };
 use playdrop_core::pin_store::Grants;
 use serde::{Deserialize, Serialize};
@@ -55,11 +55,31 @@ pub const PIPE_PREFIX: &str = r"\\.\pipe\playdrop-";
 /// must carry this ID in its `/proc/<pid>/root/.flatpak-info`, or the daemon refuses it (SR-26).
 pub const FLATPAK_APP_ID: &str = "org.playdrop.PlayDrop";
 
-/// Most files or folders one [`Request::SendFiles`] may carry. On Linux each item travels as a
+/// Most files or folders one [`Request::SendFiles`] or [`Request::QueueOutbox`] may carry. On Linux each item travels as a
 /// file descriptor and the kernel passes at most 253 descriptors in one message
 /// (`SCM_MAX_FD`), so the client refuses more with [`ErrorCode::TooLarge`]. Sending a folder
 /// counts as one item however many files it holds.
 pub const MAX_SEND_ITEMS: usize = 250;
+
+/// What a request that carries files does with them. On Linux both travel as file
+/// descriptors through their own D-Bus method (SR-26).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilesOp {
+    /// [`Request::SendFiles`], D-Bus `SendFiles`.
+    Send,
+    /// [`Request::QueueOutbox`], D-Bus `QueueOutboxFiles`.
+    QueueOutbox,
+}
+
+impl FilesOp {
+    /// The request the daemon handles once the files are paths again.
+    pub(crate) fn request(self, peer: String, paths: Vec<PathBuf>) -> Request {
+        match self {
+            Self::Send => Request::SendFiles { peer, paths },
+            Self::QueueOutbox => Request::QueueOutbox { peer, paths },
+        }
+    }
+}
 
 /// Largest JSON message either side accepts, in bytes. Requests are small; the biggest
 /// responses are diagnostics and transfer lists.
@@ -160,9 +180,34 @@ pub enum Request {
         /// Optional message, cut to 256 bytes by the core.
         message: Option<String>,
     },
+    /// Queue files or folders for a peer to pull later (protocol.md 7.8): the outbox an
+    /// iPhone, which cannot receive in the background, pulls from when it opens `PlayDrop`.
+    ///
+    /// Travels like [`Request::SendFiles`]: on Linux [`client::Client::queue_outbox`] passes
+    /// file descriptors through the `QueueOutboxFiles` method (SR-26) and paths are refused
+    /// over the bus; on Windows paths travel as is (SR-27). Answers [`Ok::OutboxQueued`].
+    QueueOutbox {
+        /// Peer query.
+        peer: String,
+        /// Absolute paths.
+        paths: Vec<PathBuf>,
+    },
+    /// Items this daemon holds for peers. Answers [`Ok::Outbox`].
+    Outbox,
+    /// Drop a held outbox item.
+    RemoveOutbox {
+        /// Item ID from [`Request::Outbox`] or [`Ok::OutboxQueued`].
+        id: String,
+    },
+    /// Pull every item a peer holds for us (protocol.md 7.8). Answers [`Ok::OutboxPulled`];
+    /// progress and completion arrive as receive-side transfer events.
+    PullOutbox {
+        /// Peer query.
+        peer: String,
+    },
     /// Push clipboard text to every online peer with `clipboardOut` (protocol.md 5.7).
     PushClipboard {
-        /// Text, at most 32 KiB inline.
+        /// Text, at most 1 MiB; over 32 KiB it travels as a blob (protocol.md 5.15).
         text: String,
         /// Password-manager clip sent by hand (SR-24).
         sensitive: bool,
@@ -220,6 +265,10 @@ impl Request {
             Self::ShowQr => "show_qr",
             Self::ScanQr { .. } => "scan_qr",
             Self::SendFiles { .. } => "send_files",
+            Self::QueueOutbox { .. } => "queue_outbox",
+            Self::Outbox => "outbox",
+            Self::RemoveOutbox { .. } => "remove_outbox",
+            Self::PullOutbox { .. } => "pull_outbox",
             Self::RespondOffer { .. } => "respond_offer",
             Self::CancelTransfer { .. } => "cancel_transfer",
             Self::Ping { .. } => "ping",
@@ -272,6 +321,10 @@ pub struct Settings {
     pub device_name: String,
     /// Watch the local clipboard and push changes to peers (COSMIC and Windows only).
     pub clipboard_sync: bool,
+    /// Sync clipboard images as well as text, both ways (PNG, at most 16 MiB). Missing from
+    /// an older daemon's answer means on, its only behaviour.
+    #[serde(default = "default_true")]
+    pub clipboard_images: bool,
     /// Whether the platform can watch the clipboard at all; `false` on GNOME, where the
     /// window offers a button instead (anti-pattern 18: say why, do not fail silently).
     pub clipboard_watch_supported: bool,
@@ -279,6 +332,10 @@ pub struct Settings {
     pub autostart: bool,
     /// Show desktop notifications.
     pub notifications: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// A partial [`Settings`] update.
@@ -293,6 +350,9 @@ pub struct SettingsPatch {
     /// Clipboard sync on or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clipboard_sync: Option<bool>,
+    /// Clipboard images on or off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard_images: Option<bool>,
     /// Autostart on or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub autostart: Option<bool>,
@@ -404,6 +464,18 @@ pub enum Ok {
     TransferStarted {
         /// Transfer ID.
         id: String,
+    },
+    /// [`Request::QueueOutbox`]: the new outbox item ID.
+    OutboxQueued {
+        /// Item ID.
+        id: String,
+    },
+    /// [`Request::Outbox`]: held items, oldest first.
+    Outbox(Vec<OutboxItem>),
+    /// [`Request::PullOutbox`]: the incoming transfers started, one per item.
+    OutboxPulled {
+        /// Transfer IDs.
+        ids: Vec<String>,
     },
     /// [`Request::PushClipboard`] and [`Request::SendClipboard`].
     ClipboardPushed {
@@ -602,6 +674,18 @@ mod tests {
             Ok::AddDeviceList(Vec::new()),
             Ok::QrUri("playdrop://x".into()),
             Ok::TransferStarted { id: "t1".into() },
+            Ok::OutboxQueued { id: "o1".into() },
+            Ok::Outbox(vec![OutboxItem {
+                id: "o1".into(),
+                peer: "ab".repeat(32),
+                file_count: 2,
+                total_bytes: 2048,
+                note: None,
+                created_at_ms: 1,
+            }]),
+            Ok::OutboxPulled {
+                ids: vec!["t1".into()],
+            },
             Ok::ClipboardPushed {
                 sent_to: vec!["ab".into()],
                 skipped_echo: false,
@@ -630,10 +714,33 @@ mod tests {
                 peer: "p".into(),
                 message: None,
             },
+            Request::QueueOutbox {
+                peer: "p".into(),
+                paths: vec![],
+            },
+            Request::Outbox,
+            Request::RemoveOutbox { id: "o1".into() },
+            Request::PullOutbox { peer: "p".into() },
         ];
         for r in requests {
             let value = serde_json::to_value(&r).expect("serialise");
             assert_eq!(value["op"], r.op());
         }
+    }
+
+    #[test]
+    fn settings_from_an_older_daemon_default_images_on() {
+        let json = r#"{"receive_dir":"/tmp/in","device_name":"a","clipboard_sync":true,
+            "clipboard_watch_supported":true,"autostart":false,"notifications":true}"#;
+        let s: Settings = serde_json::from_str(json).expect("parse");
+        assert!(s.clipboard_images);
+    }
+
+    #[test]
+    fn unknown_events_are_an_error_the_client_can_skip() {
+        // A newer daemon's event this build does not know must fail to decode (the client
+        // then ignores it) rather than decode as something else.
+        let json = r#"{"source":"host","event":"something_new","peer":"ab"}"#;
+        assert!(serde_json::from_str::<Event>(json).is_err());
     }
 }

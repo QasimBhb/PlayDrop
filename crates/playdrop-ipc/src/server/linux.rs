@@ -25,7 +25,7 @@ use super::{ServeError, ServerOptions};
 use crate::linux::{caller_sandbox, own_uid, self_sandboxed};
 use crate::util::AbortOnDrop;
 use crate::{
-    ErrorCode, Event, IpcError, Request, RequestHandler, Response, DBUS_NAME, DBUS_PATH,
+    ErrorCode, Event, FilesOp, IpcError, Request, RequestHandler, Response, DBUS_NAME, DBUS_PATH,
     IPC_VERSION, MAX_MESSAGE_BYTES, MAX_SEND_ITEMS,
 };
 
@@ -172,11 +172,14 @@ impl Daemon {
                 "request did not parse",
             ));
         };
-        if matches!(request, Request::SendFiles { .. }) {
+        if matches!(
+            request,
+            Request::SendFiles { .. } | Request::QueueOutbox { .. }
+        ) {
             // Paths are never accepted over the bus (SR-26).
             return to_json(&Response::err(
                 ErrorCode::BadRequest,
-                "files are sent with SendFiles and file handles, not paths",
+                "files are sent with SendFiles or QueueOutboxFiles and file handles, not paths",
             ));
         }
         to_json(&self.dispatch(request).await)
@@ -190,37 +193,20 @@ impl Daemon {
         #[zbus(header)] header: Header<'_>,
         #[zbus(connection)] conn: &Connection,
     ) -> String {
-        if let Err(e) = self.authorize(conn, &header).await {
-            return to_json(&Response::Err(e));
-        }
-        if files.is_empty() {
-            return to_json(&Response::err(ErrorCode::BadRequest, "nothing to send"));
-        }
-        if files.len() > MAX_SEND_ITEMS {
-            return to_json(&Response::err(
-                ErrorCode::TooLarge,
-                format!("send at most {MAX_SEND_ITEMS} items at once, or their folder"),
-            ));
-        }
-        // Keep every descriptor open until the handler returns, so nothing is swapped
-        // between the check and the core opening the path.
-        let files: Vec<File> = files
-            .into_iter()
-            .map(|fd| File::from(std::os::fd::OwnedFd::from(fd)))
-            .collect();
-        let mut paths = Vec::with_capacity(files.len());
-        for file in &files {
-            match fd_path(file) {
-                Ok(path) => paths.push(path),
-                Err(reason) => {
-                    tracing::debug!("ipc send_files refused a handle");
-                    return to_json(&Response::err(ErrorCode::BadRequest, reason));
-                }
-            }
-        }
-        let response = self.dispatch(Request::SendFiles { peer, paths }).await;
-        drop(files);
-        to_json(&response)
+        self.files(FilesOp::Send, peer, files, conn, &header).await
+    }
+
+    /// Queue files or folders for a peer to pull, passed as file descriptors (SR-26,
+    /// protocol.md 7.8).
+    async fn queue_outbox_files(
+        &self,
+        peer: String,
+        files: Vec<OwnedFd>,
+        #[zbus(header)] header: Header<'_>,
+        #[zbus(connection)] conn: &Connection,
+    ) -> String {
+        self.files(FilesOp::QueueOutbox, peer, files, conn, &header)
+            .await
     }
 
     /// The contract version and the daemon's package version.
@@ -243,6 +229,49 @@ impl Daemon {
 }
 
 impl Daemon {
+    /// The shared body of `SendFiles` and `QueueOutboxFiles`: authorise, turn each
+    /// descriptor back into a checked path, and hand the request to the daemon.
+    async fn files(
+        &self,
+        op: FilesOp,
+        peer: String,
+        files: Vec<OwnedFd>,
+        conn: &Connection,
+        header: &Header<'_>,
+    ) -> String {
+        if let Err(e) = self.authorize(conn, header).await {
+            return to_json(&Response::Err(e));
+        }
+        if files.is_empty() {
+            return to_json(&Response::err(ErrorCode::BadRequest, "nothing to send"));
+        }
+        if files.len() > MAX_SEND_ITEMS {
+            return to_json(&Response::err(
+                ErrorCode::TooLarge,
+                format!("send at most {MAX_SEND_ITEMS} items at once, or their folder"),
+            ));
+        }
+        // Keep every descriptor open until the handler returns, so nothing is swapped
+        // between the check and the core opening the path.
+        let files: Vec<File> = files
+            .into_iter()
+            .map(|fd| File::from(std::os::fd::OwnedFd::from(fd)))
+            .collect();
+        let mut paths = Vec::with_capacity(files.len());
+        for file in &files {
+            match fd_path(file) {
+                Ok(path) => paths.push(path),
+                Err(reason) => {
+                    tracing::debug!(?op, "ipc file handle refused");
+                    return to_json(&Response::err(ErrorCode::BadRequest, reason));
+                }
+            }
+        }
+        let response = self.dispatch(op.request(peer, paths)).await;
+        drop(files);
+        to_json(&response)
+    }
+
     async fn dispatch(&self, request: Request) -> Response {
         let op = request.op();
         tracing::debug!(op, "ipc request");

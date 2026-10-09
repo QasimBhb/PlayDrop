@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
+use playdrop_core::host::{Base64Bytes, HostEvent, OutboxItem, Secret};
 use playdrop_ipc::client::{Client, ClientOptions, ConnectError};
 use playdrop_ipc::server::{ServeError, Server, ServerOptions};
 use playdrop_ipc::{
@@ -69,6 +70,7 @@ fn status() -> Status {
             receive_dir: "/tmp/in".into(),
             device_name: "alpha".into(),
             clipboard_sync: true,
+            clipboard_images: true,
             clipboard_watch_supported: true,
             autostart: false,
             notifications: true,
@@ -78,19 +80,38 @@ fn status() -> Status {
     }
 }
 
-/// Answers `Status`; echoes `SendFiles` paths one per line inside the error message.
+fn outbox_item() -> OutboxItem {
+    OutboxItem {
+        id: "o1".into(),
+        peer: "ab".repeat(32),
+        file_count: 3,
+        total_bytes: 4096,
+        note: Some("for later".into()),
+        created_at_ms: 1_760_000_000_000,
+    }
+}
+
+/// Answers `Status` and the outbox requests; echoes `SendFiles` and `QueueOutbox` paths one
+/// per line inside the error message, after the op name and the peer.
 fn handler() -> Arc<dyn RequestHandler> {
     Arc::new(|request: Request| async move {
         match request {
             Request::Status => Response::Ok(Ok::Status(status())),
-            Request::SendFiles { peer, paths } => {
-                let mut lines = vec![peer];
-                lines.extend(paths.iter().map(|p| p.display().to_string()));
-                Response::Err(IpcError::new(ErrorCode::NotFound, lines.join("\n")))
-            }
+            Request::Outbox => Response::Ok(Ok::Outbox(vec![outbox_item()])),
+            Request::RemoveOutbox { id } if id == "o1" => Response::Ok(Ok::Done),
+            Request::RemoveOutbox { .. } => Response::err(ErrorCode::NotFound, "no such item"),
+            Request::PullOutbox { peer } => Response::Ok(Ok::OutboxPulled { ids: vec![peer] }),
+            Request::SendFiles { peer, paths } => echo("send_files", peer, &paths),
+            Request::QueueOutbox { peer, paths } => echo("queue_outbox", peer, &paths),
             _ => Response::err(ErrorCode::InvalidState, "not in this test"),
         }
     })
+}
+
+fn echo(op: &str, peer: String, paths: &[PathBuf]) -> Response {
+    let mut lines = vec![op.to_owned(), peer];
+    lines.extend(paths.iter().map(|p| p.display().to_string()));
+    Response::Err(IpcError::new(ErrorCode::NotFound, lines.join("\n")))
 }
 
 fn client_options(bus: &Bus, verify_exe: bool) -> ClientOptions {
@@ -149,7 +170,9 @@ async fn dbus_round_trip() {
     assert_eq!(refused.code, ErrorCode::InvalidState);
 
     check_send_files(&client).await;
+    check_outbox(&client).await;
     check_raw_refusals(&bus).await;
+    check_host_events(&client, &events).await;
 
     // Events reach the client.
     let mut stream = client.events();
@@ -203,6 +226,7 @@ async fn check_send_files(client: &Client) {
         .await
         .expect_err("echo comes back as an error");
     let mut lines = echoed.message.lines();
+    assert_eq!(lines.next(), Some("send_files"));
     assert_eq!(lines.next(), Some("k3qd"));
     assert_eq!(lines.map(str::to_owned).collect::<Vec<_>>(), expected);
 
@@ -214,7 +238,7 @@ async fn check_send_files(client: &Client) {
         })
         .await
         .expect_err("echo");
-    assert_eq!(echoed.message.lines().nth(1), Some(expected[0].as_str()));
+    assert_eq!(echoed.message.lines().nth(2), Some(expected[0].as_str()));
 
     // A missing path fails on the client, before the bus.
     let missing = client
@@ -222,6 +246,100 @@ async fn check_send_files(client: &Client) {
         .await
         .expect_err("missing");
     assert_eq!(missing.code, ErrorCode::NotFound);
+}
+
+/// Outbox requests round trip; queued files travel as descriptors through
+/// `QueueOutboxFiles`, both from `queue_outbox` and from `request(QueueOutbox)`.
+async fn check_outbox(client: &Client) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("clip.mov");
+    std::fs::write(&file, b"mov").expect("write");
+    let expected = std::fs::canonicalize(&file)
+        .expect("canon")
+        .display()
+        .to_string();
+
+    let echoed = client
+        .queue_outbox("iphone", vec![file.clone()])
+        .await
+        .expect_err("echo");
+    let lines: Vec<&str> = echoed.message.lines().collect();
+    assert_eq!(lines, ["queue_outbox", "iphone", expected.as_str()]);
+    let echoed = client
+        .request(Request::QueueOutbox {
+            peer: "iphone".into(),
+            paths: vec![file],
+        })
+        .await
+        .expect_err("echo");
+    assert_eq!(echoed.message.lines().nth(2), Some(expected.as_str()));
+    let empty = client
+        .queue_outbox("iphone", Vec::new())
+        .await
+        .expect_err("empty");
+    assert_eq!(empty.code, ErrorCode::BadRequest);
+
+    let list = client.request(Request::Outbox).await.expect("outbox");
+    assert_eq!(list, Ok::Outbox(vec![outbox_item()]));
+    let removed = client
+        .request(Request::RemoveOutbox { id: "o1".into() })
+        .await
+        .expect("remove");
+    assert_eq!(removed, Ok::Done);
+    let missing = client
+        .request(Request::RemoveOutbox { id: "zz".into() })
+        .await
+        .expect_err("unknown item");
+    assert_eq!(missing.code, ErrorCode::NotFound);
+    let pulled = client
+        .request(Request::PullOutbox { peer: "mac".into() })
+        .await
+        .expect("pull");
+    assert_eq!(
+        pulled,
+        Ok::OutboxPulled {
+            ids: vec!["mac".into()]
+        }
+    );
+}
+
+/// Phase 3 host events reach a client intact: image clips (base64 on the wire), outbox
+/// notices, find and presence.
+async fn check_host_events(client: &Client, events: &broadcast::Sender<Event>) {
+    let mut stream = client.events();
+    let sent = [
+        Event::Host(HostEvent::ClipboardImage {
+            peer: "ab".repeat(32),
+            mime: "image/png".into(),
+            data: Secret(Base64Bytes(vec![0x89, b'P', b'N', b'G', 0, 255])),
+            sensitive: true,
+        }),
+        Event::Host(HostEvent::OutboxReady {
+            peer: "ab".repeat(32),
+            count: 2,
+            bytes: 734_003_200,
+            ids: vec!["o1".into(), "o2".into()],
+        }),
+        Event::Host(HostEvent::Find {
+            peer: "ab".repeat(32),
+            start: true,
+        }),
+        Event::Host(HostEvent::Presence {
+            peer: "ab".repeat(32),
+            state: "asleep".into(),
+        }),
+    ];
+    for event in &sent {
+        events.send(event.clone()).expect("send event");
+    }
+    for event in sent {
+        let got = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("event in time")
+            .expect("stream open")
+            .expect("not lagged");
+        assert_eq!(got, event);
+    }
 }
 
 /// A raw caller passing a non-file handle, a path-based send or garbage is refused.
@@ -232,17 +350,19 @@ async fn check_raw_refusals(bus: &Bus) {
         .await
         .expect("raw connection");
     let null = std::fs::File::open("/dev/null").expect("open null");
-    let reply = raw
-        .call_method(
-            Some(DBUS_NAME),
-            DBUS_PATH,
-            Some(DBUS_INTERFACE),
-            "SendFiles",
-            &("k3qd", vec![zbus::zvariant::Fd::from(&null)]),
-        )
-        .await
-        .expect("call");
-    assert_bad_request(&reply);
+    for method in ["SendFiles", "QueueOutboxFiles"] {
+        let reply = raw
+            .call_method(
+                Some(DBUS_NAME),
+                DBUS_PATH,
+                Some(DBUS_INTERFACE),
+                method,
+                &("k3qd", vec![zbus::zvariant::Fd::from(&null)]),
+            )
+            .await
+            .expect("call");
+        assert_bad_request(&reply);
+    }
 
     let file = tempfile::NamedTempFile::new().expect("tempfile");
     let path_send = serde_json::to_string(&Request::SendFiles {
@@ -250,7 +370,12 @@ async fn check_raw_refusals(bus: &Bus) {
         paths: vec![file.path().to_path_buf()],
     })
     .expect("json");
-    for body in [path_send.as_str(), "{not json"] {
+    let path_queue = serde_json::to_string(&Request::QueueOutbox {
+        peer: "k3qd".into(),
+        paths: vec![file.path().to_path_buf()],
+    })
+    .expect("json");
+    for body in [path_send.as_str(), path_queue.as_str(), "{not json"] {
         let reply = raw
             .call_method(
                 Some(DBUS_NAME),

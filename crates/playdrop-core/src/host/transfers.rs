@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use super::events::TransferDirection;
+use super::events::{DeliveredFile, TransferDirection};
 use crate::identity::DeviceId;
 
 /// Most finished snapshots kept.
@@ -78,9 +78,14 @@ pub struct TransferSnapshot {
     /// daemon only opens paths it reported (SR-23). Empty otherwise.
     #[serde(default)]
     pub saved: Vec<PathBuf>,
-    /// Receive side, once complete: the receive folder, for "Show in folder".
+    /// Receive side, once complete: the receive folder, for "Show in folder". `None` in
+    /// `Staged` mode.
     #[serde(default)]
     pub folder: Option<PathBuf>,
+    /// Receive side, once complete: where every file went, both modes, as in
+    /// `HostEvent::TransferComplete` (`docs/core-api.md` section 2).
+    #[serde(default)]
+    pub delivered: Vec<DeliveredFile>,
 }
 
 impl TransferSnapshot {
@@ -108,6 +113,7 @@ impl TransferSnapshot {
             note,
             saved: Vec::new(),
             folder: None,
+            delivered: Vec::new(),
         }
     }
 }
@@ -161,11 +167,12 @@ impl TransferBook {
         state: TransferStatus,
         note: Option<String>,
     ) {
-        self.finish_with_files(id, dir, state, note, Vec::new(), None);
+        self.finish_with_files(id, dir, state, note, Vec::new(), None, Vec::new());
     }
 
     /// [`finish`](Self::finish) that also records where a received transfer's files
     /// landed, so a late UI can still offer "Open" and "Show in folder".
+    #[allow(clippy::too_many_arguments, reason = "one snapshot's final fields")]
     pub(crate) fn finish_with_files(
         &mut self,
         id: &str,
@@ -174,12 +181,14 @@ impl TransferBook {
         note: Option<String>,
         saved: Vec<PathBuf>,
         folder: Option<PathBuf>,
+        delivered: Vec<DeliveredFile>,
     ) {
         let Some(mut s) = self.live.remove(&(id.to_owned(), dir)) else {
             return;
         };
         s.saved = saved;
         s.folder = folder;
+        s.delivered = delivered;
         s.state = state;
         s.bytes_per_sec = 0;
         if state == TransferStatus::Complete {
@@ -293,8 +302,13 @@ mod tests {
             None,
             vec![PathBuf::from("/r/a.txt"), PathBuf::from("/r/Dir/b.txt")],
             Some(PathBuf::from("/r")),
+            vec![DeliveredFile {
+                path: "a.txt".into(),
+                location: "/r/a.txt".into(),
+            }],
         );
         let l = b.list();
+        assert_eq!(l[0].delivered.len(), 1);
         assert_eq!(l[0].saved.len(), 2);
         assert_eq!(l[0].folder.as_deref(), Some(std::path::Path::new("/r")));
         // Older daemons sent no paths: the fields default to empty.

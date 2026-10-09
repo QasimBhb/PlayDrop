@@ -2,7 +2,6 @@
 //! verified offset, and the resume decision of protocol.md 7.6 (SR-21).
 
 use std::io::SeekFrom;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::io::AsyncSeekExt;
@@ -11,6 +10,7 @@ use super::bundle::{BundleLayout, BundleWriter, MemberOpener, MemberReader, Open
 use super::chunk::{chunk_count, prefix_hash, root_hash, ChunkEncoder, ChunkHash};
 use super::manifest::{Manifest, SourceInfo};
 use super::receiver::{FileState, TransferStateView};
+use super::source::SourceRef;
 use crate::{Error, Result};
 
 /// What the sender does with one file (or the bundle) after a drop (protocol.md 7.6).
@@ -102,21 +102,47 @@ impl TransferSender {
 
     /// Re-checks one source against its recorded size, mtime and file ID (SR-21).
     pub async fn check_source(&self, fid: u32) -> Result<SourceStatus> {
+        Ok(self.open_checked(fid).await?.0)
+    }
+
+    /// Compares a source with what was recorded at offer time and, when it is unchanged,
+    /// returns it opened at offset 0, so a `PUT` calls a stream opener once (`docs/core-api.md`
+    /// section 3). A path is checked without following symlinks before it is opened; a
+    /// stream is checked through `fstat` of the handle it returns.
+    async fn open_checked(&self, fid: u32) -> Result<(SourceStatus, Option<tokio::fs::File>)> {
         let src = self.source(fid)?;
-        let meta = match tokio::fs::symlink_metadata(&src.local_path).await {
-            Ok(m) if m.is_file() => m,
-            Ok(_) => return Ok(SourceStatus::Resized),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(SourceStatus::Resized),
-            Err(e) => return Err(e.into()),
-        };
-        let now = SourceInfo::from_metadata(src.local_path.clone(), &meta);
-        Ok(if now.size != src.size {
-            SourceStatus::Resized
-        } else if now.mtime_ms != src.mtime_ms || now.file_id != src.file_id {
-            SourceStatus::Modified
-        } else {
-            SourceStatus::Unchanged
-        })
+        match &src.source {
+            SourceRef::Path(path) => {
+                let meta = match tokio::fs::symlink_metadata(path).await {
+                    Ok(m) if m.is_file() => m,
+                    Ok(_) => return Ok((SourceStatus::Resized, None)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok((SourceStatus::Resized, None))
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let status = compare(src, &meta);
+                if status != SourceStatus::Unchanged {
+                    return Ok((status, None));
+                }
+                Ok((status, Some(tokio::fs::File::open(path).await?)))
+            }
+            SourceRef::Opener(_) => {
+                let file = match src.source.open().await {
+                    Ok(f) => f,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok((SourceStatus::Resized, None))
+                    }
+                    Err(e) => return Err(e.into()),
+                };
+                let meta = file.metadata().await?;
+                if !meta.is_file() {
+                    return Ok((SourceStatus::Resized, None));
+                }
+                let status = compare(src, &meta);
+                Ok((status, (status == SourceStatus::Unchanged).then_some(file)))
+            }
+        }
     }
 
     fn source(&self, fid: u32) -> Result<&SourceInfo> {
@@ -142,17 +168,32 @@ impl TransferSender {
             )));
         }
         let size = entry.size;
-        if self.check_source(fid).await? != SourceStatus::Unchanged {
+        let (status, file) = self.open_checked(fid).await?;
+        let Some(mut file) = file.filter(|_| status == SourceStatus::Unchanged) else {
             return Err(Error::BadRequest(format!(
                 "source of fid {fid} changed since the offer"
             )));
-        }
+        };
         let prior = self.prior(fid, from)?;
-        let mut file = tokio::fs::File::open(&self.source(fid)?.local_path).await?;
         if from > 0 {
             file.seek(SeekFrom::Start(from)).await?;
         }
         ChunkEncoder::new(file, from, size, self.chunk_size, prior)
+    }
+
+    /// The hashes recorded for file `fid` (empty when none were sent yet).
+    pub fn hashes(&self, fid: u32) -> &[ChunkHash] {
+        self.hashes.get(fid as usize).map_or(&[], Vec::as_slice)
+    }
+
+    /// The hashes recorded for the bundle stream.
+    pub fn bundle_hashes(&self) -> &[ChunkHash] {
+        &self.bundle_hashes
+    }
+
+    /// The sources recorded at offer time, by fid.
+    pub fn sources(&self) -> &[SourceInfo] {
+        &self.sources
     }
 
     fn prior(&mut self, fid: u32, from: u64) -> Result<Vec<ChunkHash>> {
@@ -336,7 +377,25 @@ fn decide(
     }
 }
 
-/// Opens bundle members from the recorded source paths.
+/// Size, mtime and file ID of a source now against what was recorded at offer time
+/// (SR-21). A recorded mtime of 0 (a stream with an unknown mtime) is not compared, and
+/// neither is a file ID the platform did not expose.
+fn compare(recorded: &SourceInfo, meta: &std::fs::Metadata) -> SourceStatus {
+    if meta.len() != recorded.size {
+        return SourceStatus::Resized;
+    }
+    let mtime_differs =
+        recorded.mtime_ms != 0 && super::manifest::mtime_ms(meta) != recorded.mtime_ms;
+    let id_now = super::manifest::file_id(meta);
+    let id_differs = recorded.file_id.is_some() && id_now.is_some() && id_now != recorded.file_id;
+    if mtime_differs || id_differs {
+        SourceStatus::Modified
+    } else {
+        SourceStatus::Unchanged
+    }
+}
+
+/// Opens bundle members from the recorded sources (paths or host openers).
 #[derive(Debug)]
 struct FsOpener {
     sources: Arc<Vec<SourceInfo>>,
@@ -344,13 +403,10 @@ struct FsOpener {
 
 impl MemberOpener for FsOpener {
     fn open(&self, fid: u32, offset: u64) -> OpenFuture {
-        let path: Option<PathBuf> = self.sources.get(fid as usize).map(|s| s.local_path.clone());
+        let source: Option<SourceRef> = self.sources.get(fid as usize).map(|s| s.source.clone());
         Box::pin(async move {
-            let path = path.ok_or_else(|| std::io::Error::other("unknown fid"))?;
-            let mut f = tokio::fs::File::open(path).await?;
-            if offset > 0 {
-                f.seek(SeekFrom::Start(offset)).await?;
-            }
+            let source = source.ok_or_else(|| std::io::Error::other("unknown fid"))?;
+            let f = source.open_at(offset).await?;
             Ok(Box::new(f) as MemberReader)
         })
     }
@@ -494,5 +550,114 @@ mod tests {
         assert!(s.bundle_root().is_some());
         let total = s.manifest().bundle.unwrap().size;
         assert_eq!(body.len() as u64, total + 32);
+    }
+
+    /// Opens a temp file, as a host's `content://` opener would.
+    #[derive(Debug)]
+    struct FileOpener(std::path::PathBuf);
+
+    impl crate::transfer::SourceOpener for FileOpener {
+        fn open(&self) -> std::io::Result<std::fs::File> {
+            std::fs::File::open(&self.0)
+        }
+    }
+
+    fn stream(path: &std::path::Path, name: &str, mtime_ms: i64) -> crate::transfer::StreamSource {
+        crate::transfer::StreamSource {
+            name: name.into(),
+            size: std::fs::metadata(path).unwrap().len(),
+            mtime_ms,
+            mime: Some("application/octet-stream".into()),
+            opener: Arc::new(FileOpener(path.to_path_buf())),
+        }
+    }
+
+    /// SR-21 for a stream source: size always, mtime only when known, file ID when the
+    /// platform has one; the encoder reads through the opener from the resume offset.
+    #[tokio::test]
+    async fn stream_source_resume_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shared.bin");
+        let data = crate::transfer::chunk::tests::TestRng(9).bytes(4 * CS as usize + 7);
+        std::fs::write(&path, &data).unwrap();
+        let mut b = ManifestBuilder::new(CS);
+        b.add_stream(stream(&path, "photo.jpg", 1_700_000_000_000))
+            .await
+            .unwrap();
+        let (m, sources) = b.build().unwrap();
+        assert_eq!(m.files[0].path, ["photo.jpg"]);
+        assert_eq!(m.files[0].mtime, 1_700_000_000_000);
+        assert_eq!(m.files[0].mime.as_deref(), Some("application/octet-stream"));
+        assert!(sources[0].source.is_stream());
+        let mut s = TransferSender::new(m, sources, CS).unwrap();
+        let mut enc = s.file_encoder(0, 0).await.unwrap();
+        let mut all = Vec::new();
+        enc.read_to_end(&mut all).await.unwrap();
+        s.record_hashes(0, enc.into_hashes());
+        let full = s.root(0).unwrap();
+        let off = 2 * u64::from(CS);
+        let mut tail = s.file_encoder(0, off).await.unwrap();
+        let mut rest = Vec::new();
+        tail.read_to_end(&mut rest).await.unwrap();
+        assert_eq!(
+            tail.root(data.len() as u64),
+            Some(full),
+            "resume reproduces the root"
+        );
+        assert_eq!(s.check_source(0).await.unwrap(), SourceStatus::Unchanged);
+
+        // A known mtime that moves: restart. A size change: cancel.
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(f);
+        assert_eq!(s.check_source(0).await.unwrap(), SourceStatus::Modified);
+        assert!(s.file_encoder(0, 0).await.is_err());
+        std::fs::write(&path, b"short").unwrap();
+        assert_eq!(s.check_source(0).await.unwrap(), SourceStatus::Resized);
+
+        // Unknown mtime (0): touching the file does not count as a change.
+        std::fs::write(&path, &data).unwrap();
+        let mut b = ManifestBuilder::new(CS);
+        b.add_stream(stream(&path, "doc.pdf", 0)).await.unwrap();
+        let (m, sources) = b.build().unwrap();
+        assert_eq!(sources[0].mtime_ms, 0);
+        let s = TransferSender::new(m, sources, CS).unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(9))
+            .unwrap();
+        drop(f);
+        assert_eq!(s.check_source(0).await.unwrap(), SourceStatus::Unchanged);
+    }
+
+    /// A stream's name is one SR-17 component; a declared size that differs from the opened
+    /// file is refused at offer time.
+    #[tokio::test]
+    async fn stream_names_follow_sr17() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("x");
+        std::fs::write(&path, b"abc").unwrap();
+        for bad in [
+            "",
+            "..",
+            "a/b",
+            "a\\b",
+            "CON",
+            "x.txt.",
+            "evil\u{202E}gpj.exe",
+            "a:b",
+        ] {
+            let mut b = ManifestBuilder::new(CS);
+            let r = b.add_stream(stream(&path, bad, 0)).await;
+            assert!(matches!(r, Err(Error::PathInvalid(_))), "{bad:?} accepted");
+        }
+        let mut b = ManifestBuilder::new(CS);
+        let mut src = stream(&path, "ok.txt", 0);
+        src.size = 4;
+        assert!(matches!(b.add_stream(src).await, Err(Error::BadRequest(_))));
+        let mut b = ManifestBuilder::new(CS);
+        b.add_stream(stream(&path, "ok.txt", 0)).await.unwrap();
+        let (m, _) = b.build().unwrap();
+        assert!(m.files[0].in_bundle, "small streams travel in the bundle");
     }
 }

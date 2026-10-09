@@ -1,4 +1,4 @@
-// Settings: receive folder, device name, clipboard sync, autostart, notifications, and
+// Settings: receive folder, device name, clipboard sync and images, autostart, notifications, and
 // this computer's identity.
 
 import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
@@ -78,6 +78,18 @@ export component SettingsPage inherits Rectangle {
 
             if !SettingsState.clipboard-watch-supported: Muted {
                 text: "This desktop does not let apps watch the clipboard (GNOME). Use Send clipboard on a device instead.";
+            }
+
+            Toggle {
+                text: "Include images";
+                checked: SettingsState.clipboard-images;
+                toggled(on) => {
+                    SettingsState.set-clipboard-images(on);
+                }
+            }
+
+            Muted {
+                text: "Text up to 1 MiB and images up to 16 MiB are synced. Larger clips are not; send them as files.";
             }
 
             Toggle {

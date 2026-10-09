@@ -30,6 +30,7 @@ pub(super) struct Server {
 }
 
 impl Server {
+    #[allow(clippy::unused_async, reason = "same signature as the D-Bus server")]
     pub(super) async fn shutdown(self) {
         // Aborting the accept task drops the listening instance and every connection.
     }
@@ -65,6 +66,7 @@ fn create_instance(
     }
 }
 
+#[allow(clippy::unused_async, reason = "same signature as the D-Bus server")]
 pub(super) async fn start(
     handler: Arc<dyn RequestHandler>,
     events: broadcast::Sender<Event>,

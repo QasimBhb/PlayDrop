@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::events::{HostEvent, Secret};
 use super::registry::Placement;
-use super::{lock, pairing, receive, send, Inner};
+use super::{blobs, lock, outbox, pairing, receive, send, status, Inner};
 use crate::identity::DeviceId;
 use crate::net::connection::short;
 use crate::net::server::SESSION_PATH;
@@ -25,7 +25,7 @@ use crate::net::{
 };
 use crate::pin_store::{AnnounceKey as PinAnnounceKey, Grants};
 use crate::session::types::{
-    AnnounceKey, CapabilitiesFrame, Capability, Caps, Frame, GrantKind, Hello, Trust,
+    AnnounceKey, CapabilitiesFrame, Capability, Caps, Frame, GrantKind, Hello, Media, Trust,
 };
 use crate::session::{
     may_send_frame, validate_hello, ErrorCode, Inbound, InboundDecoder, OutboundEncoder,
@@ -33,28 +33,25 @@ use crate::session::{
 };
 use crate::{Error, Result};
 
-/// What this build accepts (`caps.in`, protocol.md section 4). Media, input, outbox and
-/// blobs are Phase 3 to 5 and are not advertised.
+/// What this build accepts (`caps.in`, protocol.md section 4; `docs/core-api.md`
+/// section 6). Remote input (`input.*`) is Phase 5 and is not advertised.
 pub(crate) const LOCAL_IN: &[Capability] = &[
     Capability::Ping,
     Capability::Find,
     Capability::Clipboard,
+    Capability::ClipboardImage,
     Capability::Battery,
+    Capability::MediaState,
+    Capability::MediaControl,
     Capability::Presence,
     Capability::Transfer,
     Capability::TransferBundle,
+    Capability::Outbox,
+    Capability::Blobs,
 ];
 
-/// What this build may send (`caps.out`).
-pub(crate) const LOCAL_OUT: &[Capability] = &[
-    Capability::Ping,
-    Capability::Find,
-    Capability::Clipboard,
-    Capability::Battery,
-    Capability::Presence,
-    Capability::Transfer,
-    Capability::TransferBundle,
-];
+/// What this build may send (`caps.out`); the same list as [`LOCAL_IN`].
+pub(crate) const LOCAL_OUT: &[Capability] = LOCAL_IN;
 
 /// Time allowed for a closing session to flush its last frames.
 const FLUSH_GRACE: Duration = Duration::from_millis(200);
@@ -154,6 +151,11 @@ impl Session {
                 "frame not sent: peer lacks the capability"
             );
         }
+    }
+
+    /// True if the peer accepts `cap` (its `caps.in`) and this build may send it.
+    pub(crate) fn peer_accepts(&self, cap: &Capability) -> bool {
+        crate::session::may_send(LOCAL_OUT, &lock(&self.state).peer_in, cap)
     }
 
     /// Sends a frame with no capability check (hello, pairing, error, pong, `re` replies).
@@ -408,6 +410,7 @@ fn has_grant(grants: Grants, g: GrantKind) -> bool {
     }
 }
 
+#[allow(clippy::too_many_lines, reason = "one dispatch over every frame type")]
 async fn handle_frame(
     inner: &Arc<Inner>,
     sess: &Arc<Session>,
@@ -460,6 +463,11 @@ async fn handle_frame(
             peer: hex,
             start: f.action == crate::session::types::FindAction::Start,
         }),
+        Frame::Clipboard(c) if c.blob.is_some() => {
+            // Long text and images arrive as a blob (5.15): fetched and verified first; the
+            // echo hash is recorded only once the bytes match it.
+            blobs::fetch_clipboard(inner, peer, c);
+        }
         Frame::Clipboard(c) => {
             // The hash feeds echo prevention, so it must describe the text it came with:
             // a mismatch is a protocol error and the frame is dropped (protocol.md 5.7).
@@ -487,8 +495,24 @@ async fn handle_frame(
             peer: hex,
             state: p.state.to_string(),
         }),
-        // TODO(Phase 3/5): media control, remote input and the outbox act on these.
-        Frame::Media(_) | Frame::Input(_) | Frame::OutboxReady(_) => {
+        Frame::Media(Media::State(m)) => inner.emit(HostEvent::MediaState {
+            peer: hex,
+            state: m.into(),
+        }),
+        Frame::Media(Media::Command(c)) => inner.emit(HostEvent::MediaCommand {
+            peer: hex,
+            player: c.player,
+            action: c.action,
+            value: c.value,
+        }),
+        Frame::OutboxReady(o) => inner.emit(HostEvent::OutboxReady {
+            peer: hex,
+            count: o.count,
+            bytes: o.bytes,
+            ids: o.ids,
+        }),
+        // TODO(Phase 5, protocol.md 5.12, SR-25): remote input; reported, never applied.
+        Frame::Input(_) => {
             inner.emit(HostEvent::Unsupported {
                 peer: hex,
                 frame_type: t,
@@ -540,9 +564,19 @@ fn on_hello(
         st.hello = Some(v.clone());
     }
     sess.hello_tx.send_replace(true);
-    // TODO(protocol.md 5.4, SR-8): mark the pin "removed by peer" in the pin store; for now
-    // the UI gets the event and the pin is kept until the user acts.
+    // protocol.md 5.4: the pin is marked "removed by peer" and kept until the user pairs
+    // again (a fresh pin) or unpairs (no pin).
     if v.trust == TrustCheck::RemovedByPeer {
+        let i2 = Arc::clone(inner);
+        inner.spawn(async move {
+            let stored = i2
+                .pins
+                .update(move |s| s.set_removed_by_peer(&peer, true))
+                .await;
+            if let Err(e) = stored {
+                tracing::debug!(error = %e, "removed-by-peer not stored");
+            }
+        });
         inner.emit(HostEvent::RemovedByPeer {
             peer: peer.to_hex(),
             short_id: peer.short_id(),
@@ -585,6 +619,9 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
         peer: Duration::from_secs(u64::from(v.keep_alive.max(1))),
     });
     sess.send_raw(announce_key_frame(inner), None);
+    // Session start: remembered battery and presence (5.8, 5.10), waiting outbox (5.11).
+    status::on_activate(inner, sess);
+    outbox::notify(inner, peer);
 }
 
 async fn store_announce_key(inner: &Arc<Inner>, peer: DeviceId, k: &AnnounceKey) {
@@ -627,6 +664,8 @@ pub(crate) async fn unpair(inner: &Arc<Inner>, peer: DeviceId, notify: bool) -> 
     });
     receive::drop_peer(inner, &peer).await;
     send::drop_peer(inner, &peer);
+    outbox::drop_peer(inner, &peer).await;
+    lock(&inner.status).forget(&peer);
     for s in inner.registry.sessions() {
         if s.peer() != peer {
             s.send_raw(announce_key_frame(inner), None);

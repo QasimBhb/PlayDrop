@@ -37,6 +37,10 @@ fn statvfs_space(path: &Path) -> io::Result<SpaceInfo> {
 }
 
 #[cfg(not(unix))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "same signature as the Unix version"
+)]
 fn statvfs_space(_path: &Path) -> io::Result<SpaceInfo> {
     // TODO(SR-20): GetDiskFreeSpaceExW on Windows (Phase 2). Until then report a generous
     // fixed volume so offers are not refused; writes still fail cleanly on a full disk.

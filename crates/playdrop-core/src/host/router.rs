@@ -1,4 +1,4 @@
-//! Request routing for the host's server (protocol.md 7.1). The server has already applied
+//! Request routing for the host's server (protocol.md 5.15, 7.1, 7.8). The server has already applied
 //! the SR-13 gate: unpaired connections reach only `POST /v1/session`.
 
 use std::sync::Arc;
@@ -6,15 +6,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use h2::server::SendResponse;
 use h2::RecvStream;
-use http::{Method, Request, StatusCode};
+use http::{Method, Request};
 
 use super::receive::{self, Target};
-use super::{session, Inner};
+use super::{blobs, outbox, session, Inner};
 use crate::net::connection::DUPLICATE_PING_DEADLINE;
 use crate::net::server::{HandlerFuture, SESSION_PATH};
-use crate::net::{
-    respond_error, respond_json, CloseReason, Connection, Direction, HttpError, Router,
-};
+use crate::net::{respond_error, CloseReason, Connection, Direction, HttpError, Router};
 use crate::session::ErrorCode;
 
 /// The host's [`Router`].
@@ -90,17 +88,29 @@ async fn route(
             let id = (*id).to_owned();
             receive::cancel(inner, conn, req, respond, id).await;
         }
-        // TODO(Phase 3/4): the outbox (protocol.md 7.8). Nothing is ever queued yet, so the
-        // list is empty and every item is unknown.
-        (&Method::GET, ["v1", "outbox"]) => {
-            let _ = respond_json(
-                &mut respond,
-                StatusCode::OK,
-                &serde_json::json!({ "items": [] }),
-            )
-            .await;
+        (&Method::GET, ["v1", "blobs", id]) => {
+            blobs::serve(&inner, &conn, &mut respond, id).await;
         }
-        // TODO(Phase 2/3): blobs (protocol.md 5.15) for long clipboard text and images.
+        (&Method::GET, ["v1", "outbox"]) => {
+            outbox::serve_list(&inner, &conn, &mut respond).await;
+        }
+        (&Method::GET, ["v1", "outbox", id]) => {
+            outbox::serve_manifest(&inner, &conn, &mut respond, id).await;
+        }
+        (&Method::GET, ["v1", "outbox", id, "files", fid]) => match fid.parse::<u32>() {
+            Ok(fid) => {
+                let id = (*id).to_owned();
+                outbox::serve_stream(inner, conn, req, respond, id, Target::File(fid)).await;
+            }
+            Err(_) => not_found(&mut respond).await,
+        },
+        (&Method::GET, ["v1", "outbox", id, "bundle"]) => {
+            let id = (*id).to_owned();
+            outbox::serve_stream(inner, conn, req, respond, id, Target::Bundle).await;
+        }
+        (&Method::DELETE, ["v1", "outbox", id]) => {
+            outbox::serve_delete(&inner, &conn, &mut respond, id).await;
+        }
         _ => not_found(&mut respond).await,
     }
 }

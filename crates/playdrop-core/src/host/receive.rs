@@ -281,6 +281,59 @@ enum OfferReply {
     Known(Box<TransferStateView>),
 }
 
+/// Registers an outbox item pulled from `peer` exactly as an offer from it (protocol.md
+/// 7.8): the `files` grant decides between accepting now and asking the user.
+pub(crate) async fn register_pulled(
+    inner: &Arc<Inner>,
+    peer: DeviceId,
+    manifest: &[u8],
+) -> std::result::Result<(), HttpError> {
+    offer_inner(inner, peer, manifest).await.map(drop)
+}
+
+/// The receiver of an incoming transfer: `Ok` once accepted, `Err(true)` while it waits
+/// for the user, `Err(false)` once declined, expired or cancelled. `None` if unknown.
+pub(crate) fn receiver_state(
+    inner: &Inner,
+    id: &str,
+) -> Option<std::result::Result<TransferReceiver, bool>> {
+    lock(&inner.incoming).get(id).map(|e| match &e.state {
+        OfferState::Accepted(rx) => Ok(rx.clone()),
+        OfferState::Pending { .. } | OfferState::Accepting => Err(true),
+        _ => Err(false),
+    })
+}
+
+/// Fails an incoming transfer from inside (an outbox pull that cannot go on): deletes its
+/// `.part` files and reports it once.
+pub(crate) async fn fail_local(inner: &Arc<Inner>, id: &str, why: String) {
+    let (owner, rx) = {
+        let mut map = lock(&inner.incoming);
+        let Some(e) = map.get_mut(id) else { return };
+        if e.reported {
+            return;
+        }
+        e.reported = true;
+        let rx = if let OfferState::Accepted(rx) = &e.state {
+            Some(rx.clone())
+        } else {
+            e.state = OfferState::Cancelled;
+            None
+        };
+        (e.owner, rx)
+    };
+    if let Some(rx) = rx {
+        let _ = rx.cancel().await;
+    }
+    remove_owner(inner, id);
+    inner.transfer_ended(
+        id,
+        &owner,
+        TransferDirection::Receive,
+        TransferEnd::Failed(why),
+    );
+}
+
 async fn offer_inner(
     inner: &Arc<Inner>,
     peer: DeviceId,
@@ -316,7 +369,7 @@ async fn offer_inner(
         }
         let space = inner
             .free_space
-            .space(&inner.receive_dir)
+            .space(inner.receive_root())
             .map_err(|e| HttpError::from(Error::Io(e)))?;
         if !space.fits(manifest.total_bytes) {
             return Err(HttpError::from_code(ErrorCode::NoSpace, ""));
@@ -406,11 +459,15 @@ async fn accept_now(
     owner: DeviceId,
     manifest: &Manifest,
 ) -> Result<TransferReceiver> {
+    let opts = AcceptOptions {
+        sink: inner.sink_binding(&owner),
+        ..AcceptOptions::default()
+    };
     let rx = TransferReceiver::accept(
-        &inner.receive_dir,
+        inner.receive_root(),
         manifest.clone(),
         Arc::clone(&inner.free_space),
-        AcceptOptions::default(),
+        opts,
     )
     .await?;
     write_owner(inner, id, owner).await?;
@@ -597,8 +654,8 @@ fn check_put_headers(
     Ok((token, start, end))
 }
 
-/// After every `PUT`: report integrity failures and completion once.
-fn after_put(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver, target: Target) {
+/// After every `PUT` (or outbox pull): report integrity failures and completion once.
+pub(crate) fn after_put(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver, target: Target) {
     let st = rx.state();
     let failed_stream = match target {
         Target::File(fid) => st
@@ -613,7 +670,8 @@ fn after_put(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver, target: Target
     };
     let owner = lock(&inner.incoming).get(id).map(|e| e.owner);
     let Some(owner) = owner else { return };
-    if failed_stream {
+    // A sink refusal is not an integrity failure; the final report carries its message.
+    if failed_stream && rx.failure().is_none() {
         inner.emit(HostEvent::TransferFailed {
             id: id.to_owned(),
             peer: owner.to_hex(),
@@ -664,11 +722,15 @@ fn report_if_done(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver) {
                 roots,
                 bundle_root: st.bundle.and_then(|b| b.root),
                 saved: rx.saved_paths(),
-                folder: Some(rx.receive_root().to_path_buf()),
+                folder: (!rx.is_staged()).then(|| rx.receive_root().to_path_buf()),
+                delivered: rx.delivered(),
             }
         }
         TransferState::Cancelled => TransferEnd::Cancelled("transfer cancelled".into()),
-        _ => TransferEnd::Failed(format!("transfer {state:?}").to_lowercase()),
+        _ => TransferEnd::Failed(
+            rx.failure()
+                .unwrap_or_else(|| format!("transfer {state:?}").to_lowercase()),
+        ),
     };
     inner.transfer_ended(id, &owner, TransferDirection::Receive, end);
 }
@@ -905,11 +967,12 @@ pub(crate) async fn load_persisted(inner: &Arc<Inner>) {
         }
     }
     for (id, owner) in found {
-        let loaded = TransferReceiver::load(
-            &inner.receive_dir,
+        let loaded = TransferReceiver::load_with(
+            inner.receive_root(),
             &id,
             Arc::clone(&inner.free_space),
             SyncPolicy::default(),
+            inner.sink_binding(&owner),
         )
         .await;
         match loaded {
@@ -1032,7 +1095,7 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
         }
         if last_cleanup.is_none_or(|t| now.duration_since(t) >= CLEANUP_EVERY) {
             last_cleanup = Some(now);
-            match cleanup_idle(&inner.receive_dir, IDLE_TIMEOUT).await {
+            match cleanup_idle(inner.receive_root(), IDLE_TIMEOUT).await {
                 Ok(ids) => {
                     let gone: Vec<(String, Incoming)> = {
                         let mut map: std::sync::MutexGuard<'_, HashMap<String, Incoming>> =

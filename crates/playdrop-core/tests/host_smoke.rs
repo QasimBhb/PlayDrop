@@ -372,7 +372,7 @@ async fn offer_names_and_cancel_by_id() {
 
 /// Gap 5: one clipboard change goes to every online peer with `clipboardOut`, the echo
 /// rule applies once, a push that reached nobody does not suppress the next one, and text
-/// over 32 KiB is refused (protocol.md 5.7).
+/// over 1 MiB is refused (protocol.md 5.7, SR-24).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[allow(clippy::many_single_char_names, reason = "a, b are the hosts")]
 async fn clipboard_push_to_all_with_echo_rule() {
@@ -422,7 +422,8 @@ async fn clipboard_push_to_all_with_echo_rule() {
     assert!(b.host.push_clipboard("hello", false).unwrap().skipped_echo);
     assert!(!b.host.send_clipboard(&a_id, "hello", false).unwrap());
 
-    let big = "x".repeat(32 * 1024 + 1);
+    // Over 32 KiB goes as a blob now; over 1 MiB is not synced (SR-24).
+    let big = "x".repeat(1024 * 1024 + 1);
     assert!(matches!(
         a.host.push_clipboard(&big, false),
         Err(Error::TooLarge(_))

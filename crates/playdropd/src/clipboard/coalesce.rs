@@ -1,8 +1,8 @@
 //! Pure coalescing and dedup for watcher reports. Time is passed in, so tests need no clock.
 //!
 //! Rules: report at most one clip per `min_gap`, the newest clip of a burst wins, and never
-//! report a text whose hash equals the last one reported. The first clip after a quiet period
-//! goes out at once, so a single copy is not delayed.
+//! report a clip (text or image) whose hash equals the last one reported. The first clip after
+//! a quiet period goes out at once, so a single copy is not delayed.
 
 use std::time::{Duration, Instant};
 
@@ -63,19 +63,13 @@ impl Coalescer {
 
 #[cfg(test)]
 mod tests {
-    use super::super::text_hash;
+    use super::super::{text_hash, ClipContent};
     use super::*;
 
     const GAP: Duration = Duration::from_millis(100);
 
     fn clip(text: &str) -> (LocalClip, blake3::Hash) {
-        (
-            LocalClip {
-                text: text.to_string(),
-                sensitive: false,
-            },
-            text_hash(text),
-        )
+        (LocalClip::text(text, false), text_hash(text))
     }
 
     fn push(c: &mut Coalescer, text: &str) {
@@ -85,7 +79,10 @@ mod tests {
 
     fn ready_text(p: Poll) -> String {
         match p {
-            Poll::Ready(c) => c.text,
+            Poll::Ready(LocalClip {
+                content: ClipContent::Text(t),
+                ..
+            }) => t,
             other => panic!("expected Ready, got {other:?}"),
         }
     }

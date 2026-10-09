@@ -17,9 +17,11 @@
 //! - `probe`: the port self-check behind `Request::Diagnose` (SR-31 wording).
 //! - `open`: "Open" and "Show in folder" with the SR-23 executable rule.
 //! - `network`: OS network change notifications (`NetworkManager`, `systemd-networkd`).
-//! - `clipboard`: watcher and applier per platform (SR-24).
+//! - `clipboard`: watcher and applier per platform, text and PNG images (SR-24).
+//! - `battery`: this computer's battery for the `battery` frame (protocol.md 5.8).
 
 mod autostart;
+mod battery;
 mod cli;
 mod clipboard;
 mod daemon;

@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Strings owned by the host layer (service, notifications, share target). The UI agent's
+     strings live in strings_ui.xml. -->
+<resources>
+    <string name="app_name">PlayDrop</string>
+
+    <!-- Notification channels -->
+    <string name="channel_service">Running in the background</string>
+    <string name="channel_service_desc">Keeps PlayDrop reachable by your devices. Low priority and silent.</string>
+    <string name="channel_transfers">Transfers</string>
+    <string name="channel_transfers_desc">Files received, incoming offers and failed transfers.</string>
+    <string name="channel_pairing">Pairing</string>
+    <string name="channel_pairing_desc">A new device was paired with this phone.</string>
+    <string name="channel_find">Find my phone</string>
+    <string name="channel_find_desc">Rings at full volume when a paired device looks for this phone.</string>
+
+    <!-- Persistent service notification -->
+    <string name="service_title">PlayDrop</string>
+    <string name="service_starting">Starting</string>
+    <plurals name="service_online">
+        <item quantity="one">%d device online</item>
+        <item quantity="other">%d devices online</item>
+    </plurals>
+    <string name="service_none_online">No device online</string>
+    <string name="action_send_clipboard">Send clipboard</string>
+    <string name="action_send_to">Send to %1$s</string>
+    <string name="action_send_files">Send files</string>
+    <string name="service_failed_title">PlayDrop could not start</string>
+    <string name="service_port_held">Port %1$d is used by another app. Change the port in PlayDrop settings.</string>
+
+    <!-- Pairing, pings, clipboard -->
+    <string name="paired_title">New device paired</string>
+    <string name="paired_text">New device paired: %1$s (%2$s)</string>
+    <string name="ping_title">Ping from %1$s</string>
+    <string name="ping_no_message">Ping</string>
+    <string name="clipboard_from">Clipboard from %1$s</string>
+    <string name="clipboard_sensitive_text">Marked sensitive; hidden from previews</string>
+    <string name="clipboard_apply_failed">Could not apply the clipboard from %1$s: %2$s</string>
+
+    <!-- Transfers -->
+    <string name="offer_title">%1$s wants to send files</string>
+    <plurals name="offer_text">
+        <item quantity="one">%1$d file, %2$s</item>
+        <item quantity="other">%1$d files, %2$s</item>
+    </plurals>
+    <string name="action_accept">Accept</string>
+    <string name="action_decline">Decline</string>
+    <string name="received_one">Received %1$s</string>
+    <plurals name="received_many">
+        <item quantity="one">%d file received</item>
+        <item quantity="other">%d files received</item>
+    </plurals>
+    <string name="received_from">From %1$s, saved in Download/PlayDrop</string>
+    <string name="transfer_failed_send">Sending to %1$s failed</string>
+    <string name="transfer_failed_receive">Receiving from %1$s failed</string>
+    <string name="offer_answer_failed">Could not answer the offer: %1$s</string>
+
+    <!-- Find my phone -->
+    <string name="find_title">%1$s is looking for this phone</string>
+    <string name="find_text">Tap Stop to silence</string>
+    <string name="action_stop">Stop</string>
+
+    <!-- Toasts from the share target and notification actions -->
+    <plurals name="toast_sent_to">
+        <item quantity="one">Sent to %d device</item>
+        <item quantity="other">Sent to %d devices</item>
+    </plurals>
+    <string name="toast_nothing_to_send">Nothing to send</string>
+    <string name="toast_no_device_online">No device online</string>
+    <string name="toast_no_clipboard_grant">No device accepts this phone\'s clipboard. Turn it on in the device settings.</string>
+    <string name="toast_clipboard_unchanged">Already sent</string>
+    <string name="toast_not_running">PlayDrop did not start in time. Open PlayDrop and try again.</string>
+    <string name="toast_copied_to">Copied to %1$s</string>
+    <string name="toast_peer_offline">%1$s is offline</string>
+    <plurals name="toast_sending_items">
+        <item quantity="one">Sending %1$d item to %2$s</item>
+        <item quantity="other">Sending %1$d items to %2$s</item>
+    </plurals>
+    <string name="toast_send_failed">Could not send: %1$s</string>
+    <string name="toast_cancelled">Cancelled</string>
+    <string name="toast_no_paired_devices">No paired devices. Open PlayDrop to add one.</string>
+
+    <!-- Sensitive clipboard confirmation (SR-24) -->
+    <string name="sensitive_title">Send a sensitive clip?</string>
+    <string name="sensitive_text">The app that copied this marked it as sensitive, for example a password. It will be sent marked sensitive.</string>
+    <string name="sensitive_send">Send</string>
+    <string name="cancel">Cancel</string>
+
+    <!-- Share card (SR-29) -->
+    <plurals name="share_sending">
+        <item quantity="one">Sending %1$d item to %2$s</item>
+        <item quantity="other">Sending %1$d items to %2$s</item>
+    </plurals>
+    <string name="share_sending_text">Sending text to %1$s</string>
+    <string name="share_pick_device">Send to which device?</string>
+    <string name="share_pick_hint">Your choice becomes the default for one-tap sends.</string>
+    <string name="share_offline">offline</string>
+    <string name="share_preparing">Preparing</string>
+</resources>

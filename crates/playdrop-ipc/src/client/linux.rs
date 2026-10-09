@@ -18,7 +18,7 @@ use crate::linux::{is_daemon_exe, own_uid, process_exe, self_sandboxed, DAEMON_E
 use crate::pipe::events_stream;
 use crate::util::{AbortOnDrop, EVENT_CAPACITY};
 use crate::{
-    ErrorCode, IpcError, Ok, Request, Response, DBUS_NAME, IPC_VERSION, MAX_MESSAGE_BYTES,
+    ErrorCode, FilesOp, IpcError, Ok, Request, Response, DBUS_NAME, IPC_VERSION, MAX_MESSAGE_BYTES,
 };
 
 // The proxy macro generates a signal type named `Event`, so the contract's `Event` is
@@ -33,6 +33,8 @@ trait Daemon1 {
     fn request(&self, request: &str) -> zbus::Result<String>;
 
     fn send_files(&self, peer: &str, files: &[Fd<'_>]) -> zbus::Result<String>;
+
+    fn queue_outbox_files(&self, peer: &str, files: &[Fd<'_>]) -> zbus::Result<String>;
 
     fn version(&self) -> zbus::Result<(u32, String)>;
 
@@ -139,7 +141,12 @@ impl Client {
         parse_response(&answer)
     }
 
-    pub(super) async fn send_files(&self, peer: &str, paths: &[PathBuf]) -> Result<Ok, IpcError> {
+    pub(super) async fn files(
+        &self,
+        op: FilesOp,
+        peer: &str,
+        paths: &[PathBuf],
+    ) -> Result<Ok, IpcError> {
         let paths = paths.to_vec();
         let fds = tokio::task::spawn_blocking(move || {
             paths
@@ -150,11 +157,11 @@ impl Client {
         .await
         .map_err(|_| IpcError::new(ErrorCode::Internal, "opening the files failed"))??;
         let handles: Vec<Fd<'_>> = fds.iter().map(Fd::from).collect();
-        let answer = self
-            .proxy
-            .send_files(peer, &handles)
-            .await
-            .map_err(|e| call_failed(&e))?;
+        let answer = match op {
+            FilesOp::Send => self.proxy.send_files(peer, &handles).await,
+            FilesOp::QueueOutbox => self.proxy.queue_outbox_files(peer, &handles).await,
+        }
+        .map_err(|e| call_failed(&e))?;
         parse_response(&answer)
     }
 

@@ -180,6 +180,10 @@ mod platform {
     /// Where the window procedure publishes. Set once before the window exists.
     static TARGET: OnceLock<(Arc<LockFlag>, watch::Sender<bool>)> = OnceLock::new();
 
+    #[allow(
+        clippy::unused_async,
+        reason = "same signature as the logind watcher on Linux"
+    )]
     pub(super) async fn start(flag: Arc<LockFlag>, tx: watch::Sender<bool>) -> anyhow::Result<()> {
         if TARGET.set((flag, tx)).is_err() {
             anyhow::bail!("lock tracking already started");
@@ -220,7 +224,7 @@ mod platform {
         };
         // SAFETY: `wc` is fully initialised and outlives the call; the class name is a
         // static wide string. A null hInstance registers the class for this process image.
-        if unsafe { RegisterClassW(&wc) } == 0 {
+        if unsafe { RegisterClassW(&raw const wc) } == 0 {
             tracing::warn!("lock watcher window class not registered; desktop counts as unlocked");
             return;
         }
@@ -255,11 +259,12 @@ mod platform {
         }
         let mut msg = MSG::default();
         // SAFETY: standard message pump on the thread that owns the window; `msg` is a
-        // valid, writable MSG for every call.
+        // valid, writable MSG for every call. GetMessageW returns 0 on WM_QUIT and -1 on
+        // error; both end the loop.
         unsafe {
-            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&msg);
-                DispatchMessageW(&msg);
+            while GetMessageW(&raw mut msg, None, 0, 0).0 > 0 {
+                let _ = TranslateMessage(&raw const msg);
+                DispatchMessageW(&raw const msg);
             }
         }
     }

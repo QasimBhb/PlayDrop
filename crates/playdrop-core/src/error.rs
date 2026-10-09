@@ -117,6 +117,11 @@ pub enum Error {
         port: u16,
     },
 
+    /// A host `ReceiveSink` refused a verified file; the transfer fails with this text
+    /// (`docs/core-api.md` section 2). Answered as `internal` on the wire.
+    #[error("{0}")]
+    Sink(String),
+
     /// JSON encode or decode failure.
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),

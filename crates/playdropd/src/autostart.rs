@@ -21,6 +21,7 @@
 use std::path::{Path, PathBuf};
 
 /// The XDG autostart file name.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub const AUTOSTART_FILE: &str = "org.playdrop.Daemon.desktop";
 /// The D-Bus session service file name.
 pub const DBUS_SERVICE_FILE: &str = "org.playdrop.PlayDrop.Daemon1.service";
@@ -30,6 +31,7 @@ pub const DBUS_SERVICE_FILE: &str = "org.playdrop.PlayDrop.Daemon1.service";
 #[derive(Debug, Clone)]
 pub struct Locations {
     /// `$XDG_CONFIG_HOME` (`~/.config`).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub config_home: PathBuf,
     /// `$XDG_DATA_HOME` (`~/.local/share`).
     pub data_home: PathBuf,
@@ -52,6 +54,7 @@ impl Locations {
         })
     }
 
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn autostart_path(&self) -> PathBuf {
         self.config_home.join("autostart").join(AUTOSTART_FILE)
     }
@@ -100,6 +103,7 @@ pub fn sync_dbus_service(loc: &Locations) -> anyhow::Result<Outcome> {
 
 /// The XDG autostart entry. `Exec` is the bare `playdropd` when that name on `PATH` is this
 /// binary, otherwise the absolute path.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn desktop_entry(exe: &Path) -> String {
     let exec = if on_path_as("playdropd", exe) {
         "playdropd".to_owned()
@@ -143,6 +147,7 @@ pub fn exec_quote(arg: &str) -> String {
     out
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn on_path_as(name: &str, exe: &Path) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -261,7 +266,7 @@ mod platform {
                 RRF_RT_REG_SZ,
                 None,
                 Some(buf.as_mut_ptr().cast()),
-                Some(&mut len),
+                Some(&raw mut len),
             )
         };
         if rc != ERROR_SUCCESS {

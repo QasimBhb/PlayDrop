@@ -13,6 +13,8 @@ mod fsx;
 pub mod manifest;
 pub mod receiver;
 pub mod sender;
+pub mod sink;
+pub mod source;
 
 #[cfg(test)]
 mod e2e_tests;
@@ -25,10 +27,12 @@ pub use chunk::{
 };
 pub use manifest::{BundleInfo, FileEntry, FileId, Manifest, ManifestBuilder, SourceInfo};
 pub use receiver::{
-    AcceptOptions, FileState, FreeSpace, PartFile, PutError, PutResponse, SpaceInfo, SyncPolicy,
-    TransferReceiver, TransferState, TransferStateView,
+    AcceptOptions, FileState, FreeSpace, PartFile, PutError, PutResponse, SinkBinding, SpaceInfo,
+    SyncPolicy, TransferReceiver, TransferState, TransferStateView,
 };
 pub use sender::{ResumeAction, ResumePlan, TransferSender};
+pub use sink::{DeliverItem, DeliveredFile, ReceiveSink, SinkError};
+pub use source::{SourceOpener, SourceRef, StreamSource};
 
 /// Encodes a 32-byte hash as lowercase hex, the form roots and prefixes take on the wire
 /// (protocol.md 7.4, 7.5).

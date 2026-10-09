@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::identity::sealing::{self, Sealer};
 use crate::identity::{fill_random, inspect_certificate, secure_fs, DeviceId};
 use crate::tls::PinLookup;
 use crate::{Error, Result};
@@ -212,6 +213,10 @@ pub struct Pin {
     /// Phase 2, hence the default.
     #[serde(default)]
     pub last_seen: Option<u64>,
+    /// The peer's `hello` said it no longer has us pinned (protocol.md 5.4). Cleared by a
+    /// new pairing (a fresh pin) and gone with unpair (no pin).
+    #[serde(default)]
+    pub removed_by_peer: bool,
 }
 
 impl Pin {
@@ -233,6 +238,7 @@ impl Pin {
             last_known: Vec::new(),
             paired_at,
             last_seen: None,
+            removed_by_peer: false,
         })
     }
 
@@ -269,6 +275,8 @@ pub struct PinStore {
     path: PathBuf,
     local_announce_key: LocalAnnounceKey,
     pins: BTreeMap<DeviceId, Pin>,
+    /// Seals the file at rest when the host supplies a store (`docs/core-api.md` 2a).
+    sealer: Sealer,
 }
 
 impl fmt::Debug for PinStore {
@@ -277,6 +285,7 @@ impl fmt::Debug for PinStore {
             .field("path", &self.path)
             .field("local_announce_key", &self.local_announce_key)
             .field("pins", &self.pins.len())
+            .field("sealed", &self.sealer.is_some())
             .finish()
     }
 }
@@ -287,17 +296,32 @@ impl PinStore {
     /// 0600 on Unix; looser modes are refused (SR-28). Every pin is checked against its
     /// certificate, and a file that fails is refused rather than partly loaded.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_sealed(path, None)
+    }
+
+    /// [`open`](Self::open) with the file sealed by `sealer` (`docs/core-api.md` section
+    /// 2a). A plain file is read once and saved sealed at once (migration); a sealed file
+    /// without a store fails with [`Error::Identity`]. Call it from a blocking thread.
+    pub fn open_sealed(path: impl Into<PathBuf>, sealer: Sealer) -> Result<Self> {
         let path = path.into();
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             secure_fs::ensure_private_dir(dir)?;
         }
-        if let Some(bytes) = secure_fs::read_private(&path)? {
-            return Self::from_json(path, &bytes);
+        if let Some(raw) = secure_fs::read_private(&path)? {
+            let (bytes, was_plain) = sealing::unseal(&sealer, raw, PIN_FILE)?;
+            let mut store = Self::from_json(path, &bytes)?;
+            let migrate = was_plain && sealer.is_some();
+            store.sealer = sealer;
+            if migrate {
+                store.save()?;
+            }
+            return Ok(store);
         }
         let store = Self {
             path,
             local_announce_key: LocalAnnounceKey::generate()?,
             pins: BTreeMap::new(),
+            sealer,
         };
         store.save()?;
         Ok(store)
@@ -326,6 +350,7 @@ impl PinStore {
             path,
             local_announce_key: file.local_announce_key,
             pins,
+            sealer: None,
         })
     }
 
@@ -338,7 +363,8 @@ impl PinStore {
             pins: self.pins.values().cloned().collect(),
         };
         let json = serde_json::to_vec_pretty(&file)?;
-        secure_fs::write_private_atomic(&self.path, &json)
+        let bytes = sealing::seal(&self.sealer, &json, PIN_FILE)?;
+        secure_fs::write_private_atomic(&self.path, &bytes)
     }
 
     /// The file this store saves to.
@@ -415,6 +441,12 @@ impl PinStore {
         if pin.last_seen.is_none_or(|t| t < at) {
             pin.last_seen = Some(at);
         }
+        Ok(())
+    }
+
+    /// Marks or clears "removed by peer" for `id` (protocol.md 5.4).
+    pub fn set_removed_by_peer(&mut self, id: &DeviceId, removed: bool) -> Result<()> {
+        self.get_mut(id)?.removed_by_peer = removed;
         Ok(())
     }
 

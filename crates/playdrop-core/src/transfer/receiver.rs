@@ -35,7 +35,8 @@ use super::chunk::{
 };
 use super::fsx;
 use super::hash_to_hex;
-use super::manifest::{is_valid_chunk_size, is_valid_transfer_id, Manifest};
+use super::manifest::{is_valid_chunk_size, is_valid_transfer_id, FileEntry, Manifest};
+use super::sink::{DeliverItem, DeliveredFile, ReceiveSink};
 use crate::{Error, Result};
 
 /// Name of the staging folder inside the receive root. Manifest paths may not start with
@@ -235,6 +236,17 @@ pub enum PutError {
     Core(#[from] Error),
 }
 
+/// `Staged` mode (`docs/core-api.md` section 2): every verified file goes to `sink`
+/// instead of being renamed beneath the receive root, which is then only a private staging
+/// directory.
+#[derive(Debug, Clone)]
+pub struct SinkBinding {
+    /// The host's sink.
+    pub sink: Arc<dyn ReceiveSink>,
+    /// The sender's Device ID (hex), for [`DeliverItem::peer`].
+    pub peer: String,
+}
+
 /// Options for [`TransferReceiver::accept`].
 #[derive(Debug, Clone, Default)]
 pub struct AcceptOptions {
@@ -244,6 +256,8 @@ pub struct AcceptOptions {
     pub skip: Vec<u32>,
     /// Durability batching.
     pub sync: SyncPolicy,
+    /// `Staged` mode: hand verified files to a sink. `None` places them beneath the root.
+    pub sink: Option<SinkBinding>,
 }
 
 // ---------------------------------------------------------------------------------------
@@ -297,11 +311,76 @@ struct LedgerRecord {
 }
 
 /// One placed file: its manifest fid and its final path relative to the receive root
-/// (after any " (n)" collision rename).
+/// (after any " (n)" collision rename), or in `Staged` mode the sink's location string.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SavedFile {
     fid: u32,
+    #[serde(default)]
     path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location: Option<String>,
+}
+
+impl SavedFile {
+    fn placed(fid: u32, path: PathBuf) -> Self {
+        Self {
+            fid,
+            path,
+            location: None,
+        }
+    }
+
+    fn delivered(fid: u32, location: String) -> Self {
+        Self {
+            fid,
+            path: PathBuf::new(),
+            location: Some(location),
+        }
+    }
+}
+
+/// Where verified files go.
+#[derive(Debug, Clone)]
+enum Dest {
+    /// Renamed beneath this receive root (desktop).
+    Directory(PathBuf),
+    /// Handed to a sink (mobile, `docs/core-api.md` section 2).
+    Sink {
+        binding: SinkBinding,
+        transfer_id: String,
+    },
+}
+
+impl Dest {
+    /// Places or delivers one verified staged file and says where it went. In `Staged`
+    /// mode the staging file is deleted afterwards whatever the sink did, and a sink
+    /// failure becomes [`Error::Sink`].
+    fn put(&self, staged: &Path, entry: &FileEntry) -> Result<SavedFile> {
+        match self {
+            Dest::Directory(root) => {
+                let rel = place(staged, root, &entry.path)?;
+                Ok(SavedFile::placed(entry.fid, rel))
+            }
+            Dest::Sink {
+                binding,
+                transfer_id,
+            } => {
+                let file = File::open(staged)?;
+                let item = DeliverItem {
+                    transfer_id: transfer_id.clone(),
+                    peer: binding.peer.clone(),
+                    path: entry.path.clone(),
+                    size: entry.size,
+                    mtime_ms: entry.mtime,
+                    mime: entry.mime.clone(),
+                };
+                let res = binding.sink.deliver(item, file);
+                fsx::remove_if_exists(staged)?;
+                res.map(|loc| SavedFile::delivered(entry.fid, loc))
+                    .map_err(|e| Error::Sink(e.message))
+            }
+        }
+    }
 }
 
 /// Durable verified offset plus chunk hashes for one stream (a file or the bundle).
@@ -603,12 +682,7 @@ impl PartInner {
         self.ledger.finish(FileState::Failed, None)
     }
 
-    fn finalize(
-        &mut self,
-        claimed: &ChunkHash,
-        dest_root: &Path,
-        path: &[String],
-    ) -> Result<PathBuf> {
+    fn finalize(&mut self, claimed: &ChunkHash, dest: &Dest, entry: &FileEntry) -> Result<()> {
         if self.ledger.verified() != self.ledger.size {
             return Err(Error::BadRequest("file is not fully verified".into()));
         }
@@ -622,13 +696,16 @@ impl PartInner {
             self.file()?;
         }
         self.file = None;
-        let rel = place(&self.path, dest_root, path)?;
-        self.ledger.saved = vec![SavedFile {
-            fid: self.fid,
-            path: rel.clone(),
-        }];
-        self.ledger.finish(FileState::Verified, Some(*claimed))?;
-        Ok(dest_root.join(rel))
+        let saved = match dest.put(&self.path, entry) {
+            Ok(s) => s,
+            Err(e @ Error::Sink(_)) => {
+                self.fail()?;
+                return Err(e);
+            }
+            Err(e) => return Err(e),
+        };
+        self.ledger.saved = vec![saved];
+        self.ledger.finish(FileState::Verified, Some(*claimed))
     }
 }
 
@@ -831,8 +908,25 @@ impl PartFile {
     ) -> Result<PathBuf> {
         let dest_root = dest_root.to_path_buf();
         let path = path.to_vec();
-        self.run(move |p| p.finalize(&root, &dest_root, &path))
-            .await
+        self.run(move |p| {
+            let entry = FileEntry {
+                fid: p.fid,
+                path,
+                size: p.ledger.size,
+                mtime: 0,
+                mime: None,
+                in_bundle: false,
+            };
+            p.finalize(&root, &Dest::Directory(dest_root.clone()), &entry)?;
+            let rel = p
+                .ledger
+                .saved
+                .first()
+                .map(|s| s.path.clone())
+                .unwrap_or_default();
+            Ok(dest_root.join(rel))
+        })
+        .await
     }
 }
 
@@ -982,7 +1076,7 @@ impl BundleInner {
     fn finalize(
         &mut self,
         claimed: &ChunkHash,
-        dest_root: &Path,
+        dest: &Dest,
         manifest: &Manifest,
     ) -> Result<Vec<SavedFile>> {
         if self.ledger.verified() != self.ledger.size {
@@ -998,6 +1092,33 @@ impl BundleInner {
             .map(|fid| self.member_path(fid))
             .collect();
         fsx::sync_files(&self.staging, &dirty)?;
+        let saved = match dest {
+            Dest::Directory(dest_root) => self.place_members(dest_root, manifest)?,
+            Dest::Sink { .. } => {
+                let mut saved = Vec::with_capacity(self.layout.members().len());
+                let members: Vec<u32> = self.layout.members().iter().map(|m| m.fid).collect();
+                for fid in members {
+                    if self.is_skipped(fid) {
+                        continue;
+                    }
+                    match dest.put(&self.member_path(fid), &manifest.files[fid as usize]) {
+                        Ok(s) => saved.push(s),
+                        Err(e) => {
+                            self.fail()?;
+                            return Err(e);
+                        }
+                    }
+                }
+                saved
+            }
+        };
+        self.ledger.saved.clone_from(&saved);
+        self.ledger.finish(FileState::Verified, Some(*claimed))?;
+        Ok(saved)
+    }
+
+    /// Renames every member beneath `dest_root` (SR-18).
+    fn place_members(&self, dest_root: &Path, manifest: &Manifest) -> Result<Vec<SavedFile>> {
         // One rename per member, then one sync per destination folder instead of one per
         // file: thousands of small files must not cost thousands of journal commits. Each
         // folder is walked once (SR-18) and its handle reused for every member in it.
@@ -1017,16 +1138,14 @@ impl BundleInner {
                 }
             };
             let final_name = fsx::place_into(&staging, &member_name(m.fid), dir, name)?;
-            saved.push(SavedFile {
-                fid: m.fid,
-                path: relative_path(parents, &final_name),
-            });
+            saved.push(SavedFile::placed(
+                m.fid,
+                relative_path(parents, &final_name),
+            ));
         }
         for dir in dirs.values() {
             fsx::sync_dir_handle(dir)?;
         }
-        self.ledger.saved.clone_from(&saved);
-        self.ledger.finish(FileState::Verified, Some(*claimed))?;
         Ok(saved)
     }
 }
@@ -1076,8 +1195,13 @@ struct Shared {
     files: Vec<Slot>,
     bundle: Option<Slot>,
     status: StdMutex<(TransferState, SystemTime)>,
-    /// Final destination of each fid relative to the receive root, once placed.
-    saved: StdMutex<Vec<Option<PathBuf>>>,
+    /// Final destination of each fid (relative to the receive root, or the sink's
+    /// location), once placed.
+    saved: StdMutex<Vec<Option<SavedFile>>>,
+    /// `Staged` mode binding; `None` renames beneath `root`.
+    sink: Option<SinkBinding>,
+    /// Why the transfer failed, when a sink said so (shown to the user).
+    failure: StdMutex<Option<String>>,
     /// Serialises [`Shared::settle_blocking`]: concurrent `PUT`s that finish together
     /// must not both complete the transfer.
     settle_gate: StdMutex<()>,
@@ -1209,7 +1333,9 @@ impl TransferReceiver {
                 &staging.join("transfer.json"),
                 &serde_json::to_vec(&record)?,
             )?;
-            Self::build(root, staging, record, free_space, opts.sync, false)
+            Self::build(
+                root, staging, record, free_space, opts.sync, opts.sink, false,
+            )
         })
         .await
         .map_err(join_err)?
@@ -1222,6 +1348,18 @@ impl TransferReceiver {
         id: &str,
         free_space: Arc<dyn FreeSpace>,
         policy: SyncPolicy,
+    ) -> Result<Self> {
+        Self::load_with(root, id, free_space, policy, None).await
+    }
+
+    /// [`load`](Self::load) for a receiver in `Staged` mode: `sink` gets the files that
+    /// verify from now on.
+    pub async fn load_with(
+        root: &Path,
+        id: &str,
+        free_space: Arc<dyn FreeSpace>,
+        policy: SyncPolicy,
+        sink: Option<SinkBinding>,
     ) -> Result<Self> {
         if !is_valid_transfer_id(id) {
             return Err(Error::NotFound);
@@ -1236,7 +1374,7 @@ impl TransferReceiver {
             };
             let record: TransferRecord = serde_json::from_slice(&bytes)?;
             record.manifest.validate()?;
-            Self::build(root, staging, record, free_space, policy, true)
+            Self::build(root, staging, record, free_space, policy, sink, true)
         })
         .await
         .map_err(join_err)?
@@ -1248,6 +1386,7 @@ impl TransferReceiver {
         rec: TransferRecord,
         free_space: Arc<dyn FreeSpace>,
         policy: SyncPolicy,
+        sink: Option<SinkBinding>,
         from_disk: bool,
     ) -> Result<Self> {
         let m = &rec.manifest;
@@ -1333,6 +1472,8 @@ impl TransferReceiver {
                 bundle,
                 status: StdMutex::new((rec.state, SystemTime::now())),
                 saved: StdMutex::new(saved),
+                sink,
+                failure: StdMutex::new(None),
                 settle_gate: StdMutex::new(()),
             }),
         };
@@ -1384,8 +1525,41 @@ impl TransferReceiver {
         lock(&self.shared.saved)
             .iter()
             .flatten()
-            .map(|rel| self.shared.root.join(rel))
+            .filter(|s| s.location.is_none())
+            .map(|s| self.shared.root.join(&s.path))
             .collect()
+    }
+
+    /// Where each file placed so far went, in manifest order (`docs/core-api.md` section
+    /// 2): the final path in `Directory` mode, the sink's string in `Staged` mode.
+    pub fn delivered(&self) -> Vec<DeliveredFile> {
+        let s = &self.shared;
+        lock(&s.saved)
+            .iter()
+            .flatten()
+            .map(|f| DeliveredFile {
+                path: s
+                    .manifest
+                    .files
+                    .get(f.fid as usize)
+                    .map(|e| e.path.join("/"))
+                    .unwrap_or_default(),
+                location: f
+                    .location
+                    .clone()
+                    .unwrap_or_else(|| s.root.join(&f.path).display().to_string()),
+            })
+            .collect()
+    }
+
+    /// True in `Staged` mode (files go to a sink).
+    pub fn is_staged(&self) -> bool {
+        self.shared.sink.is_some()
+    }
+
+    /// The sink's message when it made the transfer fail.
+    pub fn failure(&self) -> Option<String> {
+        lock(&self.shared.failure).clone()
     }
 
     /// The `GET /v1/transfers/{id}` body (protocol.md 7.5).
@@ -1633,12 +1807,12 @@ fn placeholder_bundle() -> BundleInner {
 }
 
 /// Destinations recorded in the ledgers of a freshly built (or reloaded) transfer, by fid.
-fn saved_from_ledgers(files: &[Slot], bundle: Option<&Slot>) -> Vec<Option<PathBuf>> {
-    let mut saved: Vec<Option<PathBuf>> = vec![None; files.len()];
+fn saved_from_ledgers(files: &[Slot], bundle: Option<&Slot>) -> Vec<Option<SavedFile>> {
+    let mut saved: Vec<Option<SavedFile>> = vec![None; files.len()];
     let mut restore = |list: &[SavedFile]| {
         for f in list {
             if let Some(slot) = saved.get_mut(f.fid as usize) {
-                *slot = Some(f.path.clone());
+                *slot = Some(f.clone());
             }
         }
     };
@@ -1693,9 +1867,70 @@ impl Shared {
         let mut saved = lock(&self.saved);
         for f in list {
             if let Some(slot) = saved.get_mut(f.fid as usize) {
-                *slot = Some(f.path.clone());
+                *slot = Some(f.clone());
             }
         }
+    }
+
+    /// Where verified files go.
+    fn dest(&self) -> Dest {
+        match &self.sink {
+            Some(binding) => Dest::Sink {
+                binding: binding.clone(),
+                transfer_id: self.manifest.id.clone(),
+            },
+            None => Dest::Directory(self.root.clone()),
+        }
+    }
+
+    /// Remembers why the transfer failed (the first reason wins).
+    fn set_failure(&self, why: String) {
+        let mut f = lock(&self.failure);
+        if f.is_none() {
+            *f = Some(why);
+        }
+    }
+
+    /// Completion work once every stream verified (protocol.md 7.2): empty folders and
+    /// zero-length files, made beneath the root or handed to the sink.
+    fn complete_blocking(&self) -> Result<()> {
+        let dest = self.dest();
+        match &dest {
+            Dest::Directory(_) => {
+                let root = fsx::open_root(&self.root)?;
+                for d in &self.manifest.dirs {
+                    fsx::safe_dir(&root, d, false)?;
+                }
+                for f in &self.manifest.files {
+                    if f.size == 0 && !f.in_bundle && !self.is_skipped(f.fid) {
+                        let (name, dirs) = split_path(&f.path)?;
+                        let dir = fsx::safe_dir(&root, dirs, false)?;
+                        let (final_name, _) = fsx::create_unique(&dir, name)?;
+                        self.record_saved(&[SavedFile::placed(
+                            f.fid,
+                            relative_path(dirs, &final_name),
+                        )]);
+                    }
+                }
+            }
+            Dest::Sink { binding, .. } => {
+                for d in &self.manifest.dirs {
+                    binding
+                        .sink
+                        .make_dir(d.clone())
+                        .map_err(|e| Error::Sink(e.message))?;
+                }
+                for f in &self.manifest.files {
+                    if f.size == 0 && !f.in_bundle && !self.is_skipped(f.fid) {
+                        let staged = self.staging.join(format!("{}.empty", f.fid));
+                        drop(fsx::open_or_create(&staged)?);
+                        let saved = dest.put(&staged, f)?;
+                        self.record_saved(&[saved]);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn write_record(&self, state: TransferState) -> Result<()> {
@@ -1747,22 +1982,14 @@ impl Shared {
         let new_state = if any_failed {
             TransferState::Failed
         } else {
-            let root = fsx::open_root(&self.root)?;
-            for d in &self.manifest.dirs {
-                fsx::safe_dir(&root, d, false)?;
-            }
-            for f in &self.manifest.files {
-                if f.size == 0 && !f.in_bundle && !self.is_skipped(f.fid) {
-                    let (name, dirs) = split_path(&f.path)?;
-                    let dir = fsx::safe_dir(&root, dirs, false)?;
-                    let (final_name, _) = fsx::create_unique(&dir, name)?;
-                    self.record_saved(&[SavedFile {
-                        fid: f.fid,
-                        path: relative_path(dirs, &final_name),
-                    }]);
+            match self.complete_blocking() {
+                Ok(()) => TransferState::Complete,
+                Err(Error::Sink(why)) => {
+                    self.set_failure(why);
+                    TransferState::Failed
                 }
+                Err(e) => return Err(e),
             }
-            TransferState::Complete
         };
         {
             let mut st = lock(&self.status);
@@ -1976,26 +2203,26 @@ impl Upload {
             return Ok(self.response());
         }
         let claimed = root.ok_or_else(|| Error::BadRequest("missing pd-root trailer".into()))?;
-        let dest_root = self.receiver.shared.root.clone();
+        let dest = self.receiver.shared.dest();
         let result = match self.target {
             Target::File(fid) => {
-                let path = self.receiver.shared.manifest.files[fid as usize]
-                    .path
-                    .clone();
+                let entry = self.receiver.shared.manifest.files[fid as usize].clone();
                 self.blocking(move |p| {
-                    p.finalize(&claimed, &dest_root, &path)?;
+                    p.finalize(&claimed, &dest, &entry)?;
                     Ok(p.ledger.saved.clone())
                 })
                 .await
             }
             Target::Bundle => {
                 let shared = self.receiver.shared.clone();
-                self.bundle_blocking(move |b| b.finalize(&claimed, &dest_root, &shared.manifest))
+                self.bundle_blocking(move |b| b.finalize(&claimed, &dest, &shared.manifest))
                     .await
             }
         };
-        if let Ok(saved) = &result {
-            self.receiver.shared.record_saved(saved);
+        match &result {
+            Ok(saved) => self.receiver.shared.record_saved(saved),
+            Err(Error::Sink(why)) => self.receiver.shared.set_failure(why.clone()),
+            Err(_) => {}
         }
         self.settle().await?;
         result?;
@@ -2508,5 +2735,174 @@ pub(crate) mod tests {
         let r = up.finish(Some(root_of(&contents[0]))).await;
         assert!(matches!(r, Err(PutError::Core(Error::PathInvalid(_)))));
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    /// A sink that keeps what it was given, for `Staged` mode tests.
+    #[derive(Debug, Default)]
+    struct MemSink {
+        got: StdMutex<Vec<(DeliverItem, Vec<u8>)>>,
+        dirs: StdMutex<Vec<Vec<String>>>,
+        refuse: bool,
+    }
+
+    impl ReceiveSink for MemSink {
+        fn deliver(
+            &self,
+            item: DeliverItem,
+            mut file: File,
+        ) -> std::result::Result<String, crate::transfer::SinkError> {
+            if self.refuse {
+                return Err(crate::transfer::SinkError::new(
+                    "storage permission revoked",
+                ));
+            }
+            assert_eq!(
+                file.stream_position().unwrap(),
+                0,
+                "handed over at offset 0"
+            );
+            let mut v = Vec::new();
+            file.read_to_end(&mut v).unwrap();
+            let loc = format!("content://test/{}", item.path.join("/"));
+            lock(&self.got).push((item, v));
+            Ok(loc)
+        }
+
+        fn make_dir(
+            &self,
+            path: Vec<String>,
+        ) -> std::result::Result<(), crate::transfer::SinkError> {
+            lock(&self.dirs).push(path);
+            Ok(())
+        }
+    }
+
+    async fn bundle_of(m: &Manifest, contents: &[Vec<u8>]) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        #[derive(Debug)]
+        struct Mem(Vec<Vec<u8>>);
+        impl crate::transfer::MemberOpener for Mem {
+            fn open(&self, fid: u32, off: u64) -> crate::transfer::bundle::OpenFuture {
+                let d = self.0[fid as usize][usize::try_from(off).unwrap()..].to_vec();
+                Box::pin(async move {
+                    Ok(Box::new(std::io::Cursor::new(d)) as crate::transfer::bundle::MemberReader)
+                })
+            }
+        }
+        let layout = Arc::new(BundleLayout::new(m).unwrap());
+        let mut w = crate::transfer::BundleWriter::new(layout, Arc::new(Mem(contents.to_vec())), 0)
+            .unwrap();
+        let mut v = Vec::new();
+        w.read_to_end(&mut v).await.unwrap();
+        v
+    }
+
+    /// `Staged` mode (`docs/core-api.md` section 2): every verified file, empty file and
+    /// bundle member reaches the sink once, at offset 0; staging files are deleted; the
+    /// staging root holds no final files; `delivered` lists the sink's strings.
+    #[tokio::test]
+    async fn staged_mode_hands_every_file_to_the_sink() {
+        let tmp = tempfile::tempdir().unwrap();
+        let staging = tmp.path().join("staging");
+        let (m, contents) = manifest(&[
+            (2 * CS as usize + 5, false),
+            (900, true),
+            (0, false),
+            (40, true),
+        ]);
+        let sink = Arc::new(MemSink::default());
+        let opts = AcceptOptions {
+            sink: Some(SinkBinding {
+                sink: sink.clone(),
+                peer: "ab".repeat(32),
+            }),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(&staging, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        assert!(rx.is_staged());
+        let st = rx.state();
+        let tok0 = st.files[0].token.clone().unwrap();
+        let btok = st.bundle.as_ref().unwrap().token.clone().unwrap();
+        let size0 = contents[0].len() as u64;
+        let mut up = rx.begin_file(0, &tok0, 0, size0 - 1).await.unwrap();
+        up.receive(&body(&contents[0], 0, size0).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&contents[0]))).await.unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let bsize = bundle.len() as u64;
+        let mut up = rx.begin_bundle(&btok, 0, bsize - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, bsize).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        let got = lock(&sink.got);
+        assert_eq!(got.len(), 4, "streamed, two members and the empty file");
+        for (item, bytes) in got.iter() {
+            let fid: usize = item.path[1][1..2].parse().unwrap();
+            assert_eq!(bytes, &contents[fid], "{:?}", item.path);
+            assert_eq!(item.size, contents[fid].len() as u64);
+            assert_eq!(item.transfer_id, m.id);
+            assert_eq!(item.peer, "ab".repeat(32));
+            assert_eq!(item.mtime_ms, 1_700_000_000_000);
+        }
+        assert_eq!(
+            *lock(&sink.dirs),
+            vec![vec!["T".to_owned(), "empty".to_owned()]]
+        );
+        assert!(rx.saved_paths().is_empty(), "no paths in Staged mode");
+        let mut delivered = rx.delivered();
+        delivered.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(delivered.len(), 4);
+        assert_eq!(delivered[0].path, "T/f0.dat");
+        assert_eq!(delivered[0].location, "content://test/T/f0.dat");
+        // Nothing but the staging folder is left under the staging root.
+        let left: Vec<_> = std::fs::read_dir(&staging)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(left, [std::ffi::OsString::from(STAGING_DIR)]);
+        let staged: Vec<_> = std::fs::read_dir(rx.staging_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(staged, [std::ffi::OsString::from("transfer.json")]);
+    }
+
+    /// A sink error fails the file and the transfer with the sink's message.
+    #[tokio::test]
+    async fn sink_error_fails_the_transfer_with_its_message() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&[(3000, false)]);
+        let sink = Arc::new(MemSink {
+            refuse: true,
+            ..MemSink::default()
+        });
+        let opts = AcceptOptions {
+            sink: Some(SinkBinding {
+                sink,
+                peer: "cd".repeat(32),
+            }),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(tmp.path(), m, FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let tok = rx.state().files[0].token.clone().unwrap();
+        let mut up = rx.begin_file(0, &tok, 0, 2999).await.unwrap();
+        up.receive(&body(&contents[0], 0, 3000).await[..])
+            .await
+            .unwrap();
+        let r = up.finish(Some(root_of(&contents[0]))).await;
+        assert!(
+            matches!(r, Err(PutError::Core(Error::Sink(ref m))) if m == "storage permission revoked")
+        );
+        assert_eq!(rx.transfer_state(), TransferState::Failed);
+        assert_eq!(rx.failure().as_deref(), Some("storage permission revoked"));
+        assert!(!rx.staging_dir().join("0.part").exists());
     }
 }

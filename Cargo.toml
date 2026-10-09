@@ -6,6 +6,8 @@ members = [
     "crates/playdrop-ipc",
     "crates/playdropd",
     "apps/desktop",
+    "crates/playdrop-ffi",
+    "crates/uniffi-bindgen",
 ]
 
 [workspace.package]

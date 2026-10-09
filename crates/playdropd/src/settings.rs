@@ -36,6 +36,8 @@ pub struct Settings {
     pub port: u16,
     /// Watch the local clipboard and push changes to peers.
     pub clipboard_sync: bool,
+    /// Sync clipboard images (PNG, at most 16 MiB) as well as text, both ways.
+    pub clipboard_images: bool,
     /// Start the daemon at login.
     pub autostart: bool,
     /// Show desktop notifications.
@@ -51,6 +53,7 @@ impl Default for Settings {
             device_name: default_device_name(),
             port: playdrop_core::constants::TCP_PORT,
             clipboard_sync: true,
+            clipboard_images: true,
             autostart: true,
             notifications: true,
             discovery: true,
@@ -68,6 +71,8 @@ pub struct Changes {
     pub restart_host: bool,
     /// `clipboard_sync` changed.
     pub clipboard_sync: bool,
+    /// `clipboard_images` changed.
+    pub clipboard_images: bool,
     /// `autostart` changed.
     pub autostart: bool,
     /// `notifications` changed.
@@ -77,7 +82,11 @@ pub struct Changes {
 impl Changes {
     /// True if anything changed at all.
     pub fn any(self) -> bool {
-        self.restart_host || self.clipboard_sync || self.autostart || self.notifications
+        self.restart_host
+            || self.clipboard_sync
+            || self.clipboard_images
+            || self.autostart
+            || self.notifications
     }
 }
 
@@ -99,6 +108,7 @@ impl Settings {
             receive_dir: self.receive_dir.clone(),
             device_name: self.device_name.clone(),
             clipboard_sync: self.clipboard_sync,
+            clipboard_images: self.clipboard_images,
             clipboard_watch_supported,
             autostart: self.autostart,
             notifications: self.notifications,
@@ -143,6 +153,10 @@ impl Settings {
         if let Some(v) = patch.clipboard_sync {
             c.clipboard_sync = v != self.clipboard_sync;
             self.clipboard_sync = v;
+        }
+        if let Some(v) = patch.clipboard_images {
+            c.clipboard_images = v != self.clipboard_images;
+            self.clipboard_images = v;
         }
         if let Some(v) = patch.autostart {
             c.autostart = v != self.autostart;
@@ -357,6 +371,7 @@ mod tests {
             device_name: "desk".into(),
             port: 42187,
             clipboard_sync: true,
+            clipboard_images: true,
             autostart: true,
             notifications: true,
             discovery: true,
@@ -408,6 +423,10 @@ mod tests {
         let s = load(tmp.path()).unwrap().settings;
         assert_eq!(s.port, 42999);
         assert!(s.clipboard_sync && s.autostart && s.notifications && s.discovery);
+        assert!(
+            s.clipboard_images,
+            "a file from before images defaults them on"
+        );
 
         std::fs::write(tmp.path().join(SETTINGS_FILE), b"{not json").unwrap();
         let l = load(tmp.path()).unwrap();
@@ -430,6 +449,14 @@ mod tests {
             .unwrap();
         assert!(c.notifications && !c.clipboard_sync && !c.restart_host);
         assert!(!s.notifications);
+
+        let c = s
+            .apply_patch(&SettingsPatch {
+                clipboard_images: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(c.clipboard_images && c.any() && !s.clipboard_images);
 
         let c = s
             .apply_patch(&SettingsPatch {

@@ -598,3 +598,9 @@ Where the Phase 1 code (`crates/playdrop-core`) differs from or settles a gap in
 - **Sender persistence (7.6) is receiver-only for now:** a restarted receiver resumes; a restarted sender re-offers.
 - **"Removed by peer" (5.4)** is reported to the UI but not yet stored in the pin.
 - **Benchmark (section 10, last bullet):** on loopback, tuned HTTP/2 measured about 25 to 30% below raw framing on the same TLS socket. Not acted on; the Phase 1 review decides.
+- **"Removed by peer" is now stored (5.4, Phase 3):** the pin keeps a `removedByPeer` flag until the next successful pairing (a fresh pin) or unpair; this replaces the bullet above.
+- **Text blobs carry normalised newlines (5.7, 5.15):** a long text clip is stored with CRLF and lone CR converted to LF, so the blob `id` (BLAKE3 of the bytes) equals the clip `hash`. The fetcher rejects a blob whose `id` differs from `hash`, whose body exceeds the announced `size`, or whose bytes do not hash to `id`.
+- **Blob expiry answer (5.15):** an expired blob is answered `410 expired` for 30 minutes after its 5 minutes end, then `404 not_found`; the holder keeps at most 64 MiB of blobs and evicts the oldest first.
+- **Outbox source changed (7.8):** when a queued source changed since it was queued (size, mtime or file ID), the holder cannot serve it at all and answers `410 expired` with the message "source changed since it was queued".
+- **Outbox decline (7.8):** a puller that declines (or cancels) a pulled item still sends `DELETE /v1/outbox/{id}`, so the holder stops announcing it at every session start.
+- **Media state goes only to peers with the sender's `media` grant (5.9):** what is playing is private, so the grant gates sending as well as receiving.

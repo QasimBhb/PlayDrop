@@ -48,7 +48,9 @@ pub struct PeerView {
     pub label: String,
     /// Session up.
     pub online: bool,
-    /// Last `presence` state reported while online.
+    /// Last `presence` state reported while online. Kept as `asleep` after the device
+    /// drops, so a phone in Doze reads "Asleep" rather than "Offline" (protocol.md 5.10:
+    /// after `asleep` the peer expects a drop).
     pub presence: Option<String>,
     /// Last battery report: level, charging.
     pub battery: Option<(u8, bool)>,
@@ -245,9 +247,10 @@ impl Store {
                 if let Some(o) = old.iter().find(|o| o.device_id == v.device_id) {
                     v.battery = o.battery;
                     v.note.clone_from(&o.note);
-                    if v.online {
+                    if v.online || o.presence.as_deref() == Some(ASLEEP) {
                         v.presence.clone_from(&o.presence);
-                    } else {
+                    }
+                    if !v.online {
                         v.last_seen = v.last_seen.max(o.last_seen);
                     }
                 }
@@ -349,7 +352,9 @@ impl Store {
             }),
             HostEvent::PeerOffline { peer, .. } => self.with_peer(&peer, |p| {
                 p.online = false;
-                p.presence = None;
+                if p.presence.as_deref() != Some(ASLEEP) {
+                    p.presence = None;
+                }
                 p.last_seen = Some(now);
             }),
             HostEvent::Battery {
@@ -515,6 +520,10 @@ impl Store {
             }),
             HostEvent::Clipboard { peer, .. } => vec![Change::Notice(
                 format!("Clipboard received from {}", self.peer_name(&peer)),
+                false,
+            )],
+            HostEvent::ClipboardImage { peer, .. } => vec![Change::Notice(
+                format!("Clipboard image received from {}", self.peer_name(&peer)),
                 false,
             )],
             HostEvent::Ping { peer, message } => {
@@ -698,12 +707,21 @@ pub fn parse_pair_addr(text: &str) -> Option<SocketAddr> {
         .map(|ip| SocketAddr::new(ip, DEFAULT_PORT))
 }
 
+/// The `presence` state a phone sends before Doze or the background drops it.
+const ASLEEP: &str = "asleep";
+
 fn state_text(p: &PeerView) -> &'static str {
     if !p.online {
-        return "Offline";
+        // A device that said it was going to sleep is asleep, not gone (PLAN.md Phase 3:
+        // "honestly shown as asleep").
+        return if p.presence.as_deref() == Some(ASLEEP) {
+            "Asleep"
+        } else {
+            "Offline"
+        };
     }
     match p.presence.as_deref() {
-        Some("asleep") => "Asleep",
+        Some(ASLEEP) => "Asleep",
         Some("idle") => "Idle",
         Some("locked") => "Locked",
         _ => "Online",
@@ -1060,6 +1078,7 @@ mod tests {
             last_known: Vec::new(),
             paired_at: 1_791_417_600, // 2026-10-08
             last_seen: None,
+            removed_by_peer: false,
         }
     }
 
@@ -1159,14 +1178,16 @@ mod tests {
             }),
             1100,
         );
+        // It said it was going to sleep before it dropped: asleep, not gone.
         let row = device_row(&s.peers[0], 1400);
-        assert_eq!(row.state, "Offline");
+        assert_eq!(row.state, "Asleep");
         assert_eq!(row.last_seen, "5 min ago");
 
         // A reload keeps what only events told us.
         s.set_peers(vec![peer("aa", false)], 1500);
         assert_eq!(s.peers[0].battery, Some((81, true)));
         assert_eq!(s.peers[0].last_seen, Some(1100));
+        assert_eq!(device_row(&s.peers[0], 1500).state, "Asleep");
 
         // The daemon's persisted time wins over "never" and is shown for offline devices.
         let mut known = peer("cc", false);
@@ -1178,6 +1199,24 @@ mod tests {
         stale.last_seen = Some(900);
         s.set_peers(vec![stale], 1500);
         assert_eq!(s.peers[0].last_seen, Some(1100));
+
+        // Back online clears it; a plain drop then reads "Offline".
+        let online = HostEvent::PeerOnline {
+            peer: "aa".into(),
+            short_id: "K3QD".into(),
+            name: "Phone".into(),
+            addr: "10.0.0.2:42187".parse().unwrap(),
+        };
+        s.apply(Event::Host(online), 1501);
+        assert_eq!(device_row(&s.peers[0], 1501).state, "Online");
+        s.apply(
+            Event::Host(HostEvent::PeerOffline {
+                peer: "aa".into(),
+                short_id: "K3QD".into(),
+            }),
+            1502,
+        );
+        assert_eq!(device_row(&s.peers[0], 1502).state, "Offline");
 
         // Unknown peer asks for a reload; unpair removes the row.
         let ch = s.apply(
@@ -1199,6 +1238,33 @@ mod tests {
         );
         assert_eq!(ch, vec![Change::Peers]);
         assert!(s.peers.is_empty());
+    }
+
+    #[test]
+    fn phase3_events_decode_and_unrendered_ones_change_nothing() {
+        let mut s = Store::default();
+        s.set_peers(vec![peer("aa", true)], 1000);
+        // Exactly what the daemon puts on the bus: the image arrives as base64.
+        let image: Event = serde_json::from_value(serde_json::json!({
+            "source": "host", "event": "clipboard_image", "peer": "aa",
+            "mime": "image/png", "data": "iVBORw0K", "sensitive": false
+        }))
+        .unwrap();
+        let ch = s.apply(image, 1001);
+        assert!(matches!(&ch[..], [Change::Notice(t, false)] if t.contains("image")));
+
+        let outbox: Event = serde_json::from_value(serde_json::json!({
+            "source": "host", "event": "outbox_ready", "peer": "aa",
+            "count": 2, "bytes": 10, "ids": ["o1", "o2"]
+        }))
+        .unwrap();
+        assert!(s.apply(outbox, 1002).is_empty());
+        let command: Event = serde_json::from_value(serde_json::json!({
+            "source": "host", "event": "media_command", "peer": "aa",
+            "player": "spotify", "action": "playPause", "value": null
+        }))
+        .unwrap();
+        assert!(s.apply(command, 1003).is_empty());
     }
 
     #[test]
@@ -1331,6 +1397,7 @@ mod tests {
                 bundle_root: None,
                 saved: vec![PathBuf::from("/d/f0.jpg"), PathBuf::from("/d/f1.jpg")],
                 folder: Some(PathBuf::from("/d")),
+                delivered: Vec::new(),
             }),
             0,
         );

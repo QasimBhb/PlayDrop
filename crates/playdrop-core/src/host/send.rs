@@ -31,7 +31,7 @@ use crate::transfer::chunk::HASH_LEN;
 use crate::transfer::receiver::MAX_CHUNK_RETRIES;
 use crate::transfer::{
     hash_to_hex, ChunkEncoder, FileState, Manifest, ManifestBuilder, PutResponse, ResumeAction,
-    SourceInfo, TransferSender, TransferState, TransferStateView,
+    SourceInfo, StreamSource, TransferSender, TransferState, TransferStateView,
 };
 use crate::{Error, Result};
 
@@ -40,7 +40,7 @@ pub const FILE_CONCURRENCY: usize = 4;
 
 /// How long a sender keeps trying to reach the receiver after a drop. *Choice:* ten
 /// minutes covers a Wi-Fi switch or a restarted daemon; the user can cancel sooner.
-const RECONNECT_FOR: Duration = Duration::from_secs(600);
+pub(crate) const RECONNECT_FOR: Duration = Duration::from_secs(600);
 
 /// Progress event period.
 const PROGRESS_EVERY: Duration = Duration::from_millis(500);
@@ -51,6 +51,36 @@ const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 // TODO(SR-21, protocol.md 7.6): persist the sender's transfer ID, manifest, sources and
 // chunk hashes so a send survives a restart of the sending host; today only the receiver
 // side persists, so a receiver restart resumes but a sender restart starts a new offer.
+
+/// One thing to send (`docs/core-api.md` section 3).
+#[derive(Debug, Clone)]
+pub enum SendSource {
+    /// A file or folder, walked as before (desktop).
+    Path(PathBuf),
+    /// One file behind a reopenable handle (mobile share targets).
+    Stream(StreamSource),
+}
+
+/// Builds the manifest and per-fid sources for `sources` (protocol.md 7.2).
+pub(crate) async fn build_manifest(
+    sources: Vec<SendSource>,
+    note: Option<String>,
+) -> Result<(Manifest, Vec<SourceInfo>)> {
+    if sources.is_empty() {
+        return Err(Error::BadRequest("nothing to send".into()));
+    }
+    let mut b = ManifestBuilder::new(DEFAULT_CHUNK_SIZE);
+    if let Some(n) = note {
+        b = b.note(n);
+    }
+    for src in sources {
+        match src {
+            SendSource::Path(p) => b.add_path(&p).await?,
+            SendSource::Stream(s) => b.add_stream(s).await?,
+        }
+    }
+    b.build()
+}
 
 /// Bookkeeping for a send, so `transfer` frames reach it (protocol.md 5.13).
 pub(crate) struct Outgoing {
@@ -162,20 +192,17 @@ impl Job {
     }
 }
 
-/// Builds the manifest for `paths` and starts sending to `peer`.
+/// Builds the manifest for `sources` and starts sending to `peer`.
 pub(crate) async fn start(
     inner: &Arc<Inner>,
     peer: DeviceId,
-    paths: Vec<PathBuf>,
+    sources: Vec<SendSource>,
+    note: Option<String>,
 ) -> Result<TransferHandle> {
     if !inner.pins.contains(&peer) {
         return Err(Error::NotPaired);
     }
-    let mut b = ManifestBuilder::new(DEFAULT_CHUNK_SIZE);
-    for p in &paths {
-        b.add_path(p).await?;
-    }
-    let (manifest, sources) = b.build()?;
+    let (manifest, sources) = build_manifest(sources, note).await?;
     let id = manifest.id.clone();
     let total = manifest.total_bytes;
     lock(&inner.transfers).begin(TransferSnapshot::new(
@@ -228,6 +255,7 @@ pub(crate) async fn start(
                 bundle_root: s.bundle_root.clone(),
                 saved: Vec::new(),
                 folder: None,
+                delivered: Vec::new(),
             },
             Err(reason) => job.end_for(reason.clone()),
         };
@@ -296,14 +324,14 @@ pub(crate) fn drop_peer(inner: &Inner, peer: &DeviceId) {
 }
 
 /// One step's failure.
-enum Step {
+pub(crate) enum Step {
     /// The connection is gone or unusable: reconnect and resume.
     Conn(String),
     /// The receiver refused: stop.
     Fatal(String),
 }
 
-async fn request_json(
+pub(crate) async fn request_json(
     conn: &Connection,
     method: Method,
     path: &str,
@@ -332,7 +360,7 @@ async fn request_json(
     Ok((status, bytes))
 }
 
-fn error_code(body: &[u8]) -> (ErrorCode, Option<u64>, String) {
+pub(crate) fn error_code(body: &[u8]) -> (ErrorCode, Option<u64>, String) {
     match serde_json::from_slice::<ErrorBody>(body) {
         Ok(b) => (b.error.code, b.error.verified_offset, b.error.message),
         Err(_) => (ErrorCode::Internal, None, String::new()),
