@@ -1,0 +1,7 @@
+# Build output from the packaging scripts
+deb/dist/
+windows/dist/
+flatpak/build-dir/
+flatpak/repo/
+flatpak/.flatpak-builder/
+flatpak/*.flatpak

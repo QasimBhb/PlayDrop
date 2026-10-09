@@ -1,0 +1,133 @@
+// Add device: opens the 120 s window (SR-6), lists devices that are in their own window,
+// pairs with one click, takes a typed address, or shows a QR code.
+
+import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
+import { PairingState } from "globals.slint";
+import { Label, Muted, Heading, Card } from "widgets.slint";
+
+export component AddDevicePage inherits Rectangle {
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        Heading {
+            text: "Add a device";
+        }
+
+        Muted {
+            text: "Choose Add device on the other device too. It shows up below; pick it, then check that both screens show the same six digits.";
+        }
+
+        if PairingState.blocked-reason != "": Card {
+            border-color: #c42b1c;
+            VerticalLayout {
+                padding: 10px;
+                Label {
+                    text: PairingState.blocked-reason;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            if !PairingState.window-open: Button {
+                text: "Start looking";
+                primary: true;
+                clicked => {
+                    PairingState.open-window();
+                }
+            }
+            if PairingState.window-open: Button {
+                text: "Stop";
+                clicked => {
+                    PairingState.close-window();
+                }
+            }
+            Button {
+                text: "Show QR code";
+                clicked => {
+                    PairingState.show-qr();
+                }
+            }
+        }
+
+        if PairingState.window-open: Muted {
+            text: "Looking for devices, " + PairingState.remaining + " left.";
+        }
+
+        if PairingState.status != "": Label {
+            text: PairingState.status;
+            color: PairingState.status-error ? #c42b1c : Palette.foreground;
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 8px;
+                alignment: start;
+                if PairingState.window-open && PairingState.candidates.length == 0: Muted {
+                    text: "No devices yet. Make sure the other device is on the same network with Add device open.";
+                }
+                for c in PairingState.candidates: Card {
+                    accessible-role: list-item;
+                    accessible-label: c.name;
+                    TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            PairingState.pair-with(c.addr);
+                        }
+                    }
+
+                    HorizontalLayout {
+                        padding: 10px;
+                        spacing: 8px;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            Label {
+                                text: c.name;
+                                font-weight: 600;
+                            }
+
+                            Muted {
+                                text: c.device-type + " · " + c.addr;
+                            }
+                        }
+
+                        Button {
+                            text: "Pair";
+                            primary: true;
+                            clicked => {
+                                PairingState.pair-with(c.addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Label {
+            text: "Or type its address";
+            font-weight: 600;
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            addr := LineEdit {
+                placeholder-text: "192.168.1.20 or 192.168.1.20:42187";
+                horizontal-stretch: 1;
+                accepted(text) => {
+                    PairingState.pair-with(text);
+                }
+            }
+
+            Button {
+                text: "Pair";
+                enabled: addr.text != "";
+                clicked => {
+                    PairingState.pair-with(addr.text);
+                }
+            }
+        }
+    }
+}

@@ -17,6 +17,7 @@
 //! A file leaves staging only after its root verifies, through an exclusive create of the
 //! final name (with " (n)" on collision) and a rename onto that placeholder (SR-18).
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -289,6 +290,18 @@ struct LedgerRecord {
     state: FileState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     root: Option<String>,
+    /// Where verified files were placed, relative to the receive root, so a transfer
+    /// resumed after a restart can still report every destination.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    saved: Vec<SavedFile>,
+}
+
+/// One placed file: its manifest fid and its final path relative to the receive root
+/// (after any " (n)" collision rename).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SavedFile {
+    fid: u32,
+    path: PathBuf,
 }
 
 /// Durable verified offset plus chunk hashes for one stream (a file or the bundle).
@@ -308,6 +321,8 @@ struct Ledger {
     unsynced: u64,
     last_sync: Instant,
     progress: SharedProgress,
+    /// Final destinations of the files this stream placed, written with every record.
+    saved: Vec<SavedFile>,
 }
 
 impl Ledger {
@@ -331,6 +346,7 @@ impl Ledger {
             unsynced: 0,
             last_sync: Instant::now(),
             progress: Arc::new(StdMutex::new(Progress::fresh())),
+            saved: Vec::new(),
         }
     }
 
@@ -352,6 +368,7 @@ impl Ledger {
         else {
             return Ok(l);
         };
+        l.saved = rec.saved;
         let mut p = Progress::fresh();
         p.state = rec.state;
         p.root = rec
@@ -463,6 +480,7 @@ impl Ledger {
             hash_count: count,
             state,
             root: root.as_ref().map(hash_to_hex),
+            saved: self.saved.clone(),
         };
         fsx::write_atomic(&self.json, &serde_json::to_vec(&rec)?)
     }
@@ -516,6 +534,7 @@ impl Ledger {
 
 #[derive(Debug)]
 struct PartInner {
+    fid: u32,
     ledger: Ledger,
     path: PathBuf,
     file: Option<File>,
@@ -603,32 +622,59 @@ impl PartInner {
             self.file()?;
         }
         self.file = None;
-        let dest = place(&self.path, dest_root, path)?;
+        let rel = place(&self.path, dest_root, path)?;
+        self.ledger.saved = vec![SavedFile {
+            fid: self.fid,
+            path: rel.clone(),
+        }];
         self.ledger.finish(FileState::Verified, Some(*claimed))?;
-        Ok(dest)
+        Ok(dest_root.join(rel))
     }
 }
 
 /// Moves a staged file to its final name beneath `dest_root` without overwriting anything
-/// and without following symlinks (SR-18): the final name is created exclusively, with
-/// " (n)" on collision, and the staged file is renamed onto that placeholder.
+/// and without following symlinks (SR-18): the folders are walked through directory
+/// handles, the final name is created exclusively (with " (n)" on collision) and the staged
+/// file is renamed onto that placeholder. Returns the final path relative to `dest_root`.
 fn place(staged: &Path, dest_root: &Path, path: &[String]) -> Result<PathBuf> {
-    let (dest, dir) = place_unsynced(staged, dest_root, path)?;
-    fsx::sync_dir(&dir)?;
-    Ok(dest)
+    let (staging, staged_name) = staged_parts(staged)?;
+    let staging = fsx::open_own_dir(staging)?;
+    let root = fsx::open_root(dest_root)?;
+    let (name, dirs) = split_path(path)?;
+    let dir = fsx::safe_dir(&root, dirs, false)?;
+    let final_name = fsx::place_into(&staging, staged_name, &dir, name)?;
+    fsx::sync_dir_handle(&dir)?;
+    Ok(relative_path(dirs, &final_name))
 }
 
-/// [`place`] without the directory sync; returns the final path and its directory so a
-/// caller placing many files can sync each directory once (protocol.md 7.6 durability).
-fn place_unsynced(staged: &Path, dest_root: &Path, path: &[String]) -> Result<(PathBuf, PathBuf)> {
-    let (name, dirs) = path
-        .split_last()
-        .ok_or_else(|| Error::PathInvalid("empty path".into()))?;
-    let dir = fsx::safe_dir(dest_root, dirs, false)?;
-    let (dest, placeholder) = fsx::create_unique(&dir, name)?;
-    drop(placeholder);
-    std::fs::rename(staged, &dest).map_err(fsx::map_io)?;
-    Ok((dest, dir))
+/// Staged file name of a bundle member (or streamed file) in the staging folder.
+fn member_name(fid: u32) -> String {
+    format!("{fid}.part")
+}
+
+/// A staged file's folder and file name.
+fn staged_parts(staged: &Path) -> Result<(&Path, &str)> {
+    match (staged.parent(), staged.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) => Ok((dir, name)),
+        _ => Err(Error::PathInvalid(format!(
+            "bad staged path {}",
+            staged.display()
+        ))),
+    }
+}
+
+/// Splits a manifest path into its file name and its folders.
+fn split_path(path: &[String]) -> Result<(&str, &[String])> {
+    path.split_last()
+        .map(|(n, d)| (n.as_str(), d))
+        .ok_or_else(|| Error::PathInvalid("empty path".into()))
+}
+
+/// `dirs/.../name` as a relative path.
+fn relative_path(dirs: &[String], name: &str) -> PathBuf {
+    let mut p: PathBuf = dirs.iter().collect();
+    p.push(name);
+    p
 }
 
 /// Receive state of one streamed file (protocol.md 7.4, 7.6; SR-18, SR-21, SR-22, SR-23).
@@ -646,13 +692,14 @@ pub struct PartFile {
 impl PartFile {
     fn fresh(staging: &Path, fid: u32, size: u64, chunk_size: u32, policy: SyncPolicy) -> Self {
         let ledger = Ledger::fresh(staging, &fid.to_string(), size, chunk_size, policy);
-        Self::from_ledger(ledger, staging.join(format!("{fid}.part")))
+        Self::from_ledger(fid, ledger, staging.join(format!("{fid}.part")))
     }
 
-    fn from_ledger(ledger: Ledger, path: PathBuf) -> Self {
+    fn from_ledger(fid: u32, ledger: Ledger, path: PathBuf) -> Self {
         let progress = ledger.progress.clone();
         Self {
             inner: Some(Box::new(PartInner {
+                fid,
                 ledger,
                 path,
                 file: None,
@@ -673,7 +720,7 @@ impl PartFile {
         let path = staging.join(format!("{fid}.part"));
         let state = lock(&ledger.progress).state;
         let verified = ledger.verified();
-        let mut part = Self::from_ledger(ledger, path.clone());
+        let mut part = Self::from_ledger(fid, ledger, path.clone());
         if matches!(state, FileState::Verified | FileState::Failed) {
             return Ok(part);
         }
@@ -806,7 +853,7 @@ struct BundleInner {
 
 impl BundleInner {
     fn member_path(&self, fid: u32) -> PathBuf {
-        self.staging.join(format!("{fid}.part"))
+        self.staging.join(member_name(fid))
     }
 
     fn is_skipped(&self, fid: u32) -> bool {
@@ -937,7 +984,7 @@ impl BundleInner {
         claimed: &ChunkHash,
         dest_root: &Path,
         manifest: &Manifest,
-    ) -> Result<()> {
+    ) -> Result<Vec<SavedFile>> {
         if self.ledger.verified() != self.ledger.size {
             return Err(Error::BadRequest("bundle is not fully verified".into()));
         }
@@ -952,22 +999,35 @@ impl BundleInner {
             .collect();
         fsx::sync_files(&self.staging, &dirty)?;
         // One rename per member, then one sync per destination folder instead of one per
-        // file: thousands of small files must not cost thousands of journal commits.
-        let mut dirs: Vec<PathBuf> = Vec::new();
+        // file: thousands of small files must not cost thousands of journal commits. Each
+        // folder is walked once (SR-18) and its handle reused for every member in it.
+        let staging = fsx::open_own_dir(&self.staging)?;
+        let root = fsx::open_root(dest_root)?;
+        let mut dirs: HashMap<&[String], cap_std::fs::Dir> = HashMap::new();
+        let mut saved = Vec::with_capacity(self.layout.members().len());
         for m in self.layout.members() {
             if self.is_skipped(m.fid) {
                 continue;
             }
-            let path = &manifest.files[m.fid as usize].path;
-            let (_, dir) = place_unsynced(&self.member_path(m.fid), dest_root, path)?;
-            if dirs.last() != Some(&dir) && !dirs.contains(&dir) {
-                dirs.push(dir);
-            }
+            let (name, parents) = split_path(&manifest.files[m.fid as usize].path)?;
+            let dir = match dirs.entry(parents) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(fsx::safe_dir(&root, parents, false)?)
+                }
+            };
+            let final_name = fsx::place_into(&staging, &member_name(m.fid), dir, name)?;
+            saved.push(SavedFile {
+                fid: m.fid,
+                path: relative_path(parents, &final_name),
+            });
         }
-        for dir in &dirs {
-            fsx::sync_dir(dir)?;
+        for dir in dirs.values() {
+            fsx::sync_dir_handle(dir)?;
         }
-        self.ledger.finish(FileState::Verified, Some(*claimed))
+        self.ledger.saved.clone_from(&saved);
+        self.ledger.finish(FileState::Verified, Some(*claimed))?;
+        Ok(saved)
     }
 }
 
@@ -1016,6 +1076,8 @@ struct Shared {
     files: Vec<Slot>,
     bundle: Option<Slot>,
     status: StdMutex<(TransferState, SystemTime)>,
+    /// Final destination of each fid relative to the receive root, once placed.
+    saved: StdMutex<Vec<Option<PathBuf>>>,
     /// Serialises [`Shared::settle_blocking`]: concurrent `PUT`s that finish together
     /// must not both complete the transfer.
     settle_gate: StdMutex<()>,
@@ -1126,9 +1188,10 @@ impl TransferReceiver {
         };
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let parent = fsx::safe_dir(&root, &[STAGING_DIR.to_owned()], true)?;
-            let staging = parent.join(&record.manifest.id);
-            match std::fs::DirBuilder::new().create(&staging) {
+            let root_dir = fsx::open_root(&root)?;
+            let parent = fsx::safe_dir(&root_dir, &[STAGING_DIR.to_owned()], true)?;
+            let staging = root.join(STAGING_DIR).join(&record.manifest.id);
+            match parent.create_dir(&record.manifest.id) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
                     return Err(Error::BadRequest(
@@ -1253,6 +1316,7 @@ impl TransferReceiver {
             }
             _ => None,
         };
+        let saved = saved_from_ledgers(&files, bundle.as_ref());
         let receiver = Self {
             shared: Arc::new(Shared {
                 manifest: rec.manifest,
@@ -1268,6 +1332,7 @@ impl TransferReceiver {
                 files,
                 bundle,
                 status: StdMutex::new((rec.state, SystemTime::now())),
+                saved: StdMutex::new(saved),
                 settle_gate: StdMutex::new(()),
             }),
         };
@@ -1305,6 +1370,22 @@ impl TransferReceiver {
     /// Path of this transfer's staging folder.
     pub fn staging_dir(&self) -> &Path {
         &self.shared.staging
+    }
+
+    /// The receive root every file of this transfer is placed beneath.
+    pub fn receive_root(&self) -> &Path {
+        &self.shared.root
+    }
+
+    /// Final paths of the files placed so far, in manifest order, after any " (n)"
+    /// collision rename (SR-18). Skipped files and files not yet verified are absent, so
+    /// once the transfer is `complete` this lists every received file.
+    pub fn saved_paths(&self) -> Vec<PathBuf> {
+        lock(&self.shared.saved)
+            .iter()
+            .flatten()
+            .map(|rel| self.shared.root.join(rel))
+            .collect()
     }
 
     /// The `GET /v1/transfers/{id}` body (protocol.md 7.5).
@@ -1551,6 +1632,31 @@ fn placeholder_bundle() -> BundleInner {
     }
 }
 
+/// Destinations recorded in the ledgers of a freshly built (or reloaded) transfer, by fid.
+fn saved_from_ledgers(files: &[Slot], bundle: Option<&Slot>) -> Vec<Option<PathBuf>> {
+    let mut saved: Vec<Option<PathBuf>> = vec![None; files.len()];
+    let mut restore = |list: &[SavedFile]| {
+        for f in list {
+            if let Some(slot) = saved.get_mut(f.fid as usize) {
+                *slot = Some(f.path.clone());
+            }
+        }
+    };
+    // Nothing else holds these locks yet: the receiver is still being built.
+    for slot in files.iter().chain(bundle) {
+        if let Ok(io) = slot.io.try_lock() {
+            match &*io {
+                SlotIo::File(PartFile {
+                    inner: Some(part), ..
+                }) => restore(&part.ledger.saved),
+                SlotIo::Bundle(b) => restore(&b.ledger.saved),
+                _ => {}
+            }
+        }
+    }
+    saved
+}
+
 /// Per-fid skip flags from a list of skipped fids (unknown fids are ignored).
 fn skip_mask(skip: &[u32], files: usize) -> Vec<bool> {
     let mut mask = vec![false; files];
@@ -1581,6 +1687,15 @@ fn remove_staging_contents(staging: &Path) -> Result<()> {
 impl Shared {
     fn is_skipped(&self, fid: u32) -> bool {
         self.skipped.get(fid as usize).copied().unwrap_or(false)
+    }
+
+    fn record_saved(&self, list: &[SavedFile]) {
+        let mut saved = lock(&self.saved);
+        for f in list {
+            if let Some(slot) = saved.get_mut(f.fid as usize) {
+                *slot = Some(f.path.clone());
+            }
+        }
     }
 
     fn write_record(&self, state: TransferState) -> Result<()> {
@@ -1632,14 +1747,19 @@ impl Shared {
         let new_state = if any_failed {
             TransferState::Failed
         } else {
+            let root = fsx::open_root(&self.root)?;
             for d in &self.manifest.dirs {
-                fsx::safe_dir(&self.root, d, false)?;
+                fsx::safe_dir(&root, d, false)?;
             }
             for f in &self.manifest.files {
                 if f.size == 0 && !f.in_bundle && !self.is_skipped(f.fid) {
-                    let (name, dirs) = f.path.split_last().expect("validated path");
-                    let dir = fsx::safe_dir(&self.root, dirs, false)?;
-                    fsx::create_unique(&dir, name)?;
+                    let (name, dirs) = split_path(&f.path)?;
+                    let dir = fsx::safe_dir(&root, dirs, false)?;
+                    let (final_name, _) = fsx::create_unique(&dir, name)?;
+                    self.record_saved(&[SavedFile {
+                        fid: f.fid,
+                        path: relative_path(dirs, &final_name),
+                    }]);
                 }
             }
             TransferState::Complete
@@ -1720,9 +1840,10 @@ impl Upload {
         }
     }
 
-    async fn blocking<F>(&mut self, f: F) -> Result<()>
+    async fn blocking<T, F>(&mut self, f: F) -> Result<T>
     where
-        F: FnOnce(&mut PartInner) -> Result<()> + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut PartInner) -> Result<T> + Send + 'static,
     {
         match &mut *self.guard {
             SlotIo::File(part) => part.run(f).await,
@@ -1730,9 +1851,10 @@ impl Upload {
         }
     }
 
-    async fn bundle_blocking<F>(&mut self, f: F) -> Result<()>
+    async fn bundle_blocking<T, F>(&mut self, f: F) -> Result<T>
     where
-        F: FnOnce(&mut BundleInner) -> Result<()> + Send + 'static,
+        T: Send + 'static,
+        F: FnOnce(&mut BundleInner) -> Result<T> + Send + 'static,
     {
         let SlotIo::Bundle(inner) = &mut *self.guard else {
             return Err(Error::NotFound);
@@ -1860,8 +1982,11 @@ impl Upload {
                 let path = self.receiver.shared.manifest.files[fid as usize]
                     .path
                     .clone();
-                self.blocking(move |p| p.finalize(&claimed, &dest_root, &path).map(|_| ()))
-                    .await
+                self.blocking(move |p| {
+                    p.finalize(&claimed, &dest_root, &path)?;
+                    Ok(p.ledger.saved.clone())
+                })
+                .await
             }
             Target::Bundle => {
                 let shared = self.receiver.shared.clone();
@@ -1869,6 +1994,9 @@ impl Upload {
                     .await
             }
         };
+        if let Ok(saved) = &result {
+            self.receiver.shared.record_saved(saved);
+        }
         self.settle().await?;
         result?;
         Ok(self.response())
@@ -2121,6 +2249,9 @@ pub(crate) mod tests {
                 0o700
             );
         }
+        // A file already at a destination name: the incoming one gets " (1)".
+        std::fs::create_dir(root.join("T")).unwrap();
+        std::fs::write(root.join("T").join("f3.dat"), b"keep me").unwrap();
         let st = rx.state();
         assert_eq!(st.state, TransferState::Accepted);
         let tok0 = st.files[0].token.clone().unwrap();
@@ -2213,6 +2344,14 @@ pub(crate) mod tests {
         assert_eq!(resp.state, FileState::Verified);
         assert_eq!(resp.root.unwrap(), hash_to_hex(&root_of(&contents[0])));
         assert_eq!(rx.transfer_state(), TransferState::Active);
+        assert_eq!(rx.saved_paths(), [root.join("T").join("f0.dat")]);
+        // A restart after file 0 was placed still knows where it went.
+        drop(rx);
+        let rx = TransferReceiver::load(&root, &m.id, FakeSpace::plenty(), SyncPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(rx.saved_paths(), [root.join("T").join("f0.dat")]);
+        assert_eq!(rx.receive_root(), root.as_path());
 
         let bstart = u64::from(CS);
         let mut up = rx.begin_bundle(&btok, bstart, btotal - 1).await.unwrap();
@@ -2227,9 +2366,15 @@ pub(crate) mod tests {
         assert_eq!(std::fs::read(t.join("f0.dat")).unwrap(), contents[0]);
         assert_eq!(std::fs::read(t.join("f1.dat")).unwrap(), contents[1]);
         assert_eq!(std::fs::read(t.join("f2.dat")).unwrap(), b"");
-        assert_eq!(std::fs::read(t.join("f3.dat")).unwrap(), contents[3]);
+        assert_eq!(std::fs::read(t.join("f3 (1).dat")).unwrap(), contents[3]);
+        assert_eq!(std::fs::read(t.join("f3.dat")).unwrap(), b"keep me");
         assert_eq!(std::fs::read(t.join("f4.dat")).unwrap(), b"");
         assert!(t.join("empty").is_dir());
+        assert_eq!(
+            rx.saved_paths(),
+            ["f0.dat", "f1.dat", "f2.dat", "f3 (1).dat", "f4.dat"].map(|n| t.join(n)),
+            "every destination in manifest order, collision rename included"
+        );
         let st = rx.state();
         assert_eq!(st.bytes_verified, m.total_bytes);
         let json = serde_json::to_value(&st).unwrap();

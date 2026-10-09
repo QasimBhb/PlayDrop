@@ -1,0 +1,142 @@
+// Pairing prompt (SR-8) and QR code (SR-9), shown over every screen.
+
+import { Button, Palette } from "std-widgets.slint";
+import { PairingState } from "globals.slint";
+import { Label, Muted, Heading, Dialog } from "widgets.slint";
+
+// SAS comparison or scanner confirmation. Neither button is focused when it opens and
+// Enter does nothing: the user must pick one on purpose (SR-8).
+export component PairingDialog inherits Dialog {
+    card-width: 420px;
+
+    // Holds focus while the dialog is up so a key press cannot reach a button behind it
+    // or answer the prompt by accident. Tab still moves to the buttons.
+    guard := FocusScope {
+        height: 0px;
+        key-pressed(event) => {
+            if event.text == Key.Return || event.text == " " || event.text == Key.Escape {
+                return accept;
+            }
+            reject
+        }
+        init => {
+            self.focus();
+        }
+    }
+
+    Heading {
+        text: PairingState.prompt-is-sas ? "Pair with " + PairingState.prompt-name + "?" : "Add " + PairingState.prompt-name + " (" + PairingState.prompt-short-id + ")?";
+    }
+
+    if PairingState.prompt-is-sas: Muted {
+        text: "Accept only if the other screen shows the same six digits.";
+    }
+
+    if PairingState.prompt-is-sas: Text {
+        text: PairingState.prompt-sas;
+        font-size: 44px;
+        font-weight: 700;
+        letter-spacing: 6px;
+        font-family: "monospace";
+        horizontal-alignment: center;
+        color: Palette.foreground;
+        accessible-label: "Pairing code " + PairingState.prompt-sas;
+    }
+
+    Label {
+        text: "Name: " + PairingState.prompt-name;
+    }
+
+    Label {
+        text: "Short ID: " + PairingState.prompt-short-id;
+        font-family: "monospace";
+    }
+
+    HorizontalLayout {
+        spacing: 12px;
+        alignment: end;
+        Button {
+            text: "Reject";
+            clicked => {
+                PairingState.respond(false);
+            }
+        }
+
+        Button {
+            text: "Accept";
+            clicked => {
+                PairingState.respond(true);
+            }
+        }
+    }
+}
+
+// The one-use QR code. On Windows the window is excluded from screen capture while this
+// is up (SR-9); the image is only filled in after that succeeded.
+export component QrDialog inherits Dialog {
+    card-width: 360px;
+
+    uri-holder := TextInput {
+        visible: false;
+        height: 0px;
+        read-only: true;
+        text: PairingState.qr-uri;
+    }
+
+    Heading {
+        text: "Scan with your phone";
+    }
+
+    HorizontalLayout {
+        alignment: center;
+        Rectangle {
+            width: 240px;
+            height: 240px;
+            background: #ffffff;
+            border-radius: 6px;
+            if PairingState.qr-ready: Image {
+                width: parent.width;
+                height: parent.height;
+                source: PairingState.qr-image;
+                image-rendering: pixelated;
+                accessible-role: image;
+                accessible-label: "Pairing QR code";
+            }
+            if !PairingState.qr-ready: Text {
+                text: "Preparing code...";
+                color: #333333;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    Muted {
+        text: "Works once, for two minutes. Anyone who sees this code can pair, so do not share it.";
+    }
+
+    if PairingState.qr-warning != "": Label {
+        text: PairingState.qr-warning;
+        color: #c42b1c;
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: end;
+        Button {
+            text: "Copy link";
+            enabled: PairingState.qr-ready;
+            clicked => {
+                uri-holder.select-all();
+                uri-holder.copy();
+            }
+        }
+
+        Button {
+            text: "Close";
+            clicked => {
+                PairingState.hide-qr();
+            }
+        }
+    }
+}

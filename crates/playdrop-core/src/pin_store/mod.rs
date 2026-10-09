@@ -207,6 +207,11 @@ pub struct Pin {
     pub last_known: Vec<SocketAddr>,
     /// When pairing completed, Unix seconds.
     pub paired_at: u64,
+    /// When this peer last sent a session hello or frame, Unix seconds (SR-8: the device
+    /// list shows it). `None` until the first session. Absent in files written before
+    /// Phase 2, hence the default.
+    #[serde(default)]
+    pub last_seen: Option<u64>,
 }
 
 impl Pin {
@@ -227,6 +232,7 @@ impl Pin {
             announce_key: None,
             last_known: Vec::new(),
             paired_at,
+            last_seen: None,
         })
     }
 
@@ -402,6 +408,16 @@ impl PinStore {
         Ok(())
     }
 
+    /// Records that `id` was last heard from at `at` (Unix seconds). Never moves the
+    /// time backwards, so a late write from an older session cannot hide a newer one.
+    pub fn set_last_seen(&mut self, id: &DeviceId, at: u64) -> Result<()> {
+        let pin = self.get_mut(id)?;
+        if pin.last_seen.is_none_or(|t| t < at) {
+            pin.last_seen = Some(at);
+        }
+        Ok(())
+    }
+
     /// Stores a peer's announce key if its `kid` is higher than the one held; the receiver
     /// keeps the highest `kid` only (protocol.md 8.2). Returns whether it was stored.
     pub fn set_announce_key(&mut self, id: &DeviceId, key: AnnounceKey) -> Result<bool> {
@@ -524,6 +540,35 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, vec![std::ffi::OsString::from(PIN_FILE)]);
+    }
+
+    #[test]
+    fn last_seen_persists_and_never_goes_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("s").join(PIN_FILE);
+        let mut store = PinStore::open(&path).unwrap();
+        let pin = new_pin("a");
+        let id = pin.device_id;
+        assert_eq!(pin.last_seen, None);
+        store.insert(pin).unwrap();
+        store.set_last_seen(&id, 2_000).unwrap();
+        store.set_last_seen(&id, 1_000).unwrap();
+        assert_eq!(store.get(&id).unwrap().last_seen, Some(2_000));
+        store.save().unwrap();
+        assert_eq!(
+            PinStore::open(&path).unwrap().get(&id).unwrap().last_seen,
+            Some(2_000)
+        );
+        let unknown = *DeviceIdentity::generate().unwrap().device_id();
+        assert!(store.set_last_seen(&unknown, 1).is_err());
+    }
+
+    #[test]
+    fn pin_without_last_seen_still_loads() {
+        let mut v = serde_json::to_value(new_pin("old")).unwrap();
+        v.as_object_mut().unwrap().remove("last_seen");
+        let pin: Pin = serde_json::from_value(v).unwrap();
+        assert_eq!(pin.last_seen, None);
     }
 
     #[test]

@@ -96,10 +96,18 @@ fn unregister(daemon: &ServiceDaemon, reg: Option<Registration>) {
 fn reregister(daemon: &ServiceDaemon, shared: &Shared, current: &mut Option<Registration>) {
     unregister(daemon, current.take());
     match register(daemon, shared) {
-        Ok(r) => *current = Some(r),
+        Ok(r) => {
+            *current = Some(r);
+            let mut st = shared.status();
+            st.mdns_registered = true;
+            st.mdns_error = None;
+        }
         Err(e) => {
             shared.own.set_mdns(None);
             tracing::warn!(error = %e, "mdns: register failed");
+            let mut st = shared.status();
+            st.mdns_registered = false;
+            st.mdns_error = Some(e.to_string());
         }
     }
 }
@@ -160,6 +168,7 @@ pub(crate) async fn run(shared: Arc<Shared>, daemon: ServiceDaemon) {
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(error = %e, "mdns: browse failed");
+            shared.status().mdns_error = Some(format!("browse failed: {e}"));
             let _ = daemon.shutdown();
             return;
         }
@@ -192,6 +201,7 @@ pub(crate) async fn run(shared: Arc<Shared>, daemon: ServiceDaemon) {
 
     unregister(&daemon, current.take());
     shared.own.set_mdns(None);
+    shared.status().mdns_registered = false;
     let _ = daemon.stop_browse(MDNS_SERVICE);
     if let Ok(done) = daemon.shutdown() {
         // Give the daemon a moment to flush goodbye packets.

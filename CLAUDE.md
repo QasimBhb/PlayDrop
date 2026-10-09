@@ -9,10 +9,12 @@ always-on companion link (ping, clipboard, battery, media, later notifications a
 LocalSend's fast, account-free file drop, and adds resume and steady speed for thousands of small files.
 Targets: Android, iOS, Windows, Linux (Pop!_OS COSMIC first, Ubuntu GNOME second). Speed is the top priority.
 
-State: Phase 1 core complete on 2026-10-08. Rust workspace with `playdrop-core` (identity, pin store,
-TLS, session plane, pairing, transfer engine, discovery, HTTP/2 net layer, host runtime) and
-`playdrop-cli`. 176 tests, clippy clean, all five Phase 1 gates pass. Licence GPL-3.0-or-later.
-UI native per platform. Build fully agentic. Next: Phase 2 desktop daemon.
+State: Phase 2 desktop complete on 2026-10-08 (branch `phase-2-desktop`). Rust workspace with
+`playdrop-core` (identity, pin store, TLS, session plane, pairing, transfer engine, discovery,
+HTTP/2 net layer, host runtime), `playdrop-cli`, `playdrop-ipc` (D-Bus and named pipe contract),
+`playdropd` (daemon: tray, notifications, clipboard sync, autostart, diagnostics) and
+`apps/desktop` (Slint window). 271 tests, clippy clean. Licence GPL-3.0-or-later. UI native per
+platform. Build fully agentic. Next: Phase 3 Android and session plane, after freezing the core API.
 
 ## Read first
 
@@ -69,10 +71,14 @@ gates A, B, D, E are tests in `crates/playdrop-core/tests/phase1_gates.rs`; gate
 `playdrop bench` run described under Commands. Loopback numbers (release): 500 MiB
 resume at ~405 MiB/s, 5,000 small files at 0.88x of one big file, HTTP/2 ~2,080 MiB/s vs raw
 framing ~2,845 MiB/s (h2 about 27% slower; kept for v1, `playdrop/2` reserved for raw bulk if
-phone CPU measurements in Phase 3 demand it). Open TODOs are tagged with their SR in the code
-(`grep -rn "TODO" crates/`). Handoff for the next session: `docs/phases/phase-1-core.md`. Next is
-Phase 2: `playdropd` daemon, tray, notifications, Slint window, Windows installer. Every PR must
-say which SRs it satisfies.
+phone CPU measurements in Phase 3 demand it). Phase 2 is done on Linux: `playdropd` over D-Bus
+(`org.playdrop.PlayDrop.Daemon1`, spec in `docs/ipc.md`), COSMIC receives with the window
+closed (200 MiB in 439 ms loopback), desktop copy reaches a peer in 2 to 5 ms, restart needs no
+re-pair, packaging for deb, Flatpak and Inno Setup written. Windows and Flatpak are written but
+never compiled or built. Open TODOs are tagged with their SR in the code
+(`grep -rn "TODO" crates/ apps/`). Handoff for the next session: `docs/phases/phase-2-desktop.md`.
+Next is Phase 3: freeze the core API, `playdrop-ffi` (UniFFI), Android `connectedDevice`
+service, share target, blobs and outbox. Every PR must say which SRs it satisfies.
 
 ## Commands
 
@@ -83,6 +89,12 @@ Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
 - One module or test: `cargo test -p playdrop-core transfer::` or `cargo test -p playdrop-core --test phase1_gates gate_a`
 - Lint and format: `cargo clippy --workspace --all-targets` (zero warnings), `cargo fmt --all`
 - Debug logs in tests: `PD_LOG=1 cargo test ...`; in the CLI: `RUST_LOG=playdrop_core=debug`
+- System packages for the Slint window on Linux: `libfontconfig1-dev libxkbcommon-dev libgl1-mesa-dev`
+- Daemon and window on this machine (data dirs must be on ext4, never under the repo; keep the real
+  user config untouched): `HOME=/tmp/pd-home target/release/playdropd --data-dir /tmp/pd-a --receive-dir /tmp/pd-a-in --port 42187 --name alpha --no-tray --no-autostart`
+  then `target/release/playdrop-desktop` (`--page <tab>` opens a tab; `PLAYDROP_SNAPSHOT=<png>` renders the window to a file and exits); drive the daemon from a shell with
+  `busctl --user call org.playdrop.PlayDrop.Daemon1 /org/playdrop/PlayDrop/Daemon1 org.playdrop.PlayDrop.Daemon1 Request s '{"op":"status"}'`
+- Live tests against a running daemon: `PD_PEER=<peer> cargo test -p playdrop-ipc --test live_daemon -- --ignored`, `cargo test -p playdropd -- --ignored clipboard`
 - Two hosts for a manual transfer, one per terminal:
   `cargo run -p playdrop-cli -- host --data-dir /tmp/pd-a --receive-dir /tmp/pd-a-in --port 42187 --name alpha`
   `cargo run -p playdrop-cli -- host --data-dir /tmp/pd-b --receive-dir /tmp/pd-b-in --port 42188 --name bravo`

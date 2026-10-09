@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=PlayDrop
+GenericName=Phone Link and File Drop
+Comment=Send files and share the clipboard between your phone and this computer
+Exec=playdrop-desktop
+Icon=org.playdrop.PlayDrop
+Terminal=false
+Categories=Network;Utility;
+Keywords=phone;android;iphone;transfer;send;share;clipboard;files;
+StartupNotify=true
+StartupWMClass=org.playdrop.PlayDrop

@@ -31,7 +31,7 @@ use tokio::time::Instant;
 pub use advert::{sanitize_name, AddDeviceFields, Advert};
 pub use beacon::BeaconSchedule;
 pub use limits::{DialLimiter, RateLimiter};
-pub use service::{Discovery, DiscoveryConfig};
+pub use service::{Discovery, DiscoveryConfig, DiscoveryStatus};
 pub use tag::{tag, verify, DeviceIdString, PeerKeys};
 
 /// Which carrier delivered an advert (protocol.md 8.1).

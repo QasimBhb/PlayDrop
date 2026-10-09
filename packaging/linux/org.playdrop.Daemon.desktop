@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=PlayDrop Background Service
+Comment=Keeps PlayDrop reachable from your phone while the window is closed
+Exec=playdropd
+Icon=org.playdrop.PlayDrop
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Phase=Applications
+# Installed to /etc/xdg/autostart. A user copy with the same file name in
+# ~/.config/autostart (for example one with Hidden=true, written when the user
+# turns autostart off) overrides this one. Users who enable the systemd user
+# unit playdropd.service should hide this entry so only one starter runs.

@@ -50,11 +50,19 @@ enum Start {
     Qr(QrPayload),
 }
 
+/// Refuses pairing while the desktop is locked (SR-6).
+pub(crate) fn ensure_unlocked(inner: &Inner) -> Result<()> {
+    if inner.lock_state.is_locked() {
+        return Err(Error::Locked);
+    }
+    Ok(())
+}
+
 /// Opens the "Add device" window for 120 s (protocol.md 6.1, SR-6) and closes the flag
-/// when it expires or fails three times.
+/// when it expires or fails three times. Refused with [`Error::Locked`] while the desktop
+/// is locked (SR-6).
 pub(crate) fn open_window(inner: &Arc<Inner>) -> Result<()> {
-    // TODO(SR-6, Phase 2): refuse while the desktop is locked (logind LockedHint,
-    // WTS_SESSION_LOCK); the CLI has no lock signal.
+    ensure_unlocked(inner)?;
     lock(&inner.window)
         .open(Instant::now(), false)
         .map_err(|e| Error::Protocol(e.to_string()))?;
@@ -419,6 +427,7 @@ async fn start_initiator(inner: &Arc<Inner>, sess: Arc<Session>, how: Start) -> 
 
 /// SAS initiator (protocol.md 6.2): the user picked `addr` from the "Add device" list.
 pub(crate) async fn pair_with(inner: &Arc<Inner>, addr: SocketAddr) -> Result<()> {
+    ensure_unlocked(inner)?;
     if !inner.window_flag.load(Ordering::SeqCst) {
         open_window(inner)?;
     }
@@ -458,6 +467,7 @@ pub(crate) fn show_qr(inner: &Arc<Inner>) -> Result<String> {
 /// QR scanner (protocol.md 6.3): aborts before sending anything unless the peer's
 /// certificate matches both `id` and `fp` (SR-9).
 pub(crate) async fn scan_qr(inner: &Arc<Inner>, uri: &str) -> Result<()> {
+    ensure_unlocked(inner)?;
     let payload = QrPayload::parse(uri)?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

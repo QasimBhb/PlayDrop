@@ -1,0 +1,124 @@
+// Transfers: offers waiting for an answer, progress with rate and time left, results
+// with Open and Show in folder.
+
+import { Button, ProgressIndicator, ScrollView, Palette } from "std-widgets.slint";
+import { TransferRow } from "types.slint";
+import { TransfersState } from "globals.slint";
+import { Label, Muted, Heading, Card } from "widgets.slint";
+
+component TransferCard inherits Card {
+    in property <TransferRow> transfer;
+    border-color: root.transfer.can-respond ? Palette.accent-background : Palette.border;
+    border-width: root.transfer.can-respond ? 2px : 1px;
+    accessible-role: list-item;
+    accessible-label: root.transfer.title + ", " + root.transfer.status-text;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 6px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Label {
+                text: root.transfer.title;
+                font-weight: 600;
+                wrap: no-wrap;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+
+            Muted {
+                text: root.transfer.status-text;
+                wrap: no-wrap;
+                color: root.transfer.state == "failed" ? #c42b1c : Palette.foreground;
+            }
+        }
+
+        Muted {
+            text: root.transfer.files;
+        }
+
+        if root.transfer.show-progress: ProgressIndicator {
+            progress: root.transfer.progress;
+        }
+
+        if root.transfer.detail != "": Muted {
+            text: root.transfer.detail;
+        }
+
+        HorizontalLayout {
+            spacing: 6px;
+            alignment: end;
+            if root.transfer.can-respond: Button {
+                text: "Decline";
+                clicked => {
+                    TransfersState.respond(root.transfer.id, false);
+                }
+            }
+            if root.transfer.can-respond: Button {
+                text: "Accept";
+                primary: true;
+                clicked => {
+                    TransfersState.respond(root.transfer.id, true);
+                }
+            }
+            if root.transfer.can-open: Button {
+                text: "Open";
+                primary: true;
+                clicked => {
+                    TransfersState.open(root.transfer.id);
+                }
+            }
+            if root.transfer.can-show: Button {
+                text: "Show in folder";
+                clicked => {
+                    TransfersState.show-in-folder(root.transfer.id);
+                }
+            }
+            if root.transfer.can-cancel: Button {
+                text: "Cancel";
+                clicked => {
+                    TransfersState.cancel(root.transfer.id);
+                }
+            }
+        }
+    }
+}
+
+export component TransfersPage inherits Rectangle {
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Heading {
+                text: "Transfers";
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "Clear finished";
+                enabled: TransfersState.rows.length > 0;
+                clicked => {
+                    TransfersState.clear-finished();
+                }
+            }
+        }
+
+        if TransfersState.rows.length == 0: Muted {
+            text: "Nothing yet. Send files from Devices; files sent to this computer show up here.";
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 10px;
+                alignment: start;
+                for row in TransfersState.rows: TransferCard {
+                    transfer: row;
+                }
+            }
+        }
+    }
+}

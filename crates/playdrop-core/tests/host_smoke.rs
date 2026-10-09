@@ -6,7 +6,7 @@ mod common;
 use std::time::Duration;
 
 use common::{pair, start_host, temp_root, write_random_file};
-use playdrop_core::host::HostEvent;
+use playdrop_core::host::{HostEvent, TransferDirection, TransferStatus};
 use playdrop_core::net::BodyReader;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -31,11 +31,64 @@ async fn pair_send_ping_unpair() {
         .expect("send finished in time")
         .expect("send succeeded");
     assert_eq!(summary.bytes, 5 * 1024 * 1024 + 123 + 1000 + 70_000);
-    b.events
+    let done = b
+        .events
         .wait_for(Duration::from_secs(10), |e| {
             matches!(e, HostEvent::TransferComplete { .. })
         })
         .await;
+    let HostEvent::TransferComplete {
+        direction,
+        saved,
+        folder,
+        roots,
+        ..
+    } = done
+    else {
+        unreachable!()
+    };
+    assert_eq!(direction, TransferDirection::Receive);
+    assert_eq!(folder.as_deref(), Some(b.recv_dir.as_path()));
+    let mut saved = saved;
+    saved.sort();
+    let mut want: Vec<_> = ["big.bin", "small1.txt", "small2.txt", "zero.txt"]
+        .iter()
+        .map(|n| b.recv_dir.join("Holiday").join(n))
+        .collect();
+    want.sort();
+    assert_eq!(
+        saved, want,
+        "every received file is reported where it landed"
+    );
+    assert_eq!(roots.len(), 4);
+    let big_root = roots.iter().find(|r| r.path == "Holiday/big.bin").unwrap();
+    assert_eq!(
+        big_root.root,
+        summary
+            .roots
+            .iter()
+            .find(|r| r.path == "Holiday/big.bin")
+            .unwrap()
+            .root,
+        "both sides report the same verified root"
+    );
+    for (host, dir) in [
+        (&a.host, TransferDirection::Send),
+        (&b.host, TransferDirection::Receive),
+    ] {
+        let list = host.transfers();
+        let t = list.iter().find(|t| t.id == summary.id).unwrap();
+        assert_eq!(t.direction, dir);
+        assert_eq!(t.state, TransferStatus::Complete);
+        assert_eq!(t.bytes, summary.bytes);
+        assert_eq!(t.file_count, 4);
+        // A late UI sees where received files landed; senders report none.
+        let got: std::collections::BTreeSet<_> = t.saved.iter().collect();
+        let receive = dir == TransferDirection::Receive;
+        assert_eq!(got.len(), if receive { 4 } else { 0 });
+        assert!(got.iter().all(|p| want.contains(p)));
+        assert_eq!(t.folder.is_some(), receive);
+    }
     for name in ["big.bin", "small1.txt", "small2.txt", "zero.txt"] {
         let want = std::fs::read(src.join(name)).unwrap();
         let got = std::fs::read(b.recv_dir.join("Holiday").join(name)).unwrap();
@@ -62,6 +115,36 @@ async fn pair_send_ping_unpair() {
 
     a.host.shutdown().await;
     b.host.shutdown().await;
+}
+
+/// SR-8: the last-seen time is written to the pin, so it is still shown after a restart
+/// while the peer is offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn last_seen_survives_restart() {
+    common::init_logs();
+    let root = temp_root();
+    let mut a = start_host(root.path(), "alpha", 0).await;
+    let mut b = start_host(root.path(), "bravo", 0).await;
+    pair(&mut a, &mut b).await;
+    a.events
+        .wait_for(Duration::from_secs(10), |e| {
+            matches!(e, HostEvent::PeerOnline { .. })
+        })
+        .await;
+    assert!(b.host.peers()[0].last_seen.is_some());
+    b.host.shutdown().await;
+    a.events
+        .wait_for(Duration::from_secs(10), |e| {
+            matches!(e, HostEvent::PeerOffline { .. })
+        })
+        .await;
+    let before = a.host.peers()[0].last_seen.expect("seen while paired");
+    // No pause: shutdown itself writes the newest time to the pin.
+    let a = a.restart(root.path()).await;
+    let p = &a.host.peers()[0];
+    assert!(!p.online);
+    assert_eq!(p.last_seen, Some(before));
+    a.host.shutdown().await;
 }
 
 /// SR-13: an unpaired connection reaches only the session stream (`403 not_paired`), and a
@@ -202,4 +285,183 @@ async fn qr_pairing_and_single_use_secret() {
     a.host.shutdown().await;
     b.host.shutdown().await;
     c.host.shutdown().await;
+}
+
+/// Gap 10 and gap 2: an offer lists its file names, both sides list it as `offered`, and
+/// the receiver can cancel it by ID; the sender then sees a cancel, not a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::many_single_char_names, reason = "a, b are the hosts")]
+async fn offer_names_and_cancel_by_id() {
+    common::init_logs();
+    let root = temp_root();
+    let mut a = start_host(root.path(), "alpha", 0).await;
+    let mut b = start_host(root.path(), "bravo", 0).await;
+    pair(&mut a, &mut b).await;
+    let a_id = a.host.device_id();
+    let mut g = b.host.grants(&a_id).unwrap();
+    g.files = false;
+    b.host.set_grants(&a_id, g).await.unwrap();
+
+    let src = root.path().join("src").join("Docs");
+    std::fs::create_dir_all(&src).unwrap();
+    write_random_file(&src.join("one.pdf"), 4096, 1);
+    write_random_file(&src.join("two.txt"), 10, 2);
+    let mut handle = a.host.send(&b.host.device_id(), vec![src]).await.unwrap();
+    let offer = b
+        .events
+        .wait_for(Duration::from_secs(10), |e| {
+            matches!(e, HostEvent::TransferOffer { .. })
+        })
+        .await;
+    let HostEvent::TransferOffer {
+        id,
+        files,
+        file_count,
+        ..
+    } = offer
+    else {
+        unreachable!()
+    };
+    assert_eq!(file_count, 2);
+    let mut names: Vec<_> = files.iter().map(|f| f.path.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["Docs/one.pdf", "Docs/two.txt"]);
+    let b_list = b.host.transfers();
+    assert_eq!(b_list.len(), 1);
+    assert_eq!(b_list[0].state, TransferStatus::Offered);
+    assert_eq!(b_list[0].peer, a_id.to_hex());
+    assert_eq!(a.host.transfers()[0].state, TransferStatus::Offered);
+
+    b.host.cancel_transfer(&id).await.unwrap();
+    assert!(
+        b.host.cancel_transfer(&id).await.is_err(),
+        "already cancelled"
+    );
+    let r = tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("sender stopped in time");
+    assert!(r.is_err());
+    b.events
+        .wait_for(Duration::from_secs(5), |e| {
+            matches!(e, HostEvent::TransferFailed { .. })
+        })
+        .await;
+    assert_eq!(b.host.transfers()[0].state, TransferStatus::Cancelled);
+    assert_eq!(a.host.transfers()[0].state, TransferStatus::Cancelled);
+    assert!(b.recv_dir.read_dir().map_or(true, |mut d| d
+        .all(|e| e.unwrap().file_name() == ".playdrop-partial")));
+
+    // A sender-side cancel by ID of a new pending offer.
+    let other = root.path().join("src").join("x.bin");
+    write_random_file(&other, 100, 3);
+    let mut handle = a.host.send(&b.host.device_id(), vec![other]).await.unwrap();
+    let id = handle.id().to_owned();
+    a.host.cancel_transfer(&id).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(10), handle.wait())
+        .await
+        .expect("sender stopped in time");
+    assert!(r.is_err());
+    let t = a.host.transfers().into_iter().find(|t| t.id == id).unwrap();
+    assert_eq!(t.state, TransferStatus::Cancelled);
+    assert!(a.host.cancel_transfer("nope").await.is_err());
+
+    a.host.shutdown().await;
+    a.host.shutdown().await;
+    b.host.shutdown().await;
+}
+
+/// Gap 5: one clipboard change goes to every online peer with `clipboardOut`, the echo
+/// rule applies once, a push that reached nobody does not suppress the next one, and text
+/// over 32 KiB is refused (protocol.md 5.7).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::many_single_char_names, reason = "a, b are the hosts")]
+async fn clipboard_push_to_all_with_echo_rule() {
+    use playdrop_core::Error;
+
+    common::init_logs();
+    let root = temp_root();
+    let mut a = start_host(root.path(), "alpha", 0).await;
+    let mut b = start_host(root.path(), "bravo", 0).await;
+    pair(&mut a, &mut b).await;
+    let (a_id, b_id) = (a.host.device_id(), b.host.device_id());
+    let mut g = a.host.grants(&b_id).unwrap();
+    g.clipboard_out = false;
+    a.host.set_grants(&b_id, g).await.unwrap();
+    let mut g = b.host.grants(&a_id).unwrap();
+    g.clipboard_in = true;
+    g.clipboard_out = true;
+    b.host.set_grants(&a_id, g).await.unwrap();
+
+    let r = a.host.push_clipboard("hello", false).unwrap();
+    assert_eq!(r.skipped_no_grant, 1);
+    assert_eq!(r.sent_to, []);
+
+    let mut g = a.host.grants(&b_id).unwrap();
+    g.clipboard_out = true;
+    a.host.set_grants(&b_id, g).await.unwrap();
+    let r = a.host.push_clipboard("hello", false).unwrap();
+    assert_eq!(
+        r.sent_to,
+        [b_id],
+        "an unsent clip is not remembered as sent"
+    );
+    assert!(!r.skipped_echo);
+    let ev = b
+        .events
+        .wait_for(Duration::from_secs(5), |e| {
+            matches!(e, HostEvent::Clipboard { .. })
+        })
+        .await;
+    let HostEvent::Clipboard { text, .. } = ev else {
+        unreachable!()
+    };
+    assert_eq!(text.0.as_deref(), Some("hello"));
+
+    assert!(a.host.push_clipboard("hello", false).unwrap().skipped_echo);
+    // B applied "hello"; its clipboard watcher then reports the same text: no echo back.
+    assert!(b.host.push_clipboard("hello", false).unwrap().skipped_echo);
+    assert!(!b.host.send_clipboard(&a_id, "hello", false).unwrap());
+
+    let big = "x".repeat(32 * 1024 + 1);
+    assert!(matches!(
+        a.host.push_clipboard(&big, false),
+        Err(Error::TooLarge(_))
+    ));
+    assert!(matches!(
+        a.host.send_clipboard(&b_id, &big, false),
+        Err(Error::TooLarge(_))
+    ));
+    assert!(a.host.send_clipboard(&b_id, "world", true).unwrap());
+
+    // Gap 6: diagnostics on demand.
+    let d = a.host.diagnose();
+    assert!(d.bind_ok);
+    assert_eq!(d.port, a.host.local_addr().port());
+    assert_eq!(d.device_id, a_id.to_hex());
+    assert!(!d.multicast.enabled, "discovery is off in loopback tests");
+    assert!(!d.mdns.enabled);
+    assert_eq!(d.peers.len(), 1);
+    assert!(d.peers[0].online);
+    assert_eq!(d.peers[0].peer, b_id.to_hex());
+    let json = serde_json::to_string(&d).unwrap();
+    let back: playdrop_core::host::Diagnostics = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, d);
+
+    b.host.shutdown().await;
+    a.events
+        .wait_for(Duration::from_secs(5), |e| {
+            matches!(e, HostEvent::PeerOffline { .. })
+        })
+        .await;
+    a.host.network_changed();
+    assert!(a.host.connect(&b_id).await.is_err());
+    let d = a.host.diagnose();
+    assert!(!d.peers[0].online);
+    let fail = d.peers[0]
+        .last_result
+        .clone()
+        .expect("dial failure recorded");
+    assert_eq!(fail.path, playdrop_core::host::DiscoveryPath::LastKnown);
+    assert!(fail.at > 0);
+    a.host.shutdown().await;
 }

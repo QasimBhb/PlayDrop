@@ -1,0 +1,72 @@
+// Diagnostics: which discovery layer failed and whether the port is blocked, worded for
+// the user first, details after.
+
+import { Button, ScrollView, Palette } from "std-widgets.slint";
+import { DiagnosticsState } from "globals.slint";
+import { Label, Muted, Heading, Card } from "widgets.slint";
+
+export component DiagnosticsPage inherits Rectangle {
+    VerticalLayout {
+        padding: 16px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Heading {
+                text: "Diagnostics";
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "Refresh";
+                enabled: !DiagnosticsState.loading;
+                clicked => {
+                    DiagnosticsState.refresh();
+                }
+            }
+
+            Button {
+                text: "Network changed, retry";
+                clicked => {
+                    DiagnosticsState.network-changed();
+                }
+            }
+        }
+
+        if DiagnosticsState.loading: Muted {
+            text: "Checking the network...";
+        }
+
+        if DiagnosticsState.error != "": Label {
+            text: DiagnosticsState.error;
+            color: #c42b1c;
+        }
+
+        ScrollView {
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: 10px;
+                alignment: start;
+                for line in DiagnosticsState.summary: Label {
+                    text: line;
+                    font-weight: 600;
+                }
+                for section in DiagnosticsState.sections: Card {
+                    border-color: section.ok ? Palette.border : #c42b1c;
+                    VerticalLayout {
+                        padding: 10px;
+                        spacing: 4px;
+                        Label {
+                            text: section.title;
+                            font-weight: 600;
+                        }
+
+                        for line in section.lines: Muted {
+                            text: line;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

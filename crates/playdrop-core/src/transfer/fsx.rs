@@ -2,19 +2,29 @@
 //! follow symlinks, exclusive file creation with " (n)" collision names, owner-only
 //! permissions and atomic small-file writes (SR-18, SR-23).
 //!
-//! These use `std::fs` only. A planted symlink is refused by checking every component with
-//! `symlink_metadata` and by creating files with `create_new` (which fails on any existing
-//! name, symlinks included). A local attacker racing between check and use is out of reach
-//! of `std`; `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` through `cap-std` or `rustix`
-//! closes that gap.
+//! Everything a peer's manifest names is reached through directory handles, never through
+//! a re-resolved path (SR-18). The receive root is opened once as a `cap_std::fs::Dir`;
+//! each manifest folder is then opened one component at a time relative to its parent:
 //!
-//! TODO(SR-18): walk and create through `rustix::fs::openat2` with `RESOLVE_BENEATH |
-//! RESOLVE_NO_SYMLINKS` on Linux (rustix is now a dependency) to close the check-then-use
-//! window.
+//! - On Linux with `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, so the kernel refuses
+//!   any symlink and any escape at the moment of the open: no check-then-use window.
+//! - Elsewhere (and on Linux kernels before 5.6, or under a seccomp filter that hides
+//!   `openat2`) through `cap-std`, which keeps every open beneath the root, after refusing a
+//!   component that is a symlink. A race there can at worst redirect within the root.
+//!
+//! Final names are created with `create_new` relative to the folder handle (fails on any
+//! existing name, symlinks included) and the staged file is renamed onto that name with
+//! `renameat` between the two handles.
+//!
+//! The staging folder `<root>/.playdrop-partial/<id>` is created the same way, owner-only;
+//! files inside it (`.part`, ledgers) are then used by path, since nothing in it is named
+//! by a peer and only this user can write there (SR-23).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+use cap_std::fs::Dir;
 
 use crate::{Error, Result};
 
@@ -46,45 +56,110 @@ fn private_dir_builder(recursive: bool) -> std::fs::DirBuilder {
     b
 }
 
-/// Walks `components` beneath `root`, creating missing directories, and refuses any
-/// component that is a symlink or not a directory (SR-18). Returns the final directory.
-pub(crate) fn safe_dir(root: &Path, components: &[String], private: bool) -> Result<PathBuf> {
-    let mut dir = root.to_path_buf();
-    for c in components {
-        dir.push(c);
-        loop {
-            match std::fs::symlink_metadata(&dir) {
-                Ok(m) if m.file_type().is_symlink() => {
-                    return Err(Error::PathInvalid(format!(
-                        "{} is a symlink; not followed",
-                        dir.display()
-                    )))
-                }
-                Ok(m) if m.is_dir() => break,
-                Ok(_) => {
-                    return Err(Error::PathInvalid(format!(
-                        "{} exists and is not a folder",
-                        dir.display()
-                    )))
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    let mut b = if private {
-                        private_dir_builder(false)
-                    } else {
-                        std::fs::DirBuilder::new()
-                    };
-                    match b.recursive(false).create(&dir) {
-                        // Re-check on the next loop turn: a racing creator may have won.
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(e) => return Err(e.into()),
-                    }
-                }
-                Err(e) => return Err(e.into()),
-            }
+/// Opens the receive root as a directory handle, creating it owner-only first if needed
+/// (SR-23). The root itself may be a symlink the user chose; nothing beneath it may be.
+pub(crate) fn open_root(root: &Path) -> Result<Dir> {
+    ensure_root(root)?;
+    Ok(Dir::open_ambient_dir(root, cap_std::ambient_authority())?)
+}
+
+/// Refuses a component that is not one plain name. Manifest validation already does this
+/// (protocol.md 7.2); this keeps the walk safe on its own.
+fn check_component(c: &str) -> Result<()> {
+    if c.is_empty() || c == "." || c == ".." || c.contains(['/', '\\', '\0']) {
+        return Err(Error::PathInvalid(format!("{c:?} is not a plain name")));
+    }
+    Ok(())
+}
+
+/// Opens the folder `name` directly inside `parent`, never following a symlink (SR-18).
+fn open_child_dir(parent: &Dir, name: &str) -> io::Result<Dir> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{openat2, Mode, OFlags, ResolveFlags};
+        let opened = openat2(
+            parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+        );
+        match opened {
+            Ok(fd) => return Ok(Dir::from(fd)),
+            // No openat2 here (old kernel, seccomp): use the portable path below.
+            Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => {}
+            Err(e) => return Err(io::Error::from(e)),
         }
     }
+    if parent.symlink_metadata(name)?.file_type().is_symlink() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "symlink"));
+    }
+    parent.open_dir(name)
+}
+
+/// Why opening `name` in `parent` failed, worded for the user.
+fn refusal(parent: &Dir, name: &str, e: io::Error) -> Error {
+    match parent.symlink_metadata(name) {
+        Ok(m) if m.file_type().is_symlink() => {
+            Error::PathInvalid(format!("{name} is a symlink; not followed"))
+        }
+        Ok(m) if !m.is_dir() => Error::PathInvalid(format!("{name} exists and is not a folder")),
+        _ => map_io(e),
+    }
+}
+
+/// Walks `components` beneath `root`, creating missing folders (0700 if `private`, SR-23),
+/// and refuses any component that is a symlink or not a folder (SR-18). Returns a handle to
+/// the final folder.
+pub(crate) fn safe_dir(root: &Dir, components: &[String], private: bool) -> Result<Dir> {
+    let mut dir = root.try_clone()?;
+    let mut builder = cap_std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    if private {
+        use cap_std::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    #[cfg(not(unix))]
+    let _ = private;
+    for c in components {
+        check_component(c)?;
+        match dir.create_dir_with(c, &builder) {
+            Ok(()) => {}
+            // Existing folder, file or symlink: the open below tells them apart.
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(refusal(&dir, c, e)),
+        }
+        dir = open_child_dir(&dir, c).map_err(|e| refusal(&dir, c, e))?;
+    }
     Ok(dir)
+}
+
+/// Opens a directory handle on a path this host created itself (a staging folder).
+pub(crate) fn open_own_dir(path: &Path) -> Result<Dir> {
+    Ok(Dir::open_ambient_dir(path, cap_std::ambient_authority())?)
+}
+
+/// Makes a folder's entries durable (Unix `fsync`). A no-op elsewhere. `cap-std` may hold
+/// a folder as an `O_PATH` handle, which cannot be synced, so `.` is reopened readable
+/// first; that open is relative to the handle and resolves nothing else.
+pub(crate) fn sync_dir_handle(dir: &Dir) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{openat, Mode, OFlags};
+        let sync = || -> rustix::io::Result<()> {
+            let fd = openat(
+                dir,
+                ".",
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            rustix::fs::fsync(&fd)
+        };
+        sync().map_err(|e| map_io(io::Error::from(e)))?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
 }
 
 /// Opens options for a new owner-only, never-executable file (0600 on Unix, SR-23).
@@ -124,13 +199,29 @@ pub(crate) fn collision_name(name: &str, n: u32) -> String {
     format!("{}{suffix}{ext}", &stem[..cut])
 }
 
-/// Exclusively creates `dir/name`, or `name (1)`, `name (2)`, ... on collision; never
-/// overwrites and never follows a symlink at the final name (SR-18).
-pub(crate) fn create_unique(dir: &Path, name: &str) -> Result<(PathBuf, File)> {
+/// Options for a new owner-only, never-executable file relative to a [`Dir`] (0600 on
+/// Unix, SR-23), created exclusively.
+fn private_create_new() -> cap_std::fs::OpenOptions {
+    let mut o = cap_std::fs::OpenOptions::new();
+    o.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o
+}
+
+/// Exclusively creates `name` in `dir`, or `name (1)`, `name (2)`, ... on collision; never
+/// overwrites and never follows a symlink at the final name (SR-18). Returns the name used
+/// and the open file.
+pub(crate) fn create_unique(dir: &Dir, name: &str) -> Result<(String, File)> {
+    check_component(name)?;
+    let options = private_create_new();
     for n in 0..MAX_COLLISIONS {
-        let candidate = dir.join(collision_name(name, n));
-        match private_file_options().create_new(true).open(&candidate) {
-            Ok(f) => return Ok((candidate, f)),
+        let candidate = collision_name(name, n);
+        match dir.open_with(&candidate, &options) {
+            Ok(f) => return Ok((candidate, f.into_std())),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
             Err(e) => return Err(map_io(e)),
         }
@@ -138,6 +229,24 @@ pub(crate) fn create_unique(dir: &Path, name: &str) -> Result<(PathBuf, File)> {
     Err(Error::PathInvalid(format!(
         "{name}: too many existing files with this name"
     )))
+}
+
+/// Moves `staged_name` from the `staging` folder to `name` (or its " (n)" form) in `dir`
+/// without overwriting anything (SR-18): the final name is created exclusively, then the
+/// staged file is renamed onto that placeholder between the two handles. Returns the name
+/// used. The caller syncs `dir`.
+pub(crate) fn place_into(
+    staging: &Dir,
+    staged_name: &str,
+    dir: &Dir,
+    name: &str,
+) -> Result<String> {
+    let (final_name, placeholder) = create_unique(dir, name)?;
+    drop(placeholder);
+    staging
+        .rename(staged_name, dir, &final_name)
+        .map_err(map_io)?;
+    Ok(final_name)
 }
 
 /// Opens an existing regular file for writing without following a symlink: the path must
@@ -263,9 +372,40 @@ mod tests {
     fn create_unique_never_overwrites() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.txt"), b"keep").unwrap();
-        let (p, _) = create_unique(dir.path(), "a.txt").unwrap();
-        assert_eq!(p.file_name().unwrap(), "a (1).txt");
+        let d = open_root(dir.path()).unwrap();
+        let (name, _) = create_unique(&d, "a.txt").unwrap();
+        assert_eq!(name, "a (1).txt");
         assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"keep");
+        assert!(matches!(
+            create_unique(&d, "../x"),
+            Err(Error::PathInvalid(_))
+        ));
+        assert!(matches!(
+            safe_dir(&d, &["..".into()], false),
+            Err(Error::PathInvalid(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_modes_and_nested_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("r");
+        let d = open_root(&root).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root), 0o700);
+        let leaf = safe_dir(&d, &["a".into(), "b".into()], true).unwrap();
+        assert_eq!(mode(&root.join("a").join("b")), 0o700);
+        let (name, _) = create_unique(&leaf, "f").unwrap();
+        assert_eq!(mode(&root.join("a").join("b").join(name)), 0o600);
+        // Walking again reuses the existing folders.
+        safe_dir(&d, &["a".into(), "b".into()], true).unwrap();
+        std::fs::write(root.join("file"), b"x").unwrap();
+        assert!(matches!(
+            safe_dir(&d, &["file".into()], false),
+            Err(Error::PathInvalid(_))
+        ));
     }
 
     #[cfg(unix)]
@@ -276,14 +416,54 @@ mod tests {
         let target = outside.path().join("bashrc");
         std::fs::write(&target, b"original").unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("sub")).unwrap();
+        let d = open_root(dir.path()).unwrap();
         assert!(matches!(
-            safe_dir(dir.path(), &["sub".into()], false),
+            safe_dir(&d, &["sub".into()], false),
+            Err(Error::PathInvalid(_))
+        ));
+        // A link deeper in the walk is refused too.
+        let inner = safe_dir(&d, &["ok".into()], false).unwrap();
+        drop(inner);
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("ok").join("deep")).unwrap();
+        assert!(matches!(
+            safe_dir(&d, &["ok".into(), "deep".into(), "x".into()], false),
             Err(Error::PathInvalid(_))
         ));
         std::os::unix::fs::symlink(&target, dir.path().join("x")).unwrap();
-        let (p, _) = create_unique(dir.path(), "x").unwrap();
-        assert_eq!(p.file_name().unwrap(), "x (1)");
+        let (name, _) = create_unique(&d, "x").unwrap();
+        assert_eq!(name, "x (1)");
         assert!(open_existing_regular(&dir.path().join("x")).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 1);
+    }
+
+    /// SR-18: a symlink planted inside the receive root that points outside is never used to
+    /// create a file there, even when the walk would go through it.
+    #[cfg(unix)]
+    #[test]
+    fn planted_symlink_to_outside_is_not_followed_when_creating() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = dir.path().join("Downloads");
+        let d = open_root(&root).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join("Photos")).unwrap();
+        let staging = safe_dir(&d, &[".staging".into()], true).unwrap();
+        std::fs::write(root.join(".staging").join("0.part"), b"payload").unwrap();
+
+        let r = safe_dir(&d, &["Photos".into()], false)
+            .and_then(|photos| place_into(&staging, "0.part", &photos, "evil.sh"));
+        assert!(matches!(r, Err(Error::PathInvalid(_))), "{r:?}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        assert!(
+            root.join(".staging").join("0.part").exists(),
+            "nothing moved"
+        );
+
+        // A link at the final name is not overwritten either.
+        std::os::unix::fs::symlink(outside.path().join("t"), root.join("evil.sh")).unwrap();
+        let name = place_into(&staging, "0.part", &d, "evil.sh").unwrap();
+        assert_eq!(name, "evil (1).sh");
+        assert_eq!(std::fs::read(root.join("evil (1).sh")).unwrap(), b"payload");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 }

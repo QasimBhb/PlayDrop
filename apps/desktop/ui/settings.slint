@@ -1,0 +1,120 @@
+// Settings: receive folder, device name, clipboard sync, autostart, notifications, and
+// this computer's identity.
+
+import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
+import { SettingsState } from "globals.slint";
+import { Label, Muted, Heading, Toggle } from "widgets.slint";
+
+export component SettingsPage inherits Rectangle {
+    ScrollView {
+        VerticalLayout {
+            padding: 16px;
+            spacing: 12px;
+            alignment: start;
+
+            Heading {
+                text: "Settings";
+            }
+
+            Label {
+                text: "Received files go to";
+                font-weight: 600;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Label {
+                    text: SettingsState.receive-dir;
+                    wrap: no-wrap;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    text: "Change...";
+                    clicked => {
+                        SettingsState.choose-receive-dir();
+                    }
+                }
+            }
+
+            Label {
+                text: "This computer's name";
+                font-weight: 600;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                name := LineEdit {
+                    text: SettingsState.device-name;
+                    placeholder-text: "Name other devices see";
+                    horizontal-stretch: 1;
+                    accepted(text) => {
+                        SettingsState.set-device-name(text);
+                    }
+                }
+
+                Button {
+                    text: "Save";
+                    enabled: name.text != "" && name.text != SettingsState.device-name;
+                    clicked => {
+                        SettingsState.set-device-name(name.text);
+                    }
+                }
+            }
+
+            Muted {
+                text: "Changing the folder or the name reconnects devices for a moment.";
+            }
+
+            Toggle {
+                text: "Sync the clipboard automatically";
+                checked: SettingsState.clipboard-sync;
+                enabled: SettingsState.clipboard-watch-supported;
+                toggled(on) => {
+                    SettingsState.set-clipboard-sync(on);
+                }
+            }
+
+            if !SettingsState.clipboard-watch-supported: Muted {
+                text: "This desktop does not let apps watch the clipboard (GNOME). Use Send clipboard on a device instead.";
+            }
+
+            Toggle {
+                text: "Start PlayDrop when I log in";
+                checked: SettingsState.autostart;
+                toggled(on) => {
+                    SettingsState.set-autostart(on);
+                }
+            }
+
+            Toggle {
+                text: "Show notifications";
+                checked: SettingsState.notifications;
+                toggled(on) => {
+                    SettingsState.set-notifications(on);
+                }
+            }
+
+            Label {
+                text: "This computer";
+                font-weight: 600;
+            }
+
+            Label {
+                text: "Short ID: " + SettingsState.short-id;
+                font-family: "monospace";
+            }
+
+            Muted {
+                text: "Device ID: " + SettingsState.device-id;
+                font-family: "monospace";
+                wrap: char-wrap;
+            }
+
+            Muted {
+                text: SettingsState.about;
+            }
+        }
+    }
+}

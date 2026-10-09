@@ -98,6 +98,7 @@ pub struct BeaconReceiver {
     socket: UdpSocket,
     group: Ipv4Addr,
     joined: HashSet<Ipv4Addr>,
+    failed: Vec<(Ipv4Addr, String)>,
 }
 
 impl BeaconReceiver {
@@ -127,6 +128,7 @@ impl BeaconReceiver {
             socket,
             group: *group.ip(),
             joined: HashSet::new(),
+            failed: Vec::new(),
         })
     }
 
@@ -134,6 +136,7 @@ impl BeaconReceiver {
     /// listed. Failures are logged and skipped so one bad interface does not stop the rest.
     pub fn sync_membership(&mut self, interfaces: &[Ipv4Interface]) {
         let want: HashSet<Ipv4Addr> = interfaces.iter().map(|i| i.addr).collect();
+        self.failed.clear();
         for gone in self.joined.difference(&want).copied().collect::<Vec<_>>() {
             // The interface may already be gone, in which case the kernel dropped it too.
             let _ = self.socket.leave_multicast_v4(self.group, gone);
@@ -150,9 +153,30 @@ impl BeaconReceiver {
                 Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
                     self.joined.insert(addr);
                 }
-                Err(e) => tracing::debug!(%addr, error = %e, "beacon: join failed"),
+                Err(e) => {
+                    tracing::debug!(%addr, error = %e, "beacon: join failed");
+                    self.failed.push((addr, e.to_string()));
+                }
             }
         }
+    }
+
+    /// Interface addresses currently joined to the group, sorted.
+    pub fn joined(&self) -> Vec<Ipv4Addr> {
+        let mut v: Vec<Ipv4Addr> = self.joined.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// Joins that failed in the last [`BeaconReceiver::sync_membership`], with the error.
+    pub fn join_failures(&self) -> &[(Ipv4Addr, String)] {
+        &self.failed
+    }
+
+    fn report(&self, shared: &Shared) {
+        let mut st = shared.status();
+        st.beacon_joined = self.joined();
+        st.beacon_join_failed.clone_from(&self.failed);
     }
 }
 
@@ -251,6 +275,7 @@ pub(crate) async fn run_receiver(shared: Arc<Shared>, mut rx: BeaconReceiver) {
     // silently truncated to a legal length.
     let mut buf = vec![0u8; MAX_BEACON_LEN + 1];
     rx.sync_membership(&shared.interfaces());
+    rx.report(&shared);
     loop {
         tokio::select! {
             r = rx.socket.recv_from(&mut buf) => match r {
@@ -271,6 +296,7 @@ pub(crate) async fn run_receiver(shared: Arc<Shared>, mut rx: BeaconReceiver) {
             r = refresh.changed() => {
                 if r.is_err() { return; }
                 rx.sync_membership(&shared.interfaces());
+                rx.report(&shared);
             }
             () = stopped(&mut stop) => return,
         }
@@ -439,6 +465,9 @@ mod tests {
             matches!(ev, DiscoveryEvent::Verified { ref device_id, addr: got, .. }
             if *device_id == "a".repeat(64) && got.ip() == IpAddr::V4(addr))
         );
+        let st = b.status();
+        assert!(st.last_beacon.is_some(), "a foreign beacon is noted");
+        assert_eq!(st.beacon_joined, [addr]);
         a.stop().await;
         b.stop().await;
     }

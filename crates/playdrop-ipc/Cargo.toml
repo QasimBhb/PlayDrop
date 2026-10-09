@@ -1,0 +1,53 @@
+[package]
+name = "playdrop-ipc"
+description = "PlayDrop local IPC: the contract between the desktop daemon and its UI clients, plus the D-Bus and named pipe transports"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Same lint set as the workspace, except `unsafe_code` is `deny` rather than `forbid`:
+# the Windows named pipe security descriptor and token SID checks (SR-27) need a few
+# audited `unsafe` FFI calls, each under a scoped `#[allow(unsafe_code)]` with a SAFETY comment.
+# Linux builds contain no unsafe code.
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[dependencies]
+futures-util = "0.3.34"
+playdrop-core = { path = "../playdrop-core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "net", "fs", "io-util", "sync", "time", "macros"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tokio-util = { version = "0.7.19", features = ["codec"] }
+tracing = "0.1.44"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", features = ["fs", "process"] }
+zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tracing-subscriber = "0.3.23"

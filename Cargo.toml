@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["crates/playdrop-core", "crates/playdrop-cli"]
+members = [
+    "crates/playdrop-core",
+    "crates/playdrop-cli",
+    "crates/playdrop-ipc",
+    "crates/playdropd",
+    "apps/desktop",
+]
 
 [workspace.package]
 version = "0.1.0"

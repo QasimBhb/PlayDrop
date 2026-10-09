@@ -1,0 +1,19 @@
+Package: playdrop
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: PlayDrop maintainers <playdrop@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Section: net
+Priority: optional
+Homepage: https://github.com/QasimBhb/PlayDrop
+Depends: libc6 (>= 2.39), libgcc-s1, libfontconfig1, libxkbcommon0, libgl1, libegl1, libwayland-client0
+Recommends: xdg-desktop-portal
+Suggests: ufw
+Description: phone-to-computer link and fast local file drop
+ PlayDrop links a phone and a computer over the local network. It sends
+ files in both directions without an account or cloud service, resumes
+ interrupted transfers, and keeps the clipboard in step.
+ .
+ This package installs the background service (playdropd), which starts at
+ login and stays reachable while the window is closed, and the desktop
+ window (playdrop-desktop).
