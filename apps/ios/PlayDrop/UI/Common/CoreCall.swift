@@ -9,7 +9,7 @@ import Foundation
 enum CoreCall {
     /// Runs `body`; returns its value, or nil after posting the error to `messages`.
     @discardableResult
-    static func run<T>(_ messages: MessageCenter, _ body: () async throws -> T) async -> T? {
+    static func run<T: Sendable>(_ messages: MessageCenter, _ body: () async throws -> T) async -> T? {
         do {
             return try await body()
         } catch {

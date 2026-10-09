@@ -173,11 +173,11 @@ enum CoreHostImpl {
         }
         loggingInitialised = true
         #if DEBUG
-        let debug = true
+        let level: LogLevel = .debug
         #else
-        let debug = AppSettings.shared.logLevelDebug
+        let level: LogLevel = AppSettings.shared.logLevelDebug ? .debug : .info
         #endif
-        initLogging(level: debug ? .debug : .info)
+        initLogging(level: level)
     }
 
     // MARK: - Host access

@@ -87,15 +87,19 @@ jobs:
         run: ./scripts/build-core.sh --sim-only
 
       - name: Write an unsigned Local.xcconfig
-        # project.yml refuses to generate without Local.xcconfig. CI never signs, so the
-        # team is left empty and signing is switched off for every target.
+        # project.yml refuses to generate without Local.xcconfig. CI has no team, so the
+        # build is ad-hoc signed ("Sign to Run Locally", identity "-"): that is what Xcode
+        # does for simulator runs and it still embeds the entitlements, which the Keychain
+        # tests need. Switching signing off entirely left the test host without a keychain
+        # entitlement (OSStatus -34018).
         run: |
           cat > Local.xcconfig <<'XC'
           DEVELOPMENT_TEAM =
           CODE_SIGN_STYLE = Manual
-          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGN_IDENTITY = -
           CODE_SIGNING_REQUIRED = NO
-          CODE_SIGN_IDENTITY =
+          CODE_SIGNING_ALLOWED = YES
+          PROVISIONING_PROFILE_SPECIFIER =
           XC
 
       - name: Generate the Xcode project
@@ -120,7 +124,6 @@ jobs:
             -scheme PlayDrop \
             -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
             -derivedDataPath build/DerivedData \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             2>&1 | tee build/xcodebuild-build.log | grep -E "error:|warning:|BUILD|Compiling|Linking" || true
           grep -q "BUILD SUCCEEDED" build/xcodebuild-build.log
 
@@ -133,7 +136,6 @@ jobs:
             -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
             -derivedDataPath build/DerivedData \
             -resultBundlePath build/PlayDropTests.xcresult \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             2>&1 | tee build/xcodebuild-test.log | grep -E "error:|Test Case|Test Suite|Executed|TEST" || true
           grep -q "TEST SUCCEEDED" build/xcodebuild-test.log
 

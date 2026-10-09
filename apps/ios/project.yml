@@ -83,6 +83,10 @@ targets:
           - "Info.plist"
           - "*.entitlements"
     dependencies:
+      # Explicit so appintentsmetadataprocessor sees the dependency and extracts the
+      # Shortcut metadata; autolinking alone made it report "No AppIntents.framework
+      # dependency found" and skip the extraction.
+      - sdk: AppIntents.framework
       - package: PlayDropCore
       - package: PlayDropShared
       # Embedded into PlayDrop.app/PlugIns (embed defaults to true for app extensions).

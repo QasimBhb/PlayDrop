@@ -15,7 +15,7 @@ final class SerialLifecycle {
     init() {}
 
     /// Runs `body` once every earlier caller has finished.
-    func run<T>(_ body: () async throws -> T) async rethrows -> T {
+    func run<T: Sendable>(_ body: () async throws -> T) async rethrows -> T {
         await acquire()
         defer { release() }
         return try await body()

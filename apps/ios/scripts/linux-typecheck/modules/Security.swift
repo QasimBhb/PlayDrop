@@ -20,6 +20,7 @@ public let kSecMatchLimitOne = CFString()
 public let kSecValueData = CFString()
 public let errSecSuccess: OSStatus = 0
 public let errSecItemNotFound: OSStatus = -25300
+public let errSecMissingEntitlement: OSStatus = -34018
 public let errSecDuplicateItem: OSStatus = -25299
 public func SecItemCopyMatching(_ query: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus { 0 }
 public func SecItemAdd(_ attributes: CFDictionary, _ result: UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus { 0 }

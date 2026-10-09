@@ -9,9 +9,27 @@ final class KeychainSecretStoreTests: XCTestCase {
     private let service = "org.playdrop.ios.tests"
     private var account = ""
 
-    override func setUp() {
-        super.setUp()
+    override func setUpWithError() throws {
+        try super.setUpWithError()
         account = "test-\(UUID().uuidString)"
+        try skipWithoutKeychainAccess()
+    }
+
+    /// The Keychain refuses every call with `errSecMissingEntitlement` (-34018) when the test
+    /// host runs without a keychain entitlement, which is what an unsigned CI build on the
+    /// simulator gets. Skip, loudly, instead of failing: the store itself is exercised on a
+    /// signed device build. A probe write is made and removed again.
+    private func skipWithoutKeychainAccess() throws {
+        let probeAccount = "probe-\(UUID().uuidString)"
+        let probe: [CFString: Any] = [
+            kSecClass: kSecClassGenericPassword, kSecAttrService: service, kSecAttrAccount: probeAccount,
+            kSecValueData: Data([1]),
+        ]
+        let status = SecItemAdd(probe as CFDictionary, nil)
+        deleteKey(account: probeAccount)
+        if status == errSecMissingEntitlement {
+            throw XCTSkip("Keychain unavailable: the test host has no keychain entitlement (OSStatus -34018); run on a signed build")
+        }
     }
 
     override func tearDown() {
