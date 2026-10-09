@@ -141,8 +141,11 @@ jobs:
         if: always()
         run: |
           for f in build/xcodebuild-build.log build/xcodebuild-test.log; do
-            [ -f "$f" ] && echo "$f: $(grep -c 'warning:' "$f" || true) warnings"
+            if [ -f "$f" ]; then
+              echo "$f: $(grep -c 'warning:' "$f" || true) warnings"
+            fi
           done
+          true
 
       - name: Upload logs and results
         if: always()
