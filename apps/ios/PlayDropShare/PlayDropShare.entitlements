@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements of the share extension: only the App Group, where it queues outgoing items for
+  the app. No multicast and no keychain group: the extension never touches the network or the
+  device identity.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.org.playdrop.ios</string>
+	</array>
+</dict>
+</plist>

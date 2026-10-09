@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stub archiver: writes a valid empty ar archive at the first path ending in .a.
+for a in "$@"; do case "$a" in *.a) printf '!<arch>\n' > "$a"; break;; esac; done
+exit 0

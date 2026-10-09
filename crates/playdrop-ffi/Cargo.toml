@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 name = "playdrop_ffi"
 
 # Same lint set as the workspace, except `unsafe_code` is `deny` rather than `forbid`: file

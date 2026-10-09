@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Entitlements of the PlayDrop app. Referenced by CODE_SIGN_ENTITLEMENTS in project.yml.
+
+  - App Group: shared with the share extension, which queues outgoing items there.
+  - Multicast: the core sends and joins the beacon group 239.255.42.187:42187 and runs its own
+    mDNS responder, both raw UDP multicast, which iOS allows only with this entitlement.
+    Apple grants it on request: developer.apple.com/contact/request/networking-multicast
+    (README "Multicast entitlement"). Until it is granted, remove this key to sign the app:
+    discovery then fails, Settings > Diagnostics shows the multicast join failures, and
+    pairing still works by address and by QR code, and paired devices still reconnect by
+    their last-known address.
+  - Keychain group: the key that seals the device identity at rest (SR-28). Xcode expands
+    $(AppIdentifierPrefix) to the team prefix.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.org.playdrop.ios</string>
+	</array>
+	<key>com.apple.developer.networking.multicast</key>
+	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)org.playdrop.ios</string>
+	</array>
+</dict>
+</plist>

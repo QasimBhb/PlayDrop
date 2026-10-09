@@ -1,0 +1,12 @@
+#!/bin/sh
+# Stub C compiler for type-checking Rust on a target with no native toolchain here.
+# Writes an empty object file for every -o argument and exits 0; never links.
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+case " $* " in *" -E "*) exit 0;; esac
+if [ -n "$out" ]; then : > "$out"; fi
+exit 0

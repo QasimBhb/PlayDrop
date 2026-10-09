@@ -1,0 +1,156 @@
+# Builds and tests the iOS app on GitHub's free macOS runners, since the development machine
+# has no Xcode. What this proves: the Rust core links for the simulator, the UniFFI Swift
+# bindings compile, every Swift file in the app, the extension and the test target compiles
+# under Xcode, and the unit tests pass on a simulator. What it cannot prove: anything that
+# needs a real iPhone or signing (Local Network permission, multicast, the share sheet on a
+# device, the Phase 4 gates in apps/ios/README.md).
+#
+# Runs on pushes and pull requests that touch the iOS app or the FFI crate, and on demand.
+
+name: iOS
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/ios/**"
+      - "crates/playdrop-ffi/**"
+      - "crates/playdrop-core/**"
+      - "crates/uniffi-bindgen/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    paths:
+      - "apps/ios/**"
+      - "crates/playdrop-ffi/**"
+      - "crates/playdrop-core/**"
+      - "crates/uniffi-bindgen/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shared-package-linux:
+    # The Foundation-only package also builds on Linux; this is the quick, cheap signal.
+    name: PlayDropShared tests (Linux)
+    runs-on: ubuntu-24.04
+    container: swift:6.1-noble
+    defaults:
+      run:
+        working-directory: apps/ios/Packages/PlayDropShared
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test
+        run: swift test 2>&1 | tail -n 40
+
+  app-simulator-macos:
+    name: Build and test on the simulator (macOS)
+    # macos-15 runners are Apple silicon with Xcode 16, which is what project.yml targets.
+    runs-on: macos-15
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: apps/ios
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain versions
+        run: |
+          xcodebuild -version
+          sw_vers
+          uname -m
+
+      - name: Install Rust targets
+        run: |
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+          rustc --version
+          cargo --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: ios-sim
+
+      - name: Install XcodeGen
+        run: brew install xcodegen && xcodegen --version
+
+      - name: Build the Rust core, bindings and XCFramework (simulator slice only)
+        # Release profile so the link matches what ships; --sim-only skips the device slice,
+        # which an unsigned simulator build never uses.
+        run: ./scripts/build-core.sh --sim-only
+
+      - name: Write an unsigned Local.xcconfig
+        # project.yml refuses to generate without Local.xcconfig. CI never signs, so the
+        # team is left empty and signing is switched off for every target.
+        run: |
+          cat > Local.xcconfig <<'XC'
+          DEVELOPMENT_TEAM =
+          CODE_SIGN_STYLE = Manual
+          CODE_SIGNING_ALLOWED = NO
+          CODE_SIGNING_REQUIRED = NO
+          CODE_SIGN_IDENTITY =
+          XC
+
+      - name: Generate the Xcode project
+        run: xcodegen generate
+
+      - name: Pick a simulator
+        id: sim
+        run: |
+          name="$(xcrun simctl list devices available | grep -oE 'iPhone [0-9]+( Pro| Plus| Pro Max)?' | head -n 1)"
+          if [ -z "$name" ]; then
+            echo "no iPhone simulator available"; xcrun simctl list devices available; exit 1
+          fi
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "Using simulator: $name"
+
+      - name: Build the app and the share extension
+        run: |
+          set -o pipefail
+          mkdir -p build
+          xcodebuild build \
+            -project PlayDrop.xcodeproj \
+            -scheme PlayDrop \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee build/xcodebuild-build.log | grep -E "error:|warning:|BUILD|Compiling|Linking" || true
+          grep -q "BUILD SUCCEEDED" build/xcodebuild-build.log
+
+      - name: Run the unit tests on the simulator
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project PlayDrop.xcodeproj \
+            -scheme PlayDrop \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }}" \
+            -derivedDataPath build/DerivedData \
+            -resultBundlePath build/PlayDropTests.xcresult \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            2>&1 | tee build/xcodebuild-test.log | grep -E "error:|Test Case|Test Suite|Executed|TEST" || true
+          grep -q "TEST SUCCEEDED" build/xcodebuild-test.log
+
+      - name: Count warnings
+        if: always()
+        run: |
+          for f in build/xcodebuild-build.log build/xcodebuild-test.log; do
+            [ -f "$f" ] && echo "$f: $(grep -c 'warning:' "$f" || true) warnings"
+          done
+
+      - name: Upload logs and results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs
+          path: |
+            apps/ios/build/xcodebuild-build.log
+            apps/ios/build/xcodebuild-test.log
+            apps/ios/build/PlayDropTests.xcresult
+          if-no-files-found: ignore

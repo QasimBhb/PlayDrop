@@ -1,0 +1,12 @@
+// Local signing settings for the PlayDrop iOS project. Copy this file to Local.xcconfig
+// (gitignored) and fill in your own team before running `xcodegen generate`; project.yml
+// points every configuration at Local.xcconfig, so each developer signs with their own team
+// without touching a committed file.
+
+// Your Apple Developer Team ID: 10 characters, shown at developer.apple.com/account under
+// Membership details, or in Xcode > Settings > Accounts.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID
+
+// Automatic lets Xcode create the App IDs, the App Group and the provisioning profiles.
+// Use Manual only with profiles you made yourself on developer.apple.com.
+CODE_SIGN_STYLE = Automatic

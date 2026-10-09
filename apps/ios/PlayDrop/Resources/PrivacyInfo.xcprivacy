@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Privacy manifest of the PlayDrop app. App Review requires one entry per "required reason"
+  API category the app or its statically linked code (the Rust core) calls, with the reason
+  code that matches the use. PlayDrop collects no data and does no tracking.
+
+  - UserDefaults: CA92.1 for the app's own settings, 1C8F.1 because the settings live in
+    the App Group suite shared with the share extension.
+  - File timestamps: C617.1 for files inside the app container and the App Group container
+    (the core keeps mtimes for resume; the outgoing queue sweeps old batches); 3B52.1 for
+    files the user picked or shared, whose modification time is sent with the file.
+  - Disk space: E174.1, the core checks free space with statvfs before accepting a transfer
+    (protocol.md 6.4, SR-20) and refuses with "not enough space" instead of failing midway.
+  - System boot time: 35F9.1, the Rust runtime measures elapsed time (timeouts, transfer
+    speed) with a monotonic clock; nothing leaves the device.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+				<string>1C8F.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>C617.1</string>
+				<string>3B52.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryDiskSpace</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>E174.1</string>
+			</array>
+		</dict>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

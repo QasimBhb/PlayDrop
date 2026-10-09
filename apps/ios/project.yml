@@ -1,0 +1,167 @@
+# XcodeGen spec for the PlayDrop iOS app. The .xcodeproj is generated from this file and is
+# never committed (see .gitignore), so every project setting lives here and is reviewable.
+#
+# Targets XcodeGen 2.46.0, the version it was generated with (`brew install xcodegen`);
+# 2.42.0 is the oldest accepted, untested.
+# Generate from apps/ios with `xcodegen generate` after scripts/build-core.sh has produced
+# the Rust core and after Local.xcconfig exists (XcodeGen refuses a missing config file).
+#
+# Identifiers here must match Packages/PlayDropShared/Sources/PlayDropShared/Identifiers.swift
+# (PlayDropIdentifiers). Change both together.
+
+name: PlayDrop
+
+options:
+  minimumXcodeGenVersion: 2.42.0
+  bundleIdPrefix: org.playdrop
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "16.0"
+  developmentLanguage: en
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+# Signing comes from Local.xcconfig (gitignored, one per developer): DEVELOPMENT_TEAM and
+# CODE_SIGN_STYLE. Nothing below sets those two keys, because a project or target build
+# setting would override the xcconfig value.
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
+
+settings:
+  base:
+    # Version shown in the App Store and in Settings (Info.plist reads these two).
+    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 1
+    # Swift 6 toolchain, Swift 5 language mode for the app and the extension, with the
+    # Swift 6 concurrency checks on as warnings. PlayDropShared opts into Swift 6 mode in its
+    # own Package.swift.
+    SWIFT_VERSION: "5.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    # iPhone only for v1: an iPad build would need its own layouts and screenshots.
+    TARGETED_DEVICE_FAMILY: "1"
+    SUPPORTED_PLATFORMS: iphoneos iphonesimulator
+    SUPPORTS_MACCATALYST: NO
+    SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: NO
+    SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD: NO
+    # Strings come from the String Catalog (Localizable.xcstrings).
+    LOCALIZATION_PREFERS_STRING_CATALOGS: YES
+    SWIFT_EMIT_LOC_STRINGS: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    DEAD_CODE_STRIPPING: YES
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+    Release:
+      SWIFT_COMPILATION_MODE: wholemodule
+      DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+
+packages:
+  # The UniFFI Swift bindings plus the Rust core as an XCFramework, both produced by
+  # scripts/build-core.sh. Only the app links it: the share extension never hosts the core.
+  PlayDropCore:
+    path: Packages/PlayDropCore
+  # Foundation-only logic shared by the app and the extension (builds and tests on Linux).
+  PlayDropShared:
+    path: Packages/PlayDropShared
+
+targets:
+  PlayDrop:
+    type: application
+    platform: iOS
+    sources:
+      # Swift sources (App, Core, Share, Outbox, Clipboard, Intents, Notifications, UI).
+      - path: PlayDrop
+        excludes:
+          - "Resources/**"
+      # Asset catalog, string catalog and privacy manifest go to Copy Bundle Resources.
+      # Info.plist and the entitlements are referenced by build settings, not copied.
+      - path: PlayDrop/Resources
+        buildPhase: resources
+        excludes:
+          - "Info.plist"
+          - "*.entitlements"
+    dependencies:
+      - package: PlayDropCore
+      - package: PlayDropShared
+      # Embedded into PlayDrop.app/PlugIns (embed defaults to true for app extensions).
+      - target: PlayDropShare
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.playdrop.ios
+        PRODUCT_NAME: PlayDrop
+        INFOPLIST_FILE: PlayDrop/Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: PlayDrop/Resources/PlayDrop.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_PREVIEWS: YES
+        # The pre-build check below must look at Packages/ without declaring every file
+        # inside the XCFramework as an input, so this one target turns the script sandbox off.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    preBuildScripts:
+      - name: Check the Rust core is built
+        basedOnDependencyAnalysis: false
+        showEnvVarsInLog: false
+        script: |
+          # The Rust core and its Swift bindings are generated, not committed. Fail early with
+          # a plain message instead of a wall of linker or "no such module" errors.
+          core="${PROJECT_DIR}/Packages/PlayDropCore"
+          missing=0
+          if [ ! -d "${core}/PlayDropCoreFFI.xcframework" ]; then
+            echo "error: Packages/PlayDropCore/PlayDropCoreFFI.xcframework is missing: run scripts/build-core.sh (from apps/ios), then build again."
+            missing=1
+          fi
+          if [ ! -f "${core}/Sources/PlayDropCore/PlayDropCore.swift" ]; then
+            echo "error: Packages/PlayDropCore/Sources/PlayDropCore/PlayDropCore.swift is missing: run scripts/build-core.sh (from apps/ios), then build again."
+            missing=1
+          fi
+          exit "${missing}"
+    scheme:
+      testTargets:
+        - PlayDropTests
+      gatherCoverageData: true
+
+  PlayDropShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: PlayDropShare
+    dependencies:
+      # Only the shared package: the extension writes items into the App Group queue and the
+      # app sends them. It must never link the Rust core (memory ceiling, no listening).
+      - package: PlayDropShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.playdrop.ios.share
+        PRODUCT_NAME: PlayDropShare
+        INFOPLIST_FILE: PlayDropShare/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: PlayDropShare/PlayDropShare.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+
+  PlayDropTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: PlayDropTests
+    dependencies:
+      - target: PlayDrop
+      # The tests import both packages directly (`import PlayDropCore`, `import
+      # PlayDropShared`) to build fixtures, so they are listed explicitly instead of relying
+      # on the host app. They are not linked again (`link: false`): both are static, the
+      # host app already contains them and BUNDLE_LOADER resolves their symbols from it, so
+      # a second copy in the test bundle would give every type two definitions at run time.
+      - package: PlayDropCore
+        link: false
+      - package: PlayDropShared
+        link: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.playdrop.ios.tests
+        GENERATE_INFOPLIST_FILE: YES
+        # Hosted by the app so `@testable import PlayDrop` sees the app's code and packages.
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/PlayDrop.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/PlayDrop
+        BUNDLE_LOADER: $(TEST_HOST)
