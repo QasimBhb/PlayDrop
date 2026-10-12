@@ -1,0 +1,22 @@
+# xtool (https://xtool.sh) build of the PlayDrop iOS app from Linux: which package
+# products are the app and the share extension, and the files Xcode would otherwise take
+# from project.yml. Run `scripts/xtool-dev.sh`, not `xtool dev` directly: it builds the
+# Rust core and writes the generated files under build/xtool first (scripts/xtool-prepare.py
+# expands the $(...) build settings in the Xcode plists and strips the entitlements xtool
+# cannot provision). README "Building on Linux with xtool".
+version: 1
+# xtool registers it under its own prefix (XTL-<id>.org.playdrop.ios); the code reads the
+# real identifiers back from the embedded profile (PlayDropIdentifiers.appGroup).
+bundleID: org.playdrop.ios
+product: PlayDrop
+infoPath: build/xtool/PlayDrop-Info.plist
+entitlementsPath: build/xtool/PlayDrop.entitlements
+resources:
+  - PlayDrop/Resources/PrivacyInfo.xcprivacy
+extensions:
+  - product: PlayDropShare
+    bundleID: org.playdrop.ios.share
+    infoPath: build/xtool/PlayDropShare-Info.plist
+    entitlementsPath: build/xtool/PlayDropShare.entitlements
+    resources:
+      - PlayDropShare/PrivacyInfo.xcprivacy

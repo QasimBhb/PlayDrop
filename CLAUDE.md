@@ -16,11 +16,13 @@ HTTP/2 net layer, host runtime, blobs, outbox, sealed secrets), `playdrop-cli`, 
 autostart, diagnostics, battery and presence), `playdrop-ffi` (UniFFI surface, frozen in
 `docs/core-api.md`), `uniffi-bindgen`, `apps/desktop` (Slint window) and `apps/android`
 (Kotlin/Compose app hosting the core in a `connectedDevice` foreground service), `apps/ios`
-(SwiftUI app plus share extension hosting the core while in the foreground; written and
-checked on Linux, never built: Phase 4 code complete on 2026-10-09, its gates wait for a Mac).
-306 Rust tests plus 59 Android JUnit tests plus the Linux-run `PlayDropShared` Swift tests,
-clippy clean. Licence GPL-3.0-or-later. UI native per platform. Build fully agentic. Next: run
-the Phase 4 gates on a Mac (`apps/ios/README.md`), then Phase 5, see `docs/phases/phase-4-ios.md`.
+(SwiftUI app plus share extension hosting the core while in the foreground; Phase 4 code
+complete on 2026-10-09, compiled and unit-tested by GitHub's macOS CI, and built, signed
+and installed on an iPhone from this Linux machine with xtool since 2026-10-12; the gates
+are still to run). 306 Rust tests plus 59 Android JUnit tests plus the Linux-run
+`PlayDropShared` Swift tests, clippy clean. Licence GPL-3.0-or-later. UI native per
+platform. Build fully agentic. Next: run the Phase 4 gates on the iPhone
+(`apps/ios/README.md`), then Phase 5, see `docs/phases/phase-4-ios.md`.
 
 ## Read first
 
@@ -88,11 +90,14 @@ A54; details and the remaining manual checks in `docs/phases/phase-3-android.md`
 written: `apps/ios` holds the SwiftUI app (foreground host, outbox pull on open, Local Network
 fix-it screen, "Send Clipboard" Shortcut), the share extension (App Group queue handoff,
 `playdrop://` with no parameters), XcodeGen `project.yml`, `scripts/build-core.sh`
-(XCFramework) and the App Store copy. This machine has no Xcode, so the Swift was parse-checked,
-the Foundation-only `PlayDropShared` package was unit-tested on Linux, and the Rust core is
-clippy-clean for `aarch64-apple-ios`; none of the Phase 4 gates has run. Open TODOs are tagged
-with their SR in the code (`grep -rn "TODO" crates/ apps/`). Next: on a Mac, follow
-`apps/ios/README.md`, run the gates, record them in `docs/phases/phase-4-ios.md`; then Phase 5.
+(XCFramework) and the App Store copy. This machine has no Xcode: the Swift was parse-checked and the Foundation-only
+`PlayDropShared` package unit-tested on Linux, GitHub's macOS CI compiles the app and runs
+`PlayDropTests`, and xtool (`apps/ios/Package.swift`, `xtool.yml`,
+`scripts/xtool-dev.sh`) builds, signs and installs the app on the user's iPhone from
+Linux with a free personal Apple team (no App Group, no multicast: pair by address or QR).
+None of the Phase 4 gates has run. Open TODOs are tagged with their SR in the code
+(`grep -rn "TODO" crates/ apps/`). Next: run the gates on the iPhone per
+`apps/ios/README.md`, record them in `docs/phases/phase-4-ios.md`; then Phase 5.
 
 ## Commands
 
@@ -116,7 +121,8 @@ Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
 - Benchmark (release): `target/release/playdrop bench --role server --addr 127.0.0.1:42200 --mode h2` in one terminal, `target/release/playdrop bench --role client --addr 127.0.0.1:42200 --mode h2 --size 1GiB --runs 3` in another; repeat with `--mode raw`; compare with `iperf3 -s` and `iperf3 -c 127.0.0.1 -t 5`
 - LAN discovery test (needs a real interface with multicast): `cargo test -p playdrop-core --test phase1_gates -- --ignored`
 - Android (from `apps/android`, Gradle 9.6, AGP 9.4.1, SDK platform 37.0, NDK 27.1, `cargo-ndk`): `./gradlew :app:compileDebugKotlin` (Kotlin check, regenerates the UniFFI bindings), `./gradlew :app:assembleDebug` or `assembleRelease` (Rust for arm64-v8a and x86_64 per `playdrop.rustAbis` in `gradle.properties`), `./gradlew :app:testDebugUnitTest`, `adb install -r app/build/outputs/apk/debug/app-debug.apk`, `adb logcat -s playdrop:*`. Bindings alone: `cargo build -p playdrop-ffi && cargo run -p uniffi-bindgen -- generate --library target/debug/libplaydrop_ffi.so --language kotlin --no-format --out-dir <dir>`
-- iOS (needs a Mac with Xcode 16+, XcodeGen, rustup; from `apps/ios`): `scripts/build-core.sh` (Rust for `aarch64-apple-ios` and `aarch64-apple-ios-sim`, Swift bindings, `PlayDropCoreFFI.xcframework`), `cp Local.xcconfig.example Local.xcconfig` and set the team, `xcodegen generate`, open `PlayDrop.xcodeproj`, run on a device. On Linux: `apps/ios/scripts/check-linux.sh` (needs a Swift toolchain in `$SWIFT_TOOLCHAIN`; parses every Swift file, runs `swift test` in `Packages/PlayDropShared`, clippy for both iOS Rust targets through stub `cc` and `ar`, validates plists, and type-checks the non-SwiftUI Swift with strict concurrency against stub Apple modules via `scripts/typecheck-linux.sh`)
+- iOS on Linux (from `apps/ios`, after the one-time xtool setup in its README): `scripts/xtool-dev.sh` builds the Rust core, the app and the share extension, signs them and installs on the USB iPhone (`--core` after a change under `crates/`); `xtool launch org.playdrop.ios`
+- iOS on a Mac (Xcode 16+, XcodeGen, rustup; from `apps/ios`): `scripts/build-core.sh` (Rust for `aarch64-apple-ios` and `aarch64-apple-ios-sim`, Swift bindings, `PlayDropCoreFFI.xcframework`), `cp Local.xcconfig.example Local.xcconfig` and set the team, `xcodegen generate`, open `PlayDrop.xcodeproj`, run on a device. On Linux: `apps/ios/scripts/check-linux.sh` (needs a Swift toolchain in `$SWIFT_TOOLCHAIN`; parses every Swift file, runs `swift test` in `Packages/PlayDropShared`, clippy for both iOS Rust targets through stub `cc` and `ar`, validates plists, and type-checks the non-SwiftUI Swift with strict concurrency against stub Apple modules via `scripts/typecheck-linux.sh`)
 - Windows type check without MinGW: point `CC_x86_64_pc_windows_gnu` at a script that writes empty object files and set `AR=ar`, then `cargo check --workspace --exclude playdrop-ffi --exclude uniffi-bindgen --target x86_64-pc-windows-gnu --all-targets`
 
 ## Writing and git rules

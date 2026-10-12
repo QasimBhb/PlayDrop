@@ -1315,6 +1315,7 @@ impl TransferReceiver {
             let root_dir = fsx::open_root(&root)?;
             let parent = fsx::safe_dir(&root_dir, &[STAGING_DIR.to_owned()], true)?;
             let staging = root.join(STAGING_DIR).join(&record.manifest.id);
+            discard_if_finished(&staging)?;
             match parent.create_dir(&record.manifest.id) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -1843,6 +1844,43 @@ fn skip_mask(skip: &[u32], files: usize) -> Vec<bool> {
 }
 
 /// Deletes everything in a staging folder except `transfer.json`.
+/// Removes the staging folder of an earlier transfer with the same ID if that transfer
+/// ended for good (declined, cancelled, failed) or its record is unreadable. `cancel` and
+/// failures keep the folder with a terminal record, and an outbox pull offers the same ID
+/// again on every retry (protocol.md 7.8), so without this one failed pull would refuse
+/// every later one with "transfer id already known". A folder whose transfer can still
+/// resume (pending, accepted, active) or that completed is left alone; `accept` then
+/// refuses it as before.
+fn discard_if_finished(staging: &Path) -> Result<()> {
+    let bytes = match std::fs::read(staging.join("transfer.json")) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // No record: either no folder at all, or a folder left half-made by a crash
+            // between `create_dir` and the first record write.
+            return match std::fs::symlink_metadata(staging) {
+                Ok(m) if m.is_dir() => Ok(std::fs::remove_dir_all(staging)?),
+                Ok(_) => Err(Error::BadRequest(
+                    "transfer id already known; use load".into(),
+                )),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            };
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let finished = match serde_json::from_slice::<TransferRecord>(&bytes) {
+        Ok(r) => matches!(
+            r.state,
+            TransferState::Declined | TransferState::Cancelled | TransferState::Failed
+        ),
+        Err(_) => true,
+    };
+    if finished {
+        std::fs::remove_dir_all(staging)?;
+    }
+    Ok(())
+}
+
 fn remove_staging_contents(staging: &Path) -> Result<()> {
     let rd = match std::fs::read_dir(staging) {
         Ok(rd) => rd,
@@ -2904,5 +2942,64 @@ pub(crate) mod tests {
         assert_eq!(rx.transfer_state(), TransferState::Failed);
         assert_eq!(rx.failure().as_deref(), Some("storage permission revoked"));
         assert!(!rx.staging_dir().join("0.part").exists());
+    }
+
+    #[tokio::test]
+    async fn same_id_is_accepted_again_after_a_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manifest_for_reuse();
+        let rx = TransferReceiver::accept(
+            tmp.path(),
+            m.clone(),
+            FakeSpace::plenty(),
+            AcceptOptions::default(),
+        )
+        .await
+        .unwrap();
+        rx.cancel().await.unwrap();
+        // An outbox pull retries with the same transfer ID (protocol.md 7.8).
+        let again = TransferReceiver::accept(
+            tmp.path(),
+            m.clone(),
+            FakeSpace::plenty(),
+            AcceptOptions::default(),
+        )
+        .await
+        .expect("a cancelled transfer must not block its ID");
+        assert_eq!(again.transfer_state(), TransferState::Accepted);
+    }
+
+    #[tokio::test]
+    async fn same_id_is_still_refused_while_resumable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manifest_for_reuse();
+        let _rx = TransferReceiver::accept(
+            tmp.path(),
+            m.clone(),
+            FakeSpace::plenty(),
+            AcceptOptions::default(),
+        )
+        .await
+        .unwrap();
+        let err =
+            TransferReceiver::accept(tmp.path(), m, FakeSpace::plenty(), AcceptOptions::default())
+                .await
+                .expect_err("an accepted transfer is resumed with load, not accepted twice");
+        assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn half_made_staging_without_a_record_is_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manifest_for_reuse();
+        std::fs::create_dir_all(tmp.path().join(STAGING_DIR).join(&m.id)).unwrap();
+        TransferReceiver::accept(tmp.path(), m, FakeSpace::plenty(), AcceptOptions::default())
+            .await
+            .expect("a folder with no record is left over from a crash");
+    }
+
+    /// A one-file manifest with a fixed ID, for the ID reuse tests.
+    fn manifest_for_reuse() -> Manifest {
+        manifest(&[(1000, false)]).0
     }
 }

@@ -1,4 +1,7 @@
 import PhotosUI
+// PhotosPickerItem lives in the PhotosUI + SwiftUI cross-import overlay. Xcode loads it on
+// its own; the swift-build backend xtool uses on Linux does not, so it is named here.
+import _PhotosUI_SwiftUI
 import PlayDropCore
 import SwiftUI
 import UniformTypeIdentifiers

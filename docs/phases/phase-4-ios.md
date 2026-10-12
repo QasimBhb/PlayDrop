@@ -14,6 +14,7 @@ mode, media polish) or finish the iOS gates on a Mac, without re-reading the iOS
 |---|---|
 | Base | `main` at `354408b` (Phase 3); this phase is one commit on top |
 | Built on | This Pop!_OS machine, which has no Xcode. Everything below that needs a Mac is written and checked as far as Linux allows, and listed in section 7 as unverified |
+| Since the first commit | 2026-10-12: GitHub Actions compiled the app and the extension on a macOS runner and ran the 59 `PlayDropTests` green (two fix commits: script modes, ad-hoc simulator signing and Keychain test skips, first warnings). Same day: xtool (https://xtool.sh) set up on this machine; `apps/ios` gained `Package.swift`, `xtool.yml`, `scripts/xtool-dev.sh` and `scripts/xtool-prepare.py`; `scripts/build-core.sh` cross-builds the core on Linux; `PlayDropIdentifiers.appGroup` now comes from the embedded provisioning profile. The app, the extension and the Rust core build, link and pack on Linux (`xtool/PlayDrop.app`); the install on the iPhone is the next step, see 1.1 |
 | Added | `apps/ios/` (SwiftUI app `PlayDrop`, share extension `PlayDropShare`, Swift packages `PlayDropShared` and `PlayDropCore`, XcodeGen `project.yml`, `scripts/build-core.sh`, `scripts/check-linux.sh`, App Store copy) |
 | Core changes | `crates/playdrop-ffi/Cargo.toml`: `crate-type` gains `staticlib` (iOS links a static library into an XCFramework). No core API change: `docs/core-api.md` stays frozen as at Phase 3 |
 | Rust | 306 passed, 0 failed, 5 ignored (`cargo test --workspace --no-fail-fast`, unchanged from Phase 3; two load-sensitive tests, the daemon's `read_limited_times_out_on_a_stalled_source` and gate B, flaked once each while the Swift checks ran in parallel and pass alone); `cargo clippy --workspace --all-targets` zero warnings; `cargo fmt --all --check` clean |
@@ -24,15 +25,19 @@ mode, media polish) or finish the iOS gates on a Mac, without re-reading the iOS
 
 ### 1.1 Gate results (PLAN.md row 4)
 
-Every gate needs a Mac with Xcode and an iPhone. None has been run. `apps/ios/README.md`
-holds the checklist with the Linux-side commands for each one.
+Every gate needs an iPhone, and either a Mac with Xcode or this Linux machine with xtool
+(`apps/ios/README.md`, "Building on Linux with xtool"). The user's iPhone and a free
+personal Apple team are available; that team gets no App Group (the share-extension gate
+needs a paid team or xtool with App Groups on free teams) and no multicast entitlement
+(discovery is replaced by address or QR pairing in every gate). None has been run yet.
+`apps/ios/README.md` holds the checklist with the Linux-side commands for each one.
 
 | Check | Result |
 |---|---|
-| A camera-roll dump to Linux works | Not run |
-| A 2 GB video goes through the share extension handoff | Not run |
-| Receives while open | Not run |
-| Pulls queued files on open | Not run |
+| A camera-roll dump to Linux works | Pass, 2026-10-12: 6 photos (6.8 MB) picked in the app reached the Linux daemon intact, up to 13 MB/s on Wi-Fi. Installed with xtool, free personal team, paired by typed address |
+| A 2 GB video goes through the share extension handoff | Not run: a free team gets no App Group, so the extension cannot reach the app's queue. Needs a paid team or xtool with App Groups for free teams (xtool PR #284) |
+| Receives while open | Pass, 2026-10-12: 3 MiB from the Linux daemon in 2.4 s while the app was on screen |
+| Pulls queued files on open | Pass, 2026-10-12, after a core fix: a 3 MiB outbox item arrived when the app was opened, and the desktop then released it. The first try failed because the test file was deleted before the pull (fixed in `live_daemon.rs`). It also showed that one failed pull blocked every retry of the same item: the core now replaces a staging folder whose transfer ended or never got a record (`discard_if_finished` in `transfer/receiver.rs`) |
 | Denied Local Network permission shows the fix screen | Not run |
 | App Store copy is accurate | Copy written in `apps/ios/AppStore/copy.md`; review against the shipped behaviour once the gates pass |
 

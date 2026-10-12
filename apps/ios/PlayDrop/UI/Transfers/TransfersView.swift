@@ -1,5 +1,8 @@
 import PlayDropCore
 import QuickLook
+// quickLookPreview lives in the QuickLook + SwiftUI cross-import overlay. Xcode loads it on
+// its own; the swift-build backend xtool uses on Linux does not, so it is named here.
+import _QuickLook_SwiftUI
 import SwiftUI
 
 // The Transfers tab: incoming offers waiting for an answer on top, then the items the share
