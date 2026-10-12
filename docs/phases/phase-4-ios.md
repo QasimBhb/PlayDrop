@@ -29,7 +29,8 @@ Every gate needs an iPhone, and either a Mac with Xcode or this Linux machine wi
 (`apps/ios/README.md`, "Building on Linux with xtool"). The user's iPhone and a free
 personal Apple team are available; that team gets no App Group (the share-extension gate
 needs a paid team or xtool with App Groups on free teams) and no multicast entitlement
-(discovery is replaced by address or QR pairing in every gate). None has been run yet.
+(discovery is replaced by address or QR pairing in every gate). Four of the five device
+gates passed on 2026-10-12; the share-extension gate is blocked by the free team.
 `apps/ios/README.md` holds the checklist with the Linux-side commands for each one.
 
 | Check | Result |
@@ -38,7 +39,7 @@ needs a paid team or xtool with App Groups on free teams) and no multicast entit
 | A 2 GB video goes through the share extension handoff | Not run: a free team gets no App Group, so the extension cannot reach the app's queue. Needs a paid team or xtool with App Groups for free teams (xtool PR #284) |
 | Receives while open | Pass, 2026-10-12: 3 MiB from the Linux daemon in 2.4 s while the app was on screen |
 | Pulls queued files on open | Pass, 2026-10-12, after a core fix: a 3 MiB outbox item arrived when the app was opened, and the desktop then released it. The first try failed because the test file was deleted before the pull (fixed in `live_daemon.rs`). It also showed that one failed pull blocked every retry of the same item: the core now replaces a staging folder whose transfer ended or never got a record (`discard_if_finished` in `transfer/receiver.rs`) |
-| Denied Local Network permission shows the fix screen | Not run |
+| Denied Local Network permission shows the fix screen | Pass, 2026-10-12: with PlayDrop switched off under Privacy & Security > Local Network and the app restarted, the Devices tab showed "PlayDrop cannot reach your network. Tap to fix it." and the banner opened the Local Network access screen (cause, Settings path, Open Settings, Try again) |
 | App Store copy is accurate | Copy written in `apps/ios/AppStore/copy.md`; review against the shipped behaviour once the gates pass |
 
 ---

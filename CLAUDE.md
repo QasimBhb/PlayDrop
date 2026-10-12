@@ -18,11 +18,11 @@ autostart, diagnostics, battery and presence), `playdrop-ffi` (UniFFI surface, f
 (Kotlin/Compose app hosting the core in a `connectedDevice` foreground service), `apps/ios`
 (SwiftUI app plus share extension hosting the core while in the foreground; Phase 4 code
 complete on 2026-10-09, compiled and unit-tested by GitHub's macOS CI, and built, signed
-and installed on an iPhone from this Linux machine with xtool since 2026-10-12; the gates
-are still to run). 306 Rust tests plus 59 Android JUnit tests plus the Linux-run
+and installed on an iPhone from this Linux machine with xtool since 2026-10-12; four of
+five device gates passed that day, the share-extension one needs an App Group). 306 Rust tests plus 59 Android JUnit tests plus the Linux-run
 `PlayDropShared` Swift tests, clippy clean. Licence GPL-3.0-or-later. UI native per
-platform. Build fully agentic. Next: run the Phase 4 gates on the iPhone
-(`apps/ios/README.md`), then Phase 5, see `docs/phases/phase-4-ios.md`.
+platform. Build fully agentic. Next: Phase 5, see `docs/phases/phase-4-ios.md`
+(the share-extension gate waits for a paid team or xtool App Groups on free teams).
 
 ## Read first
 
@@ -95,9 +95,9 @@ fix-it screen, "Send Clipboard" Shortcut), the share extension (App Group queue 
 `PlayDropTests`, and xtool (`apps/ios/Package.swift`, `xtool.yml`,
 `scripts/xtool-dev.sh`) builds, signs and installs the app on the user's iPhone from
 Linux with a free personal Apple team (no App Group, no multicast: pair by address or QR).
-None of the Phase 4 gates has run. Open TODOs are tagged with their SR in the code
-(`grep -rn "TODO" crates/ apps/`). Next: run the gates on the iPhone per
-`apps/ios/README.md`, record them in `docs/phases/phase-4-ios.md`; then Phase 5.
+Four of the five Phase 4 device gates passed on 2026-10-12; the share-extension one is
+blocked without an App Group. Open TODOs are tagged with their SR in the code
+(`grep -rn "TODO" crates/ apps/`). Next: Phase 5.
 
 ## Commands
 
