@@ -160,6 +160,7 @@ enum CoreHostImpl {
         state.pairingPrompt = nil
         state.pendingOffers = []
         state.peerSeenOnlineThisRun = false
+        state.mediaPlayers = [:]
         state.peers = state.peers.map { peer in
             var copy = peer
             copy.online = false
@@ -412,8 +413,14 @@ enum CoreHostImpl {
             state.peerSeenOnlineThisRun = true
             await refreshPeers()
 
-        case .peerOffline, .unpaired, .removedByPeer:
+        case let .peerOffline(peer, _), let .unpaired(peer, _), let .removedByPeer(peer, _):
+            state.mediaPlayers[peer] = nil
             await refreshPeers()
+
+        case let .mediaState(peer, media):
+            let gone = MediaPlayback.isGone(playing: media.playing, canIsEmpty: media.can.isEmpty)
+            let players = MediaPlayback.merge(state.mediaPlayers[peer] ?? [], with: media, gone: gone) { $0.player }
+            state.mediaPlayers[peer] = players.isEmpty ? nil : players
 
         case .paired:
             state.pairingPrompt = nil

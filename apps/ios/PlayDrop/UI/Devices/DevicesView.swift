@@ -15,6 +15,8 @@ enum DevicesRoute: Hashable {
     case addDevice
     /// The Local Network fix-it screen.
     case localNetworkFixIt
+    /// The remote input screen for a hex Device ID.
+    case remoteInput(String)
 }
 
 /// The Devices tab.
@@ -44,6 +46,7 @@ struct DevicesView: View {
                     case .device(let id): DeviceDetailView(peerId: id)
                     case .addDevice: AddDeviceView()
                     case .localNetworkFixIt: LocalNetworkFixItView(reason: core.startError)
+                    case .remoteInput(let id): RemoteInputView(peerId: id)
                     }
                 }
         }

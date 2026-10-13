@@ -120,6 +120,9 @@ pub(crate) struct StatusState {
     battery_pending: HashSet<DeviceId>,
     media_sent: HashMap<String, Instant>,
     media_pending: HashMap<String, MediaState>,
+    /// The last state sent per player, so a peer that connects later learns what is
+    /// playing now (5.9, Phase 5). A "gone" state (not playing, no actions) removes it.
+    media_last: HashMap<String, MediaState>,
 }
 
 impl StatusState {
@@ -196,6 +199,24 @@ impl StatusState {
         Some(s)
     }
 
+    /// Remembers the state just broadcast for its player, or forgets a player that went
+    /// away. Returns the states to send to a new session, in player order.
+    pub(crate) fn media_remember(&mut self, state: &MediaState) {
+        let gone = !state.playing && state.can.is_empty();
+        if gone {
+            self.media_last.remove(&state.player);
+        } else {
+            self.media_last.insert(state.player.clone(), state.clone());
+        }
+    }
+
+    /// The remembered player states, sorted by player ID.
+    pub(crate) fn media_current(&self) -> Vec<MediaState> {
+        let mut v: Vec<MediaState> = self.media_last.values().cloned().collect();
+        v.sort_by(|a, b| a.player.cmp(&b.player));
+        v
+    }
+
     /// Forgets a peer's battery bookkeeping (unpair).
     pub(crate) fn forget(&mut self, peer: &DeviceId) {
         self.battery_sent.remove(peer);
@@ -258,21 +279,28 @@ pub(crate) fn set_presence(
     }
 }
 
-/// At session start: the remembered battery (always, 5.8) and presence (5.10).
+/// At session start: the remembered battery (always, 5.8), presence (5.10) and, for a
+/// peer with our `media` grant, the current state of every local player (5.9).
 pub(crate) fn on_activate(inner: &Arc<Inner>, sess: &Arc<Session>) {
-    let (battery, presence) = {
+    let (battery, presence, players) = {
         let mut st = lock(&inner.status);
         let b = st.battery.clone();
         if let Some(b) = &b {
             st.battery_record(sess.peer(), b, Instant::now());
         }
-        (b, st.presence.clone())
+        (b, st.presence.clone(), st.media_current())
     };
     if let Some(b) = battery {
         sess.send(Frame::Battery(b));
     }
     if let Some(p) = presence {
         sess.send(Frame::Presence(p));
+    }
+    let media_allowed = inner.pins.get(&sess.peer()).is_some_and(|p| p.grants.media);
+    if media_allowed {
+        for s in players {
+            sess.send(Frame::Media(Media::State(s.into())));
+        }
     }
 }
 
@@ -303,6 +331,7 @@ pub(crate) fn push_media_state(inner: &Arc<Inner>, state: MediaState) {
 }
 
 fn broadcast_media(inner: &Inner, state: MediaState) {
+    lock(&inner.status).media_remember(&state);
     let frame = Frame::Media(Media::State(state.into()));
     for s in inner.registry.sessions() {
         let allowed = inner.pins.get(&s.peer()).is_some_and(|p| p.grants.media);
@@ -413,5 +442,39 @@ mod tests {
         ));
         let frame: MediaStateFrame = state("a", "5").into();
         assert_eq!(MediaState::from(frame), state("a", "5"));
+    }
+
+    /// 5.9, Phase 5: the last state per player is remembered for later sessions, and a
+    /// "gone" state (not playing, no actions) forgets the player.
+    #[test]
+    fn media_last_state_is_remembered_until_gone() {
+        let mut st = StatusState::default();
+        let mut a = MediaState {
+            player: "a".into(),
+            name: None,
+            playing: true,
+            title: Some("1".into()),
+            artist: None,
+            album: None,
+            duration_ms: None,
+            position_ms: None,
+            position_at_ms: None,
+            volume: None,
+            can: vec![MediaAction::Play],
+        };
+        st.media_remember(&a);
+        a.title = Some("2".into());
+        st.media_remember(&a);
+        let mut b = a.clone();
+        b.player = "b".into();
+        st.media_remember(&b);
+        let cur = st.media_current();
+        assert_eq!(cur.len(), 2);
+        assert_eq!(cur[0].title.as_deref(), Some("2"));
+        a.playing = false;
+        a.can.clear();
+        st.media_remember(&a);
+        assert_eq!(st.media_current().len(), 1);
+        assert_eq!(st.media_current()[0].player, "b");
     }
 }

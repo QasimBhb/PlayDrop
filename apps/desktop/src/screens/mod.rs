@@ -22,7 +22,9 @@ use slint::{ComponentHandle, Timer, TimerMode, VecModel};
 
 use crate::ipc::{Ipc, IpcMsg};
 use crate::model::{self, Change, Refetch, Store};
-use crate::{App, CandidateRow, ConnPhase, ConnState, DeviceRow, Nav, NoticeState, TransferRow};
+use crate::{
+    App, CandidateRow, ConnPhase, ConnState, DeviceRow, InputState, Nav, NoticeState, TransferRow,
+};
 
 /// Tab index of the diagnostics page (see `ui/app.slint`).
 const DIAGNOSTICS_PAGE: i32 = 4;
@@ -82,6 +84,9 @@ pub fn install(app: &App, ipc: Arc<Ipc>) {
     let notice = app.global::<NoticeState>();
     notice.on_dismiss(|| {
         with(Controller::clear_notice);
+    });
+    app.global::<InputState>().on_stop(|| {
+        with(stop_input);
     });
     connection::install(app);
     devices::install(app, &c);
@@ -152,6 +157,7 @@ impl Controller {
                 with(|c| match r {
                     Result::Ok(Ok::Status(s)) => {
                         c.store.borrow_mut().set_status(s);
+                        refresh_input_banner(c);
                         settings::refresh(c);
                         pairing::refresh_lock(c);
                     }
@@ -199,6 +205,7 @@ impl Controller {
                 Change::Notice(text, error) => self.notice(&text, error),
                 Change::Settings => settings::refresh(self),
                 Change::Lock => pairing::refresh_lock(self),
+                Change::InputSessions => refresh_input_banner(self),
                 Change::Refetch(what) => self.load(what),
                 Change::ShuttingDown => {
                     self.ipc.disconnect();
@@ -248,6 +255,28 @@ impl Controller {
             Result::Err(e) => self.notice(&format!("{what}: {}", e.message), true),
         }
     }
+}
+
+/// Shows or hides the remote input banner from the stored sessions (SR-25).
+pub(super) fn refresh_input_banner(c: &Controller) {
+    let text = model::input_banner_text(&c.store.borrow().input_sessions);
+    if let Some(app) = c.app() {
+        app.global::<InputState>().set_banner(text.into());
+    }
+}
+
+/// The banner's Stop button: the SR-25 kill switch. The daemon ends every session and
+/// sends `InputSession { active: false }` for each, which hides the banner.
+fn stop_input(c: &Controller) {
+    c.ipc().request(Request::StopInput, |r| {
+        with(|c| {
+            if r.is_ok() {
+                c.store.borrow_mut().clear_input_sessions();
+                refresh_input_banner(c);
+            }
+            c.done_or_report("Remote input stopped", "Could not stop remote input", r);
+        });
+    });
 }
 
 /// The variant name of an answer, for logs (never the payload, SR-32).

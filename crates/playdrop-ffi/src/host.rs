@@ -14,7 +14,8 @@ use crate::error::PlayDropError;
 use crate::traits::HostListener;
 use crate::types::{
     parse_addr, parse_peer, AddDeviceCandidate, ClipboardPush, Diagnostics, Grants, HostConfig,
-    MediaAction, MediaState, OutboxItem, PeerSummary, PresenceState, SendSource, TransferSnapshot,
+    InputEvent, MediaAction, MediaState, OutboxItem, PeerSummary, PresenceState, SendSource,
+    TransferSnapshot,
 };
 
 /// Worker threads for the core runtime. *Choice:* two is enough for one connection's TLS
@@ -348,6 +349,40 @@ impl PlayDropHost {
     pub fn push_media_state(&self, state: MediaState) {
         let _rt = self.rt.enter();
         self.host.push_media_state(state.into());
+    }
+
+    /// Sends one remote input frame to a peer (protocol.md 5.12). Open with
+    /// `Session { start: true }` and close with `start: false`. Fails with `NotFound`
+    /// without a session and `Forbidden` when the peer does not list the needed
+    /// `input.*` capability (see `PeerSummary.capabilities`). Pointer moves and scrolls
+    /// are coalesced to one frame per 8 ms, so send them as fast as the touch surface
+    /// reports. A peer with remote input off for us answers with `PeerRefused`.
+    pub fn send_input(&self, peer: String, input: InputEvent) -> Result<(), PlayDropError> {
+        let _rt = self.rt.enter();
+        let peer = parse_peer(&peer)?;
+        Ok(self.host.send_input(&peer, input.into())?)
+    }
+
+    /// Peers holding an open input session on this host (hosts with `acceptsInput`).
+    pub fn input_sessions(&self) -> Vec<String> {
+        let _rt = self.rt.enter();
+        self.host
+            .input_sessions()
+            .iter()
+            .map(playdrop_core::identity::DeviceId::to_hex)
+            .collect()
+    }
+
+    /// The kill switch (SR-25): ends every input session this host is the target of and
+    /// tells the peers. Each ended session arrives as a final `Input` event with
+    /// `Session { start: false }`. Returns the peers that had one.
+    pub fn stop_input_sessions(&self) -> Vec<String> {
+        let _rt = self.rt.enter();
+        self.host
+            .stop_input_sessions()
+            .iter()
+            .map(playdrop_core::identity::DeviceId::to_hex)
+            .collect()
     }
 
     /// Queues files for a peer that cannot listen (an iPhone); returns the item ID.

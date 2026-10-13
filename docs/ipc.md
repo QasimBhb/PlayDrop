@@ -49,6 +49,36 @@ does not render; an event this build cannot decode is skipped, never fatal (sect
 transports drop a single event over `MAX_MESSAGE_BYTES` (4 MiB) with a warning, so a large
 `clipboard_image` reaches the daemon's clipboard but not the UIs.
 
+### 1.2 Requests, settings and events added in Phase 5
+
+`IPC_VERSION` stays 1 (additions only).
+
+| Request (`op`) | Fields | Answer (`kind`) | Maps to |
+|---|---|---|---|
+| `stop_input` | none | `done` | `Host::stop_input_sessions` (SR-25 kill switch): ends every remote input session this desktop is the target of, releases held keys and buttons, tells the peers. The tray has the same action |
+
+| Settings field | Default | Meaning |
+|---|---|---|
+| `remote_input_supported` | `false` | The desktop can apply remote input (`SendInput` on Windows, the RemoteDesktop portal on Linux). When `false` the window shows the `input` grant toggle disabled with `remote_input_reason` next to it (anti-pattern 18) |
+| `remote_input_reason` | absent | A sentence saying why remote input is unavailable |
+
+`Status` gains `input_from` (labels of the peers controlling this desktop right now), so a
+window that starts mid-session shows its banner at once.
+
+Daemon event `input_session` `{peer, label, active}`: a peer opened (`active: true`) or ended
+(`false`) a remote input session on this desktop; the window shows "Remote input from
+<label>" with a Stop button while one is active.
+
+Host events new in Phase 5 pass through unchanged as `Event::Host`: `input` (`peer`,
+`input`: the protocol.md 5.12 frame body, tagged on `kind`; the daemon has already applied
+it, UIs may ignore it), `peer_refused` (`peer`, `frame_type`, `code`, `message`: the peer
+refused one of our frames, usually `forbidden` for a missing grant on its side; the window
+shows "<label> does not allow <feature>"), `input_session_ended` (`peer`, `reason`: a
+desktop we controlled ended the session; desktops do not control others in v1, so UIs may
+ignore it). `PeerSummary` gains `capabilities` (the peer's
+`caps.in` while online, empty offline): a UI shows remote input, media control or image
+clips only when the matching capability is listed. `unsupported` is no longer emitted.
+
 Requests are independent and may be issued concurrently. Events are broadcast to every
 connected client from the moment it connects; there is no replay. A UI that starts late
 rebuilds its view from `Status`, `Peers` and `Transfers` and then applies events.

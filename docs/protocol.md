@@ -557,6 +557,7 @@ t = first 16 bytes of HMAC-SHA256(K, "pd-announce-v1" || n)      (n as its 16 ra
 | `identity_mismatch` | - | `hello.deviceId` differs from certificate; close |
 | `duplicate_connection` | - | GOAWAY debug data (3.3) |
 | `timeout`, `commit_mismatch`, `qr_proof_invalid`, `qr_expired`, `busy` | - | `pair_reject` reasons |
+| `input_session_ended` | - | The target ended the sender's input session (5.12); `message` says why. Phase 5 |
 
 Session codes travel in `error` frames, HTTP codes in the 7.1 error body. Oversized, malformed and out-of-sequence frames close the connection without an error frame.
 
@@ -604,3 +605,8 @@ Where the Phase 1 code (`crates/playdrop-core`) differs from or settles a gap in
 - **Outbox source changed (7.8):** when a queued source changed since it was queued (size, mtime or file ID), the holder cannot serve it at all and answers `410 expired` with the message "source changed since it was queued".
 - **Outbox decline (7.8):** a puller that declines (or cancels) a pulled item still sends `DELETE /v1/outbox/{id}`, so the holder stops announcing it at every session start.
 - **Media state goes only to peers with the sender's `media` grant (5.9):** what is playing is private, so the grant gates sending as well as receiving.
+- **Refusal errors name the frame (5.3, 5.14, Phase 5):** the one `forbidden` or `not_paired` error per frame type carries `message` "<t> is not allowed for this device" or "<t> needs a paired connection", and the sender matches `re` to the frame it sent so a UI can hide that feature with the reason.
+- **Input target rules (5.12, SR-25, Phase 5):** frames outside a `session`/`start` are dropped; a frame arriving while the desktop is locked ends the session; a session with no frame for 10 minutes ends; the target's user can end it with a kill switch. In each case the target sends an `error` frame with code `input_session_ended` and a `message` saying why (an `input` frame flows only from the controller, 5.3, and a phone lists no `input.*` capability), so both sides agree the session is over and the controller's UI says why it must start again. Keys beyond 60 per second are dropped, not queued. Scrolls are coalesced like moves, per unit.
+- **A player that goes away (5.9, Phase 5):** the host sends one last `media` state for it with `playing: false` and an empty `can` list; receivers treat that as "gone" and drop it from their list. A paused player that cannot be controlled looks the same and is dropped too.
+- **Media state at session start (5.9, Phase 5):** like battery and presence, the host sends the current state of every local player to a peer with the `media` grant when its session starts, so a phone that connects mid-track sees what is playing.
+- **Empty "Add device" window (8.1, Phase 5):** a host whose window has been open for 10 s with no candidate sends a fresh 0/1/3 s beacon burst, and again every 10 s while the list stays empty, so a peer that opened its window after the first burst does not wait for the 60 s steady beacon.

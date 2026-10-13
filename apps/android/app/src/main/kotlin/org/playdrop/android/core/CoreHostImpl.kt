@@ -35,6 +35,7 @@ import org.playdrop.core.HostEvent
 import org.playdrop.core.HostListener
 import org.playdrop.core.KeepAliveProfile
 import org.playdrop.core.LogLevel
+import org.playdrop.core.MediaState
 import org.playdrop.core.PeerSummary
 import org.playdrop.core.PlayDropHost
 import org.playdrop.core.ReceiveTarget
@@ -59,6 +60,7 @@ internal object CoreHostImpl {
     val addDeviceCandidates = MutableStateFlow<List<AddDeviceCandidate>>(emptyList())
     val pairingPrompt = MutableStateFlow<PendingPairing?>(null)
     val peerStatus = MutableStateFlow<Map<String, PeerStatus>>(emptyMap())
+    val media = MutableStateFlow<Map<String, List<MediaState>>>(emptyMap())
     val events: SharedFlow<HostEvent> get() = eventsFlow
     val identity = MutableStateFlow<OwnIdentity?>(null)
 
@@ -168,6 +170,7 @@ internal object CoreHostImpl {
         identity.value = null
         addDeviceCandidates.value = emptyList()
         pairingPrompt.value = null
+        media.value = emptyMap()
         MulticastPolicy.set(DiscoveryReason.ADD_DEVICE, false)
     }
 
@@ -307,8 +310,17 @@ internal object CoreHostImpl {
     private suspend fun route(ev: HostEvent) {
         when (ev) {
             is HostEvent.Listening -> identity.value = OwnIdentity(ev.deviceId, ev.shortId, ev.addr)
-            is HostEvent.PeerOnline, is HostEvent.PeerOffline, is HostEvent.Unpaired, is HostEvent.RemovedByPeer ->
+            is HostEvent.PeerOnline -> refreshPeers()
+            is HostEvent.PeerOffline -> {
+                media.update { MediaPlayers.forget(it, ev.peer) }
                 refreshPeers()
+            }
+            is HostEvent.Unpaired -> {
+                media.update { MediaPlayers.forget(it, ev.peer) }
+                refreshPeers()
+            }
+            is HostEvent.RemovedByPeer -> refreshPeers()
+            is HostEvent.MediaState -> media.update { MediaPlayers.apply(it, ev.peer, ev.state) }
             is HostEvent.Paired -> {
                 pairingPrompt.value = null
                 refreshPeers()

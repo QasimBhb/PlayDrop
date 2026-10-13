@@ -19,13 +19,21 @@
 //! - `network`: OS network change notifications (`NetworkManager`, `systemd-networkd`).
 //! - `clipboard`: watcher and applier per platform, text and PNG images (SR-24).
 //! - `battery`: this computer's battery for the `battery` frame (protocol.md 5.8).
+//! - `input`: remote input injection (`SendInput`, the `RemoteDesktop` portal) and the key
+//!   vocabulary mapping (protocol.md 5.12, SR-25). Phase 5.
+//! - `media`: local media players (MPRIS on Linux, GSMTC on Windows) for the `media`
+//!   frames (protocol.md 5.9). Phase 5.
+//! - `control`: the glue for both: one injector task per controlling peer, the media feed.
 
 mod autostart;
 mod battery;
 mod cli;
 mod clipboard;
+mod control;
 mod daemon;
+mod input;
 mod lock;
+mod media;
 mod network;
 mod notify;
 mod open;

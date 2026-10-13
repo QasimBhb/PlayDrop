@@ -22,7 +22,18 @@ object Settings {
         val onboarded: Boolean,
         /** The battery-optimisation request was offered after a user action (anti-pattern 14). */
         val batteryPromptShown: Boolean,
+        /** Trackpad pointer speed on the remote input screen, a multiplier on finger travel in dp. */
+        val trackpadSensitivity: Float = DEFAULT_TRACKPAD_SENSITIVITY,
     )
+
+    /** Trackpad speed used until the user picks one. */
+    const val DEFAULT_TRACKPAD_SENSITIVITY = 1.5f
+
+    /** Slowest trackpad speed the screen offers. */
+    const val MIN_TRACKPAD_SENSITIVITY = 0.5f
+
+    /** Fastest trackpad speed the screen offers. */
+    const val MAX_TRACKPAD_SENSITIVITY = 4f
 
     /** Live settings. */
     fun flow(context: Context): Flow<Values> = SettingsImpl.flow(context)

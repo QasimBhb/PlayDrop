@@ -139,6 +139,10 @@ extension L10n {
         static var grantsTitle: String {
             String(localized: "ui_grants_title", defaultValue: "Allow this device to")
         }
+        /// Footer of the grants section: the `input` grant has no switch on iOS.
+        static var inputNotPossible: String {
+            String(localized: "ui_grant_input_ios", defaultValue: "This iPhone cannot be controlled remotely")
+        }
         /// Clipboard sent.
         static func copiedTo(_ label: String) -> String {
             String(localized: "toast_copied_to", defaultValue: "Copied to \(label)")

@@ -24,6 +24,8 @@ pub enum TrayCommand {
     OpenWindow,
     /// Pause (true) or resume automatic clipboard sync for this run.
     SetClipboardPaused(bool),
+    /// End every remote input session now (the SR-25 kill switch).
+    StopInput,
     /// Quit the daemon.
     Quit,
 }
@@ -51,6 +53,8 @@ pub struct TrayView {
     pub clipboard_paused: bool,
     /// Automatic clipboard sync is running at all (setting on and platform supported).
     pub clipboard_sync: bool,
+    /// Labels of the peers controlling this desktop right now (remote input, SR-25).
+    pub input_from: Vec<String>,
 }
 
 /// The menu text of a device line.
@@ -290,6 +294,13 @@ mod platform {
                 }
                 .into(),
             );
+            if !self.view.input_from.is_empty() {
+                items.push(MenuItem::Separator);
+                items.push(action(
+                    &format!("Stop remote input from {}", self.view.input_from.join(", ")),
+                    TrayCommand::StopInput,
+                ));
+            }
             items.push(MenuItem::Separator);
             items.push(action("Quit", TrayCommand::Quit));
             items
@@ -386,6 +397,8 @@ mod platform {
         let clip = MenuItem::new("Send clipboard", true, None);
         let open = MenuItem::new("Open window", true, None);
         let pause = CheckMenuItem::new("Pause clipboard sync", true, false, None);
+        // Always present on Windows: the menu is built once and `update` is a no-op there.
+        let stop_input = MenuItem::new("Stop remote input", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let built = menu
             .append_items(&[
@@ -393,6 +406,8 @@ mod platform {
                 &clip,
                 &open,
                 &pause,
+                &PredefinedMenuItem::separator(),
+                &stop_input,
                 &PredefinedMenuItem::separator(),
                 &quit,
             ])
@@ -420,6 +435,7 @@ mod platform {
             open.id().clone(),
             pause.id().clone(),
             quit.id().clone(),
+            stop_input.id().clone(),
         );
         // Menu events are read on this thread, after each dispatched message, because the
         // menu items are not `Send` and `pause.is_checked()` must run where they live.
@@ -452,6 +468,8 @@ mod platform {
                     TrayCommand::SetClipboardPaused(pause.is_checked())
                 } else if e.id == ids.4 {
                     TrayCommand::Quit
+                } else if e.id == ids.5 {
+                    TrayCommand::StopInput
                 } else {
                     continue;
                 };

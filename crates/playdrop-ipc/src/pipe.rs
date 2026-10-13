@@ -481,11 +481,14 @@ mod tests {
                 clipboard_sync: false,
                 clipboard_images: true,
                 clipboard_watch_supported: true,
+                remote_input_supported: false,
+                remote_input_reason: None,
                 autostart: false,
                 notifications: true,
             },
             add_device_window_open: false,
             locked: false,
+            input_from: vec![],
         })
     }
 

@@ -11,9 +11,9 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use playdrop_core::host::{
-    AddDeviceCandidate, Diagnostics, DiscoveryPath, HostEvent, MdnsStatus, MulticastStatus,
-    PairingPromptKind, PeerDiagnostic, PeerSummary, TransferDirection, TransferSnapshot,
-    TransferStatus,
+    AddDeviceCandidate, Diagnostics, DiscoveryPath, HostEvent, MdnsStatus, MediaState,
+    MulticastStatus, PairingPromptKind, PeerDiagnostic, PeerSummary, TransferDirection,
+    TransferSnapshot, TransferStatus,
 };
 use playdrop_core::pin_store::Grants;
 use playdrop_ipc::{
@@ -63,6 +63,11 @@ pub struct PeerView {
     pub grants: Grants,
     /// Last discovery diagnostic, already worded.
     pub note: Option<String>,
+    /// What the peer accepts (`caps.in`) while online; empty offline.
+    pub capabilities: Vec<String>,
+    /// The peer's media players (protocol.md 5.9), most recently updated first. Only
+    /// arrives with the `media` grant; dropped when the peer goes offline.
+    pub media: Vec<MediaState>,
 }
 
 impl PeerView {
@@ -78,6 +83,8 @@ impl PeerView {
             paired_at: p.paired_at,
             grants: p.grants,
             note: None,
+            capabilities: p.capabilities,
+            media: Vec::new(),
         }
     }
 }
@@ -197,6 +204,8 @@ pub enum Change {
     Settings,
     /// Lock state changed (SR-6).
     Lock,
+    /// The set of remote input sessions changed (SR-25 banner).
+    InputSessions,
     /// Re-request something from the daemon.
     Refetch(Refetch),
     /// The daemon is going away.
@@ -216,11 +225,30 @@ pub struct Store {
     pub candidates: Vec<AddDeviceCandidate>,
     /// The open pairing prompt.
     pub prompt: Option<PromptView>,
+    /// Peers with a remote input session open on this desktop (SR-25), as hex Device ID
+    /// and label, in the order they started.
+    pub input_sessions: Vec<(String, String)>,
 }
 
 impl Store {
-    /// Replaces the status.
+    /// Replaces the status, and seeds the remote input sessions from its `input_from`
+    /// labels (the daemon's current truth), so a window opened mid-session shows its
+    /// banner at once. A label is matched to a listed peer when it can be; otherwise the
+    /// entry waits for that peer's next `input_session` event to learn its ID.
     pub fn set_status(&mut self, status: Status) {
+        self.input_sessions = status
+            .input_from
+            .iter()
+            .map(|label| {
+                let id = self
+                    .peers
+                    .iter()
+                    .find(|p| p.label == *label)
+                    .map(|p| p.device_id.clone())
+                    .unwrap_or_default();
+                (id, label.clone())
+            })
+            .collect();
         self.status = Some(status);
     }
 
@@ -246,6 +274,9 @@ impl Store {
                 let mut v = PeerView::from_summary(p, now);
                 if let Some(o) = old.iter().find(|o| o.device_id == v.device_id) {
                     v.battery = o.battery;
+                    if v.online && v.grants.media {
+                        v.media.clone_from(&o.media);
+                    }
                     v.note.clone_from(&o.note);
                     if v.online || o.presence.as_deref() == Some(ASLEEP) {
                         v.presence.clone_from(&o.presence);
@@ -257,6 +288,14 @@ impl Store {
                 v
             })
             .collect();
+        // Sessions seeded from `Status` before the peers were listed learn their IDs.
+        for (id, label) in &mut self.input_sessions {
+            if id.is_empty() {
+                if let Some(p) = self.peers.iter().find(|p| p.label == *label) {
+                    id.clone_from(&p.device_id);
+                }
+            }
+        }
     }
 
     /// Replaces the transfer list, keeping saved paths and offered names already known.
@@ -284,6 +323,17 @@ impl Store {
     /// Drops finished transfers from the list (local only; the daemon keeps its own).
     pub fn clear_finished(&mut self) {
         self.transfers.retain(|t| !t.state.is_finished());
+    }
+
+    /// Stores new grants for peer `i`. Turning `media` off drops the media state shown for
+    /// it, since none arrives without the grant.
+    pub fn set_peer_grants(&mut self, i: usize, grants: Grants) {
+        if let Some(p) = self.peers.get_mut(i) {
+            p.grants = grants;
+            if !grants.media {
+                p.media.clear();
+            }
+        }
     }
 
     /// Index of a peer by hex Device ID.
@@ -332,11 +382,75 @@ impl Store {
                 if let Some(s) = self.status.as_mut() {
                     s.locked = locked;
                 }
-                vec![Change::Lock]
+                let mut changes = vec![Change::Lock];
+                // Locking ends every input session (SR-25); do not wait for the events.
+                if locked {
+                    changes.extend(self.clear_input_sessions());
+                }
+                changes
             }
-            DaemonEvent::HostRestarted => vec![Change::Refetch(Refetch::All)],
-            DaemonEvent::ShuttingDown => vec![Change::ShuttingDown],
+            DaemonEvent::HostRestarted => {
+                let mut changes = self.clear_input_sessions();
+                changes.push(Change::Refetch(Refetch::All));
+                changes
+            }
+            DaemonEvent::InputSession {
+                peer,
+                label,
+                active,
+            } => self.set_input_session(peer, label, active),
+            DaemonEvent::ShuttingDown => {
+                let mut changes = self.clear_input_sessions();
+                changes.push(Change::ShuttingDown);
+                changes
+            }
             _ => Vec::new(),
+        }
+    }
+
+    /// Records a remote input session starting or ending. Returns
+    /// [`Change::InputSessions`] when the set changed.
+    fn set_input_session(&mut self, peer: String, label: String, active: bool) -> Vec<Change> {
+        // An entry seeded from `Status` without a known ID matches by label.
+        let at = self
+            .input_sessions
+            .iter()
+            .position(|(p, _)| *p == peer)
+            .or_else(|| {
+                self.input_sessions
+                    .iter()
+                    .position(|(p, l)| p.is_empty() && !label.is_empty() && *l == label)
+            });
+        match (active, at) {
+            (true, Some(i)) => {
+                let entry = &mut self.input_sessions[i];
+                if entry.0 == peer && entry.1 == label {
+                    return Vec::new();
+                }
+                let renamed = entry.1 != label;
+                entry.0 = peer;
+                entry.1 = label;
+                if !renamed {
+                    return Vec::new();
+                }
+            }
+            (true, None) => self.input_sessions.push((peer, label)),
+            (false, Some(i)) => {
+                self.input_sessions.remove(i);
+            }
+            (false, None) => return Vec::new(),
+        }
+        vec![Change::InputSessions]
+    }
+
+    /// Forgets every input session (lock, host restart, daemon gone). Returns
+    /// [`Change::InputSessions`] when there were any.
+    pub fn clear_input_sessions(&mut self) -> Vec<Change> {
+        if self.input_sessions.is_empty() {
+            Vec::new()
+        } else {
+            self.input_sessions.clear();
+            vec![Change::InputSessions]
         }
     }
 
@@ -350,13 +464,40 @@ impl Store {
                 p.note = None;
                 p.last_seen = Some(now);
             }),
-            HostEvent::PeerOffline { peer, .. } => self.with_peer(&peer, |p| {
-                p.online = false;
-                if p.presence.as_deref() != Some(ASLEEP) {
-                    p.presence = None;
+            HostEvent::PeerOffline { peer, .. } => {
+                let mut changes = self.with_peer(&peer, |p| {
+                    p.online = false;
+                    if p.presence.as_deref() != Some(ASLEEP) {
+                        p.presence = None;
+                    }
+                    p.last_seen = Some(now);
+                    p.capabilities.clear();
+                    p.media.clear();
+                });
+                // A dropped connection ends its input session (protocol.md 5.12).
+                changes.extend(self.set_input_session(peer, String::new(), false));
+                changes
+            }
+            HostEvent::MediaState { peer, state } => {
+                self.with_peer(&peer, |p| merge_media(&mut p.media, state))
+            }
+            HostEvent::PeerRefused {
+                peer,
+                frame_type,
+                code,
+                ..
+            } => {
+                let feature = refused_feature(frame_type.as_deref());
+                if code == "forbidden" {
+                    vec![Change::Notice(
+                        format!("{} does not allow {feature}", self.peer_name(&peer)),
+                        true,
+                    )]
+                } else {
+                    tracing::debug!(code, feature, "peer refused a frame");
+                    Vec::new()
                 }
-                p.last_seen = Some(now);
-            }),
+            }
             HostEvent::Battery {
                 peer,
                 level,
@@ -583,6 +724,105 @@ fn short_from_hex(device_id: &str) -> String {
     device_id.chars().take(8).collect()
 }
 
+/// Applies a peer's media state to its player list (protocol.md 5.9). A state that is
+/// not playing and supports no action means the player is gone, so it is dropped;
+/// anything else replaces that player's entry and moves it to the front.
+pub fn merge_media(players: &mut Vec<MediaState>, state: MediaState) {
+    players.retain(|m| m.player != state.player);
+    if state.playing || !state.can.is_empty() {
+        players.insert(0, state);
+    }
+}
+
+/// The player a device row shows: the most recent one that is playing, else the most
+/// recent one.
+pub fn shown_player(players: &[MediaState]) -> Option<&MediaState> {
+    players
+        .iter()
+        .find(|m| m.playing)
+        .or_else(|| players.first())
+}
+
+/// The feature a peer refused, from the type of the frame we sent, for "<peer> does not
+/// allow <feature>".
+pub fn refused_feature(frame_type: Option<&str>) -> String {
+    match frame_type {
+        Some("input") => "remote input".to_owned(),
+        Some("clipboard") => "clipboard".to_owned(),
+        Some("find") => "find".to_owned(),
+        Some("media") => "media control".to_owned(),
+        Some(other) => other.to_owned(),
+        None => "that request".to_owned(),
+    }
+}
+
+/// Whether a peer accepts remote input (any `input.*` capability). The desktop does not
+/// control other devices in v1; the row carries this for a later phase.
+pub fn can_be_controlled(capabilities: &[String]) -> bool {
+    capabilities.iter().any(|c| c.starts_with("input."))
+}
+
+/// The banner text while remote input sessions are open: "Remote input from Phone",
+/// "... from Phone and Tablet", "... from A, B and C". Empty when there are none.
+pub fn input_banner_text(sessions: &[(String, String)]) -> String {
+    let names: Vec<&str> = sessions
+        .iter()
+        .map(|(id, label)| {
+            if label.is_empty() {
+                id.get(..8).unwrap_or(id)
+            } else {
+                label.as_str()
+            }
+        })
+        .collect();
+    let list = match names.as_slice() {
+        [] => return String::new(),
+        [one] => (*one).to_owned(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    format!("Remote input from {list}")
+}
+
+/// The "Remote input" line on the Settings screen.
+pub fn remote_input_line(settings: &Settings) -> String {
+    if settings.remote_input_supported {
+        "Remote input: available (devices you allow can move the pointer and type here)".to_owned()
+    } else {
+        format!(
+            "Remote input: unavailable: {}",
+            remote_input_reason(settings)
+        )
+    }
+}
+
+/// Why remote input cannot be offered, for the greyed-out grant toggle.
+pub fn remote_input_reason(settings: &Settings) -> String {
+    settings
+        .remote_input_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .unwrap_or("this desktop gives PlayDrop no way to apply it")
+        .to_owned()
+}
+
+/// The grants after the user flips one toggle, or `None` when that toggle is not offered:
+/// an unknown name, or `input` while this desktop cannot apply remote input (SR-14,
+/// PLAN.md anti-pattern 18). Turning `input` off is always allowed.
+pub fn apply_grant(grants: Grants, grant: &str, on: bool, input_supported: bool) -> Option<Grants> {
+    let mut g = grants;
+    match grant {
+        "files" => g.files = on,
+        "clipboard_in" => g.clipboard_in = on,
+        "clipboard_out" => g.clipboard_out = on,
+        "find" => g.find = on,
+        "media" => g.media = on,
+        "input" if input_supported || !on => g.input = on,
+        _ => return None,
+    }
+    Some(g)
+}
+
 /// User-facing name of a discovery path.
 pub fn path_name(path: DiscoveryPath) -> &'static str {
     match path {
@@ -750,6 +990,7 @@ pub fn device_row(p: &PeerView, now: u64) -> DeviceRow {
         p.last_seen
             .map_or_else(|| "never".to_owned(), |t| format_ago(t, now))
     };
+    let media = shown_player(&p.media);
     DeviceRow {
         id: p.device_id.as_str().into(),
         label: p.label.as_str().into(),
@@ -766,7 +1007,34 @@ pub fn device_row(p: &PeerView, now: u64) -> DeviceRow {
         grant_find: p.grants.find,
         grant_input: p.grants.input,
         grant_media: p.grants.media,
+        can_be_controlled: can_be_controlled(&p.capabilities),
+        media_visible: media.is_some(),
+        media_title: media.map(|m| media_title(m).into()).unwrap_or_default(),
+        media_detail: media.map(|m| media_detail(m).into()).unwrap_or_default(),
+        media_playing: media.is_some_and(|m| m.playing),
     }
+}
+
+/// The title line of a now-playing block: the track title, else the player's name.
+fn media_title(m: &MediaState) -> String {
+    m.title
+        .clone()
+        .filter(|t| !t.is_empty())
+        .or_else(|| m.name.clone())
+        .unwrap_or_else(|| m.player.clone())
+}
+
+/// The second line: "Artist · Player · Paused" with the parts that are known.
+fn media_detail(m: &MediaState) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(a) = m.artist.as_deref().filter(|a| !a.is_empty()) {
+        parts.push(a);
+    }
+    if let Some(n) = m.name.as_deref().filter(|n| !n.is_empty()) {
+        parts.push(n);
+    }
+    parts.push(if m.playing { "Playing" } else { "Paused" });
+    parts.join(" · ")
 }
 
 /// Adds one advert to the candidate list, one row per device: the core reports every
@@ -1066,6 +1334,7 @@ fn section(title: &str, lines: Vec<String>, ok: bool) -> DiagSection {
 mod tests {
     use super::*;
     use playdrop_core::host::{OfferedFile, Secret};
+    use playdrop_core::session::types::MediaAction;
     use slint::Model;
 
     fn peer(id: &str, online: bool) -> PeerSummary {
@@ -1079,7 +1348,332 @@ mod tests {
             paired_at: 1_791_417_600, // 2026-10-08
             last_seen: None,
             removed_by_peer: false,
+            capabilities: Vec::new(),
         }
+    }
+
+    fn settings(supported: bool, reason: Option<&str>) -> Settings {
+        Settings {
+            receive_dir: PathBuf::from("/tmp/in"),
+            device_name: "desk".into(),
+            clipboard_sync: true,
+            clipboard_images: true,
+            clipboard_watch_supported: true,
+            remote_input_supported: supported,
+            remote_input_reason: reason.map(str::to_owned),
+            autostart: false,
+            notifications: true,
+        }
+    }
+
+    fn media(player: &str, playing: bool, can: Vec<MediaAction>) -> MediaState {
+        MediaState {
+            player: player.into(),
+            name: Some("Spotify".into()),
+            playing,
+            title: Some("Song".into()),
+            artist: Some("Band".into()),
+            album: None,
+            duration_ms: None,
+            position_ms: None,
+            position_at_ms: None,
+            volume: None,
+            can,
+        }
+    }
+
+    fn session(peer: &str, label: &str, active: bool) -> Event {
+        Event::Daemon(DaemonEvent::InputSession {
+            peer: peer.into(),
+            label: label.into(),
+            active,
+        })
+    }
+
+    #[test]
+    fn grant_toggles_offer_media_and_input_only_when_supported() {
+        let g = Grants::default();
+        assert!(!g.input && g.media);
+        let off = apply_grant(g, "media", false, false).unwrap();
+        assert!(!off.media);
+        assert_eq!(apply_grant(g, "input", true, false), None);
+        assert!(apply_grant(g, "input", true, true).unwrap().input);
+        // Turning input off always works, even where it cannot be applied.
+        let on = Grants { input: true, ..g };
+        assert!(!apply_grant(on, "input", false, false).unwrap().input);
+        assert!(!apply_grant(g, "files", false, false).unwrap().files);
+        assert_eq!(apply_grant(g, "bogus", true, true), None);
+    }
+
+    #[test]
+    fn remote_input_settings_line_and_reason() {
+        assert!(remote_input_line(&settings(true, None)).starts_with("Remote input: available ("));
+        let s = settings(false, Some("the RemoteDesktop portal is missing"));
+        assert_eq!(
+            remote_input_line(&s),
+            "Remote input: unavailable: the RemoteDesktop portal is missing"
+        );
+        assert_eq!(
+            remote_input_reason(&s),
+            "the RemoteDesktop portal is missing"
+        );
+        // No reason from the daemon still explains instead of showing nothing.
+        assert!(!remote_input_reason(&settings(false, Some("  "))).is_empty());
+        assert!(!remote_input_reason(&settings(false, None)).is_empty());
+        // An older daemon's settings without the new fields read as unsupported.
+        let mut v = serde_json::to_value(settings(true, None)).unwrap();
+        v.as_object_mut().unwrap().remove("remote_input_supported");
+        let old: Settings = serde_json::from_value(v).unwrap();
+        assert!(!old.remote_input_supported);
+    }
+
+    #[test]
+    fn input_sessions_drive_the_banner() {
+        let mut s = Store::default();
+        s.set_peers(vec![peer("aa", true), peer("bb", true)], 1000);
+        assert_eq!(input_banner_text(&s.input_sessions), "");
+        assert_eq!(
+            s.apply(session("aa", "Phone", true), 1),
+            vec![Change::InputSessions]
+        );
+        // A repeat start changes nothing.
+        assert!(s.apply(session("aa", "Phone", true), 1).is_empty());
+        assert_eq!(
+            input_banner_text(&s.input_sessions),
+            "Remote input from Phone"
+        );
+        s.apply(session("bb", "Tablet", true), 2);
+        assert_eq!(
+            input_banner_text(&s.input_sessions),
+            "Remote input from Phone and Tablet"
+        );
+        s.apply(session("cc", "", true), 3);
+        assert_eq!(
+            input_banner_text(&s.input_sessions),
+            "Remote input from Phone, Tablet and cc"
+        );
+        assert_eq!(
+            s.apply(session("aa", "Phone", false), 4),
+            vec![Change::InputSessions]
+        );
+        assert!(s.apply(session("aa", "Phone", false), 4).is_empty());
+        assert_eq!(
+            input_banner_text(&s.input_sessions),
+            "Remote input from Tablet and cc"
+        );
+        // A dropped connection ends that peer's session.
+        let ch = s.apply(
+            Event::Host(HostEvent::PeerOffline {
+                peer: "bb".into(),
+                short_id: "K3QD".into(),
+            }),
+            5,
+        );
+        assert_eq!(ch, vec![Change::Peer(1), Change::InputSessions]);
+        // Locking ends the rest.
+        let ch = s.apply(Event::Daemon(DaemonEvent::LockChanged { locked: true }), 6);
+        assert_eq!(ch, vec![Change::Lock, Change::InputSessions]);
+        assert!(s.input_sessions.is_empty());
+        // The daemon's JSON decodes.
+        let e: Event = serde_json::from_value(serde_json::json!({
+            "source": "daemon", "event": "input_session",
+            "peer": "aa", "label": "Phone", "active": true
+        }))
+        .unwrap();
+        s.apply(e, 7);
+        let ch = s.apply(Event::Daemon(DaemonEvent::HostRestarted), 8);
+        assert_eq!(
+            ch,
+            vec![Change::InputSessions, Change::Refetch(Refetch::All)]
+        );
+    }
+
+    #[test]
+    fn status_seeds_the_input_banner() {
+        let status = |input_from: Vec<String>| Status {
+            device_id: "me".into(),
+            short_id: "ME".into(),
+            addr: "127.0.0.1:42187".parse().unwrap(),
+            daemon_version: "0".into(),
+            ipc_version: 1,
+            settings: settings(true, None),
+            add_device_window_open: false,
+            locked: false,
+            input_from,
+        };
+        let mut s = Store::default();
+        // Status before the peer list: seeded by label, ID learnt from the list.
+        s.set_status(status(vec!["Phone".into()]));
+        assert_eq!(
+            input_banner_text(&s.input_sessions),
+            "Remote input from Phone"
+        );
+        s.set_peers(vec![peer("aa", true)], 1000);
+        assert_eq!(s.input_sessions, vec![("aa".into(), "Phone".into())]);
+        // Later events keep adjusting it; a repeat start is no change.
+        assert!(s.apply(session("aa", "Phone", true), 1).is_empty());
+        assert_eq!(
+            s.apply(session("aa", "Phone", false), 2),
+            vec![Change::InputSessions]
+        );
+        assert!(s.input_sessions.is_empty());
+
+        // A seeded label with no listed peer still matches its stop event by label.
+        s.set_status(status(vec!["Tablet".into()]));
+        assert_eq!(s.input_sessions, vec![(String::new(), "Tablet".into())]);
+        assert_eq!(
+            s.apply(session("bb", "Tablet", false), 3),
+            vec![Change::InputSessions]
+        );
+        assert!(s.input_sessions.is_empty());
+
+        // A fresh Status is the daemon's truth: an empty list clears the banner.
+        s.apply(session("aa", "Phone", true), 4);
+        s.set_status(status(Vec::new()));
+        assert_eq!(input_banner_text(&s.input_sessions), "");
+        // An older daemon without the field reads as no sessions.
+        let mut v = serde_json::to_value(status(vec!["Phone".into()])).unwrap();
+        v.as_object_mut().unwrap().remove("input_from");
+        let old: Status = serde_json::from_value(v).unwrap();
+        assert!(old.input_from.is_empty());
+    }
+
+    #[test]
+    fn refusals_name_the_feature() {
+        assert_eq!(refused_feature(Some("input")), "remote input");
+        assert_eq!(refused_feature(Some("clipboard")), "clipboard");
+        assert_eq!(refused_feature(Some("find")), "find");
+        assert_eq!(refused_feature(Some("media")), "media control");
+        assert_eq!(refused_feature(Some("ping")), "ping");
+        assert_eq!(refused_feature(None), "that request");
+
+        let mut s = Store::default();
+        s.set_peers(vec![peer("aa", true)], 1000);
+        let refused: Event = serde_json::from_value(serde_json::json!({
+            "source": "host", "event": "peer_refused", "peer": "aa",
+            "frame_type": "input", "code": "forbidden", "message": null
+        }))
+        .unwrap();
+        assert_eq!(
+            s.apply(refused, 1),
+            vec![Change::Notice(
+                "Phone does not allow remote input".into(),
+                true
+            )]
+        );
+        // Other codes are not the user's to act on here.
+        let other = HostEvent::PeerRefused {
+            peer: "aa".into(),
+            frame_type: Some("media".into()),
+            code: "bad_request".into(),
+            message: None,
+        };
+        assert!(s.apply(Event::Host(other), 2).is_empty());
+    }
+
+    #[test]
+    fn media_state_fills_the_row() {
+        let mut s = Store::default();
+        s.set_peers(vec![peer("aa", true)], 1000);
+        let row = device_row(&s.peers[0], 1000);
+        assert!(!row.media_visible);
+        let ch = s.apply(
+            Event::Host(HostEvent::MediaState {
+                peer: "aa".into(),
+                state: media("spotify", true, vec![MediaAction::PlayPause]),
+            }),
+            1001,
+        );
+        assert_eq!(ch, vec![Change::Peer(0)]);
+        let row = device_row(&s.peers[0], 1001);
+        assert!(row.media_visible && row.media_playing);
+        assert_eq!(row.media_title, "Song");
+        assert_eq!(row.media_detail, "Band · Spotify · Playing");
+
+        // Paused but still controllable: kept, shown as paused.
+        s.apply(
+            Event::Host(HostEvent::MediaState {
+                peer: "aa".into(),
+                state: media("spotify", false, vec![MediaAction::Play]),
+            }),
+            1002,
+        );
+        let row = device_row(&s.peers[0], 1002);
+        assert!(row.media_visible && !row.media_playing);
+        assert_eq!(row.media_detail, "Band · Spotify · Paused");
+
+        // A reload keeps it while online with the media grant.
+        s.set_peers(vec![peer("aa", true)], 1003);
+        assert_eq!(s.peers[0].media.len(), 1);
+
+        // Turning the grant off drops it.
+        let no_media = Grants {
+            media: false,
+            ..Grants::default()
+        };
+        s.set_peer_grants(0, no_media);
+        assert!(!device_row(&s.peers[0], 1003).media_visible);
+
+        // Going offline drops it too.
+        s.set_peer_grants(0, Grants::default());
+        merge_media(&mut s.peers[0].media, media("spotify", true, Vec::new()));
+        s.apply(
+            Event::Host(HostEvent::PeerOffline {
+                peer: "aa".into(),
+                short_id: "K3QD".into(),
+            }),
+            1004,
+        );
+        assert!(s.peers[0].media.is_empty());
+    }
+
+    #[test]
+    fn gone_players_are_dropped_and_playing_ones_win() {
+        let mut players = Vec::new();
+        merge_media(&mut players, media("a", true, vec![MediaAction::Pause]));
+        merge_media(&mut players, media("b", false, vec![MediaAction::Play]));
+        assert_eq!(players.len(), 2);
+        // Most recent first, but a playing player is the one shown.
+        assert_eq!(players[0].player, "b");
+        assert_eq!(shown_player(&players).unwrap().player, "a");
+        // Not playing and nothing it can do: the player is gone.
+        merge_media(&mut players, media("a", false, Vec::new()));
+        assert_eq!(players.len(), 1);
+        assert_eq!(shown_player(&players).unwrap().player, "b");
+        merge_media(&mut players, media("b", false, Vec::new()));
+        assert!(players.is_empty() && shown_player(&players).is_none());
+        // A gone state for a player never seen adds nothing.
+        merge_media(&mut players, media("z", false, Vec::new()));
+        assert!(players.is_empty());
+        // Untitled track falls back to the player name.
+        let mut untitled = media("c", true, Vec::new());
+        untitled.title = None;
+        untitled.artist = None;
+        assert_eq!(media_title(&untitled), "Spotify");
+        assert_eq!(media_detail(&untitled), "Spotify · Playing");
+    }
+
+    #[test]
+    fn capabilities_decide_whether_a_peer_could_be_controlled() {
+        assert!(!can_be_controlled(&[]));
+        assert!(!can_be_controlled(&["ping".into(), "media.control".into()]));
+        assert!(can_be_controlled(&["ping".into(), "input.pointer".into()]));
+        assert!(can_be_controlled(&["input.key".into()]));
+
+        let mut s = Store::default();
+        let mut p = peer("aa", true);
+        p.capabilities = vec!["input.key".into(), "transfer".into()];
+        s.set_peers(vec![p], 1000);
+        assert!(device_row(&s.peers[0], 1000).can_be_controlled);
+        // Offline the peer advertises nothing.
+        s.apply(
+            Event::Host(HostEvent::PeerOffline {
+                peer: "aa".into(),
+                short_id: "K3QD".into(),
+            }),
+            1001,
+        );
+        assert!(!device_row(&s.peers[0], 1001).can_be_controlled);
     }
 
     #[test]

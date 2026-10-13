@@ -253,18 +253,20 @@ fn set_grant(c: &Controller, peer: &str, grant: &str, on: bool) {
     let Some(i) = c.store.borrow().peer_index(peer) else {
         return;
     };
-    let mut grants = c.store.borrow().peers[i].grants;
-    let old = grants;
-    match grant {
-        "files" => grants.files = on,
-        "clipboard_in" => grants.clipboard_in = on,
-        "clipboard_out" => grants.clipboard_out = on,
-        "find" => grants.find = on,
-        // Input and media are shown but not offered until their phases (SR-14).
-        _ => return,
-    }
+    let old = c.store.borrow().peers[i].grants;
+    let input_supported = c
+        .store
+        .borrow()
+        .status
+        .as_ref()
+        .is_some_and(|s| s.settings.remote_input_supported);
+    // Input is offered only where this desktop can apply it (SR-14, anti-pattern 18).
+    let Some(grants) = model::apply_grant(old, grant, on, input_supported) else {
+        refresh_row(c, i);
+        return;
+    };
     // Show the change at once; snap back if the daemon refuses.
-    c.store.borrow_mut().peers[i].grants = grants;
+    c.store.borrow_mut().set_peer_grants(i, grants);
     refresh_row(c, i);
     let peer_id = peer.to_owned();
     c.ipc().request(
@@ -277,7 +279,7 @@ fn set_grant(c: &Controller, peer: &str, grant: &str, on: bool) {
                 if r.is_err() {
                     let idx = c.store.borrow().peer_index(&peer_id);
                     if let Some(i) = idx {
-                        c.store.borrow_mut().peers[i].grants = old;
+                        c.store.borrow_mut().set_peer_grants(i, old);
                         refresh_row(c, i);
                     }
                 }

@@ -6,7 +6,8 @@ use slint::ComponentHandle;
 
 use super::{with, Controller};
 use crate::ipc::post;
-use crate::{App, SettingsState};
+use crate::model::{remote_input_line, remote_input_reason};
+use crate::{App, DevicesState, SettingsState};
 
 pub(super) fn install(app: &App) {
     let s = app.global::<SettingsState>();
@@ -89,6 +90,10 @@ pub(super) fn refresh(c: &Controller) {
     s.set_clipboard_watch_supported(set.clipboard_watch_supported);
     s.set_autostart(set.autostart);
     s.set_notifications(set.notifications);
+    s.set_remote_input(remote_input_line(set).into());
+    let d = app.global::<DevicesState>();
+    d.set_input_supported(set.remote_input_supported);
+    d.set_input_reason(remote_input_reason(set).into());
     s.set_short_id(status.short_id.as_str().into());
     s.set_device_id(status.device_id.as_str().into());
     s.set_about(

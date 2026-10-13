@@ -1,7 +1,9 @@
 [package]
 name = "playdrop-ffi"
 description = "UniFFI surface over playdrop-core for the Android and iOS hosts"
-version.workspace = true
+# Own version: bumped on every change to the frozen surface (docs/core-api.md). 0.2.0 is
+# the Phase 5 surface: remote input, peer capabilities, PeerRefused.
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

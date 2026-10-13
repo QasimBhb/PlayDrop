@@ -108,8 +108,7 @@
     <string name="ui_grant_media_body">Play, pause and skip what is playing on this phone.</string>
     <string name="ui_grant_find">Ring this phone</string>
     <string name="ui_grant_find_body">Rings at full volume, even on silent, so you can find it.</string>
-    <string name="ui_grant_input">Remote input</string>
-    <string name="ui_grant_input_body">Arrives in Phase 5.</string>
+    <string name="ui_grant_input_phone">This phone cannot be controlled remotely.</string>
 
     <!-- Add device -->
     <string name="ui_add_tab_nearby">Nearby</string>
@@ -273,4 +272,64 @@
     <string name="ui_onboarding_3_body">PlayDrop runs quietly in the background so your devices can reach this phone. Next, pair your computer from the Devices tab.</string>
     <string name="ui_onboarding_start">Start</string>
     <string name="ui_onboarding_start_slow">PlayDrop is taking a while to start. Check the Devices tab.</string>
+
+    <!-- Device detail: remote input and media -->
+    <string name="ui_detail_input">Remote input</string>
+    <string name="ui_detail_input_unsupported">This device cannot be controlled remotely</string>
+    <string name="ui_media_title">Now playing</string>
+    <string name="ui_media_missing">-</string>
+    <string name="ui_media_play">Play</string>
+    <string name="ui_media_pause">Pause</string>
+    <string name="ui_media_previous">Previous track</string>
+    <string name="ui_media_next">Next track</string>
+    <string name="ui_media_volume">Volume</string>
+
+    <!-- Remote input screen -->
+    <string name="ui_input_title">Remote input</string>
+    <string name="ui_input_more">More options</string>
+    <string name="ui_input_offline">%1$s is offline. Input picks up again when it reconnects.</string>
+    <string name="ui_input_unsupported">This device cannot be controlled remotely</string>
+    <string name="ui_input_refused">Allow remote input for this phone on %1$s first</string>
+    <string name="ui_input_ended">The computer ended remote input: %1$s</string>
+    <string name="ui_input_refused_other">The computer refused remote input: %1$s</string>
+    <string name="ui_input_tab_trackpad">Trackpad</string>
+    <string name="ui_input_tab_keyboard">Keyboard</string>
+    <string name="ui_input_tab_presenter">Presenter</string>
+    <string name="ui_input_trackpad_hint">Drag to move the pointer. Tap to click, tap with two fingers to right-click. Hold, then drag to drag. Drag with two fingers to scroll.</string>
+    <string name="ui_input_left">Left</string>
+    <string name="ui_input_middle">Middle</string>
+    <string name="ui_input_right">Right</string>
+    <string name="ui_input_speed">Pointer speed</string>
+    <string name="ui_input_speed_body">How far the pointer moves for each finger movement.</string>
+    <string name="ui_input_speed_value">%1$.1fx</string>
+    <string name="ui_input_done">Done</string>
+    <string name="ui_input_type_hint">Type here to type on the computer</string>
+    <string name="ui_input_mods">Hold for the next key</string>
+    <string name="ui_input_ctrl">Ctrl</string>
+    <string name="ui_input_alt">Alt</string>
+    <string name="ui_input_shift">Shift</string>
+    <string name="ui_input_meta">Meta</string>
+    <string name="ui_input_media_keys">Media keys</string>
+    <string name="ui_input_previous">Previous</string>
+    <string name="ui_input_next">Next</string>
+    <string name="ui_input_blackout">Blackout</string>
+    <string name="ui_input_pointer">Pointer</string>
+    <string name="ui_input_volume_keys">While this tab is open, the phone\'s volume buttons change the computer\'s volume.</string>
+    <string name="ui_key_escape">Esc</string>
+    <string name="ui_key_tab">Tab</string>
+    <string name="ui_key_enter">Enter</string>
+    <string name="ui_key_backspace">Backspace</string>
+    <string name="ui_key_delete">Delete</string>
+    <string name="ui_key_left">←</string>
+    <string name="ui_key_up">↑</string>
+    <string name="ui_key_down">↓</string>
+    <string name="ui_key_right">→</string>
+    <string name="ui_key_home">Home</string>
+    <string name="ui_key_end">End</string>
+    <string name="ui_key_page_up">Page Up</string>
+    <string name="ui_key_page_down">Page Down</string>
+    <string name="ui_key_volume_down">Volume -</string>
+    <string name="ui_key_mute">Mute</string>
+    <string name="ui_key_volume_up">Volume +</string>
+    <string name="ui_key_play_pause">Play/Pause</string>
 </resources>

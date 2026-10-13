@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -34,6 +35,7 @@ internal object SettingsImpl {
     private val AUTO_CLIPBOARD = booleanPreferencesKey("auto_clipboard")
     private val ONBOARDED = booleanPreferencesKey("onboarded")
     private val BATTERY_PROMPT_SHOWN = booleanPreferencesKey("battery_prompt_shown")
+    private val TRACKPAD_SENSITIVITY = floatPreferencesKey("trackpad_sensitivity")
 
     /** Live settings; a read error logs and falls back to the defaults instead of crashing. */
     fun flow(context: Context): Flow<Settings.Values> =
@@ -63,6 +65,7 @@ internal object SettingsImpl {
             prefs[AUTO_CLIPBOARD] = after.autoClipboard
             prefs[ONBOARDED] = after.onboarded
             prefs[BATTERY_PROMPT_SHOWN] = after.batteryPromptShown
+            prefs[TRACKPAD_SENSITIVITY] = after.trackpadSensitivity
         }
     }
 
@@ -75,6 +78,9 @@ internal object SettingsImpl {
         autoClipboard = prefs[AUTO_CLIPBOARD] ?: true,
         onboarded = prefs[ONBOARDED] ?: false,
         batteryPromptShown = prefs[BATTERY_PROMPT_SHOWN] ?: false,
+        trackpadSensitivity = prefs[TRACKPAD_SENSITIVITY]
+            ?.takeIf { it in Settings.MIN_TRACKPAD_SENSITIVITY..Settings.MAX_TRACKPAD_SENSITIVITY }
+            ?: Settings.DEFAULT_TRACKPAD_SENSITIVITY,
     )
 
     /** The device model, e.g. "SM-A546B"; the core sanitises it further (SR-8). */

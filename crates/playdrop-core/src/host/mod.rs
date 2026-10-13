@@ -24,6 +24,7 @@ mod blobs;
 mod connect;
 pub mod diagnostics;
 pub mod events;
+mod input;
 pub mod lock;
 mod outbox;
 mod pairing;
@@ -68,6 +69,7 @@ use crate::identity::{DeviceId, DeviceIdentity};
 use crate::net::connection::{short, CloseReason, DESKTOP_KEEPALIVE, MOBILE_KEEPALIVE};
 use crate::net::{Server, TlsAcceptor};
 use crate::pin_store::{Grants, PinStore, PIN_FILE};
+use crate::session::types::Input;
 use crate::session::types::{
     Capability, Clipboard, ClipboardKind, DeviceType, Find, FindAction, Frame, MediaAction, Ping,
     PresenceState,
@@ -157,6 +159,11 @@ pub struct HostConfig {
     /// Seals `identity.key` and `pins.json` at rest (`docs/core-api.md` section 2a).
     /// `None` keeps the 0600 files of the desktop.
     pub secret_store: Option<Arc<dyn SecretStore>>,
+    /// Advertise `input.pointer`, `input.key` and `input.presenter` in `caps.in`
+    /// (protocol.md 5.12): the host has a backend that applies remote input (a desktop
+    /// daemon with `SendInput` or the `RemoteDesktop` portal). Off by default; phones never
+    /// accept input. Any host may send input (`caps.out`) regardless.
+    pub accepts_input: bool,
 }
 
 impl HostConfig {
@@ -180,6 +187,7 @@ impl HostConfig {
             lock_state: Box::new(AlwaysUnlocked),
             free_space: Arc::new(platform::VolumeSpace),
             secret_store: None,
+            accepts_input: false,
         }
     }
 
@@ -241,6 +249,11 @@ pub struct PeerSummary {
     /// successful pairing or unpair. Persisted in the pin.
     #[serde(default)]
     pub removed_by_peer: bool,
+    /// What the peer accepts (`hello.caps.in`, protocol.md section 4) while online; empty
+    /// offline. A UI shows a feature such as remote input only when the peer lists its
+    /// capability here (PLAN.md anti-pattern 18: hide what cannot work, with the reason).
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 /// A device seen in "Add device" mode (protocol.md 8.3 rule 1): listed, never dialled
@@ -325,6 +338,10 @@ pub(crate) struct Inner {
     pub(crate) blobs: Mutex<blobs::BlobStore>,
     /// Remembered battery and presence, and the media and battery rate state.
     pub(crate) status: Mutex<status::StatusState>,
+    /// Whether this host applies remote input (`caps.in` carries `input.*`, 5.12).
+    pub(crate) accepts_input: bool,
+    /// Remote input sessions and pending motion, both directions (5.12, SR-25).
+    pub(crate) input: Mutex<input::InputState>,
     /// Outbox items held for peers (7.8).
     pub(crate) outbox: Mutex<HashMap<String, Arc<outbox::Held>>>,
     /// Outbox items being pulled from peers right now.
@@ -736,6 +753,8 @@ impl Host {
             free_space: config.free_space,
             blobs: Mutex::new(blobs::BlobStore::default()),
             status: Mutex::new(status::StatusState::default()),
+            accepts_input: config.accepts_input,
+            input: Mutex::new(input::InputState::default()),
             outbox: Mutex::new(HashMap::new()),
             pulling: Mutex::new(HashSet::new()),
             add_device_seen: Mutex::new(HashMap::new()),
@@ -792,6 +811,7 @@ impl Host {
         inner.spawn(connect::diagnostics(Arc::clone(&inner)));
         inner.spawn(receive::maintenance(Arc::clone(&inner)));
         inner.spawn(outbox::maintenance(Arc::clone(&inner)));
+        inner.spawn(input::maintenance(Arc::clone(&inner)));
 
         inner.emit(HostEvent::Listening {
             addr: local_addr,
@@ -888,6 +908,12 @@ impl Host {
                     .copied()
                     .max(p.last_seen),
                 removed_by_peer: p.removed_by_peer,
+                capabilities: self
+                    .inner
+                    .registry
+                    .session(&p.device_id)
+                    .map(|s| s.peer_caps_in())
+                    .unwrap_or_default(),
             })
             .collect()
     }
@@ -1236,6 +1262,31 @@ impl Host {
     /// coalesced to 2 frames per second per player (protocol.md 5.9).
     pub fn push_media_state(&self, state: MediaState) {
         status::push_media_state(&self.inner, state);
+    }
+
+    /// Sends one remote input frame to `peer` (protocol.md 5.12). Open with
+    /// `Input::Session { op: Start }`, end with `Stop`; the target applies nothing outside
+    /// a session. Needs a session ([`Error::NotFound`]) and the matching `input.*`
+    /// capability on the peer ([`Error::Forbidden`]; see [`PeerSummary::capabilities`]).
+    /// Pointer moves and scrolls are coalesced to one frame per 8 ms. A peer that refuses
+    /// a frame (no `input` grant on its side) answers with an `error` that arrives as
+    /// [`HostEvent::PeerRefused`].
+    pub fn send_input(&self, peer: &DeviceId, input: Input) -> Result<()> {
+        input::send_input(&self.inner, peer, input)
+    }
+
+    /// Peers that hold an open input session on this host (we are the target), for a
+    /// "Remote input from <label>" indicator (SR-25).
+    pub fn input_sessions(&self) -> Vec<DeviceId> {
+        lock(&self.inner.input).open_sessions()
+    }
+
+    /// Ends every input session this host is the target of and tells the peers: the
+    /// SR-25 kill switch. Each ended session arrives as a final
+    /// [`HostEvent::Input`] with `session`/`stop` so the backend releases every key and
+    /// button. Returns the peers that had one.
+    pub fn stop_input_sessions(&self) -> Vec<DeviceId> {
+        input::stop_all_incoming(&self.inner)
     }
 
     /// Queues files for `peer` to pull (protocol.md 7.8) and returns the item ID. Sends

@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::session::types::MediaAction;
+use crate::session::types::{Input, MediaAction};
 pub use crate::transfer::DeliveredFile;
 
 use super::status::MediaState;
@@ -372,7 +372,42 @@ pub enum HostEvent {
         /// `active`, `idle`, `locked` or `asleep`.
         state: String,
     },
-    /// A frame this build parses but does not act on yet: `input` only (Phase 5).
+    /// Remote input from a peer that holds the `input` grant, inside an input session it
+    /// opened, while this desktop is unlocked (protocol.md 5.12, SR-25). The host's
+    /// platform backend applies it. `Session { Stop }` always arrives last: when the peer
+    /// stops, when its connection drops, after 10 idle minutes, on lock, and from
+    /// `Host::stop_input_sessions`; release every key and button on it.
+    Input {
+        /// Device ID.
+        peer: String,
+        /// The frame.
+        input: Input,
+    },
+    /// The peer answered one of our frames with an `error` (protocol.md 5.3, 5.14): most
+    /// often `forbidden`, meaning the peer has no grant for that frame type from us (a
+    /// desktop with remote input off for this phone). `frame_type` names the frame we
+    /// sent when it is still known.
+    PeerRefused {
+        /// Device ID.
+        peer: String,
+        /// The frame type we sent, if known.
+        frame_type: Option<String>,
+        /// Error code, such as `forbidden` or `not_paired`.
+        code: String,
+        /// The peer's message, if any.
+        message: Option<String>,
+    },
+    /// The target of an input session we control ended it (protocol.md 11.1 `error`
+    /// `input_session_ended`): it locked, saw no input for 10 minutes, or its user hit the
+    /// kill switch. The controlling UI leaves its input screen and shows `reason`.
+    InputSessionEnded {
+        /// Device ID.
+        peer: String,
+        /// Why, in the target's words.
+        reason: String,
+    },
+    /// A frame this build parses but does not act on. No frame uses it since Phase 5
+    /// (remote input is applied); kept so older IPC clients still decode the tag.
     Unsupported {
         /// Device ID.
         peer: String,
@@ -400,6 +435,7 @@ mod tests {
     /// A UI process decodes what the daemon encodes (IPC), and secrets never reach `Debug`
     /// (SR-32).
     #[test]
+    #[allow(clippy::too_many_lines, reason = "one sample per variant")]
     fn events_round_trip_and_secrets_stay_redacted() {
         let events = vec![
             HostEvent::PairingPrompt {
@@ -469,6 +505,25 @@ mod tests {
                 short_id: "s".into(),
                 path: DiscoveryPath::LastKnown,
                 failure: "refused".into(),
+            },
+            HostEvent::Input {
+                peer: "ab".repeat(32),
+                input: Input::Key(crate::session::types::KeyInput {
+                    key: Some("Enter".into()),
+                    text: None,
+                    mods: vec![crate::session::types::Modifier::Ctrl],
+                    action: crate::session::types::KeyAction::Press,
+                }),
+            },
+            HostEvent::PeerRefused {
+                peer: "ab".repeat(32),
+                frame_type: Some("input".into()),
+                code: "forbidden".into(),
+                message: None,
+            },
+            HostEvent::InputSessionEnded {
+                peer: "ab".repeat(32),
+                reason: "the desktop is locked".into(),
             },
         ];
         for ev in events {

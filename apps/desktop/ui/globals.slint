@@ -24,9 +24,21 @@ export global NoticeState {
     callback dismiss();
 }
 
+// Remote input sessions open on this desktop (SR-25): a banner above every tab with a
+// Stop button, the window's kill switch.
+export global InputState {
+    // "Remote input from Phone"; empty when no session is open.
+    in property <string> banner;
+    callback stop();
+}
+
 // Devices screen.
 export global DevicesState {
     in property <[DeviceRow]> rows;
+    // Whether this desktop can apply remote input; false greys out the input grant with
+    // `input-reason` beside it (PLAN.md anti-pattern 18).
+    in property <bool> input-supported;
+    in property <string> input-reason;
     in-out property <int> selected: -1;
     callback send-files(string);
     callback send-folder(string);
@@ -85,6 +97,8 @@ export global SettingsState {
     in property <bool> clipboard-watch-supported: true;
     in property <bool> autostart;
     in property <bool> notifications;
+    // "Remote input: available (...)" or "Remote input: unavailable: <reason>".
+    in property <string> remote-input;
     in property <string> short-id;
     in property <string> device-id;
     in property <string> about;

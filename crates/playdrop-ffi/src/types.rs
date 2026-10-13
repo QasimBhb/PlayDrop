@@ -104,6 +104,11 @@ pub struct HostConfig {
     pub interfaces: Option<Arc<dyn NetworkInterfaces>>,
     /// Seals the key and pin files at rest (SR-28); `None` keeps plain 0600 files.
     pub secret_store: Option<Arc<dyn SecretStore>>,
+    /// Advertise that this host applies remote input (`input.*` in `caps.in`,
+    /// protocol.md 5.12). Phones leave it off: only a desktop with an input backend
+    /// accepts input. Any host may send input regardless.
+    #[uniffi(default = false)]
+    pub accepts_input: bool,
 }
 
 impl HostConfig {
@@ -136,6 +141,7 @@ impl HostConfig {
         if let Some(store) = self.secret_store {
             cfg.secret_store = Some(Arc::new(ForeignSecretStore(store)));
         }
+        cfg.accepts_input = self.accepts_input;
         Ok(cfg)
     }
 }
@@ -223,6 +229,10 @@ pub struct PeerSummary {
     pub last_seen: Option<u64>,
     /// The peer told us it no longer has us pinned (protocol.md 5.4).
     pub removed_by_peer: bool,
+    /// What the peer accepts (its `hello.caps.in`, protocol.md section 4) while online,
+    /// empty offline: `input.pointer`, `input.key`, `input.presenter`, `media.control`,
+    /// `clipboard.image` and so on. Show a feature only when its capability is listed.
+    pub capabilities: Vec<String>,
 }
 
 impl From<host::PeerSummary> for PeerSummary {
@@ -237,6 +247,7 @@ impl From<host::PeerSummary> for PeerSummary {
             paired_at: p.paired_at,
             last_seen: p.last_seen,
             removed_by_peer: p.removed_by_peer,
+            capabilities: p.capabilities,
         }
     }
 }
@@ -867,4 +878,381 @@ pub(crate) fn parse_peer(peer: &str) -> Result<playdrop_core::identity::DeviceId
     peer.parse().map_err(|_| PlayDropError::NotFound {
         detail: format!("not a device id: {peer}"),
     })
+}
+
+// ---------------------------------------------------------------------------------------
+// Remote input (protocol.md 5.12, Phase 5)
+// ---------------------------------------------------------------------------------------
+
+/// Pointer buttons.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PointerButton {
+    /// Left.
+    Left,
+    /// Right.
+    Right,
+    /// Middle.
+    Middle,
+}
+
+impl From<PointerButton> for wire::PointerButton {
+    fn from(b: PointerButton) -> Self {
+        match b {
+            PointerButton::Left => Self::Left,
+            PointerButton::Right => Self::Right,
+            PointerButton::Middle => Self::Middle,
+        }
+    }
+}
+
+impl From<wire::PointerButton> for PointerButton {
+    fn from(b: wire::PointerButton) -> Self {
+        match b {
+            wire::PointerButton::Right => Self::Right,
+            wire::PointerButton::Middle => Self::Middle,
+            wire::PointerButton::Left | wire::PointerButton::Unknown(_) => Self::Left,
+        }
+    }
+}
+
+/// What happened to a pointer button.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum ButtonAction {
+    /// Pressed and held.
+    Down,
+    /// Released.
+    Up,
+    /// Down then up.
+    Click,
+    /// Two clicks.
+    Double,
+}
+
+impl From<ButtonAction> for wire::ButtonAction {
+    fn from(a: ButtonAction) -> Self {
+        match a {
+            ButtonAction::Down => Self::Down,
+            ButtonAction::Up => Self::Up,
+            ButtonAction::Click => Self::Click,
+            ButtonAction::Double => Self::Double,
+        }
+    }
+}
+
+impl From<wire::ButtonAction> for ButtonAction {
+    fn from(a: wire::ButtonAction) -> Self {
+        match a {
+            wire::ButtonAction::Down => Self::Down,
+            wire::ButtonAction::Up => Self::Up,
+            wire::ButtonAction::Double => Self::Double,
+            wire::ButtonAction::Click | wire::ButtonAction::Unknown(_) => Self::Click,
+        }
+    }
+}
+
+/// What happened to a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum KeyAction {
+    /// Down then up.
+    Press,
+    /// Pressed and held.
+    Down,
+    /// Released.
+    Up,
+}
+
+impl From<KeyAction> for wire::KeyAction {
+    fn from(a: KeyAction) -> Self {
+        match a {
+            KeyAction::Press => Self::Press,
+            KeyAction::Down => Self::Down,
+            KeyAction::Up => Self::Up,
+        }
+    }
+}
+
+impl From<wire::KeyAction> for KeyAction {
+    fn from(a: wire::KeyAction) -> Self {
+        match a {
+            wire::KeyAction::Down => Self::Down,
+            wire::KeyAction::Up => Self::Up,
+            wire::KeyAction::Press | wire::KeyAction::Unknown(_) => Self::Press,
+        }
+    }
+}
+
+/// A held modifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum Modifier {
+    /// Control.
+    Ctrl,
+    /// Alt (Option).
+    Alt,
+    /// Shift.
+    Shift,
+    /// Meta (Super, Windows, Command).
+    Meta,
+}
+
+impl From<Modifier> for wire::Modifier {
+    fn from(m: Modifier) -> Self {
+        match m {
+            Modifier::Ctrl => Self::Ctrl,
+            Modifier::Alt => Self::Alt,
+            Modifier::Shift => Self::Shift,
+            Modifier::Meta => Self::Meta,
+        }
+    }
+}
+
+impl TryFrom<wire::Modifier> for Modifier {
+    type Error = ();
+
+    fn try_from(m: wire::Modifier) -> Result<Self, ()> {
+        match m {
+            wire::Modifier::Ctrl => Ok(Self::Ctrl),
+            wire::Modifier::Alt => Ok(Self::Alt),
+            wire::Modifier::Shift => Ok(Self::Shift),
+            wire::Modifier::Meta => Ok(Self::Meta),
+            wire::Modifier::Unknown(_) => Err(()),
+        }
+    }
+}
+
+/// Presenter remote actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PresenterAction {
+    /// Next slide.
+    Next,
+    /// Previous slide.
+    Previous,
+    /// Show the laser pointer.
+    PointerOn,
+    /// Hide the laser pointer.
+    PointerOff,
+    /// Black the screen.
+    Blackout,
+}
+
+impl From<PresenterAction> for wire::PresenterAction {
+    fn from(a: PresenterAction) -> Self {
+        match a {
+            PresenterAction::Next => Self::Next,
+            PresenterAction::Previous => Self::Previous,
+            PresenterAction::PointerOn => Self::PointerOn,
+            PresenterAction::PointerOff => Self::PointerOff,
+            PresenterAction::Blackout => Self::Blackout,
+        }
+    }
+}
+
+impl TryFrom<wire::PresenterAction> for PresenterAction {
+    type Error = ();
+
+    fn try_from(a: wire::PresenterAction) -> Result<Self, ()> {
+        match a {
+            wire::PresenterAction::Next => Ok(Self::Next),
+            wire::PresenterAction::Previous => Ok(Self::Previous),
+            wire::PresenterAction::PointerOn => Ok(Self::PointerOn),
+            wire::PresenterAction::PointerOff => Ok(Self::PointerOff),
+            wire::PresenterAction::Blackout => Ok(Self::Blackout),
+            wire::PresenterAction::Unknown(_) => Err(()),
+        }
+    }
+}
+
+/// One remote input frame (protocol.md 5.12). A controller opens with `Session { start:
+/// true }`, sends pointer, key and presenter frames, and closes with `Session { start:
+/// false }`; the target applies nothing outside a session.
+#[derive(Debug, Clone, PartialEq, uniffi::Enum)]
+pub enum InputEvent {
+    /// Open (`true`) or close (`false`) the input session.
+    Session {
+        /// Start or stop.
+        start: bool,
+    },
+    /// Relative pointer move, in pointer units.
+    PointerMove {
+        /// Horizontal delta.
+        dx: f64,
+        /// Vertical delta.
+        dy: f64,
+    },
+    /// Pointer button.
+    PointerButton {
+        /// Which.
+        button: PointerButton,
+        /// What happened.
+        action: ButtonAction,
+    },
+    /// Scroll; `pixels` false means lines.
+    Scroll {
+        /// Horizontal amount.
+        dx: f64,
+        /// Vertical amount.
+        dy: f64,
+        /// Pixel units rather than lines.
+        pixels: bool,
+    },
+    /// A named key (W3C UI Events `key` value, such as `Enter` or `ArrowLeft`) with
+    /// modifiers.
+    Key {
+        /// The key name.
+        key: String,
+        /// Held modifiers.
+        mods: Vec<Modifier>,
+        /// What happened.
+        action: KeyAction,
+    },
+    /// A literal string to type.
+    Text {
+        /// The text.
+        text: String,
+    },
+    /// Presenter remote.
+    Presenter {
+        /// What to do.
+        action: PresenterAction,
+    },
+}
+
+impl From<InputEvent> for wire::Input {
+    fn from(i: InputEvent) -> Self {
+        match i {
+            InputEvent::Session { start } => Self::Session {
+                op: if start {
+                    wire::SessionOp::Start
+                } else {
+                    wire::SessionOp::Stop
+                },
+            },
+            InputEvent::PointerMove { dx, dy } => {
+                Self::Pointer(wire::PointerInput::Move { dx, dy })
+            }
+            InputEvent::PointerButton { button, action } => {
+                Self::Pointer(wire::PointerInput::Button {
+                    button: button.into(),
+                    action: action.into(),
+                })
+            }
+            InputEvent::Scroll { dx, dy, pixels } => Self::Pointer(wire::PointerInput::Scroll {
+                dx,
+                dy,
+                unit: pixels.then_some(wire::ScrollUnit::Pixel),
+            }),
+            InputEvent::Key { key, mods, action } => Self::Key(wire::KeyInput {
+                key: Some(key),
+                text: None,
+                mods: mods.into_iter().map(Into::into).collect(),
+                action: action.into(),
+            }),
+            InputEvent::Text { text } => Self::Key(wire::KeyInput {
+                key: None,
+                text: Some(text),
+                mods: Vec::new(),
+                action: wire::KeyAction::Press,
+            }),
+            InputEvent::Presenter { action } => Self::Presenter {
+                action: action.into(),
+            },
+        }
+    }
+}
+
+impl InputEvent {
+    /// Maps a frame from the wire; `None` for a value this binding does not know (an
+    /// unknown presenter action, say), which the host ignores (protocol.md section 4).
+    pub(crate) fn from_wire(i: wire::Input) -> Option<Self> {
+        Some(match i {
+            wire::Input::Session { op } => Self::Session {
+                start: match op {
+                    wire::SessionOp::Start => true,
+                    wire::SessionOp::Stop => false,
+                    wire::SessionOp::Unknown(_) => return None,
+                },
+            },
+            wire::Input::Pointer(wire::PointerInput::Move { dx, dy }) => {
+                Self::PointerMove { dx, dy }
+            }
+            wire::Input::Pointer(wire::PointerInput::Button { button, action }) => {
+                if !button.is_known() || !action.is_known() {
+                    return None;
+                }
+                Self::PointerButton {
+                    button: button.into(),
+                    action: action.into(),
+                }
+            }
+            wire::Input::Pointer(wire::PointerInput::Scroll { dx, dy, unit }) => Self::Scroll {
+                dx,
+                dy,
+                pixels: unit == Some(wire::ScrollUnit::Pixel),
+            },
+            wire::Input::Key(k) => match (k.key, k.text) {
+                (Some(key), None) => {
+                    if !k.action.is_known() {
+                        return None;
+                    }
+                    let mods = k
+                        .mods
+                        .into_iter()
+                        .map(Modifier::try_from)
+                        .collect::<Result<Vec<_>, ()>>()
+                        .ok()?;
+                    Self::Key {
+                        key,
+                        mods,
+                        action: k.action.into(),
+                    }
+                }
+                (None, Some(text)) => Self::Text { text },
+                _ => return None,
+            },
+            wire::Input::Presenter { action } => Self::Presenter {
+                action: action.try_into().ok()?,
+            },
+        })
+    }
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::*;
+
+    /// Every binding-side frame survives the trip to the wire type and back.
+    #[test]
+    fn input_round_trips() {
+        let events = vec![
+            InputEvent::Session { start: true },
+            InputEvent::PointerMove { dx: 1.5, dy: -2.0 },
+            InputEvent::PointerButton {
+                button: PointerButton::Right,
+                action: ButtonAction::Double,
+            },
+            InputEvent::Scroll {
+                dx: 0.0,
+                dy: 3.0,
+                pixels: true,
+            },
+            InputEvent::Key {
+                key: "Enter".into(),
+                mods: vec![Modifier::Ctrl, Modifier::Shift],
+                action: KeyAction::Down,
+            },
+            InputEvent::Text {
+                text: "hello".into(),
+            },
+            InputEvent::Presenter {
+                action: PresenterAction::Blackout,
+            },
+        ];
+        for ev in events {
+            let wire: wire::Input = ev.clone().into();
+            assert_eq!(InputEvent::from_wire(wire), Some(ev));
+        }
+        let unknown = wire::Input::Presenter {
+            action: wire::PresenterAction::Unknown("spin".into()),
+        };
+        assert_eq!(InputEvent::from_wire(unknown), None);
+    }
 }

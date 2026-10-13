@@ -415,6 +415,9 @@ wire_enum! {
         IdentityMismatch => "identity_mismatch",
         /// GOAWAY debug data (3.3).
         DuplicateConnection => "duplicate_connection",
+        /// The target ended the sender's input session (5.12: lock, idle, kill switch);
+        /// `message` says why. Phase 5.
+        InputSessionEnded => "input_session_ended",
     }
 }
 

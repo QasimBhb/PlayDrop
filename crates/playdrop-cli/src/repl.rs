@@ -143,7 +143,10 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
              send <peer> <path>... | accept <id> | decline <id> | cancel <id> | transfers | \
              grants <peer> [+g|-g]... | \
              outbox <peer> <path>... | outbox | outbox rm <id> | pull <peer> | \
-             ping <peer> [msg] | find <peer> [stop] | clip <peer> <text> | unpair <peer> | quit"
+             ping <peer> [msg] | find <peer> [stop] | clip <peer> <text> | unpair <peer> | \
+             media <peer> <player> <play|pause|playPause|stop|next|previous|seek ms|volume n> | \
+             input <peer> <start|stop|move dx dy|click|right|scroll dy|key <name>|text <words>|next|previous> | \
+             inputs | stop-input | quit"
         ),
         ("peers", _) => {
             let peers = host.peers();
@@ -300,6 +303,78 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
             if !host.send_clipboard(&id, &w[2..].join(" "), false)? {
                 println!("not sent: same as the last clipboard");
             }
+        }
+        ("media", n) if n >= 4 => {
+            use playdrop_core::session::types::MediaAction;
+            let id = peer(host, &w[1])?;
+            let action = MediaAction::from_wire(&w[3]);
+            let value = w.get(4).and_then(|v| v.parse::<u64>().ok());
+            host.send_media_command(&id, &w[2], action, value)?;
+        }
+        ("input", n) if n >= 3 => {
+            use playdrop_core::session::types::{
+                ButtonAction, Input, KeyAction, KeyInput, PointerButton, PointerInput,
+                PresenterAction, SessionOp,
+            };
+            let id = peer(host, &w[1])?;
+            let num = |i: usize| w.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+            let input = match w[2].as_str() {
+                "start" => Input::Session {
+                    op: SessionOp::Start,
+                },
+                "stop" => Input::Session {
+                    op: SessionOp::Stop,
+                },
+                "move" => Input::Pointer(PointerInput::Move {
+                    dx: num(3),
+                    dy: num(4),
+                }),
+                "click" | "right" => Input::Pointer(PointerInput::Button {
+                    button: if w[2] == "right" {
+                        PointerButton::Right
+                    } else {
+                        PointerButton::Left
+                    },
+                    action: ButtonAction::Click,
+                }),
+                "scroll" => Input::Pointer(PointerInput::Scroll {
+                    dx: 0.0,
+                    dy: num(3),
+                    unit: None,
+                }),
+                "key" if n >= 4 => Input::Key(KeyInput {
+                    key: Some(w[3].clone()),
+                    text: None,
+                    mods: vec![],
+                    action: KeyAction::Press,
+                }),
+                "text" if n >= 4 => Input::Key(KeyInput {
+                    key: None,
+                    text: Some(w[3..].join(" ")),
+                    mods: vec![],
+                    action: KeyAction::Press,
+                }),
+                "next" | "previous" => Input::Presenter {
+                    action: if w[2] == "next" {
+                        PresenterAction::Next
+                    } else {
+                        PresenterAction::Previous
+                    },
+                },
+                other => {
+                    println!("unknown input `{other}`; see help");
+                    return Ok(());
+                }
+            };
+            host.send_input(&id, input)?;
+        }
+        ("inputs", _) => {
+            for p in host.input_sessions() {
+                println!("remote input session from {}", p.short_id());
+            }
+        }
+        ("stop-input", _) => {
+            println!("ended {} session(s)", host.stop_input_sessions().len());
         }
         ("unpair", 2) => {
             let id = peer(host, &w[1])?;
@@ -553,6 +628,56 @@ fn print_event(ev: &HostEvent, json: bool) {
             ..
         } => {
             println!("cannot reach {short_id} via {path:?}: {failure}");
+        }
+        HostEvent::MediaState { peer, state } => {
+            let gone = !state.playing && state.can.is_empty();
+            println!(
+                "media {}: {} {} {}{}",
+                short(peer),
+                state.name.as_deref().unwrap_or(&state.player),
+                if gone {
+                    "gone"
+                } else if state.playing {
+                    "playing"
+                } else {
+                    "paused"
+                },
+                state.title.as_deref().unwrap_or("-"),
+                state
+                    .artist
+                    .as_deref()
+                    .map(|a| format!(" by {a}"))
+                    .unwrap_or_default()
+            );
+        }
+        HostEvent::Input { peer, input } => {
+            // The CLI applies nothing; it shows the kind only (SR-32: never the text).
+            let kind = match input {
+                playdrop_core::session::types::Input::Session { op } => format!("session {op:?}"),
+                playdrop_core::session::types::Input::Pointer(_) => "pointer".to_owned(),
+                playdrop_core::session::types::Input::Key(_) => "key".to_owned(),
+                playdrop_core::session::types::Input::Presenter { action } => {
+                    format!("presenter {action:?}")
+                }
+            };
+            println!("input from {}: {kind}", short(peer));
+        }
+        HostEvent::PeerRefused {
+            peer,
+            frame_type,
+            code,
+            message,
+        } => println!(
+            "{} refused {}: {code}{}",
+            short(peer),
+            frame_type.as_deref().unwrap_or("a frame"),
+            message
+                .as_deref()
+                .map(|m| format!(" ({m})"))
+                .unwrap_or_default()
+        ),
+        HostEvent::InputSessionEnded { peer, reason } => {
+            println!("{} ended the input session: {reason}", short(peer));
         }
         _ => {}
     }

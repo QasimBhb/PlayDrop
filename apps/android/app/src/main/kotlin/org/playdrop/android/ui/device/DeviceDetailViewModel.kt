@@ -19,7 +19,10 @@ import org.playdrop.android.ui.common.UiMessage
 import org.playdrop.android.ui.common.nowTicker
 import org.playdrop.android.ui.devices.DeviceRow
 import org.playdrop.android.ui.devices.DeviceRows
+import org.playdrop.android.ui.input.InputSupport
 import org.playdrop.core.Grants
+import org.playdrop.core.MediaAction
+import org.playdrop.core.MediaState
 
 /** One of the six per-device permissions (SR-14). */
 enum class GrantKind {
@@ -38,7 +41,10 @@ enum class GrantKind {
     /** Let the device ring this phone. */
     FIND,
 
-    /** Remote input; arrives in Phase 5. */
+    /**
+     * Let the device control this phone with remote input. A phone never accepts input
+     * (it does not advertise `input.*`), so the screen does not offer this toggle.
+     */
     INPUT,
 }
 
@@ -77,7 +83,14 @@ data class DeviceDetailUiState(
     val pairedAt: Long = 0,
     /** A find request is ringing the device. */
     val ringing: Boolean = false,
-)
+    /** What the device accepts while online (`input.pointer`, `media.control`, ...); empty offline. */
+    val capabilities: List<String> = emptyList(),
+    /** Media players the device reports, for the "Now playing" cards. */
+    val media: List<MediaState> = emptyList(),
+) {
+    /** Show the "Remote input" button: online and able to take pointer or key input. */
+    val canControl: Boolean get() = row?.online == true && InputSupport.canControl(capabilities)
+}
 
 /** State and actions of the Device detail screen; the device ID comes from the route. */
 class DeviceDetailViewModel(application: Application, savedState: SavedStateHandle) : CoreViewModel(application) {
@@ -91,12 +104,12 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
 
     /** The screen state. */
     val state: StateFlow<DeviceDetailUiState> = combine(
-        combine(CoreHost.peers, CoreHost.peerStatus, ::Pair),
+        combine(CoreHost.peers, CoreHost.peerStatus, CoreHost.media, ::Triple),
         Settings.flow(application),
         pendingGrants,
         ringing,
         nowTicker(30_000),
-    ) { (peers, status), settings, pending, ring, now ->
+    ) { (peers, status, media), settings, pending, ring, now ->
         val peer = peers.firstOrNull { it.deviceId == peerId }
         if (peer == null) {
             DeviceDetailUiState()
@@ -107,6 +120,8 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
                 lastKnown = peer.lastKnown,
                 pairedAt = peer.pairedAt.toLong(),
                 ringing = ring,
+                capabilities = if (peer.online) peer.capabilities else emptyList(),
+                media = media[peerId].orEmpty(),
             )
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DeviceDetailUiState())
@@ -161,6 +176,11 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
                 pendingGrants.value = null
             }
         }
+    }
+
+    /** Sends a media command to one of the device's players; [value] is seek ms or volume. */
+    fun mediaCommand(player: String, action: MediaAction, value: Long?) {
+        launchCore({ it.sendMediaCommand(peerId, player, action, value?.toULong()) })
     }
 
     /** Unpairs the device, then closes the screen. */

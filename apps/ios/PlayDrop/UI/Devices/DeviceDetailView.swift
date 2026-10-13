@@ -1,9 +1,11 @@
 import PlayDropCore
+import PlayDropShared
 import SwiftUI
 
 // The Device screen: status, the actions (send files, send clipboard, ping, find, connect,
-// set as default), the permissions this iPhone grants the device (SR-14), the last-known
-// addresses and unpair. Rename lives in the toolbar. Port of Android
+// set as default), remote input for computers that accept it, the media players the device
+// reports, the permissions this iPhone grants the device (SR-14), the last-known addresses
+// and unpair. Rename lives in the toolbar. Port of Android
 // `ui/device/DeviceDetailScreen.kt`.
 
 /// One paired device.
@@ -96,6 +98,28 @@ struct DeviceDetailView: View {
         }
     }
 
+    /// The remote input entry: a link while the computer is online and accepts pointer or
+    /// key input, a disabled row saying why when it accepts neither, nothing while offline
+    /// (its capabilities are unknown then).
+    @ViewBuilder
+    private func remoteInputSection(_ peer: PeerSummary) -> some View {
+        switch RemoteInputAvailability.of(online: peer.online, capabilities: peer.capabilities) {
+        case .available:
+            Section {
+                NavigationLink(value: DevicesRoute.remoteInput(peerId)) {
+                    Label(L10n.Input.title, systemImage: "cursorarrow.motionlines")
+                }
+            }
+        case .unsupported:
+            Section {
+                Label(L10n.Input.unsupported, systemImage: "cursorarrow.slash")
+                    .foregroundStyle(.secondary)
+            }
+        case .offline:
+            EmptyView()
+        }
+    }
+
     private func form(_ peer: PeerSummary) -> some View {
         let row = DeviceRows.derive(peers: [peer], status: core.peerStatus, defaultPeer: settings.defaultPeer)[0]
         let ringing = actions.ringing.contains(peerId)
@@ -157,6 +181,12 @@ struct DeviceDetailView: View {
             } footer: {
                 if ringing { Text(L10n.Detail.ringing) }
             }
+            remoteInputSection(peer)
+            NowPlayingSection(
+                peerId: peerId,
+                players: core.mediaPlayers[peerId] ?? [],
+                controllable: peerAcceptsMediaControl(online: peer.online, capabilities: peer.capabilities)
+            )
             Section {
                 if row.isDefault {
                     Label(L10n.Detail.isDefault, systemImage: "star.fill")
@@ -168,7 +198,7 @@ struct DeviceDetailView: View {
                     }
                 }
             }
-            Section(L10n.Detail.grantsTitle) {
+            Section {
                 let grants = model.grants(of: peer)
                 ForEach(GrantKind.allCases) { kind in
                     Toggle(isOn: Binding(
@@ -183,6 +213,11 @@ struct DeviceDetailView: View {
                         }
                     }
                 }
+            } header: {
+                Text(L10n.Detail.grantsTitle)
+            } footer: {
+                // The `input` grant (control this iPhone) has no switch: iOS does not allow it.
+                Text(L10n.Detail.inputNotPossible)
             }
             Section {
                 DisclosureGroup(L10n.Detail.addresses) {

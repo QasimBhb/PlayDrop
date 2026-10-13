@@ -43,6 +43,9 @@ use crate::autostart::{self, Locations};
 use crate::battery;
 use crate::cli::Args;
 use crate::clipboard::{self, ClipContent, LocalClip};
+use crate::control::{self, InputRunners};
+use crate::input::InputSupport;
+use crate::media::{self, MediaSupport};
 use crate::notify::Notifier;
 use crate::open::OpenError;
 use crate::settings::{self, Settings};
@@ -62,6 +65,7 @@ const CLIP_QUEUE: usize = 16;
 const LOCKED_MESSAGE: &str = "desktop is locked";
 
 /// Runs the daemon until it is asked to stop.
+#[allow(clippy::too_many_lines, reason = "start-up is one linear sequence")]
 pub async fn run(args: Args) -> anyhow::Result<()> {
     let (data_dir, persisted, effective, first_run) = load_settings(&args)?;
 
@@ -74,6 +78,9 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         );
     }
     let (lock_flag, lock_rx) = lock::start().await?;
+    let input_support = crate::input::support().await;
+    let media_support = media::support().await;
+    control::log_support(&input_support, &media_support);
     let notifier = Notifier::new(effective.notifications, effective.receive_dir.clone());
     let locations = match Locations::user() {
         Ok(_) if args.no_autostart => {
@@ -96,6 +103,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         autostart: locations.clone(),
         clipboard_supported: support.supported,
         watch_clipboard: true,
+        input_support,
+        media_support,
     });
 
     let server = match Server::start(daemon.handler(), daemon.events()).await {
@@ -131,6 +140,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         .await;
     }
     daemon.shared.sync_clipboard_watcher().await;
+    daemon.shared.start_media_watcher().await;
 
     let (net_tx, net_rx) = mpsc::channel(4);
     network::watch(net_tx).await;
@@ -328,6 +338,10 @@ pub struct Options {
     pub clipboard_supported: bool,
     /// Start the clipboard watcher at all (false in tests).
     pub watch_clipboard: bool,
+    /// What the input backend said at start (`accepts_input`, the window's toggle).
+    pub input_support: InputSupport,
+    /// What the media backend said at start.
+    pub media_support: MediaSupport,
 }
 
 /// The daemon state shared by the event loop and the request handler.
@@ -366,6 +380,12 @@ struct Shared {
     local_battery: Mutex<Option<battery::Reading>>,
     tray_dirty: Arc<Notify>,
     shutdown_tx: watch::Sender<bool>,
+    input_support: InputSupport,
+    media_support: MediaSupport,
+    /// One injector task per controlling peer (Phase 5, SR-25).
+    input_runners: Arc<InputRunners>,
+    /// The local player watcher, when the platform has one.
+    media: tokio::sync::Mutex<Option<media::Watcher>>,
 }
 
 impl Daemon {
@@ -374,11 +394,19 @@ impl Daemon {
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let (clip_tx, clip_rx) = mpsc::channel(CLIP_QUEUE);
         let images = opts.effective.clipboard_images;
+        let notifier = opts.notifier;
+        let tray_dirty = Arc::new(Notify::new());
+        let input_runners = InputRunners::new(
+            opts.data_dir.clone(),
+            Arc::clone(&notifier),
+            events.clone(),
+            Arc::clone(&tray_dirty),
+        );
         let shared = Arc::new(Shared {
             data_dir: opts.data_dir,
             bind_ip: opts.bind_ip,
             lock: opts.lock,
-            notifier: opts.notifier,
+            notifier,
             autostart: opts.autostart,
             clipboard_supported: opts.clipboard_supported,
             watch_clipboard: opts.watch_clipboard,
@@ -396,9 +424,20 @@ impl Daemon {
             clipboard_images: Arc::new(AtomicBool::new(images)),
             battery: Mutex::new(HashMap::new()),
             local_battery: Mutex::new(None),
-            tray_dirty: Arc::new(Notify::new()),
+            tray_dirty,
             shutdown_tx: watch::Sender::new(false),
+            input_support: opts.input_support,
+            media_support: opts.media_support,
+            input_runners,
+            media: tokio::sync::Mutex::new(None),
         });
+        let weak = Arc::downgrade(&shared);
+        shared.input_runners.set_ender(Box::new(move |_peer: &str| {
+            if let Some(h) = weak.upgrade().and_then(|s| s.host()) {
+                // Ends every session, not just the peer's: a backend failure is global.
+                h.stop_input_sessions();
+            }
+        }));
         tokio::spawn(local_clips(Arc::downgrade(&shared), clip_rx));
         Self { shared }
     }
@@ -439,6 +478,10 @@ impl Daemon {
         if let Some(w) = s.watcher.lock().await.take() {
             w.stop();
         }
+        if let Some(m) = s.media.lock().await.take() {
+            m.stop();
+        }
+        s.input_runners.stop_all();
         s.stop_host().await;
     }
 }
@@ -512,7 +555,33 @@ impl Shared {
         c.bind_ip = self.bind_ip;
         c.discovery = s.discovery;
         c.lock_state = Box::new((*self.lock).clone());
+        c.accepts_input = self.input_support.supported;
         c
+    }
+
+    /// The settings view a UI reads, with what the platform backends can do.
+    fn ipc_settings(&self) -> playdrop_ipc::Settings {
+        let mut s = self.effective().to_ipc(self.clipboard_supported);
+        s.remote_input_supported = self.input_support.supported;
+        s.remote_input_reason.clone_from(&self.input_support.reason);
+        s
+    }
+
+    /// Starts the media watcher when the platform has one; its states reach whichever
+    /// host is running (a restart keeps the watcher).
+    async fn start_media_watcher(self: &Arc<Self>) {
+        if !self.media_support.supported {
+            return;
+        }
+        let (tx, rx) = mpsc::channel(64);
+        match media::Watcher::start(tx).await {
+            Ok(w) => {
+                *self.media.lock().await = Some(w);
+                let host = control::weak_host(&Arc::downgrade(self), Shared::host);
+                tokio::spawn(control::media_feed(rx, host));
+            }
+            Err(e) => tracing::warn!(error = %e, "media watcher did not start"),
+        }
     }
 
     /// Starts a host and its drain. Caller holds `lifecycle`.
@@ -603,6 +672,35 @@ impl Shared {
             | HostEvent::PeerOffline { .. }
             | HostEvent::Paired { .. }
             | HostEvent::RemovedByPeer { .. } => self.tray_dirty.notify_one(),
+            HostEvent::Input { peer, input } => {
+                // The core already checked grant, session, lock and rate (SR-25); the
+                // runner keeps the frames in order and owns the injector's life.
+                self.input_runners
+                    .on_input(peer, self.label_for(peer), input.clone());
+            }
+            HostEvent::MediaCommand {
+                peer,
+                player,
+                action,
+                value,
+            } => {
+                let me = Arc::clone(self);
+                let (peer, player, action, value) =
+                    (peer.clone(), player.clone(), action.clone(), *value);
+                tokio::spawn(async move {
+                    let guard = me.media.lock().await;
+                    let Some(w) = guard.as_ref() else {
+                        tracing::debug!(
+                            peer = short_hex(&peer),
+                            "media command with no media backend"
+                        );
+                        return;
+                    };
+                    if let Err(e) = w.command(&player, action, value).await {
+                        tracing::info!(peer = short_hex(&peer), error = %e, "media command not applied");
+                    }
+                });
+            }
             HostEvent::Clipboard {
                 peer,
                 text,
@@ -747,6 +845,7 @@ impl Shared {
             devices,
             clipboard_paused: self.clipboard_paused.load(Ordering::SeqCst),
             clipboard_sync: self.clipboard_supported && self.effective().clipboard_sync,
+            input_from: self.input_runners.active_labels(),
         }
     }
 
@@ -755,6 +854,15 @@ impl Shared {
         if let Some(h) = self.host() {
             if locked {
                 h.close_add_device_window();
+                // SR-25: no input into a locked desktop. The core drops frames on its own;
+                // ending the sessions releases every held key and button now (T31).
+                let ended = h.stop_input_sessions();
+                if !ended.is_empty() {
+                    tracing::info!(
+                        count = ended.len(),
+                        "desktop locked; remote input sessions ended"
+                    );
+                }
             }
             h.set_presence(presence_for(locked), None, None);
         }
@@ -790,6 +898,11 @@ impl Shared {
             TrayCommand::SetClipboardPaused(p) => {
                 self.clipboard_paused.store(p, Ordering::SeqCst);
                 self.tray_dirty.notify_one();
+            }
+            TrayCommand::StopInput => {
+                if let Some(h) = self.host() {
+                    h.stop_input_sessions();
+                }
             }
             TrayCommand::Quit => {
                 self.shutdown_tx.send_replace(true);
@@ -864,9 +977,10 @@ impl Shared {
             addr: host.local_addr(),
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             ipc_version: IPC_VERSION,
-            settings: self.effective().to_ipc(self.clipboard_supported),
+            settings: self.ipc_settings(),
             add_device_window_open: host.add_device_window_open(),
             locked: self.lock.is_locked(),
+            input_from: self.input_runners.active_labels(),
         }
     }
 
@@ -918,7 +1032,10 @@ impl Shared {
         if changes.clipboard_sync {
             self.sync_clipboard_watcher().await;
         }
-        let view = new.to_ipc(self.clipboard_supported);
+        let mut view = new.to_ipc(self.clipboard_supported);
+        view.remote_input_supported = self.input_support.supported;
+        view.remote_input_reason
+            .clone_from(&self.input_support.reason);
         if changes.any() {
             self.emit(DaemonEvent::SettingsChanged {
                 settings: view.clone(),
@@ -948,7 +1065,7 @@ impl Shared {
         match &req {
             Request::GetSettings => {
                 return Ok(IpcOk::Settings {
-                    settings: self.effective().to_ipc(self.clipboard_supported),
+                    settings: self.ipc_settings(),
                     restarted: false,
                 })
             }
@@ -1087,6 +1204,11 @@ impl Shared {
             }
             Request::NetworkChanged => {
                 host.network_changed();
+                Ok(IpcOk::Done)
+            }
+            Request::StopInput => {
+                let ended = host.stop_input_sessions();
+                tracing::info!(count = ended.len(), "remote input stopped from the UI");
                 Ok(IpcOk::Done)
             }
             _ => Err(err(
@@ -1239,6 +1361,16 @@ mod tests {
             }),
             clipboard_supported: false,
             watch_clipboard: false,
+            input_support: InputSupport {
+                supported: false,
+                backend: "none",
+                reason: Some("test".into()),
+            },
+            media_support: MediaSupport {
+                supported: false,
+                backend: "none",
+                reason: Some("test".into()),
+            },
         })
     }
 
@@ -1448,6 +1580,7 @@ mod tests {
             paired_at: 0,
             last_seen: None,
             removed_by_peer: false,
+            capabilities: vec![],
         };
         let peers = vec![
             p(&"ab".repeat(32), "k3qd-7f2m-xa9p-41bc", "Phone"),

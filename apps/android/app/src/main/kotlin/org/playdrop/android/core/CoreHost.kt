@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import org.playdrop.core.AddDeviceCandidate
 import org.playdrop.core.HostEvent
+import org.playdrop.core.MediaState
 import org.playdrop.core.PairingPrompt
 import org.playdrop.core.PeerSummary
 import org.playdrop.core.PlayDropHost
@@ -37,6 +38,13 @@ object CoreHost {
 
     /** Battery and presence last reported by each peer, keyed by hex Device ID. */
     val peerStatus: StateFlow<Map<String, PeerStatus>> get() = CoreHostImpl.peerStatus
+
+    /**
+     * Media players each peer reports, keyed by hex Device ID, in the order they first
+     * appeared. A player that stops and lists no action is removed, and a peer's players are
+     * forgotten when it goes offline; a peer with no players has no key.
+     */
+    val media: StateFlow<Map<String, List<MediaState>>> get() = CoreHostImpl.media
 
     /** Every event, in order, for screens that need more than the flows above. */
     val events: SharedFlow<HostEvent> get() = CoreHostImpl.events

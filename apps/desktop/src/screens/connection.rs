@@ -94,5 +94,8 @@ pub(super) fn on_disconnected(c: &Controller) {
         let p = app.global::<crate::PairingState>();
         p.set_prompt_visible(false);
     }
+    // The daemon is gone; whatever sessions it had are no longer ours to show.
+    c.store.borrow_mut().clear_input_sessions();
+    super::refresh_input_banner(c);
     c.ipc.connect();
 }

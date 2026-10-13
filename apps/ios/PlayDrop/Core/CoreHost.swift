@@ -158,6 +158,12 @@ public final class CoreHost {
     /// The latest `diagnose()` snapshot; refreshed by `refreshDiagnostics()`.
     public internal(set) var diagnostics: Diagnostics?
 
+    /// Media players each peer reported (protocol.md 5.9), keyed by hex Device ID, in the
+    /// order they first appeared. A player that stops playing and allows no action is gone
+    /// and removed (`MediaPlayback.isGone`); a peer's players are dropped when it goes
+    /// offline and when the core stops.
+    public internal(set) var mediaPlayers: [String: [MediaState]] = [:]
+
     /// Every event, in order, for services that need more than the properties above
     /// (notifications, the outbox puller, the clipboard applier). Each call returns an
     /// independent stream that starts at the next event.
@@ -224,6 +230,24 @@ public final class CoreHost {
     /// (for example `Io` naming an unreadable item) or `CoreHostError.notRunning`.
     public func sendFiles(peer: String, items: [SendItem], note: String? = nil) async throws -> String {
         try await CoreHostImpl.sendFiles(peer: peer, items: items, note: note)
+    }
+
+    /// Sends one remote input frame to `peer` (protocol.md 5.12). Throws `PlayDropError`:
+    /// `NotFound` without a session, `Forbidden` when the peer does not accept that kind of
+    /// input. A peer with remote input off for this phone answers later with a
+    /// `peerRefused` event instead. Callers that need frames in order serialise their calls
+    /// (`InputSender`).
+    public func sendInput(peer: String, _ input: InputEvent) async throws {
+        try await withHost { host in try host.sendInput(peer: peer, input: input) }
+    }
+
+    /// Sends a media command to one of `peer`'s players (protocol.md 5.9). `value` is the
+    /// seek position in ms or the volume from 0 to 100. Throws `Forbidden` when the peer
+    /// does not accept media control.
+    public func sendMediaCommand(peer: String, player: String, action: MediaAction, value: UInt64? = nil) async throws {
+        try await withHost { host in
+            try host.sendMediaCommand(peer: peer, player: player, action: action, value: value)
+        }
     }
 
     /// The local label of a paired peer, else its Short ID, else a truncated Device ID.

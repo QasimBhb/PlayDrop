@@ -17,6 +17,7 @@ import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.Mouse
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -43,6 +44,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -57,6 +59,7 @@ import org.playdrop.android.ui.common.ShortIdText
 import org.playdrop.android.ui.common.agoText
 import org.playdrop.android.ui.theme.MonoStyle
 import org.playdrop.android.ui.theme.PlayDropTheme
+import org.playdrop.core.MediaAction
 import java.text.DateFormat
 import java.util.Date
 
@@ -65,6 +68,7 @@ import java.util.Date
 fun DeviceDetailRoute(
     onBack: () -> Unit,
     onPairAgain: () -> Unit,
+    onOpenInput: () -> Unit,
     showMessage: (String) -> Unit,
     vm: DeviceDetailViewModel = viewModel(),
 ) {
@@ -83,6 +87,8 @@ fun DeviceDetailRoute(
             onGrant = vm::setGrant,
             onUnpair = vm::unpair,
             onPairAgain = onPairAgain,
+            onOpenInput = onOpenInput,
+            onMedia = vm::mediaCommand,
         ),
     )
 }
@@ -107,6 +113,10 @@ data class DeviceDetailActions(
     val onUnpair: () -> Unit = {},
     /** Open "Add device" to pair again. */
     val onPairAgain: () -> Unit = {},
+    /** Open the remote input screen. */
+    val onOpenInput: () -> Unit = {},
+    /** Media command: player ID, action, seek ms or volume. */
+    val onMedia: (String, MediaAction, Long?) -> Unit = { _, _, _ -> },
 )
 
 /** One paired device: actions, grants, addresses and unpair. */
@@ -191,6 +201,21 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions)
                 if (!row.online) {
                     OutlinedButton(onClick = actions.onConnect) { Text(stringResource(R.string.ui_detail_connect)) }
                 }
+                if (state.canControl) {
+                    FilledTonalButton(onClick = actions.onOpenInput) {
+                        Icon(Icons.Filled.Mouse, contentDescription = null, modifier = Modifier.padding(end = 8.dp))
+                        Text(stringResource(R.string.ui_detail_input))
+                    }
+                }
+            }
+            if (row.online && !state.canControl) {
+                // Say why the feature is missing instead of hiding it silently (anti-pattern 18).
+                ListItem(
+                    headlineContent = { Text(stringResource(R.string.ui_detail_input)) },
+                    supportingContent = { Text(stringResource(R.string.ui_detail_input_unsupported)) },
+                    leadingContent = { Icon(Icons.Filled.Mouse, contentDescription = null) },
+                    modifier = Modifier.alpha(DISABLED_ALPHA),
+                )
             }
             if (state.ringing) {
                 Text(
@@ -207,10 +232,17 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions)
                 )
             }
 
+            if (state.media.isNotEmpty()) {
+                HorizontalDivider()
+                SectionTitle(stringResource(R.string.ui_media_title))
+                state.media.forEach { player ->
+                    NowPlayingCard(player) { action, value -> actions.onMedia(player.player, action, value) }
+                }
+            }
+
             HorizontalDivider()
             SectionTitle(stringResource(R.string.ui_grants_title))
             GRANT_ROWS.forEach { (kind, title, body) ->
-                val enabled = kind != GrantKind.INPUT
                 ListItem(
                     headlineContent = { Text(stringResource(title)) },
                     supportingContent = { Text(stringResource(body)) },
@@ -218,11 +250,18 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions)
                         Switch(
                             checked = GrantEdit.get(state.grants, kind),
                             onCheckedChange = { actions.onGrant(kind, it) },
-                            enabled = enabled,
                         )
                     },
                 )
             }
+            // GrantKind.INPUT would let the device control this phone, which a phone never
+            // accepts, so it gets a note instead of a toggle that does nothing.
+            Text(
+                stringResource(R.string.ui_grant_input_phone),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 16.dp),
+            )
 
             HorizontalDivider()
             Row(
@@ -335,8 +374,9 @@ private val GRANT_ROWS = listOf(
     GrantRow(GrantKind.CLIPBOARD_OUT, R.string.ui_grant_clip_out, R.string.ui_grant_clip_out_body),
     GrantRow(GrantKind.MEDIA, R.string.ui_grant_media, R.string.ui_grant_media_body),
     GrantRow(GrantKind.FIND, R.string.ui_grant_find, R.string.ui_grant_find_body),
-    GrantRow(GrantKind.INPUT, R.string.ui_grant_input, R.string.ui_grant_input_body),
 )
+
+private const val DISABLED_ALPHA = 0.6f
 
 @Preview(showBackground = true, heightDp = 1100)
 @Composable

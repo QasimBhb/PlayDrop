@@ -69,9 +69,12 @@ pub(crate) fn open_window(inner: &Arc<Inner>) -> Result<()> {
     inner.window_flag.store(true, Ordering::SeqCst);
     let i2 = Arc::clone(inner);
     inner.spawn(async move {
+        let opened = Instant::now();
+        let mut next_burst = opened + EMPTY_WINDOW_BURST;
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let open = lock(&i2.window).is_open(Instant::now());
+            let now = Instant::now();
+            let open = lock(&i2.window).is_open(now);
             if !open {
                 i2.window_flag.store(false, Ordering::SeqCst);
                 *lock(&i2.qr_offer) = None;
@@ -80,9 +83,28 @@ pub(crate) fn open_window(inner: &Arc<Inner>) -> Result<()> {
             if !i2.window_flag.load(Ordering::SeqCst) {
                 return;
             }
+            if now >= next_burst {
+                next_burst = now + EMPTY_WINDOW_BURST;
+                burst_if_nobody_seen(&i2);
+            }
         }
     });
     Ok(())
+}
+
+/// With "Add device" open and no candidate yet, send a fresh beacon burst every this long.
+/// A peer that opened its window after our 0/1/3 s burst (and holds its multicast lock
+/// only inside its window, as Android does) would otherwise wait up to a minute for the
+/// steady beacon (Phase 3 handoff section 7).
+const EMPTY_WINDOW_BURST: Duration = Duration::from_secs(10);
+
+fn burst_if_nobody_seen(inner: &Inner) {
+    let d = lock(&inner.discovery);
+    let Some(d) = d.as_ref() else { return };
+    if d.add_device_list().is_empty() {
+        tracing::debug!("add-device window open with no candidate; sending a beacon burst");
+        d.announce_now();
+    }
 }
 
 fn context(inner: &Inner, sess: &Session, peer_name: &str) -> Result<PairingContext> {
@@ -320,7 +342,9 @@ async fn complete(inner: &Arc<Inner>, ap: ActivePairing) -> Result<()> {
     }
     inner.registry.attach(&conn);
     ap.sess.send_raw(
-        Frame::Capabilities(CapabilitiesFrame { caps: local_caps() }),
+        Frame::Capabilities(CapabilitiesFrame {
+            caps: local_caps(inner),
+        }),
         None,
     );
     ap.sess.send_raw(announce_key_frame(inner), None);

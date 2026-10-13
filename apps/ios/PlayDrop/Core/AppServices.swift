@@ -15,6 +15,8 @@ import UIKit
 //   the share extension queued. Until onboarding is done the core is not started: starting
 //   it makes iOS ask for Local Network access, and that question must come after the
 //   onboarding page that explains it. `onboardingDidFinish()` starts it then.
+// - Remote input: an open input screen stops its session on background and starts it
+//   again once the core runs in the foreground.
 // - Background: presence `asleep` ("background"), stop ringing, drop offer notifications
 //   whose buttons would no longer work, stop the core. iOS suspends the app soon after, so
 //   the stop runs inside a background task assertion to finish the shutdown cleanly. The
@@ -71,6 +73,7 @@ public enum AppServices {
         }
         await DeviceSignals.reportBattery()
         await CoreHost.shared.setForeground(true)
+        await RemoteInputModel.sceneDidBecomeActive()
         if AppSettings.shared.pullOutboxOnOpen {
             await OutboxPuller.pullAll()
         }
@@ -83,6 +86,9 @@ public enum AppServices {
         let assertion = BackgroundAssertion(name: "PlayDrop core shutdown")
         defer { assertion.end() }
         FindRinger.shared.stop()
+        // An open remote input session ends now: the core stops below, and the computer
+        // must not wait for its idle timeout to release held keys.
+        await RemoteInputModel.sceneDidEnterBackground()
         await CoreHost.shared.setForeground(false)
         LocalNotifications.shared.appDidEnterBackground()
         await CoreHost.shared.stop()

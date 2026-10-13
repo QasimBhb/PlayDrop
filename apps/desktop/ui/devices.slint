@@ -68,6 +68,32 @@ component DeviceCard inherits Card {
             text: root.device.note;
         }
 
+        if root.device.media-visible: HorizontalLayout {
+            spacing: 8px;
+            accessible-role: text;
+            accessible-label: "Now playing: " + root.device.media-title + ", " + root.device.media-detail;
+            Chip {
+                text: root.device.media-playing ? "Playing" : "Paused";
+                good: root.device.media-playing;
+                vertical-stretch: 0;
+            }
+
+            VerticalLayout {
+                horizontal-stretch: 1;
+                Label {
+                    text: root.device.media-title;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+
+                Muted {
+                    text: root.device.media-detail;
+                    wrap: no-wrap;
+                    overflow: elide;
+                }
+            }
+        }
+
         HorizontalLayout {
             spacing: 6px;
             alignment: start;
@@ -168,15 +194,25 @@ component DeviceCard inherits Card {
             }
 
             Toggle {
-                text: "Remote input (later)";
-                checked: root.device.grant-input;
-                enabled: false;
+                text: "Share what is playing and control media";
+                checked: root.device.grant-media;
+                toggled(on) => {
+                    DevicesState.set-grant(root.device.id, "media", on);
+                }
             }
 
             Toggle {
-                text: "Media control (later)";
-                checked: root.device.grant-media;
-                enabled: false;
+                text: "Control the pointer and keyboard (remote input)";
+                checked: root.device.grant-input;
+                // Turning it off stays possible even where it cannot be applied.
+                enabled: DevicesState.input-supported || root.device.grant-input;
+                toggled(on) => {
+                    DevicesState.set-grant(root.device.id, "input", on);
+                }
+            }
+
+            if !DevicesState.input-supported: Muted {
+                text: "Remote input is unavailable here: " + DevicesState.input-reason;
             }
         }
     }

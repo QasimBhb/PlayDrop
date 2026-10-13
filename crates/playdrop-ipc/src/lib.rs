@@ -240,6 +240,9 @@ pub enum Request {
     },
     /// Tell the daemon the OS reported a network change (interfaces up or down, Wi-Fi switch).
     NetworkChanged,
+    /// End every remote input session this desktop is the target of, now (the SR-25 kill
+    /// switch; the tray has the same action). Answers `done` whether or not one was open.
+    StopInput,
     /// Ask the daemon to exit cleanly.
     Shutdown,
 }
@@ -279,6 +282,7 @@ impl Request {
             Self::OpenReceived { .. } => "open_received",
             Self::ShowInFolder { .. } => "show_in_folder",
             Self::NetworkChanged => "network_changed",
+            Self::StopInput => "stop_input",
             Self::Shutdown => "shutdown",
         }
     }
@@ -328,6 +332,15 @@ pub struct Settings {
     /// Whether the platform can watch the clipboard at all; `false` on GNOME, where the
     /// window offers a button instead (anti-pattern 18: say why, do not fail silently).
     pub clipboard_watch_supported: bool,
+    /// Whether this desktop can apply remote input (`SendInput` on Windows, the
+    /// `RemoteDesktop` portal on Linux). `false` hides the `input` grant toggle, with
+    /// `remote_input_reason` as the explanation. Missing from an older daemon reads as
+    /// `false`.
+    #[serde(default)]
+    pub remote_input_supported: bool,
+    /// Why remote input is unavailable, when it is (anti-pattern 18).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_input_reason: Option<String>,
     /// Start the daemon at login.
     pub autostart: bool,
     /// Show desktop notifications.
@@ -380,6 +393,11 @@ pub struct Status {
     pub add_device_window_open: bool,
     /// Whether the desktop is locked as far as the daemon knows (SR-6).
     pub locked: bool,
+    /// Labels of the peers with an open remote input session on this desktop right now
+    /// (SR-25), so a UI that starts mid-session can show its banner. Missing from an
+    /// older daemon reads as none.
+    #[serde(default)]
+    pub input_from: Vec<String>,
 }
 
 /// What a port probe found, the daemon's part of [`Request::Diagnose`].
@@ -616,6 +634,17 @@ pub enum DaemonEvent {
     },
     /// The host was restarted (settings change or recovery).
     HostRestarted,
+    /// A peer started (`active`) or ended (`active: false`) a remote input session on this
+    /// desktop (protocol.md 5.12, SR-25). The window shows "Remote input from <label>" with
+    /// a Stop button while one is active.
+    InputSession {
+        /// Hex Device ID.
+        peer: String,
+        /// The peer's local label.
+        label: String,
+        /// Open now.
+        active: bool,
+    },
     /// The daemon is shutting down; clients should disconnect.
     ShuttingDown,
 }

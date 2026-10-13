@@ -41,6 +41,17 @@ final class AppSettingsTests: XCTestCase {
     }
 
     @MainActor
+    func testTrackpadSensitivityDefaultsAndClamps() {
+        withSettings { s, defaults in
+            XCTAssertEqual(s.trackpadSensitivity, TrackpadGestures.defaultSensitivity)
+            s.trackpadSensitivity = 2.5
+            XCTAssertEqual(defaults.double(forKey: AppSettings.trackpadSensitivityKey), 2.5)
+            s.trackpadSensitivity = 99
+            XCTAssertEqual(s.trackpadSensitivity, TrackpadGestures.sensitivityRange.upperBound)
+        }
+    }
+
+    @MainActor
     func testUnsetDefaultPeerRemovesTheKey() {
         withSettings { s, defaults in
             s.defaultPeer = "ab12"

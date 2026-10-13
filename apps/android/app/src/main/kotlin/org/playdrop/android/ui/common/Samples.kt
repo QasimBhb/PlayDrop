@@ -21,6 +21,8 @@ import org.playdrop.core.DiscoveryPath
 import org.playdrop.core.Grants
 import org.playdrop.core.Ipv4Interface
 import org.playdrop.core.MdnsStatus
+import org.playdrop.core.MediaAction
+import org.playdrop.core.MediaState
 import org.playdrop.core.MulticastStatus
 import org.playdrop.core.PairingPrompt
 import org.playdrop.core.PeerDiagnostic
@@ -36,6 +38,21 @@ object Samples {
     /** Grants as pairing sets them: everything but input. */
     val defaultGrants = Grants(files = true, clipboardIn = true, clipboardOut = true, input = false, media = true, find = true)
 
+    /** A desktop music player, playing, one minute into a 3:35 track. */
+    val song = MediaState(
+        player = "spotify",
+        name = "Spotify",
+        playing = true,
+        title = "Song",
+        artist = "Artist",
+        album = "Album",
+        durationMs = 215_000uL,
+        positionMs = 61_200uL,
+        positionAtMs = (NOW * 1000).toULong(),
+        volume = 70u.toUByte(),
+        can = listOf(MediaAction.PLAY_PAUSE, MediaAction.NEXT, MediaAction.PREVIOUS, MediaAction.SEEK, MediaAction.VOLUME),
+    )
+
     /** A paired laptop, online. */
     val laptop = PeerSummary(
         deviceId = "a1".repeat(32),
@@ -47,6 +64,7 @@ object Samples {
         pairedAt = (NOW - 86_400 * 20).toULong(),
         lastSeen = NOW.toULong(),
         removedByPeer = false,
+        capabilities = listOf("input.pointer", "input.key", "input.presenter", "media.control"),
     )
 
     /** A paired desktop, offline for two hours. */
@@ -60,6 +78,7 @@ object Samples {
         pairedAt = (NOW - 86_400 * 3).toULong(),
         lastSeen = (NOW - 7_200).toULong(),
         removedByPeer = false,
+        capabilities = emptyList(),
     )
 
     /** Device cards. */
@@ -78,6 +97,8 @@ object Samples {
         lastKnown = laptop.lastKnown,
         pairedAt = laptop.pairedAt.toLong(),
         ringing = false,
+        capabilities = laptop.capabilities,
+        media = listOf(song),
     )
 
     /** Add device with three adverts collapsing into two rows. */

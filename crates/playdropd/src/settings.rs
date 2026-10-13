@@ -110,6 +110,9 @@ impl Settings {
             clipboard_sync: self.clipboard_sync,
             clipboard_images: self.clipboard_images,
             clipboard_watch_supported,
+            // Filled in by the daemon from the input backend probe (`input::support()`).
+            remote_input_supported: false,
+            remote_input_reason: None,
             autostart: self.autostart,
             notifications: self.notifications,
         }

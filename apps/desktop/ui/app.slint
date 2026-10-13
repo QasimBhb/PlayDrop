@@ -3,7 +3,7 @@
 
 import { TabWidget, Button, Palette } from "std-widgets.slint";
 import { ConnPhase } from "types.slint";
-import { Nav, ConnState, NoticeState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState } from "globals.slint";
+import { Nav, ConnState, NoticeState, InputState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState } from "globals.slint";
 import { ConnectionScreen } from "connection.slint";
 import { DevicesPage } from "devices.slint";
 import { AddDevicePage } from "add-device.slint";
@@ -12,7 +12,7 @@ import { SettingsPage } from "settings.slint";
 import { DiagnosticsPage } from "diagnostics.slint";
 import { PairingDialog, QrDialog } from "pairing.slint";
 
-export { ConnPhase, Nav, ConnState, NoticeState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState }
+export { ConnPhase, Nav, ConnState, NoticeState, InputState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState }
 
 component NoticeBar inherits Rectangle {
     background: NoticeState.error ? #c42b1c : Palette.accent-background;
@@ -39,6 +39,35 @@ component NoticeBar inherits Rectangle {
     }
 }
 
+// Persistent while any remote input session is open (SR-25): who is in control, and the
+// kill switch. Not dismissable; it goes away when the sessions end.
+component InputBanner inherits Rectangle {
+    background: #b25e00;
+    accessible-role: text;
+    accessible-label: InputState.banner;
+    HorizontalLayout {
+        padding: 8px;
+        padding-left: 16px;
+        spacing: 8px;
+        Text {
+            text: InputState.banner;
+            color: #ffffff;
+            font-weight: 600;
+            wrap: word-wrap;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        Button {
+            text: "Stop";
+            primary: true;
+            clicked => {
+                InputState.stop();
+            }
+        }
+    }
+}
+
 export component App inherits Window {
     in property <image> app-icon;
 
@@ -53,6 +82,8 @@ export component App inherits Window {
     if ConnState.phase != ConnPhase.connected: ConnectionScreen { }
 
     if ConnState.phase == ConnPhase.connected: VerticalLayout {
+        if InputState.banner != "": InputBanner { }
+
         TabWidget {
             current-index <=> Nav.page;
             changed current-index => {

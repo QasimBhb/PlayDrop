@@ -159,6 +159,27 @@ public final class AppSettings {
         }
     }
 
+    /// UserDefaults key of `trackpadSensitivity`. App-only (the share extension never reads
+    /// it), so it is not in `SharedSettingsKeys`. Changing it loses the setting.
+    static let trackpadSensitivityKey = "trackpadSensitivity"
+
+    /// Pointer units per point of finger movement on the remote input trackpad, within
+    /// `TrackpadGestures.sensitivityRange`. Default `TrackpadGestures.defaultSensitivity`.
+    public var trackpadSensitivity: Double {
+        get {
+            access(keyPath: \.trackpadSensitivity)
+            guard defaults.object(forKey: Self.trackpadSensitivityKey) != nil else {
+                return TrackpadGestures.defaultSensitivity
+            }
+            return TrackpadGestures.clampSensitivity(defaults.double(forKey: Self.trackpadSensitivityKey))
+        }
+        set {
+            withMutation(keyPath: \.trackpadSensitivity) {
+                defaults.set(TrackpadGestures.clampSensitivity(newValue), forKey: Self.trackpadSensitivityKey)
+            }
+        }
+    }
+
     /// A stored Bool, or `fallback` when the key was never written.
     private func bool(_ key: String, default fallback: Bool) -> Bool {
         defaults.object(forKey: key) == nil ? fallback : defaults.bool(forKey: key)

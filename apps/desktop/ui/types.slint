@@ -31,6 +31,16 @@ export struct DeviceRow {
     grant-find: bool,
     grant-input: bool,
     grant-media: bool,
+    // The device accepts remote input (an `input.*` capability). Not offered in v1: the
+    // desktop does not control other devices yet.
+    can-be-controlled: bool,
+    // Now playing on the device (media state, protocol.md 5.9). Display only: the daemon
+    // has no request for sending media commands yet.
+    media-visible: bool,
+    media-title: string,
+    // "Artist · Player · Playing".
+    media-detail: string,
+    media-playing: bool,
 }
 
 // A device seen in its own "Add device" window.

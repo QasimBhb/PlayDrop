@@ -2,7 +2,7 @@
 //! length-prefixed frames both ways for the connection's life, the replay rule (SR-16),
 //! capability negotiation (section 4), grants (SR-13, SR-14) and the frame handlers.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::events::{HostEvent, Secret};
 use super::registry::Placement;
-use super::{blobs, lock, outbox, pairing, receive, send, status, Inner};
+use super::{blobs, input, lock, outbox, pairing, receive, send, status, Inner};
 use crate::identity::DeviceId;
 use crate::net::connection::short;
 use crate::net::server::SESSION_PATH;
@@ -33,8 +33,9 @@ use crate::session::{
 };
 use crate::{Error, Result};
 
-/// What this build accepts (`caps.in`, protocol.md section 4; `docs/core-api.md`
-/// section 6). Remote input (`input.*`) is Phase 5 and is not advertised.
+/// What every host accepts (`caps.in`, protocol.md section 4; `docs/core-api.md`
+/// section 6). Remote input (`input.*`, [`INPUT_CAPS`]) is added only by a host with a
+/// backend that applies it (`HostConfig::accepts_input`).
 pub(crate) const LOCAL_IN: &[Capability] = &[
     Capability::Ping,
     Capability::Find,
@@ -50,15 +51,48 @@ pub(crate) const LOCAL_IN: &[Capability] = &[
     Capability::Blobs,
 ];
 
-/// What this build may send (`caps.out`); the same list as [`LOCAL_IN`].
-pub(crate) const LOCAL_OUT: &[Capability] = LOCAL_IN;
+/// The remote input capabilities (protocol.md 5.12).
+pub(crate) const INPUT_CAPS: &[Capability] = &[
+    Capability::InputPointer,
+    Capability::InputKey,
+    Capability::InputPresenter,
+];
+
+/// What this build may send (`caps.out`): [`LOCAL_IN`] plus [`INPUT_CAPS`], since any host
+/// may act as the controller.
+pub(crate) const LOCAL_OUT: &[Capability] = &[
+    Capability::Ping,
+    Capability::Find,
+    Capability::Clipboard,
+    Capability::ClipboardImage,
+    Capability::Battery,
+    Capability::MediaState,
+    Capability::MediaControl,
+    Capability::Presence,
+    Capability::Transfer,
+    Capability::TransferBundle,
+    Capability::Outbox,
+    Capability::Blobs,
+    Capability::InputPointer,
+    Capability::InputKey,
+    Capability::InputPresenter,
+];
 
 /// Time allowed for a closing session to flush its last frames.
 const FLUSH_GRACE: Duration = Duration::from_millis(200);
 
-pub(crate) fn local_caps() -> Caps {
+/// Frame types remembered per connection so an `error` reply can be matched to what we
+/// sent (protocol.md 5.14 `re`).
+const SENT_TYPES_KEPT: usize = 256;
+
+/// This host's capability lists for `hello` (protocol.md 5.4).
+pub(crate) fn local_caps(inner: &Inner) -> Caps {
+    let mut incoming = LOCAL_IN.to_vec();
+    if inner.accepts_input {
+        incoming.extend_from_slice(INPUT_CAPS);
+    }
     Caps {
-        incoming: LOCAL_IN.to_vec(),
+        incoming,
         outgoing: LOCAL_OUT.to_vec(),
     }
 }
@@ -77,6 +111,8 @@ struct State {
     hello: Option<ValidatedHello>,
     peer_in: Vec<Capability>,
     forbidden_sent: HashSet<String>,
+    /// `(seq, type)` of the last frames we sent, newest last, for `error.re` lookups.
+    sent_types: VecDeque<(u64, String)>,
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -158,6 +194,34 @@ impl Session {
         crate::session::may_send(LOCAL_OUT, &lock(&self.state).peer_in, cap)
     }
 
+    /// The peer's `caps.in` as wire strings, for `PeerSummary::capabilities`.
+    pub(crate) fn peer_caps_in(&self) -> Vec<String> {
+        lock(&self.state)
+            .peer_in
+            .iter()
+            .map(|c| c.as_str().to_owned())
+            .collect()
+    }
+
+    /// Remembers the type of a frame we sent under `seq` (bounded).
+    fn record_sent(&self, seq: u64, t: &str) {
+        let mut st = lock(&self.state);
+        if st.sent_types.len() >= SENT_TYPES_KEPT {
+            st.sent_types.pop_front();
+        }
+        st.sent_types.push_back((seq, t.to_owned()));
+    }
+
+    /// The type of the frame we sent under `seq`, if still remembered.
+    fn sent_type(&self, seq: u64) -> Option<String> {
+        lock(&self.state)
+            .sent_types
+            .iter()
+            .rev()
+            .find(|(s, _)| *s == seq)
+            .map(|(_, t)| t.clone())
+    }
+
     /// Sends a frame with no capability check (hello, pairing, error, pong, `re` replies).
     pub(crate) fn send_raw(&self, frame: Frame, re: Option<u64>) {
         let _ = self.tx.send(Out::Frame(frame, re));
@@ -181,10 +245,15 @@ impl Session {
 
     /// Sends at most one `forbidden` or `not_paired` error per frame type per connection
     /// (protocol.md 5.3, section 11 SR-14 deviation).
-    fn refuse_once(&self, t: &str, code: ErrorCode) {
+    fn refuse_once(&self, t: &str, code: ErrorCode, re: u64) {
         let first = lock(&self.state).forbidden_sent.insert(t.to_owned());
         if first {
-            self.send_raw(Frame::error(code, None), None);
+            let message = match code {
+                ErrorCode::Forbidden => format!("{t} is not allowed for this device"),
+                _ => format!("{t} needs a paired connection"),
+            };
+            // `re` names the refused frame so the sender can tell which feature to hide.
+            self.send_raw(Frame::error(code, Some(&message)), Some(re));
         }
     }
 }
@@ -204,7 +273,7 @@ fn our_hello(inner: &Inner, conn: &Connection) -> Frame {
         } else {
             Trust::Unpaired
         },
-        caps: local_caps(),
+        caps: local_caps(inner),
     })
 }
 
@@ -223,7 +292,7 @@ fn start(
 ) -> Arc<Session> {
     let (sess, rx) = Session::new(Arc::clone(conn));
     sess.send_raw(our_hello(inner, conn), None);
-    inner.spawn(writer(send, rx));
+    inner.spawn(writer(Arc::clone(&sess), send, rx));
     inner.spawn(reader(Arc::clone(inner), Arc::clone(&sess), body));
     sess
 }
@@ -291,15 +360,22 @@ async fn open_outbound_inner(inner: &Arc<Inner>, conn: &Arc<Connection>) -> Resu
     }
 }
 
-async fn writer(mut send: SendStream<Bytes>, mut rx: mpsc::UnboundedReceiver<Out>) {
+async fn writer(
+    sess: Arc<Session>,
+    mut send: SendStream<Bytes>,
+    mut rx: mpsc::UnboundedReceiver<Out>,
+) {
     let mut enc = OutboundEncoder::new();
     while let Some(first) = rx.recv().await {
         let mut batch = BytesMut::new();
         let mut end = false;
         let mut push = |m: Out, batch: &mut BytesMut| match m {
             Out::Frame(f, re) => {
-                if let Err(e) = enc.encode_into(&f, re, batch) {
-                    tracing::debug!(error = %e, t = f.type_name(), "frame not encoded");
+                match enc.encode_into(&f, re, batch) {
+                    Ok(seq) => sess.record_sent(seq, f.type_name()),
+                    Err(e) => {
+                        tracing::debug!(error = %e, t = f.type_name(), "frame not encoded");
+                    }
                 }
                 false
             }
@@ -364,6 +440,7 @@ fn on_end(inner: &Arc<Inner>, sess: &Arc<Session>) {
     sess.conn.release_session();
     if inner.registry.uninstall(sess) {
         let id = sess.peer();
+        input::on_session_end(inner, id);
         inner.persist_last_seen(id);
         inner.emit(HostEvent::PeerOffline {
             peer: id.to_hex(),
@@ -438,12 +515,12 @@ async fn handle_frame(
                 .get(&peer)
                 .is_some_and(|p| has_grant(p.grants, g));
             if !ok {
-                sess.refuse_once(&t, ErrorCode::Forbidden);
+                sess.refuse_once(&t, ErrorCode::Forbidden, env.seq);
                 return Ok(());
             }
         }
     } else if !env.frame.allowed_unpaired() {
-        sess.refuse_once(&t, ErrorCode::NotPaired);
+        sess.refuse_once(&t, ErrorCode::NotPaired, env.seq);
         return Ok(());
     }
     let hex = peer.to_hex();
@@ -511,13 +588,7 @@ async fn handle_frame(
             bytes: o.bytes,
             ids: o.ids,
         }),
-        // TODO(Phase 5, protocol.md 5.12, SR-25): remote input; reported, never applied.
-        Frame::Input(_) => {
-            inner.emit(HostEvent::Unsupported {
-                peer: hex,
-                frame_type: t,
-            });
-        }
+        Frame::Input(i) => input::on_frame(inner, peer, i),
         Frame::Transfer(tf) => send::on_transfer_frame(inner, peer, &tf),
         Frame::PairRequest(_)
         | Frame::PairResponse(_)
@@ -534,8 +605,18 @@ async fn handle_frame(
                 });
             }
         }
+        Frame::Error(e) if e.code == ErrorCode::InputSessionEnded => {
+            input::on_ended_by_target(inner, peer, e.message);
+        }
         Frame::Error(e) => {
             tracing::debug!(peer = %short(&peer), code = %e.code, "peer sent error frame");
+            let frame_type = env.re.and_then(|re| sess.sent_type(re));
+            inner.emit(HostEvent::PeerRefused {
+                peer: hex,
+                frame_type,
+                code: e.code.as_str().to_owned(),
+                message: e.message,
+            });
         }
         Frame::Pong | Frame::Hello(_) | Frame::Unknown { .. } => {}
     }

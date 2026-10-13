@@ -4648,7 +4648,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "android_logger",
  "jni",
@@ -4711,6 +4711,7 @@ dependencies = [
  "tray-icon",
  "windows",
  "wl-clipboard-rs",
+ "xkeysym",
  "zbus",
 ]
 

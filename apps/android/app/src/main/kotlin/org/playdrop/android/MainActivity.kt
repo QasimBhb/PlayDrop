@@ -9,6 +9,7 @@ import android.content.ClipboardManager
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -18,6 +19,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.playdrop.android.ui.AppViewModel
 import org.playdrop.android.ui.PlayDropRoot
+import org.playdrop.android.ui.input.VolumeKeys
 import org.playdrop.android.ui.theme.PlayDropTheme
 
 /**
@@ -67,6 +69,12 @@ class MainActivity : ComponentActivity() {
     override fun onPause() {
         clipboard?.removePrimaryClipChangedListener(clipListener)
         super.onPause()
+    }
+
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        // The presenter tab turns the volume keys into the desktop's volume keys.
+        if (VolumeKeys.dispatch(event)) return true
+        return super.dispatchKeyEvent(event)
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {

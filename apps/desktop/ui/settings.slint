@@ -92,6 +92,14 @@ export component SettingsPage inherits Rectangle {
                 text: "Text up to 1 MiB and images up to 16 MiB are synced. Larger clips are not; send them as files.";
             }
 
+            Label {
+                text: SettingsState.remote-input;
+            }
+
+            Muted {
+                text: "Each device also needs Remote input turned on under Devices.";
+            }
+
             Toggle {
                 text: "Start PlayDrop when I log in";
                 checked: SettingsState.autostart;

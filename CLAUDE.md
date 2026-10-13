@@ -19,10 +19,14 @@ autostart, diagnostics, battery and presence), `playdrop-ffi` (UniFFI surface, f
 (SwiftUI app plus share extension hosting the core while in the foreground; Phase 4 code
 complete on 2026-10-09, compiled and unit-tested by GitHub's macOS CI, and built, signed
 and installed on an iPhone from this Linux machine with xtool since 2026-10-12; four of
-five device gates passed that day, the share-extension one needs an App Group). 306 Rust tests plus 59 Android JUnit tests plus the Linux-run
-`PlayDropShared` Swift tests, clippy clean. Licence GPL-3.0-or-later. UI native per
-platform. Build fully agentic. Next: Phase 5, see `docs/phases/phase-4-ios.md`
-(the share-extension gate waits for a paid team or xtool App Groups on free teams).
+five device gates passed that day, the share-extension one needs an App Group). Phase 5
+(remote input, presenter mode, media control) written on 2026-10-12: core `input.*`,
+daemon RemoteDesktop portal and `SendInput` injectors, MPRIS and GSMTC media, phone
+trackpad, keyboard, presenter and now-playing screens, `playdrop-ffi` 0.2.0; live gates
+that need someone at the screen are listed in `docs/phases/phase-5-companion.md` section 7.
+381 Rust tests plus 89 Android JUnit tests plus 92 Linux-run `PlayDropShared` Swift tests,
+clippy clean. Licence GPL-3.0-or-later. UI native per platform. Build fully agentic. Next:
+Phase 6, see `docs/phases/phase-5-companion.md`.
 
 ## Read first
 
@@ -96,8 +100,13 @@ fix-it screen, "Send Clipboard" Shortcut), the share extension (App Group queue 
 `scripts/xtool-dev.sh`) builds, signs and installs the app on the user's iPhone from
 Linux with a free personal Apple team (no App Group, no multicast: pair by address or QR).
 Four of the five Phase 4 device gates passed on 2026-10-12; the share-extension one is
-blocked without an App Group. Open TODOs are tagged with their SR in the code
-(`grep -rn "TODO" crates/ apps/`). Next: Phase 5.
+blocked without an App Group. Phase 5 is written: the core applies `input` frames only
+inside a session, with the grant, unlocked, keys capped at 60 per second, 10 minute idle
+timeout (SR-25), and tells the controller why a session ended; `playdropd` injects through
+the RemoteDesktop portal (COSMIC, GNOME) or `SendInput`, shows "Remote input from X" with a
+kill switch in the tray and window, and feeds MPRIS players to peers with the `media` grant.
+Open TODOs are tagged with their SR in the code (`grep -rn "TODO" crates/ apps/`). Next:
+Phase 6.
 
 ## Commands
 
@@ -119,6 +128,7 @@ Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
   `cargo run -p playdrop-cli -- host --data-dir /tmp/pd-b --receive-dir /tmp/pd-b-in --port 42188 --name bravo`
   then type `pair` in bravo, `pair 127.0.0.1:42188` in alpha, `y` in both, `peers`, and `send <short-id> <path>` (`help` lists all stdin commands)
 - Benchmark (release): `target/release/playdrop bench --role server --addr 127.0.0.1:42200 --mode h2` in one terminal, `target/release/playdrop bench --role client --addr 127.0.0.1:42200 --mode h2 --size 1GiB --runs 3` in another; repeat with `--mode raw`; compare with `iperf3 -s` and `iperf3 -c 127.0.0.1 -t 5`
+- Remote input and media (Phase 5): `cargo test -p playdrop-core --test phase5_core` (loopback, prints the latency gate with `-- --nocapture`); `cargo test -p playdropd -- --ignored input_portal_live` (opens the COSMIC consent dialog: someone must approve it) and `-- --ignored media_mpris_live --nocapture` (prints local players); in `playdrop host`: `input <peer> start|move dx dy|click|key Enter|text hi|stop`, `media <peer> <player> pause`, `inputs`, `stop-input`
 - LAN discovery test (needs a real interface with multicast): `cargo test -p playdrop-core --test phase1_gates -- --ignored`
 - Android (from `apps/android`, Gradle 9.6, AGP 9.4.1, SDK platform 37.0, NDK 27.1, `cargo-ndk`): `./gradlew :app:compileDebugKotlin` (Kotlin check, regenerates the UniFFI bindings), `./gradlew :app:assembleDebug` or `assembleRelease` (Rust for arm64-v8a and x86_64 per `playdrop.rustAbis` in `gradle.properties`), `./gradlew :app:testDebugUnitTest`, `adb install -r app/build/outputs/apk/debug/app-debug.apk`, `adb logcat -s playdrop:*`. Bindings alone: `cargo build -p playdrop-ffi && cargo run -p uniffi-bindgen -- generate --library target/debug/libplaydrop_ffi.so --language kotlin --no-format --out-dir <dir>`
 - iOS on Linux (from `apps/ios`, after the one-time xtool setup in its README): `scripts/xtool-dev.sh` builds the Rust core, the app and the share extension, signs them and installs on the USB iPhone (`--core` after a change under `crates/`); `xtool launch org.playdrop.ios`

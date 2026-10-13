@@ -231,4 +231,45 @@ All are synchronous and `Send + Sync`; none is async (UniFFI issue #2576 is avoi
   intent URI grants die with the process, so a restarted phone could not reopen them anyway;
   a restarted sender re-offers.
 - `Host::set_capabilities`. Grants already give per-peer toggles.
-- Remote input (`input.*`): Phase 5.
+
+## 9. Phase 5 additions (freeze break, `playdrop-ffi` 0.2.0, 2026-10-12)
+
+Remote input (protocol.md 5.12, SR-25) and the pieces a UI needs to hide a feature the
+peer cannot do (PLAN.md anti-pattern 18). Everything else above is unchanged.
+
+```rust
+// HostConfig
+pub accepts_input: bool,     // default false; advertise `input.*` in caps.in (a desktop with a backend)
+
+// PeerSummary
+pub capabilities: Vec<String>,   // the peer's caps.in while online, empty offline
+
+// Host
+fn send_input(&self, peer, Input) -> Result<()>;     // NotFound without a session; Forbidden when the
+                                                      // peer lacks the matching input.* capability; moves
+                                                      // and scrolls coalesced to one frame per 8 ms
+fn input_sessions(&self) -> Vec<DeviceId>;           // peers with an open input session on this host
+fn stop_input_sessions(&self) -> Vec<DeviceId>;      // SR-25 kill switch; peers are told
+```
+
+`session::types::Input` (with `PointerInput`, `KeyInput`, `SessionOp`, `PointerButton`,
+`ButtonAction`, `ScrollUnit`, `KeyAction`, `Modifier`, `PresenterAction`) joins the frozen
+surface as it is. The FFI flattens it to `InputEvent` (`Session`, `PointerMove`,
+`PointerButton`, `Scroll`, `Key`, `Text`, `Presenter`).
+
+New `HostEvent` variants:
+
+| Variant | Fields |
+|---|---|
+| `Input` | `peer`, `input: Input`. Only on a host started with `accepts_input`, only from a peer with the `input` grant, inside a session it opened, while the host is unlocked. Keys over 60 per second are dropped. `Session { Stop }` is always the last event of a session: peer stop, connection drop, 10 idle minutes, lock, or `stop_input_sessions`. The host's backend releases every key and button on it |
+| `PeerRefused` | `peer`, `frame_type: Option<String>`, `code`, `message`. The peer answered one of our frames with an `error` (usually `forbidden`: no grant on its side). The core remembers the types of the last 256 frames it sent per connection to fill `frame_type` |
+
+| `InputSessionEnded` | `peer`, `reason`. The target of a session we control ended it (lock, 10 idle minutes, kill switch): the controlling UI leaves its input screen and shows the reason |
+
+`Unsupported` is no longer emitted (kept for older IPC clients).
+
+Capabilities (section 6): `caps.out` now always lists `input.pointer`, `input.key` and
+`input.presenter`; `caps.in` lists them only with `accepts_input`.
+
+Nearby discovery: while "Add device" is open and no candidate has been seen, the host sends
+a fresh beacon burst every 10 s (Phase 3 handoff section 7).

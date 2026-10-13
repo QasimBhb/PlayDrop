@@ -49,12 +49,16 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 ksni = { version = "0.3.6", default-features = false, features = ["tokio"] }
 rustix = { version = "1.1.5", features = ["fs", "process"] }
 wl-clipboard-rs = "0.9.4"
+xkeysym = "0.2.1"
 zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.26.1"
 windows = { version = "0.62.2", features = [
     "Data_Xml_Dom",
+    "Foundation",
+    "Foundation_Collections",
+    "Media_Control",
     "UI_Notifications",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -66,6 +70,7 @@ windows = { version = "0.62.2", features = [
     "Win32_System_Registry",
     "Win32_System_RemoteDesktop",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }

@@ -5,8 +5,8 @@
 use playdrop_core::host::HostEvent as CoreEvent;
 
 use crate::types::{
-    DeliveredFile, DiscoveryPath, FileRoot, MediaAction, MediaState, OfferedFile, PairingPrompt,
-    TransferDirection,
+    DeliveredFile, DiscoveryPath, FileRoot, InputEvent, MediaAction, MediaState, OfferedFile,
+    PairingPrompt, TransferDirection,
 };
 
 /// Everything the host tells the app. Peers are hex Device IDs.
@@ -230,7 +230,39 @@ pub enum HostEvent {
         /// Item IDs.
         ids: Vec<String>,
     },
-    /// A frame this build parses but does not act on (remote input, Phase 5).
+    /// Remote input from a peer with the `input` grant, inside a session it opened, while
+    /// this host is unlocked (protocol.md 5.12, SR-25). Only hosts started with
+    /// `acceptsInput` see it. `Session { start: false }` always comes last (peer stop,
+    /// connection drop, 10 idle minutes, lock, `stopInputSessions`): release every key
+    /// and button on it.
+    Input {
+        /// Hex Device ID.
+        peer: String,
+        /// The frame.
+        input: InputEvent,
+    },
+    /// The peer answered one of our frames with an error, usually `forbidden`: it has no
+    /// grant for that frame type from us (remote input off for this phone on the
+    /// desktop). `frame_type` is the frame we sent when still known, such as `input`.
+    PeerRefused {
+        /// Hex Device ID.
+        peer: String,
+        /// Our frame type, if known.
+        frame_type: Option<String>,
+        /// Error code (`forbidden`, `not_paired`, ...).
+        code: String,
+        /// The peer's message, if any.
+        message: Option<String>,
+    },
+    /// The device we were controlling ended our input session (it locked, saw no input
+    /// for 10 minutes, or its user hit Stop). Leave the input screen and show `reason`.
+    InputSessionEnded {
+        /// Hex Device ID.
+        peer: String,
+        /// Why, in the device's words.
+        reason: String,
+    },
+    /// A frame this build parses but does not act on. Unused since Phase 5.
     Unsupported {
         /// Hex Device ID.
         peer: String,
@@ -440,6 +472,27 @@ impl From<CoreEvent> for HostEvent {
                 ids,
             },
             CoreEvent::Unsupported { peer, frame_type } => Self::Unsupported { peer, frame_type },
+            CoreEvent::Input { peer, input } => match InputEvent::from_wire(input) {
+                Some(input) => Self::Input { peer, input },
+                None => Self::Unsupported {
+                    peer,
+                    frame_type: "input".to_owned(),
+                },
+            },
+            CoreEvent::PeerRefused {
+                peer,
+                frame_type,
+                code,
+                message,
+            } => Self::PeerRefused {
+                peer,
+                frame_type,
+                code,
+                message,
+            },
+            CoreEvent::InputSessionEnded { peer, reason } => {
+                Self::InputSessionEnded { peer, reason }
+            }
             CoreEvent::DiscoveryDiagnostic {
                 peer,
                 short_id,

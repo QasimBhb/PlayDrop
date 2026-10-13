@@ -44,6 +44,8 @@ import org.playdrop.android.ui.device.DeviceDetailRoute
 import org.playdrop.android.ui.device.DeviceDetailViewModel
 import org.playdrop.android.ui.devices.DevicesRoute
 import org.playdrop.android.ui.diagnostics.DiagnosticsRoute
+import org.playdrop.android.ui.input.InputRoute
+import org.playdrop.android.ui.input.InputViewModel
 import org.playdrop.android.ui.onboarding.OnboardingRoute
 import org.playdrop.android.ui.pairing.PairingDialog
 import org.playdrop.android.ui.settings.SettingsRoute
@@ -70,8 +72,14 @@ object Routes {
     /** Diagnostics. */
     const val DIAGNOSTICS = "diagnostics"
 
+    /** Remote input for one device, with the hex Device ID as argument. */
+    const val INPUT = "input/{${InputViewModel.ARG_ID}}"
+
     /** The detail route for one device. */
     fun device(id: String) = "device/$id"
+
+    /** The remote input route for one device. */
+    fun input(id: String) = "input/$id"
 
     /** Routes that show the bottom bar. */
     val TOP_LEVEL = setOf(DEVICES, TRANSFERS, SETTINGS)
@@ -176,12 +184,20 @@ private fun MainScaffold(
             composable(
                 Routes.DEVICE,
                 arguments = listOf(navArgument(DeviceDetailViewModel.ARG_ID) { type = NavType.StringType }),
-            ) {
+            ) { entry ->
+                val id = entry.arguments?.getString(DeviceDetailViewModel.ARG_ID).orEmpty()
                 DeviceDetailRoute(
                     onBack = { nav.popIfAt(Routes.DEVICE) },
                     onPairAgain = { nav.navigate(Routes.ADD_DEVICE) },
+                    onOpenInput = { nav.navigate(Routes.input(id)) { launchSingleTop = true } },
                     showMessage = show,
                 )
+            }
+            composable(
+                Routes.INPUT,
+                arguments = listOf(navArgument(InputViewModel.ARG_ID) { type = NavType.StringType }),
+            ) {
+                InputRoute(onBack = { nav.popIfAt(Routes.INPUT) }, showMessage = show)
             }
             composable(Routes.ADD_DEVICE) {
                 AddDeviceRoute(onBack = { nav.popIfAt(Routes.ADD_DEVICE) }, showMessage = show)

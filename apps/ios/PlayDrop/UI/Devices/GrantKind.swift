@@ -2,9 +2,12 @@ import Foundation
 import PlayDropCore
 
 // The per-device permissions a user can change on the Device screen (threat model SR-14).
-// Remote input arrives in Phase 5 and media control is not offered on iOS (no system API
-// lets an app control another app's playback), so both are hidden instead of shown as
-// switches that do nothing (anti-pattern 18). Port of Android `GrantKind` and `GrantEdit`.
+// The `input` grant would let the device control this iPhone, which iOS does not allow any
+// app to do, and media control is not offered on iOS (no system API lets an app control
+// another app's playback), so both are hidden instead of shown as switches that do nothing
+// (anti-pattern 18); the grants section says so in a footer (`L10n.Detail.inputNotPossible`).
+// Controlling the computer from this iPhone needs the grant on the computer, not here.
+// Port of Android `GrantKind` and `GrantEdit`.
 
 /// One permission row.
 enum GrantKind: CaseIterable, Identifiable, Sendable {
