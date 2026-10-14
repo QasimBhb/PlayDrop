@@ -368,9 +368,17 @@ mod tests {
     use clap::Parser as _;
     use playdrop_ipc::SettingsPatch;
 
+    /// An absolute receive folder on every platform: a bare `/srv/in` has no drive on
+    /// Windows and counts as relative there.
+    fn abs_dir(name: &str) -> PathBuf {
+        std::env::temp_dir()
+            .join("playdrop-settings-test")
+            .join(name)
+    }
+
     fn sample() -> Settings {
         Settings {
-            receive_dir: PathBuf::from("/srv/in"),
+            receive_dir: abs_dir("in"),
             device_name: "desk".into(),
             port: 42187,
             clipboard_sync: true,
@@ -472,7 +480,7 @@ mod tests {
         let c = s
             .apply_patch(&SettingsPatch {
                 device_name: Some("Work laptop".into()),
-                receive_dir: Some(PathBuf::from("/srv/in")),
+                receive_dir: Some(abs_dir("in")),
                 ..SettingsPatch::default()
             })
             .unwrap();

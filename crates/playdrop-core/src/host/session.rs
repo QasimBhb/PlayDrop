@@ -675,22 +675,23 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
     let peer = sess.peer();
     let (placement, old) = inner.registry.install(sess);
     tracing::debug!(peer = %short(&peer), session = sess.id, conn = sess.conn.id(), ?placement, "session placed");
-    match placement {
-        Placement::Reject => {
-            tracing::debug!(peer = %short(&peer), "duplicate session refused (3.3)");
-            sess.end();
-            return;
-        }
-        Placement::Install => inner.emit(HostEvent::PeerOnline {
+    if matches!(placement, Placement::Reject) {
+        tracing::debug!(peer = %short(&peer), "duplicate session refused (3.3)");
+        sess.end();
+        return;
+    }
+    // Record the time before announcing the peer: a UI that reads `peers()` on the
+    // online event must already see a last-seen time (SR-8).
+    inner.touch_peer(peer);
+    inner.persist_last_seen(peer);
+    if matches!(placement, Placement::Install) {
+        inner.emit(HostEvent::PeerOnline {
             peer: peer.to_hex(),
             short_id: peer.short_id(),
             name: v.name.clone(),
             addr: sess.conn.remote_addr(),
-        }),
-        Placement::Replace => {}
+        });
     }
-    inner.touch_peer(peer);
-    inner.persist_last_seen(peer);
     if let Some(old) = old {
         tracing::debug!(peer = %short(&peer), "session moved to the preferred connection (3.3)");
         old.end();

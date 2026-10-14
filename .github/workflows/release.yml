@@ -145,7 +145,9 @@ jobs:
         # The runtime version must match runtime-version in the manifest.
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          # elfutils gives eu-strip, which flatpak-builder runs on the built binaries to
+          # split out the debug info; the distro package does not pull it in.
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder elfutils
           # Ubuntu 24.04 restricts unprivileged user namespaces; bubblewrap ships an
           # AppArmor profile for this, the sysctl is a fallback for images without it.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true

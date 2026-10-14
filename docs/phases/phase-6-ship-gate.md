@@ -137,7 +137,7 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
 | `apps/desktop/src/screens/settings.rs` | Start-at-login refusal is inferred; an IPC field would be exact | 7 |
 | `docs/release/sr-checklist.md` | SR-32 canary-log CI test missing; SR-30 iOS URL-scheme rule has no test; SR-34 external review and hostile-LAN run not done | 7 |
 | `apps/ios/project.yml` | `MARKETING_VERSION` fixed at 0.1.0; the release workflow overrides it from `Cargo.toml` | 7 |
-| Windows | Every live item | when a machine exists |
+| Windows | Every live item, plus gate B (small-file throughput: one flush per member without `syncfs`, Defender per-file scan; ignored on Windows CI, measure in release on a real machine) | when a machine exists |
 | Phase 4 carry-over | Share-extension gate needs an App Group; SideStore or AltStore may register one for the unsigned IPA, unverified | later |
 
 ---
@@ -163,8 +163,10 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
   - Flatpak: `No space left on device` inside cargo in Flathub's container image (the
     runner's root disk has about 20 GB free and the SDK, rust extension, vendored crates
     and a release build need more). The job now runs flatpak-builder on the runner itself
-    after `jlumbroso/free-disk-space` drops the unused toolchains; unproven until the next
-    dry run.
+    after `jlumbroso/free-disk-space` drops the unused toolchains. The second dry run
+    (2026-10-14, evening) then built the whole workspace in release on the host with
+    36 GB to spare and failed only at the strip step: `eu-strip` is not installed by the
+    distro `flatpak-builder` package, so the job now installs `elfutils`.
   - Windows, the first time the core tests ran there: `system_tar_lists_bundle` (bsdtar
     prints CRLF), `receiver_full_flow_with_bundle_and_reload` and
     `staged_mode_hands_every_file_to_the_sink` (bundle `finish` returns `Access is denied`:
@@ -185,8 +187,15 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
     connected rounds with no new verified bytes. Windows share mode is set explicitly on
     every staged file open. The bsdtar test compares lines. One more fix on the way: the
     outbox DELETE removed the list entry before the record file, which a loaded test
-    could observe. 394 Linux tests pass; the Windows result is proven only by the next
-    push.
+    could observe. 394 Linux tests pass. The second Windows run (push of that fix) had
+    198 core unit tests green and no hang; three were left and are fixed in the next
+    commit: `last_seen_survives_restart` (the host recorded last-seen after emitting
+    `PeerOnline`, so a reader on the event saw none; now recorded first, a real SR-8
+    race), `settings::patch_reports_what_changed` (`/srv/in` is relative on Windows; the
+    test uses the temp dir), and gate B, which measured 0.16 of the single-file rate
+    (10.3 vs 66.2 MiB/s, debug): Windows has no `syncfs`, so every bundle member costs
+    one `FlushFileBuffers`, and Defender scans each new file. Gate B is now ignored on
+    Windows with that reason; it needs a real machine and a release build, Phase 7.
 - **Guest Wi-Fi paths are documented and wired but not exercised** on a real hotspot or
   USB tether; `TetherWatcher` relies on hidden platform broadcast actions, with the core's
   interface poll as the fallback.
