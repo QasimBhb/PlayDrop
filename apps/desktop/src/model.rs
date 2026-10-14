@@ -1473,7 +1473,9 @@ fn section(title: &str, lines: Vec<String>, ok: bool) -> DiagSection {
 }
 
 #[cfg(test)]
-#[allow(clippy::assert_is_empty)] // `is_empty` reads clearer than comparing to `vec![]`.
+// `assert!(x.is_empty())` reads clearer than comparing to `vec![]`. The lint is new in
+// clippy 1.99; `unknown_lints` keeps older toolchains (CI) from rejecting the allow.
+#[allow(unknown_lints, clippy::assert_is_empty)]
 mod tests {
     use super::*;
     use playdrop_core::host::{OfferedFile, Secret};

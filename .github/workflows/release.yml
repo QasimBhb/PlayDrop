@@ -146,8 +146,11 @@ jobs:
         run: |
           sudo apt-get update
           # elfutils gives eu-strip, which flatpak-builder runs on the built binaries to
-          # split out the debug info; the distro package does not pull it in.
-          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder elfutils
+          # split out the debug info; appstream-compose and the librsvg pixbuf loader let
+          # the appstream step read the SVG icon. None of them come with the distro
+          # flatpak-builder package when recommends are off.
+          sudo apt-get install -y --no-install-recommends \
+            flatpak flatpak-builder elfutils appstream-compose librsvg2-common
           # Ubuntu 24.04 restricts unprivileged user namespaces; bubblewrap ships an
           # AppArmor profile for this, the sysctl is a fallback for images without it.
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
@@ -167,8 +170,13 @@ jobs:
           set -euo pipefail
           B="$RUNNER_TEMP/flatpak"
           cd packaging/flatpak
-          flatpak-builder --user --force-clean --disable-rofiles-fuse \
-            --state-dir="$B/state" --repo="$B/repo" "$B/build-dir" org.playdrop.PlayDrop.yml
+          if ! flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --state-dir="$B/state" --repo="$B/repo" "$B/build-dir" org.playdrop.PlayDrop.yml; then
+            # The appstream step only says "see the issue report"; print it.
+            find "$B/build-dir" -path '*app-info*' -type f -print \
+              -exec sh -c 'case "$1" in *.gz) zcat "$1";; *) cat "$1";; esac' _ {} \; || true
+            exit 1
+          fi
           mkdir -p "$GITHUB_WORKSPACE/out"
           flatpak build-bundle \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
