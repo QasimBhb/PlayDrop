@@ -132,6 +132,7 @@ pub struct BodyReader {
     recv: RecvStream,
     buf: Bytes,
     received: u64,
+    transport_failed: bool,
 }
 
 impl BodyReader {
@@ -141,12 +142,20 @@ impl BodyReader {
             recv,
             buf: Bytes::new(),
             received: 0,
+            transport_failed: false,
         }
     }
 
     /// Body bytes received so far.
     pub fn received(&self) -> u64 {
         self.received
+    }
+
+    /// True once reading the body failed in the transport (stream reset, connection
+    /// lost). Lets a handler tell a cut body, where nobody is left to answer, from a local
+    /// failure such as a disk error, which must be answered so the peer stops.
+    pub fn transport_failed(&self) -> bool {
+        self.transport_failed
     }
 
     /// Polls for the next DATA frame, releasing its flow-control capacity.
@@ -156,7 +165,10 @@ impl BodyReader {
         }
         match ready!(self.recv.poll_data(cx)) {
             None => Poll::Ready(None),
-            Some(Err(e)) => Poll::Ready(Some(Err(h2_io(e)))),
+            Some(Err(e)) => {
+                self.transport_failed = true;
+                Poll::Ready(Some(Err(h2_io(e))))
+            }
             Some(Ok(b)) => {
                 // Releasing can only fail once the stream is gone, which the next poll reports.
                 let _ = self.recv.flow_control().release_capacity(b.len());

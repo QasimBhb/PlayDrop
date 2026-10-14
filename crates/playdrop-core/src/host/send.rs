@@ -48,6 +48,36 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(500);
 /// Response bodies other than the session are small JSON.
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 
+/// Rounds in a row that may end on a lost stream while the receiver verifies nothing new
+/// before the send fails. *Choice:* a receiver that keeps resetting the upload without
+/// progress has a problem resuming cannot fix (for example its disk refuses writes), and
+/// retrying it forever only hides that from the user.
+const MAX_STALLED_ROUNDS: u32 = 8;
+
+/// Counts connected rounds that ended without the receiver verifying anything new.
+#[derive(Debug, Default)]
+struct Stall {
+    best: u64,
+    rounds: u32,
+}
+
+impl Stall {
+    /// Notes the receiver's verified byte count at the start of a round; any growth
+    /// clears the count.
+    fn observe(&mut self, verified: u64) {
+        if verified > self.best {
+            self.best = verified;
+            self.rounds = 0;
+        }
+    }
+
+    /// Counts one round lost to a dropped stream; true once too many came in a row.
+    fn lost_round(&mut self) -> bool {
+        self.rounds += 1;
+        self.rounds > MAX_STALLED_ROUNDS
+    }
+}
+
 // TODO(SR-21, protocol.md 7.6): persist the sender's transfer ID, manifest, sources and
 // chunk hashes so a send survives a restart of the sending host; today only the receiver
 // side persists, so a receiver restart resumes but a sender restart starts a new offer.
@@ -436,6 +466,7 @@ async fn run(job: Arc<Job>) -> Outcome {
     let mut reconnects = 0u32;
     let mut last_ok = Instant::now();
     let mut backoff = Duration::from_millis(100);
+    let mut stall = Stall::default();
     loop {
         if *job.cancel.borrow() {
             if let Some(c) = job.inner.registry.outbound(&job.peer) {
@@ -456,7 +487,7 @@ async fn run(job: Arc<Job>) -> Outcome {
         };
         last_ok = Instant::now();
         backoff = Duration::from_millis(100);
-        let step = attempt(&job, &conn, &mut offered).await;
+        let step = attempt(&job, &conn, &mut offered, &mut stall).await;
         match step {
             Ok(Some(done)) => {
                 let roots = roots(&job).await;
@@ -472,6 +503,11 @@ async fn run(job: Arc<Job>) -> Outcome {
             }
             Ok(None) => {}
             Err(Step::Conn(e)) => {
+                if stall.lost_round() {
+                    return Err(format!(
+                        "the receiver keeps dropping the upload without progress: {e}"
+                    ));
+                }
                 reconnects += 1;
                 tracing::info!(peer = %short(&job.peer), error = %e, "transfer connection lost; resuming");
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -491,6 +527,7 @@ async fn attempt(
     job: &Arc<Job>,
     conn: &Arc<Connection>,
     offered: &mut bool,
+    stall: &mut Stall,
 ) -> std::result::Result<Option<Option<String>>, Step> {
     let id = job.manifest.id.clone();
     if !*offered {
@@ -502,6 +539,7 @@ async fn attempt(
         lock(&job.inner.transfers).set_state(&id, TransferDirection::Send, TransferStatus::Active);
     }
     let view = get_state(conn, &id).await?;
+    stall.observe(view.bytes_verified);
     match view.state {
         TransferState::Complete => return Ok(Some(view.bundle.and_then(|b| b.root))),
         TransferState::Pending => {
@@ -863,4 +901,27 @@ async fn roots(job: &Job) -> (Vec<FileRoot>, Option<String>) {
         })
         .collect();
     (files, s.bundle_root().map(|r| hash_to_hex(&r)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lost rounds without new verified bytes end the send; any progress starts the count
+    /// again.
+    #[test]
+    fn stall_counts_only_rounds_without_progress() {
+        let mut s = Stall::default();
+        s.observe(0);
+        for _ in 0..MAX_STALLED_ROUNDS {
+            assert!(!s.lost_round());
+        }
+        s.observe(10);
+        for _ in 0..MAX_STALLED_ROUNDS {
+            s.observe(10);
+            assert!(!s.lost_round());
+        }
+        s.observe(10);
+        assert!(s.lost_round(), "no progress for too many rounds");
+    }
 }

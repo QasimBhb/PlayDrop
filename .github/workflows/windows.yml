@@ -15,6 +15,10 @@
 # the test step with a comment saying why; do not skip whole crates.
 #
 # Also called by release.yml (workflow_call) to build the installer for a release.
+#
+# The run-checks input is compared as a string below: on push and workflow_dispatch the
+# input is null, and `null != false` is false in a GitHub expression (both coerce to 0),
+# which skipped the build, test and clippy steps on every push until 2026-10-14.
 
 name: Windows
 
@@ -82,15 +86,19 @@ jobs:
           key: windows-msvc
 
       - name: Build (debug)
-        if: ${{ inputs.run-checks != false }}
+        if: ${{ format('{0}', inputs.run-checks) != 'false' }}
         run: cargo build --workspace --exclude playdrop-ffi --locked
 
       - name: Test
-        if: ${{ inputs.run-checks != false }}
+        if: ${{ format('{0}', inputs.run-checks) != 'false' }}
+        # A hung test must not eat the job's 90 minutes: the first real run on 2026-10-14
+        # had gate_b and gate_d still running after an hour. Known Windows failures are
+        # listed in docs/phases/phase-6-ship-gate.md section 6.
+        timeout-minutes: 25
         run: cargo test --workspace --exclude playdrop-ffi --locked --no-fail-fast
 
       - name: Clippy
-        if: ${{ inputs.run-checks != false }}
+        if: ${{ format('{0}', inputs.run-checks) != 'false' }}
         run: cargo clippy --workspace --exclude playdrop-ffi --all-targets --locked -- -D warnings
 
       - name: Make sure Inno Setup is installed

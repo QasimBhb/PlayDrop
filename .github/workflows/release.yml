@@ -119,34 +119,61 @@ jobs:
     needs: version
     runs-on: ubuntu-24.04
     timeout-minutes: 90
-    # Flathub's builder image for the runtime in the manifest (org.freedesktop.Platform 25.08).
-    # Change the tag together with runtime-version in packaging/flatpak/org.playdrop.PlayDrop.yml.
-    container:
-      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
-      options: --privileged
+    # Runs flatpak-builder on the runner itself, not in Flathub's container image. The first
+    # dry run used the container and died with "No space left on device" inside cargo: the
+    # runner's root disk starts with about 20 GB free, and the SDK, the rust extension, the
+    # vendored crates and a release build of the whole workspace need more than that. On
+    # the host we can first drop the preinstalled toolchains this job never uses (about
+    # 25 GB), which a container job cannot do.
     steps:
       - uses: actions/checkout@v7
 
-      - name: Build the bundle
-        # Installs the SDK and the rust-stable extension from Flathub, builds offline from
-        # packaging/flatpak/cargo-sources.json and exports a single-file bundle.
-        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
         with:
-          manifest-path: packaging/flatpak/org.playdrop.PlayDrop.yml
-          bundle: playdrop-${{ needs.version.outputs.version }}-linux-x86_64.flatpak
-          cache-key: flatpak-builder-${{ hashFiles('Cargo.lock') }}
-          upload-artifact: false
-          # Named explicitly because the manifest's skip list leaves exactly these out of
-          # the source copy (they sit in the repo root here).
-          build-dir: flatpak_app
-          repo-dir: repo
-          state-dir: .flatpak-builder
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          docker-images: true
+          # apt removal of the big packages takes minutes and is not needed.
+          large-packages: false
+          swap-storage: false
 
-      - name: Collect the bundle
+      - name: Install flatpak-builder and the runtime
+        # Same one-time setup as packaging/flatpak/README.md, with the distro flatpak-builder.
+        # The runtime version must match runtime-version in the manifest.
         run: |
-          mkdir -p out
-          find . -path ./out -prune -o -name 'playdrop-*.flatpak' -print -exec mv {} out/ \;
-          ls -la out
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak flatpak-builder
+          # Ubuntu 24.04 restricts unprivileged user namespaces; bubblewrap ships an
+          # AppArmor profile for this, the sysctl is a fallback for images without it.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub \
+            org.freedesktop.Platform//25.08 \
+            org.freedesktop.Sdk//25.08 \
+            org.freedesktop.Sdk.Extension.rust-stable//25.08
+          df -h / | tail -1
+
+      - name: Build the bundle
+        # Builds offline from packaging/flatpak/cargo-sources.json and exports a single-file
+        # bundle. State and build dirs live in the runner's temp dir, outside the checkout.
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          B="$RUNNER_TEMP/flatpak"
+          cd packaging/flatpak
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --state-dir="$B/state" --repo="$B/repo" "$B/build-dir" org.playdrop.PlayDrop.yml
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          flatpak build-bundle \
+            --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+            "$B/repo" "$GITHUB_WORKSPACE/out/playdrop-$VERSION-linux-x86_64.flatpak" \
+            org.playdrop.PlayDrop
+          ls -la "$GITHUB_WORKSPACE/out"
+          df -h / | tail -1
 
       - uses: actions/upload-artifact@v7
         with:

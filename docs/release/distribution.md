@@ -92,16 +92,22 @@ missing, so it never ships a debug-signed APK. From the repo root, with `gh` log
 (these commands pipe the values straight from the files, so nothing is printed):
 
 ```sh
+P=apps/android/keystore.properties &&
+test -s "$P" &&
 base64 -w0 ~/.local/share/playdrop-release/playdrop-release.jks \
-    | gh secret set PLAYDROP_KEYSTORE_BASE64
-sed -n 's/^storePassword=//p' apps/android/keystore.properties | tr -d '\r\n' \
-    | gh secret set PLAYDROP_KEYSTORE_PASSWORD
-sed -n 's/^keyAlias=//p' apps/android/keystore.properties | tr -d '\r\n' \
-    | gh secret set PLAYDROP_KEY_ALIAS
-sed -n 's/^keyPassword=//p' apps/android/keystore.properties | tr -d '\r\n' \
-    | gh secret set PLAYDROP_KEY_PASSWORD
+    | gh secret set PLAYDROP_KEYSTORE_BASE64 &&
+sed -n 's/^storePassword=//p' "$P" | tr -d '\r\n' \
+    | gh secret set PLAYDROP_KEYSTORE_PASSWORD &&
+sed -n 's/^keyAlias=//p' "$P" | tr -d '\r\n' \
+    | gh secret set PLAYDROP_KEY_ALIAS &&
+sed -n 's/^keyPassword=//p' "$P" | tr -d '\r\n' \
+    | gh secret set PLAYDROP_KEY_PASSWORD &&
 gh secret list
 ```
+
+The `test -s` guard matters: `gh secret set` accepts an empty stdin without complaint, so
+running this from the wrong folder would store three empty secrets and the Android job
+would only fail later with a signing error. Done on 2026-10-14 for `QasimBhb/PlayDrop`.
 
 In CI the keystore is decoded to the runner's temporary folder, used by Gradle through the
 `PLAYDROP_KEYSTORE_*` environment variables, and deleted at the end of the job. After the

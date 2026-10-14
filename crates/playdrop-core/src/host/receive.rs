@@ -594,13 +594,20 @@ pub(crate) async fn put(
             Err(HttpError::from_code(ErrorCode::ChunkHashMismatch, "")
                 .with_offset(r.verified_offset))
         }
-        Err(PutError::Core(Error::Io(e))) => {
+        Err(PutError::Core(Error::Io(e))) if body_was_cut(&body, &e) => {
             // The body was cut; whole verified chunks are kept (7.4). Nobody to answer.
             if is_remote_reset(&e) {
                 conn.record_reset();
             }
             after_put(&inner, &id, &rx, target);
             return;
+        }
+        Err(PutError::Core(Error::Io(e))) => {
+            // A local failure (disk, staging folder) with the body still flowing. Answer
+            // it: without a reply the sender sees a reset, takes it for a lost connection
+            // and resumes into the same failure forever.
+            tracing::warn!(error = %e, ?target, "PUT failed writing to storage");
+            Err(put_error(PutError::Core(Error::Io(e))))
         }
         Err(e) => {
             tracing::debug!(error = %e, ?target, "PUT failed while receiving");
@@ -619,6 +626,12 @@ pub(crate) async fn put(
     }
     drop(body);
     after_put(&inner, &id, &rx, target);
+}
+
+/// True when a receive error came from the body itself (stream reset, connection lost,
+/// body ended mid-record) rather than from this host's storage.
+pub(crate) fn body_was_cut(body: &BodyReader, e: &std::io::Error) -> bool {
+    body.transport_failed() || e.kind() == std::io::ErrorKind::UnexpectedEof
 }
 
 fn check_put_headers(

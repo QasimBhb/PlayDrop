@@ -267,10 +267,13 @@ pub(crate) fn list(inner: &Inner) -> Vec<OutboxItem> {
 
 /// Removes an item and its record. [`Error::NotFound`] if unknown.
 pub(crate) async fn remove(inner: &Arc<Inner>, id: &str) -> Result<()> {
-    if lock(&inner.outbox).remove(id).is_none() {
+    if !lock(&inner.outbox).contains_key(id) {
         return Err(Error::NotFound);
     }
+    // Record first, then the list: once the item is gone from the list its file is gone
+    // too, so nobody sees an empty outbox with a record still on disk.
     forget_record(inner, id).await;
+    lock(&inner.outbox).remove(id);
     Ok(())
 }
 
@@ -440,18 +443,15 @@ pub(crate) async fn serve_delete(
     id: &str,
 ) {
     let peer = conn.device_id();
-    let removed = {
-        let mut map = lock(&inner.outbox);
-        match map.get(id) {
-            Some(h) if h.peer == peer => map.remove(id).is_some(),
-            _ => false,
-        }
-    };
-    if !removed {
+    let owned = lock(&inner.outbox).get(id).is_some_and(|h| h.peer == peer);
+    if !owned {
         let _ = respond_error(respond, &HttpError::from_code(ErrorCode::NotFound, "")).await;
         return;
     }
+    // Record first, then the list: once the item is gone from the list its file is gone
+    // too, so nobody sees an empty outbox with a record still on disk.
     forget_record(inner, id).await;
+    lock(&inner.outbox).remove(id);
     let _ = crate::net::respond(respond, StatusCode::NO_CONTENT, None, Bytes::new()).await;
 }
 
@@ -957,6 +957,7 @@ async fn pull_stream(
         };
         let mut body = BodyReader::new(resp.into_body());
         let received = upload.receive(&mut body).await;
+        let cut = matches!(&received, Err(PutError::Core(Error::Io(e))) if receive::body_was_cut(&body, e));
         let outcome = match received {
             Ok(()) => {
                 let root = match body.trailers().await {
@@ -976,7 +977,9 @@ async fn pull_stream(
             // Verified or partial: look at the state again. A bad chunk: ask again from
             // the verified offset; the receiver fails the stream after 3 re-sends.
             Ok(()) | Err(PutError::Core(Error::ChunkHashMismatch { .. })) => {}
-            Err(PutError::Core(Error::Io(e))) => return Err(Step::Conn(e.to_string())),
+            // A cut body resumes on a new round; a local storage failure would only
+            // repeat, so it ends the pull.
+            Err(PutError::Core(Error::Io(e))) if cut => return Err(Step::Conn(e.to_string())),
             Err(PutError::Cancelled) => return Err(Step::Fatal("cancelled".into())),
             Err(e) => return Err(Step::Fatal(e.to_string())),
         }

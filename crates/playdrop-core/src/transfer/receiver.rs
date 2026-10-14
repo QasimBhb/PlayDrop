@@ -365,7 +365,9 @@ impl Dest {
                 binding,
                 transfer_id,
             } => {
-                let file = File::open(staged)?;
+                // Opened so that the delete below works on Windows even if the sink
+                // keeps the handle (FILE_SHARE_DELETE, see `fsx::open_shared_read`).
+                let file = fsx::open_shared_read(staged)?;
                 let item = DeliverItem {
                     transfer_id: transfer_id.clone(),
                     peer: binding.peer.clone(),
@@ -2909,6 +2911,85 @@ pub(crate) mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(staged, [std::ffi::OsString::from("transfer.json")]);
+    }
+
+    /// A sink that keeps every delivered file open, like a host that copies lazily.
+    #[derive(Debug, Default)]
+    struct KeepingSink {
+        kept: StdMutex<Vec<File>>,
+    }
+
+    impl ReceiveSink for KeepingSink {
+        fn deliver(
+            &self,
+            item: DeliverItem,
+            file: File,
+        ) -> std::result::Result<String, crate::transfer::SinkError> {
+            lock(&self.kept).push(file);
+            Ok(item.path.join("/"))
+        }
+
+        fn make_dir(
+            &self,
+            _path: Vec<String>,
+        ) -> std::result::Result<(), crate::transfer::SinkError> {
+            Ok(())
+        }
+    }
+
+    /// A sink that still holds the delivered handles does not stop the core from deleting
+    /// the staged files and completing (on Windows this needs `FILE_SHARE_DELETE`), and
+    /// the kept handles still read the verified bytes.
+    #[tokio::test]
+    async fn sink_keeping_files_open_does_not_block_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&[(CS as usize + 7, false), (300, true), (50, true)]);
+        let sink = Arc::new(KeepingSink::default());
+        let opts = AcceptOptions {
+            sink: Some(SinkBinding {
+                sink: sink.clone(),
+                peer: "cd".repeat(32),
+            }),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let st = rx.state();
+        let tok0 = st.files[0].token.clone().unwrap();
+        let btok = st.bundle.as_ref().unwrap().token.clone().unwrap();
+        let size0 = contents[0].len() as u64;
+        let mut up = rx.begin_file(0, &tok0, 0, size0 - 1).await.unwrap();
+        up.receive(&body(&contents[0], 0, size0).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&contents[0]))).await.unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let bsize = bundle.len() as u64;
+        let mut up = rx.begin_bundle(&btok, 0, bsize - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, bsize).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        let staged: Vec<_> = std::fs::read_dir(rx.staging_dir())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(staged, [std::ffi::OsString::from("transfer.json")]);
+        let mut kept = lock(&sink.kept);
+        assert_eq!(kept.len(), 3);
+        let mut lengths: Vec<usize> = kept
+            .iter_mut()
+            .map(|f| {
+                let mut v = Vec::new();
+                f.read_to_end(&mut v).unwrap();
+                v.len()
+            })
+            .collect();
+        lengths.sort_unstable();
+        assert_eq!(lengths, [50, 300, CS as usize + 7]);
     }
 
     /// A sink error fails the file and the transfer with the sink's message.

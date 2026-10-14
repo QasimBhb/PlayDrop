@@ -947,6 +947,9 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success());
-        assert_eq!(String::from_utf8_lossy(&out.stdout), "0\n2\n3\n");
+        // Windows' bsdtar ends lines with CRLF: compare the names, not the bytes.
+        let listed = String::from_utf8_lossy(&out.stdout);
+        let names: Vec<&str> = listed.lines().map(str::trim_end).collect();
+        assert_eq!(names, ["0", "2", "3"]);
     }
 }

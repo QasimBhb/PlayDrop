@@ -31,7 +31,7 @@ and `docs/release/` (distribution, test matrix, throughput notebook, SR checklis
 buttons in the window, "Can't find your device?" help on all three platforms, the Android
 `DownloadsSink` rewrite (1 GiB at 94 to 99% of iperf3 on the A54; small files still floored
 at one MediaProvider insert per file, shipped as is, revisit in Phase 7), Flatpak autostart through the
-Background portal, KDE Connect coexistence test. 390 Rust tests plus 110 Android JUnit
+Background portal, KDE Connect coexistence test. 394 Rust tests plus 110 Android JUnit
 tests plus 102 Linux-run `PlayDropShared` Swift tests, clippy clean. Licence
 GPL-3.0-or-later. UI native per platform. Build fully agentic. Next: close the owed items in
 `docs/phases/phase-6-ship-gate.md` sections 6 and 7, then Phase 7.

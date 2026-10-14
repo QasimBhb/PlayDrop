@@ -154,9 +154,39 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
   `MANAGE_EXTERNAL_STORAGE`, unverified and policy-limited. Decided 2026-10-14: ship as
   is, revisit in Phase 7. LocalSend is not measured (user choice, `bench/incumbents.md`
   keeps the method); it pays the same insert plus a request per file.
-- **Nothing in CI has run.** Windows link, MSVC clippy at `-D warnings`, the installer,
-  the Flatpak in the container, the Android job with secrets, the unsigned iOS archive:
-  all proven only by the first push and a manual `workflow_dispatch` dry run.
+- **First CI runs, 2026-10-14.** The push ran the iOS workflow (green, 12 min) and the
+  Windows workflow (green in 22 min, but a false pass: `inputs.run-checks != false` is
+  false when the input is null, so build, test and clippy were skipped and only the
+  release build and installer ran; fixed by comparing the input as a string). The Release
+  dry run built and uploaded the signed APK, the `.deb` and the unsigned iOS archive. Two
+  jobs failed:
+  - Flatpak: `No space left on device` inside cargo in Flathub's container image (the
+    runner's root disk has about 20 GB free and the SDK, rust extension, vendored crates
+    and a release build need more). The job now runs flatpak-builder on the runner itself
+    after `jlumbroso/free-disk-space` drops the unused toolchains; unproven until the next
+    dry run.
+  - Windows, the first time the core tests ran there: `system_tar_lists_bundle` (bsdtar
+    prints CRLF), `receiver_full_flow_with_bundle_and_reload` and
+    `staged_mode_hands_every_file_to_the_sink` (bundle `finish` returns `Access is denied`:
+    a file with an open handle cannot be deleted or renamed over on Windows),
+    `host_smoke::pair_send_ping_unpair` (send never finished in 60 s) and
+    `gate_b_many_small_files_hold_throughput` and `gate_d_restart_reconnects_without_pairing`
+    still running after an hour until the 90 minute job limit cancelled them. The user
+    chose to fix Windows before tagging; the test step now has its own 25 minute limit.
+    Root causes found by reading the code (two bugs, one of them not Windows-specific):
+    `fsx::sync_files` flushed each member through a read-only handle, which Windows
+    refuses (`FlushFileBuffers` needs write access; Linux hid it behind `syncfs` for more
+    than four files), now reopened writable; and a receiver that failed in local storage
+    with the body still flowing returned no answer, so h2 reset the stream, the sender
+    took that for a lost connection and resumed into the same failure forever (gate B
+    hung on it, gate D only waited on the shared test lock). Storage errors are now
+    answered with a 500, `BodyReader` records transport failures so only those count as
+    a cut body, the outbox pull has the same fix, and the sender gives up after 8
+    connected rounds with no new verified bytes. Windows share mode is set explicitly on
+    every staged file open. The bsdtar test compares lines. One more fix on the way: the
+    outbox DELETE removed the list entry before the record file, which a loaded test
+    could observe. 394 Linux tests pass; the Windows result is proven only by the next
+    push.
 - **Guest Wi-Fi paths are documented and wired but not exercised** on a real hotspot or
   USB tether; `TetherWatcher` relies on hidden platform broadcast actions, with the core's
   interface poll as the fallback.

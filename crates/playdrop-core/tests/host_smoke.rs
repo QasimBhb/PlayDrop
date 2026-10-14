@@ -466,3 +466,61 @@ async fn clipboard_push_to_all_with_echo_rule() {
     assert!(fail.at > 0);
     a.host.shutdown().await;
 }
+
+/// Free space that answers the offer and accept checks, then fails like a disk that went
+/// away, so the receiver's next write fails locally while the body is still arriving.
+#[derive(Debug, Default)]
+struct FailingDisk {
+    calls: std::sync::atomic::AtomicU32,
+}
+
+impl playdrop_core::transfer::FreeSpace for FailingDisk {
+    fn space(
+        &self,
+        _path: &std::path::Path,
+    ) -> std::io::Result<playdrop_core::transfer::SpaceInfo> {
+        // Call 1 checks the offer, call 2 the accept; every later call is a chunk write.
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+            Ok(playdrop_core::transfer::SpaceInfo {
+                available: 1 << 50,
+                total: 1 << 50,
+            })
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "storage refused",
+            ))
+        }
+    }
+}
+
+/// A receiver whose storage fails mid-upload answers the `PUT` with an error, so the
+/// sender fails within seconds instead of taking the reset for a lost connection and
+/// resuming into the same failure forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn receiver_storage_failure_fails_the_send_promptly() {
+    common::init_logs();
+    let root = temp_root();
+    let mut a = start_host(root.path(), "alpha", 0).await;
+    let mut b = common::start_host_with(root.path(), "bravo", 0, |cfg| {
+        cfg.free_space = std::sync::Arc::new(FailingDisk::default());
+    })
+    .await;
+    pair(&mut a, &mut b).await;
+
+    let src = root.path().join("src").join("one.bin");
+    std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+    write_random_file(&src, 2 * 1024 * 1024, 11);
+    let peer = b.host.device_id();
+    let mut handle = a.host.send(&peer, vec![src]).await.unwrap();
+    let err = tokio::time::timeout(Duration::from_secs(15), handle.wait())
+        .await
+        .expect("the send ends instead of retrying forever")
+        .expect_err("the receiver could not store the file");
+    assert!(
+        err.to_string().contains("500"),
+        "the receiver's answer reaches the sender: {err}"
+    );
+    a.host.shutdown().await;
+    b.host.shutdown().await;
+}

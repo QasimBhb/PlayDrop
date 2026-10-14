@@ -31,6 +31,17 @@ use crate::{Error, Result};
 /// Most " (n)" suffixes tried before giving up.
 const MAX_COLLISIONS: u32 = 10_000;
 
+/// Windows share mode for every staged, ledger and placeholder file:
+/// `FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE` (1 | 2 | 4, `winnt.h`).
+///
+/// On Windows a file cannot be deleted or renamed, and a rename cannot replace it, while
+/// any handle on it was opened without `FILE_SHARE_DELETE`. Opening everything with it
+/// means a handle that lives a little too long (a sink still holding a delivered file, a
+/// `.part` writer not yet dropped) cannot block cleanup or placement. `std` and `cap-std`
+/// default to this today; it is spelled out so the guarantee does not rest on a default.
+#[cfg(windows)]
+const SHARE_ALL: u32 = 0x1 | 0x2 | 0x4;
+
 /// Creates the receive root owner-only (0700 on Unix, SR-23) if it does not exist. An
 /// existing root is used as is; it may itself be a symlink the user chose.
 pub(crate) fn ensure_root(root: &Path) -> io::Result<()> {
@@ -176,7 +187,38 @@ pub(crate) fn private_file_options() -> OpenOptions {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600);
     }
+    share_all(&mut o);
     o
+}
+
+/// Lets other handles read, write, delete and rename the file while this one is open
+/// (Windows, see [`SHARE_ALL`]). A no-op elsewhere, where that is always allowed.
+fn share_all(o: &mut OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        o.share_mode(SHARE_ALL);
+    }
+    #[cfg(not(windows))]
+    let _ = o;
+}
+
+/// Opens an existing staged file read-only, without blocking its later deletion or
+/// rename on Windows (see [`SHARE_ALL`]).
+pub(crate) fn open_shared_read(path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.read(true);
+    share_all(&mut o);
+    o.open(path)
+}
+
+/// Opens an existing file so its data can be flushed. Windows' `FlushFileBuffers` needs
+/// write access: syncing a read-only handle fails with "Access is denied".
+fn open_for_sync(path: &Path) -> io::Result<File> {
+    let mut o = OpenOptions::new();
+    o.write(true);
+    share_all(&mut o);
+    o.open(path)
 }
 
 /// Splits `name` into stem and extension for collision names: `a.tar.gz` gives
@@ -213,6 +255,11 @@ fn private_create_new() -> cap_std::fs::OpenOptions {
     {
         use cap_std::fs::OpenOptionsExt;
         o.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        o.share_mode(SHARE_ALL);
     }
     o
 }
@@ -346,7 +393,9 @@ pub(crate) fn map_io(e: io::Error) -> Error {
 
 /// Makes the data of many staged files durable at once (protocol.md 7.6). On Linux one
 /// `syncfs` on the filesystem holding `dir` replaces an `fdatasync` per file, which keeps
-/// thousands of small bundle members from costing thousands of flushes.
+/// thousands of small bundle members from costing thousands of flushes. Elsewhere each
+/// file is reopened writable and flushed, since Windows refuses to flush a read-only
+/// handle.
 pub(crate) fn sync_files(dir: &Path, files: &[PathBuf]) -> Result<()> {
     #[cfg(target_os = "linux")]
     if files.len() > 4 {
@@ -355,7 +404,7 @@ pub(crate) fn sync_files(dir: &Path, files: &[PathBuf]) -> Result<()> {
     }
     let _ = dir;
     for f in files {
-        File::open(f)?.sync_data().map_err(map_io)?;
+        open_for_sync(f)?.sync_data().map_err(map_io)?;
     }
     Ok(())
 }
@@ -375,6 +424,29 @@ mod tests {
         let named = collision_name(&long, 12);
         assert!(named.len() <= 255);
         assert!(named.ends_with(" (12).txt"));
+    }
+
+    /// Flushing staged files reopens them writable: Windows refuses to flush a read-only
+    /// handle ("Access is denied"). Both the per-file path and, on Linux, the `syncfs`
+    /// path work.
+    #[test]
+    fn sync_files_flushes_few_and_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let files: Vec<PathBuf> = (0..6)
+            .map(|i| {
+                let p = dir.path().join(format!("{i}.part"));
+                drop(open_or_create(&p).unwrap());
+                std::fs::write(&p, b"data").unwrap();
+                p
+            })
+            .collect();
+        sync_files(dir.path(), &files[..2]).unwrap();
+        sync_files(dir.path(), &files).unwrap();
+        // A reader still holding a file does not stop its deletion (FILE_SHARE_DELETE).
+        let reader = open_shared_read(&files[0]).unwrap();
+        remove_if_exists(&files[0]).unwrap();
+        assert!(!files[0].exists());
+        drop(reader);
     }
 
     #[test]
