@@ -114,7 +114,7 @@ timeout (SR-25), and tells the controller why a session ended; `playdropd` injec
 the RemoteDesktop portal (COSMIC, GNOME) or `SendInput`, shows "Remote input from X" with a
 kill switch in the tray and window, and feeds MPRIS players to peers with the `media` grant.
 Phase 6 is written: see `docs/phases/phase-6-ship-gate.md` for the gate results (throughput
-passes, small files on Android sit at the MediaProvider floor by decision, CI unproven until the first push) and the list of
+passes, small files on Android sit at the MediaProvider floor by decision, CI proven on 2026-10-14: Windows tests green, Release dry run builds all five artifacts) and the list of
 what the user must do before tagging `v0.1.0`. Open TODOs are tagged with their SR in the
 code (`grep -rn "TODO" crates/ apps/`).
 

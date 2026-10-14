@@ -166,7 +166,10 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
     after `jlumbroso/free-disk-space` drops the unused toolchains. The second dry run
     (2026-10-14, evening) then built the whole workspace in release on the host with
     36 GB to spare and failed only at the strip step: `eu-strip` is not installed by the
-    distro `flatpak-builder` package, so the job now installs `elfutils`.
+    distro `flatpak-builder` package, so the job now installs `elfutils`. The third run
+    stripped and then failed in `appstreamcli compose` (`file-read-error` on the
+    component: no SVG loader on the runner), fixed by installing `appstream-compose` and
+    `librsvg2-common`. The fourth run produced the bundle in 18 minutes.
   - Windows, the first time the core tests ran there: `system_tar_lists_bundle` (bsdtar
     prints CRLF), `receiver_full_flow_with_bundle_and_reload` and
     `staged_mode_hands_every_file_to_the_sink` (bundle `finish` returns `Access is denied`:
@@ -196,6 +199,10 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
     (10.3 vs 66.2 MiB/s, debug): Windows has no `syncfs`, so every bundle member costs
     one `FlushFileBuffers`, and Defender scans each new file. Gate B is now ignored on
     Windows with that reason; it needs a real machine and a release build, Phase 7.
+    The third Windows run then had every test green and failed only in clippy: CI runs
+    Rust 1.98 and an allow named a lint new in 1.99 (`unknown_lints` now allowed with
+    it). The fourth run, 2026-10-14 evening, was green end to end: build, 198 core unit
+    tests plus the integration suites, clippy at `-D warnings`, the installer.
 - **Guest Wi-Fi paths are documented and wired but not exercised** on a real hotspot or
   USB tether; `TetherWatcher` relies on hidden platform broadcast actions, with the core's
   interface poll as the fallback.
@@ -210,11 +217,13 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
 ## 7. What the user must do before the first release
 
 1. Back up `~/.local/share/playdrop-release/` offline. Done 2026-10-14.
-2. `git update-index` already marks the scripts executable; commit, then
-   `git push origin main` and watch the Windows and iOS workflows.
-3. Set the four secrets with the commands in `docs/release/distribution.md`
-   ("Putting the key into GitHub secrets"), then run `Release` by hand as a dry run.
-4. Tag `v0.1.0` when the dry run is green.
+2. Commit, `git push origin main`, watch the Windows and iOS workflows. Done 2026-10-14:
+   four pushes, the Windows workflow green with every test running on the fourth.
+3. Set the four secrets (`docs/release/distribution.md`), run `Release` by hand as a dry
+   run. Done 2026-10-14: secrets set, the fourth dry run (38649458337) built all five
+   artifacts (installer, Flatpak, signed APK, deb, iOS archive) with no release created.
+4. Tag `v0.1.0`: `git tag v0.1.0 && git push origin v0.1.0`. The tag push runs `Release`
+   for real and publishes the five files.
 
 The incumbents run (`bench/incumbents.md`) was dropped by the user on 2026-10-14.
 
