@@ -61,9 +61,25 @@ internal object FileNames {
      * MediaStore `RELATIVE_PATH` for a received file whose manifest path is [path]:
      * `Download/PlayDrop/<dirs>/`. The last component is the file name and is left out.
      */
-    fun relativePath(downloadsDir: String, path: List<String>): String {
-        val dirs = path.dropLast(1).mapNotNull { sanitize(it) }
-        return (listOf(downloadsDir, RECEIVE_FOLDER) + dirs).joinToString("/", postfix = "/")
+    fun relativePath(downloadsDir: String, path: List<String>): String =
+        (listOf(downloadsDir, RECEIVE_FOLDER) + receivedDirs(path)).joinToString("/", postfix = "/")
+
+    /**
+     * Folders under `Download/PlayDrop` for a received file whose manifest path is [path]:
+     * every component but the last, each cleaned like a name (SR-17), empty ones dropped.
+     * The result never holds a separator, `.` or `..`, so joining it under the receive folder
+     * cannot leave that folder.
+     */
+    fun receivedDirs(path: List<String>): List<String> = path.dropLast(1).mapNotNull { sanitize(it) }
+
+    /**
+     * The [n]th name tried when [name] is taken: `name`, `name (1)`, `name (2)`... with the
+     * number before the extension (`a.txt` -> `a (1).txt`). [n] 0 is the name itself.
+     */
+    fun numberedName(name: String, n: Int): String {
+        if (n <= 0) return name
+        val ext = extension(name) ?: return "$name ($n)"
+        return "${name.dropLast(ext.length + 1)} ($n).${name.takeLast(ext.length)}"
     }
 
     /** Display name for a received file: the last manifest component, cleaned. */

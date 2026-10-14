@@ -121,6 +121,13 @@ struct AddDeviceView: View {
             } header: {
                 Text(L10n.Add.typeAddress)
             }
+            Section {
+                NavigationLink {
+                    ConnectivityHelpView()
+                } label: {
+                    Label(L10n.Connect.title, systemImage: "lifepreserver")
+                }
+            }
             ownIdentitySection
         }
     }

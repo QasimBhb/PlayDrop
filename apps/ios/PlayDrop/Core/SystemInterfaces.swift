@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import PlayDropCore
+import PlayDropShared
 
 // The iPhone's IPv4 interfaces for discovery (docs/core-api.md section 7), read with
 // `getifaddrs`. The core binds its multicast beacon and mDNS responder to each address and
@@ -13,13 +14,11 @@ import PlayDropCore
 // - `utun*`, `ipsec*`: VPN and system tunnels (iCloud Private Relay, Wi-Fi calling).
 // - `awdl*`, `llw*`: Apple Wireless Direct Link and its low-latency companion (AirDrop),
 //   link-local IPv6 only in practice and never a path to a PlayDrop peer.
-// Personal Hotspot (`bridge*`) and Wi-Fi or Ethernet (`en*`) stay in.
+// Personal Hotspot (`bridge*`, also the interface of a USB tether to a computer) and Wi-Fi or
+// Ethernet (`en*`) stay in. The rule is `InterfaceKinds.carriesLanPeers`.
 
 /// `NetworkInterfaces` backed by `getifaddrs`.
 final class SystemInterfaces: NetworkInterfaces {
-    /// Interface name prefixes that never carry LAN peers; see the file comment.
-    static let skippedPrefixes = ["utun", "pdp_ip", "ipsec", "llw", "awdl"]
-
     /// A reader with no state; `getifaddrs` is called afresh on every request.
     init() {}
 
@@ -57,7 +56,8 @@ final class SystemInterfaces: NetworkInterfaces {
             return nil
         }
         let name = String(cString: ifa.ifa_name)
-        if skippedPrefixes.contains(where: { name.hasPrefix($0) }) {
+        // The name rules (and why) live in `InterfaceKinds`, where Linux tests cover them.
+        guard InterfaceKinds.carriesLanPeers(name) else {
             return nil
         }
         let index = if_nametoindex(ifa.ifa_name)

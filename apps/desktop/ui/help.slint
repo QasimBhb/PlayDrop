@@ -1,0 +1,162 @@
+// "Can't find your device?": the ways out when discovery does not work, in the order to try
+// them (product.md: say which path failed and offer QR, hotspot or USB tether). The panel
+// puts the fix the last Diagnose pointed at first.
+
+import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
+import { HelpFocus } from "types.slint";
+import { Nav, PairingState, HelpState } from "globals.slint";
+import { Label, Muted, Heading, Card } from "widgets.slint";
+
+// One numbered way out. `focused` draws it in the accent colour.
+component Step inherits Card {
+    in property <string> title;
+    in property <bool> focused;
+    border-width: root.focused ? 2px : 1px;
+    border-color: root.focused ? Palette.accent-background : Palette.border;
+    accessible-role: groupbox;
+    accessible-label: root.title;
+    VerticalLayout {
+        padding: 12px;
+        spacing: 6px;
+        Label {
+            text: root.title;
+            font-weight: 600;
+        }
+
+        @children
+    }
+}
+
+// The panel's content, shared by the dialog and the Diagnostics page.
+export component HelpContent inherits VerticalLayout {
+    spacing: 10px;
+
+    if HelpState.focus == HelpFocus.firewall: Step {
+        title: "Most likely fix: this computer's firewall blocks PlayDrop";
+        focused: true;
+        Muted {
+            text: "Run this in a terminal, then press Refresh on Diagnostics:";
+        }
+
+        LineEdit {
+            text: HelpState.firewall-fix;
+            read-only: true;
+            font-size: 13px;
+        }
+    }
+
+    if HelpState.focus == HelpFocus.qr-or-address: Label {
+        text: "Most likely fix: this network hides devices from each other. Pair by QR code or by address (1).";
+        font-weight: 600;
+    }
+
+    if HelpState.focus == HelpFocus.hotspot-or-usb: Label {
+        text: "Most likely fix: this computer and your device are on different networks. Use the phone's hotspot (2) or USB tethering (3).";
+        font-weight: 600;
+    }
+
+    Step {
+        title: "1. On the same Wi-Fi, but the device does not show up";
+        focused: HelpState.focus == HelpFocus.qr-or-address;
+        Muted {
+            text: "Mesh Wi-Fi, a VPN or a router that filters multicast can hide devices. Pair directly instead.";
+        }
+
+        HorizontalLayout {
+            spacing: 8px;
+            alignment: start;
+            Button {
+                text: "Show QR code";
+                clicked => {
+                    HelpState.visible = false;
+                    PairingState.show-qr();
+                }
+            }
+
+            Button {
+                text: "Type an address";
+                clicked => {
+                    HelpState.visible = false;
+                    Nav.page = 1;
+                }
+            }
+        }
+    }
+
+    Step {
+        title: "2. Guest, hotel or campus Wi-Fi: use the phone's hotspot";
+        focused: HelpState.focus == HelpFocus.hotspot-or-usb;
+        Muted {
+            text: "These networks often stop devices from reaching each other. No app can get around that.";
+        }
+
+        Label {
+            text: "- Android: Settings, Network, Hotspot and tethering\n- iPhone: Settings, Personal Hotspot";
+        }
+
+        Muted {
+            text: "Connect this computer to the hotspot. PlayDrop finds the phone within seconds.";
+        }
+    }
+
+    Step {
+        title: "3. USB tether, the fastest fallback";
+        focused: HelpState.focus == HelpFocus.hotspot-or-usb;
+        Muted {
+            text: "Plug the phone into this computer with a USB cable, then turn on USB tethering. The computer gets a wired network to the phone.";
+        }
+
+        Label {
+            text: "- Android: Hotspot and tethering, USB tethering\n- iPhone: turn on Personal Hotspot, then trust this computer";
+        }
+    }
+
+    Step {
+        title: "4. A VPN is on";
+        focused: false;
+        Muted {
+            text: "Allow local network access in the VPN app, or pause the VPN while you use PlayDrop.";
+        }
+    }
+}
+
+// The panel as a dialog over the window.
+export component HelpDialog inherits Rectangle {
+    background: #00000099;
+
+    TouchArea { }
+
+    Rectangle {
+        width: min(560px, root.width - 32px);
+        height: root.height - 48px;
+        x: (root.width - self.width) / 2;
+        y: (root.height - self.height) / 2;
+        background: Palette.background;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Palette.border;
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+            HorizontalLayout {
+                spacing: 8px;
+                Heading {
+                    text: "Can't find your device?";
+                    horizontal-stretch: 1;
+                }
+
+                Button {
+                    text: "Close";
+                    clicked => {
+                        HelpState.visible = false;
+                    }
+                }
+            }
+
+            ScrollView {
+                vertical-stretch: 1;
+                HelpContent { }
+            }
+        }
+    }
+}

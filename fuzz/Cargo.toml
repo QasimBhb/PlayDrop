@@ -1,0 +1,75 @@
+# Fuzz targets for every decoder that sees bytes before (or without) authentication
+# (threat-model.md SR-33, T39). Built and run with cargo-fuzz on nightly; see fuzz/README.md.
+# Its own workspace, so the main build never needs nightly or libFuzzer.
+[package]
+name = "playdrop-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+license = "GPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1.12.1"
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["rt", "io-util", "macros"] }
+playdrop-core = { path = "../crates/playdrop-core" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "beacon"
+path = "fuzz_targets/beacon.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mdns_txt"
+path = "fuzz_targets/mdns_txt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundle"
+path = "fuzz_targets/bundle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame"
+path = "fuzz_targets/frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session_json"
+path = "fuzz_targets/session_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qr_uri"
+path = "fuzz_targets/qr_uri.rs"
+test = false
+doc = false
+bench = false

@@ -56,6 +56,7 @@ transports drop a single event over `MAX_MESSAGE_BYTES` (4 MiB) with a warning, 
 | Request (`op`) | Fields | Answer (`kind`) | Maps to |
 |---|---|---|---|
 | `stop_input` | none | `done` | `Host::stop_input_sessions` (SR-25 kill switch): ends every remote input session this desktop is the target of, releases held keys and buttons, tells the peers. The tray has the same action |
+| `media_command` | `peer`, `player`, `action` (protocol.md 5.9 spelling), optional `value` | `done` | `Host::send_media_command`: asks an online peer with `media.control` to control one of its players; a refusal arrives later as a `peer_refused` host event |
 
 | Settings field | Default | Meaning |
 |---|---|---|
@@ -176,4 +177,8 @@ Transports log request `op` names and error codes only. They never log request b
 - `Diagnose` returns the core view plus the daemon's port probe. The summary lines are
   ready to display and name the failed layer: "multicast blocked on <iface>", "port 42187
   blocked by the host firewall (ufw): run `sudo ufw allow 42187`", "no interface on the
-  same network as <peer>", or "all paths fine".
+  same network as <peer>", or "all paths fine". After those come lines that are not a
+  network problem: "start at login was not allowed: <reason>" (Flatpak, Background portal
+  refused) and informational lines starting with "note: ", such as KDE Connect or
+  GSConnect listening on port 1716, which is fine. UIs open their "Can't find your
+  device?" help only for the network lines.

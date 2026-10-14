@@ -37,5 +37,10 @@ tray goes through StatusNotifierItem. The check *a closed ufw/firewalld/Windows 
 "port X blocked"* belongs to the daemon's diagnostics; the deb README covers the manual ufw
 step until then.
 
-Build output (`deb/dist/`, `windows/dist/`, `flatpak/build-dir/`, `flatpak/repo/`) is
-gitignored in `packaging/.gitignore`.
+Build output (`deb/dist/`, `windows/dist/`, `flatpak/build-dir/`, `flatpak/repo/`,
+`flatpak/*.flatpak`) is gitignored in `packaging/.gitignore`.
+
+Releases are built by `.github/workflows/release.yml` from a `v<version>` tag and published
+on GitHub Releases, the only distribution channel; `.github/workflows/windows.yml` builds
+and tests the Windows side on every change. How releases are made, every asset, the Android
+release key and the iOS sideloading story: `docs/release/distribution.md`.

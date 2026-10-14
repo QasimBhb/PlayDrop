@@ -9,6 +9,35 @@ export enum ConnPhase {
     connected,
 }
 
+// Which way out the "Can't find your device?" panel puts first, from the Diagnose summary.
+export enum HelpFocus {
+    none,
+    // Multicast is blocked: pair by QR code or by address.
+    qr-or-address,
+    // No interface on the device's network: phone hotspot or USB tether.
+    hotspot-or-usb,
+    // The host firewall blocks the port: run its command.
+    firewall,
+}
+
+// One media player on a device, with the controls its state allows.
+export struct MediaRow {
+    // Player ID from the device, sent back with every command.
+    player: string,
+    title: string,
+    // "Artist · Player · Playing".
+    detail: string,
+    playing: bool,
+    can-previous: bool,
+    can-next: bool,
+    // The play/pause button's action in protocol.md 5.9 spelling ("playPause", "play" or
+    // "pause"); empty when the player offers none, which hides the button.
+    toggle-action: string,
+    // Volume 0 to 100; `has-volume` false hides the slider.
+    has-volume: bool,
+    volume: int,
+}
+
 // One paired device on the Devices screen.
 export struct DeviceRow {
     // Hex Device ID, used as the peer query for every request.
@@ -34,13 +63,11 @@ export struct DeviceRow {
     // The device accepts remote input (an `input.*` capability). Not offered in v1: the
     // desktop does not control other devices yet.
     can-be-controlled: bool,
-    // Now playing on the device (media state, protocol.md 5.9). Display only: the daemon
-    // has no request for sending media commands yet.
-    media-visible: bool,
-    media-title: string,
-    // "Artist · Player · Playing".
-    media-detail: string,
-    media-playing: bool,
+    // The device lists `media.control`: its players can be controlled from here.
+    can-control-media: bool,
+    // Now playing on the device (media state, protocol.md 5.9), one entry per player,
+    // the playing ones first.
+    players: [MediaRow],
 }
 
 // A device seen in its own "Add device" window.

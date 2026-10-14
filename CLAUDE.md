@@ -24,9 +24,17 @@ five device gates passed that day, the share-extension one needs an App Group). 
 daemon RemoteDesktop portal and `SendInput` injectors, MPRIS and GSMTC media, phone
 trackpad, keyboard, presenter and now-playing screens, `playdrop-ffi` 0.2.0; live gates
 that need someone at the screen are listed in `docs/phases/phase-5-companion.md` section 7.
-381 Rust tests plus 89 Android JUnit tests plus 92 Linux-run `PlayDropShared` Swift tests,
-clippy clean. Licence GPL-3.0-or-later. UI native per platform. Build fully agentic. Next:
-Phase 6, see `docs/phases/phase-5-companion.md`.
+Phase 6 (ship gate) written on 2026-10-13: GitHub Releases only (no stores), signed
+Android release key outside the repo, release and Windows and nightly fuzz workflows,
+`.deb` and Flatpak built locally, `fuzz/` with seven cargo-fuzz targets, `bench/` scripts
+and `docs/release/` (distribution, test matrix, throughput notebook, SR checklist), media
+buttons in the window, "Can't find your device?" help on all three platforms, the Android
+`DownloadsSink` rewrite (1 GiB at 94 to 99% of iperf3 on the A54; small files still floored
+at one MediaProvider insert per file, shipped as is, revisit in Phase 7), Flatpak autostart through the
+Background portal, KDE Connect coexistence test. 390 Rust tests plus 110 Android JUnit
+tests plus 102 Linux-run `PlayDropShared` Swift tests, clippy clean. Licence
+GPL-3.0-or-later. UI native per platform. Build fully agentic. Next: close the owed items in
+`docs/phases/phase-6-ship-gate.md` sections 6 and 7, then Phase 7.
 
 ## Read first
 
@@ -105,8 +113,10 @@ inside a session, with the grant, unlocked, keys capped at 60 per second, 10 min
 timeout (SR-25), and tells the controller why a session ended; `playdropd` injects through
 the RemoteDesktop portal (COSMIC, GNOME) or `SendInput`, shows "Remote input from X" with a
 kill switch in the tray and window, and feeds MPRIS players to peers with the `media` grant.
-Open TODOs are tagged with their SR in the code (`grep -rn "TODO" crates/ apps/`). Next:
-Phase 6.
+Phase 6 is written: see `docs/phases/phase-6-ship-gate.md` for the gate results (throughput
+passes, small files on Android sit at the MediaProvider floor by decision, CI unproven until the first push) and the list of
+what the user must do before tagging `v0.1.0`. Open TODOs are tagged with their SR in the
+code (`grep -rn "TODO" crates/ apps/`).
 
 ## Commands
 
@@ -129,6 +139,7 @@ Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
   then type `pair` in bravo, `pair 127.0.0.1:42188` in alpha, `y` in both, `peers`, and `send <short-id> <path>` (`help` lists all stdin commands)
 - Benchmark (release): `target/release/playdrop bench --role server --addr 127.0.0.1:42200 --mode h2` in one terminal, `target/release/playdrop bench --role client --addr 127.0.0.1:42200 --mode h2 --size 1GiB --runs 3` in another; repeat with `--mode raw`; compare with `iperf3 -s` and `iperf3 -c 127.0.0.1 -t 5`
 - Remote input and media (Phase 5): `cargo test -p playdrop-core --test phase5_core` (loopback, prints the latency gate with `-- --nocapture`); `cargo test -p playdropd -- --ignored input_portal_live` (opens the COSMIC consent dialog: someone must approve it) and `-- --ignored media_mpris_live --nocapture` (prints local players); in `playdrop host`: `input <peer> start|move dx dy|click|key Enter|text hi|stop`, `media <peer> <player> pause`, `inputs`, `stop-input`
+- Release and bench (Phase 6): `bench/make-dataset.sh`, `bench/loopback.sh`, `bench/iperf3-phone.sh`, `bench/desktop-to-phone.sh --runs 3` (daemon alpha running, phone online; `bench/README.md`); fuzz: `cargo +nightly fuzz build` then `fuzz/README.md` (run the long gate from `/tmp/pd-fuzz-src`, a symlink without spaces); packaging: `packaging/deb/build-deb.sh`, `packaging/flatpak/README.md`; Android release APK: `./gradlew :app:assembleRelease` (real key from `apps/android/keystore.properties`) or `-Pplaydrop.signWithDebugKey=true` for the test phone; never measure speed with a debug APK
 - LAN discovery test (needs a real interface with multicast): `cargo test -p playdrop-core --test phase1_gates -- --ignored`
 - Android (from `apps/android`, Gradle 9.6, AGP 9.4.1, SDK platform 37.0, NDK 27.1, `cargo-ndk`): `./gradlew :app:compileDebugKotlin` (Kotlin check, regenerates the UniFFI bindings), `./gradlew :app:assembleDebug` or `assembleRelease` (Rust for arm64-v8a and x86_64 per `playdrop.rustAbis` in `gradle.properties`), `./gradlew :app:testDebugUnitTest`, `adb install -r app/build/outputs/apk/debug/app-debug.apk`, `adb logcat -s playdrop:*`. Bindings alone: `cargo build -p playdrop-ffi && cargo run -p uniffi-bindgen -- generate --library target/debug/libplaydrop_ffi.so --language kotlin --no-format --out-dir <dir>`
 - iOS on Linux (from `apps/ios`, after the one-time xtool setup in its README): `scripts/xtool-dev.sh` builds the Rust core, the app and the share extension, signs them and installs on the USB iPhone (`--core` after a change under `crates/`); `xtool launch org.playdrop.ios`

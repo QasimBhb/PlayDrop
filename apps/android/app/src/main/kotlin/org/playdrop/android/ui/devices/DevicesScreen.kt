@@ -66,6 +66,7 @@ import org.playdrop.android.ui.theme.PlayDropTheme
 fun DevicesRoute(
     onOpenDevice: (String) -> Unit,
     onAddDevice: () -> Unit,
+    onHelp: () -> Unit,
     showMessage: (String) -> Unit,
     vm: DevicesViewModel = viewModel(),
 ) {
@@ -81,6 +82,7 @@ fun DevicesRoute(
         state = state,
         onOpenDevice = onOpenDevice,
         onAddDevice = onAddDevice,
+        onHelp = onHelp,
         onStartService = vm::startService,
         onSetDefault = vm::setDefault,
         onSend = { peer ->
@@ -97,6 +99,7 @@ fun DevicesScreen(
     state: DevicesUiState,
     onOpenDevice: (String) -> Unit,
     onAddDevice: () -> Unit,
+    onHelp: () -> Unit,
     onStartService: () -> Unit,
     onSetDefault: (String) -> Unit,
     onSend: (String) -> Unit,
@@ -129,7 +132,7 @@ fun DevicesScreen(
         Column(Modifier.padding(padding).fillMaxSize()) {
             if (!state.running) ServiceBanner(onStart = onStartService)
             if (state.rows.isEmpty()) {
-                EmptyDevices(onAddDevice)
+                EmptyDevices(onAddDevice, onHelp)
             } else {
                 LazyColumn(
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
@@ -206,7 +209,7 @@ fun DeviceCard(row: DeviceRow, onClick: () -> Unit) {
 }
 
 @Composable
-private fun EmptyDevices(onAddDevice: () -> Unit) {
+private fun EmptyDevices(onAddDevice: () -> Unit, onHelp: () -> Unit) {
     Column(
         Modifier.fillMaxSize().padding(32.dp),
         verticalArrangement = Arrangement.Center,
@@ -224,6 +227,7 @@ private fun EmptyDevices(onAddDevice: () -> Unit) {
         )
         Spacer(Modifier.size(24.dp))
         Button(onClick = onAddDevice) { Text(stringResource(R.string.ui_add_device)) }
+        TextButton(onClick = onHelp) { Text(stringResource(R.string.ui_help_link)) }
     }
 }
 
@@ -257,7 +261,7 @@ private fun ChooseTargetDialog(rows: List<DeviceRow>, onDismiss: () -> Unit, onC
 @Composable
 private fun DevicesPreview() {
     PlayDropTheme {
-        DevicesScreen(Samples.devicesState, {}, {}, {}, {}, {})
+        DevicesScreen(Samples.devicesState, {}, {}, {}, {}, {}, {})
     }
 }
 
@@ -265,6 +269,6 @@ private fun DevicesPreview() {
 @Composable
 private fun DevicesEmptyPreview() {
     PlayDropTheme {
-        DevicesScreen(DevicesUiState(running = false), {}, {}, {}, {}, {})
+        DevicesScreen(DevicesUiState(running = false), {}, {}, {}, {}, {}, {})
     }
 }

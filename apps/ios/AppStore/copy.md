@@ -1,5 +1,9 @@
 # App Store copy for PlayDrop (iOS)
 
+> Note: PlayDrop is not being shipped to the App Store for now. This file is kept for a
+> possible future listing. Today the iPhone app is installed by sideloading from a GitHub
+> release (see `docs/release/distribution.md`).
+
 Text to paste into App Store Connect, plus the privacy answers. Everything here must stay
 true to what the iOS app actually does (Phase 4 gate "App Store copy is accurate", PLAN.md
 anti-pattern 11). The limits that matter: the iPhone receives only while PlayDrop is open,

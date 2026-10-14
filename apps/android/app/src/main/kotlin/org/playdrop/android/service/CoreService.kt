@@ -37,6 +37,7 @@ class CoreService : LifecycleService() {
     private var startJob: Job? = null
     private var networkJob: Job? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private var tetherWatcher: TetherWatcher? = null
 
     /** Posts the foreground notification, then wires the platform hooks. */
     override fun onCreate() {
@@ -116,6 +117,7 @@ class CoreService : LifecycleService() {
         } catch (e: Exception) {
             HostLog.w("service", "network callback registration failed; network changes are not seen", e)
         }
+        tetherWatcher = TetherWatcher(this) { why -> networkChanged(why) }.also { it.register() }
     }
 
     /** Debounces bursts of network callbacks into one `networkChanged` after 1 s of quiet. */
@@ -140,6 +142,8 @@ class CoreService : LifecycleService() {
             runCatching { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(cb) }
         }
         networkCallback = null
+        tetherWatcher?.unregister()
+        tetherWatcher = null
         if (::signals.isInitialized) signals.unregister()
         MulticastPolicy.releaseAll()
         FindRinger.stop(this)

@@ -22,9 +22,10 @@
       connection after that is encrypted and checked against the paired key.
     </p>
     <p>
-      PlayDrop is early software. The desktop service, the window and
-      computer-to-computer transfers work today; the phone apps are still being
-      built.
+      PlayDrop is early software. It runs on Linux (Windows is being tested), with an Android
+      app and an iPhone app that receives while it is open. A paired phone can
+      also act as a trackpad, keyboard or presentation remote, and control the
+      music playing on the computer, each only after you allow it.
     </p>
   </description>
   <launchable type="desktop-id">org.playdrop.PlayDrop.desktop</launchable>
@@ -34,7 +35,7 @@
   <url type="vcs-browser">https://github.com/QasimBhb/PlayDrop</url>
   <categories>
     <category>Network</category>
-    <category>Utility</category>
+    <category>FileTransfer</category>
   </categories>
   <keywords>
     <keyword>phone</keyword>
@@ -58,7 +59,13 @@
   <releases>
     <release version="0.1.0" date="2026-10-08" type="development">
       <description>
-        <p>First desktop build: background service, tray, window and local file transfers.</p>
+        <p>First public release.</p>
+        <ul>
+          <li>Background service, tray icon and window for Linux, and a first Windows build</li>
+          <li>Pairing by short code or QR, resumable file and folder transfers</li>
+          <li>Clipboard sync, battery, ping and find my phone</li>
+          <li>Remote input, presenter mode and media control from a paired phone</li>
+        </ul>
       </description>
     </release>
   </releases>

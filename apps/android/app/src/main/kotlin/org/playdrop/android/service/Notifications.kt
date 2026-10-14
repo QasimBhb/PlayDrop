@@ -18,7 +18,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import org.playdrop.android.R
 import org.playdrop.android.core.HostLog
-import org.playdrop.android.core.MediaStoreSink
+import org.playdrop.android.core.DownloadsSink
 import org.playdrop.android.share.ClipboardSendActivity
 import org.playdrop.android.share.PickAndSendActivity
 import org.playdrop.core.HostEvent
@@ -194,7 +194,7 @@ internal object Notifications {
     private fun received(context: Context, e: HostEvent.TransferComplete, label: String) {
         val delivered = e.delivered.map { NotificationPlan.Delivered(it.path, it.location) }
         if (delivered.isEmpty()) return
-        val plan = NotificationPlan.received(delivered) { MediaStoreSink.guessMime(it) }
+        val plan = NotificationPlan.received(delivered) { DownloadsSink.guessMime(it) }
         val (title, tap) = when (plan) {
             is NotificationPlan.Received.One -> context.getString(R.string.received_one, plan.name) to
                 Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(plan.uri), plan.mime)

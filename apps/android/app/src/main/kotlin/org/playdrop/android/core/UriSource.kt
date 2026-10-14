@@ -82,7 +82,7 @@ object UriSource {
                     name = meta.name,
                     size = size.toULong(),
                     mtimeMs = meta.mtimeMs,
-                    mime = resolver.getType(uri) ?: MediaStoreSink.guessMime(meta.name),
+                    mime = resolver.getType(uri) ?: DownloadsSink.guessMime(meta.name),
                     opener = UriOpener(resolver, uri, meta.name, pfd),
                 )
             }

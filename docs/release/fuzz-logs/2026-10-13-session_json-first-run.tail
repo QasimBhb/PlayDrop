@@ -1,0 +1,3 @@
+#11273885: cov: 7088 ft: 19266 corp: 3168 exec/s: 7312 oom/timeout/crash: 0/0/0 time: 226s job: 55 dft_time: 0
+#11574543: cov: 7138 ft: 19352 corp: 3190 exec/s: 7516 oom/timeout/crash: 0/0/0 time: 232s job: 58 dft_time: 0
+thread '<unnamed>' (2316534) panicked at fuzz_targets/session_json.rs:106:21:

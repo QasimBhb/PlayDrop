@@ -5,7 +5,7 @@ import XCTest
 
 final class EmbeddedProvisioningProfileTests: XCTestCase {
     /// A profile-shaped blob: binary junk around an XML plist, as in a real file.
-    private func profile(entitlements: String) -> Data {
+    fileprivate func profile(entitlements: String) -> Data {
         var data = Data([0x30, 0x82, 0x1A, 0x2B, 0x06, 0x09, 0x00, 0xFF])
         data.append(Data("""
         <?xml version="1.0" encoding="UTF-8"?>
@@ -72,5 +72,20 @@ final class EmbeddedProvisioningProfileTests: XCTestCase {
         // Test bundles carry no embedded.mobileprovision, so the constant must win.
         XCTAssertEqual(PlayDropIdentifiers.appGroup, PlayDropIdentifiers.defaultAppGroup)
         XCTAssertEqual(PlayDropIdentifiers.defaultAppGroup, "group.org.playdrop.ios")
+    }
+}
+
+extension EmbeddedProvisioningProfileTests {
+    func testMulticastEntitlementIsReadFromTheProfile() throws {
+        let with = try XCTUnwrap(EmbeddedProvisioningProfile(data: profile(entitlements: """
+                <key>com.apple.developer.networking.multicast</key>
+                <true/>
+        """)))
+        XCTAssertTrue(with.hasMulticastEntitlement)
+        let without = try XCTUnwrap(EmbeddedProvisioningProfile(data: profile(entitlements: """
+                <key>get-task-allow</key>
+                <true/>
+        """)))
+        XCTAssertFalse(without.hasMulticastEntitlement)
     }
 }

@@ -1,0 +1,12 @@
+#173770989: cov: 8448 ft: 27840 corp: 5004 exec/s: 6820 oom/timeout/crash: 0/0/0 time: 3285s job: 224 dft_time: 0
+#175289724: cov: 8463 ft: 27960 corp: 5025 exec/s: 6720 oom/timeout/crash: 0/0/0 time: 3316s job: 225 dft_time: 0
+#176826127: cov: 8465 ft: 28006 corp: 5038 exec/s: 6768 oom/timeout/crash: 0/0/0 time: 3345s job: 226 dft_time: 0
+#178350647: cov: 8465 ft: 28023 corp: 5048 exec/s: 6686 oom/timeout/crash: 0/0/0 time: 3374s job: 227 dft_time: 0
+#179852898: cov: 8476 ft: 28069 corp: 5067 exec/s: 6560 oom/timeout/crash: 0/0/0 time: 3403s job: 228 dft_time: 0
+#181408533: cov: 8488 ft: 28107 corp: 5078 exec/s: 6763 oom/timeout/crash: 0/0/0 time: 3432s job: 229 dft_time: 0
+#183002382: cov: 8491 ft: 28419 corp: 5095 exec/s: 6899 oom/timeout/crash: 0/0/0 time: 3461s job: 230 dft_time: 0
+#184568106: cov: 8491 ft: 28448 corp: 5106 exec/s: 6748 oom/timeout/crash: 0/0/0 time: 3490s job: 231 dft_time: 0
+#186086136: cov: 8491 ft: 28537 corp: 5120 exec/s: 6515 oom/timeout/crash: 0/0/0 time: 3519s job: 232 dft_time: 0
+#187635146: cov: 8494 ft: 28572 corp: 5129 exec/s: 6619 oom/timeout/crash: 0/0/0 time: 3550s job: 233 dft_time: 0
+#189199636: cov: 8496 ft: 28611 corp: 5141 exec/s: 6657 oom/timeout/crash: 0/0/0 time: 3580s job: 234 dft_time: 0
+#190808771: cov: 8497 ft: 28686 corp: 5155 exec/s: 6818 oom/timeout/crash: 0/0/0 time: 3610s job: 235 dft_time: 0

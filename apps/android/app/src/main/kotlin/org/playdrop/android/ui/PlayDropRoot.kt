@@ -44,6 +44,8 @@ import org.playdrop.android.ui.device.DeviceDetailRoute
 import org.playdrop.android.ui.device.DeviceDetailViewModel
 import org.playdrop.android.ui.devices.DevicesRoute
 import org.playdrop.android.ui.diagnostics.DiagnosticsRoute
+import org.playdrop.android.ui.help.CantFindRoute
+import org.playdrop.android.ui.help.HelpTopic
 import org.playdrop.android.ui.input.InputRoute
 import org.playdrop.android.ui.input.InputViewModel
 import org.playdrop.android.ui.onboarding.OnboardingRoute
@@ -71,6 +73,12 @@ object Routes {
 
     /** Diagnostics. */
     const val DIAGNOSTICS = "diagnostics"
+
+    /** "Can't find your computer?", with an optional topic to highlight. */
+    const val HELP = "help?topic={topic}"
+
+    /** The help route, highlighting [topic] when given. */
+    fun help(topic: HelpTopic? = null) = if (topic == null) "help" else "help?topic=${topic.arg}"
 
     /** Remote input for one device, with the hex Device ID as argument. */
     const val INPUT = "input/{${InputViewModel.ARG_ID}}"
@@ -174,6 +182,7 @@ private fun MainScaffold(
                 DevicesRoute(
                     onOpenDevice = { nav.navigate(Routes.device(it)) },
                     onAddDevice = { nav.navigate(Routes.ADD_DEVICE) },
+                    onHelp = { nav.navigate(Routes.help()) },
                     showMessage = show,
                 )
             }
@@ -200,10 +209,41 @@ private fun MainScaffold(
                 InputRoute(onBack = { nav.popIfAt(Routes.INPUT) }, showMessage = show)
             }
             composable(Routes.ADD_DEVICE) {
-                AddDeviceRoute(onBack = { nav.popIfAt(Routes.ADD_DEVICE) }, showMessage = show)
+                AddDeviceRoute(
+                    onBack = { nav.popIfAt(Routes.ADD_DEVICE) },
+                    onHelp = { nav.navigate(Routes.help()) },
+                    showMessage = show,
+                )
             }
             composable(Routes.DIAGNOSTICS) {
-                DiagnosticsRoute(onBack = { nav.popIfAt(Routes.DIAGNOSTICS) }, showMessage = show)
+                DiagnosticsRoute(
+                    onBack = { nav.popIfAt(Routes.DIAGNOSTICS) },
+                    onHelp = { topic -> nav.navigate(Routes.help(topic)) },
+                    showMessage = show,
+                )
+            }
+            composable(
+                Routes.HELP,
+                arguments = listOf(
+                    navArgument("topic") {
+                        type = NavType.StringType
+                        nullable = true
+                        defaultValue = null
+                    },
+                ),
+            ) { entry ->
+                CantFindRoute(
+                    topic = HelpTopic.of(entry.arguments?.getString("topic")),
+                    onBack = { nav.popIfAt(Routes.HELP) },
+                    onPairByQrOrAddress = {
+                        // Reuse an open Add device screen instead of stacking a second one.
+                        nav.navigate(Routes.ADD_DEVICE) {
+                            popUpTo(Routes.ADD_DEVICE) { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    },
+                    showMessage = show,
+                )
             }
         }
     }

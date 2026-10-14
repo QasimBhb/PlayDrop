@@ -2,6 +2,7 @@ package org.playdrop.android.ui.diagnostics
 
 import org.playdrop.android.ui.common.Addresses
 import org.playdrop.core.Diagnostics
+import org.playdrop.android.ui.help.HelpTopic
 import org.playdrop.core.DiscoveryPath
 
 /**
@@ -76,6 +77,22 @@ object DiagnosticsSummary {
         if (out.isEmpty()) out += DiagIssue.AllFine
         return out
     }
+
+    /**
+     * The help topic that matches the findings where it is unambiguous: a blocked multicast
+     * or disabled discovery means the devices share a network (pair by QR or address); a peer
+     * last seen on another network means a hotspot or USB tether. A failed dial alone, a down
+     * listener or a missing interface say nothing about the path, so they suggest nothing.
+     */
+    fun helpTopic(issues: List<DiagIssue>): HelpTopic? = when {
+        issues.any { it is DiagIssue.OtherNetwork } -> HelpTopic.OTHER_NETWORK
+        issues.any { it is DiagIssue.MulticastBlocked || it is DiagIssue.DiscoveryOff } -> HelpTopic.SAME_NETWORK
+        else -> null
+    }
+
+    /** True when any finding is a reachability problem the help screen can address. */
+    fun suggestsHelp(issues: List<DiagIssue>): Boolean =
+        helpTopic(issues) != null || issues.any { it is DiagIssue.PeerNotReached || it is DiagIssue.MulticastJoinFailed }
 
     /** The core reports a failed join as `addr: error` text. */
     private fun splitJoinFailure(text: String): DiagIssue.MulticastJoinFailed {

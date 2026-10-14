@@ -1,4 +1,5 @@
-//! Devices screen: rows, one-click send, ping, clipboard, rename, grants, unpair.
+//! Devices screen: rows, one-click send, ping, clipboard, rename, grants, unpair, and the
+//! media buttons for each player a device reports.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -49,6 +50,9 @@ pub(super) fn install(app: &App, c: &Rc<Controller>) {
     });
     d.on_unpair(|id| {
         with(|c| unpair(c, id.as_str()));
+    });
+    d.on_media(|id, player, action, volume| {
+        with(|c| media(c, id.as_str(), player.as_str(), action.as_str(), volume));
     });
     install_drop_target(app);
 }
@@ -302,6 +306,28 @@ fn unpair(c: &Controller, peer: &str) {
                 }
                 c.done_or_report(&format!("Unpaired {name}"), "Could not unpair", r);
             });
+        },
+    );
+}
+
+/// One media button: asks the device to control `player`. A device that has not granted
+/// this computer `media` answers later with a refusal, which the store turns into a notice
+/// that says how to allow it.
+fn media(c: &Controller, peer: &str, player: &str, action: &str, volume: i32) {
+    let Some((action, value)) = model::media_command(action, volume) else {
+        tracing::warn!(action, "media button with an unknown action");
+        return;
+    };
+    let name = c.store.borrow().peer_name(peer);
+    c.ipc().request(
+        Request::MediaCommand {
+            peer: peer.to_owned(),
+            player: player.to_owned(),
+            action,
+            value,
+        },
+        move |r| {
+            with(|c| c.done_or_report("", &format!("Could not control media on {name}"), r));
         },
     );
 }

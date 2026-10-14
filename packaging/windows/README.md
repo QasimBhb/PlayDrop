@@ -2,9 +2,11 @@
 
 A classic Inno Setup installer (PLAN.md decision: classic first, MSIX only in Phase 7).
 
-**Status: untested.** The script and build script were written on Linux and have not been
-compiled or run. Treat the first run on a Windows 11 machine as the real test; the checklist
-below lists what to confirm.
+**Status: built in CI, not yet run on a real machine.** `.github/workflows/windows.yml`
+builds, tests and lints the workspace on GitHub's `windows-latest` runner and compiles this
+installer (uploaded as the `windows-installer` artifact); `release.yml` reuses it for
+releases. Nobody has installed it on a Windows 11 machine yet; the checklist below lists
+what to confirm on the first real run.
 
 ## Build
 

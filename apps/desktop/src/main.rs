@@ -27,8 +27,8 @@ mod ui {
 use slint::ComponentHandle;
 use ui::{
     App, CandidateRow, ConnPhase, ConnState, DeviceRow, DevicesState, DiagSection,
-    DiagnosticsState, InputState, Nav, NoticeState, PairingState, SettingsState, TransferRow,
-    TransfersState,
+    DiagnosticsState, HelpFocus, HelpState, InputState, MediaRow, Nav, NoticeState, PairingState,
+    SettingsState, TransferRow, TransfersState,
 };
 
 /// Wayland app ID and X11 class; matches `StartupWMClass` in the packaged `.desktop` file.

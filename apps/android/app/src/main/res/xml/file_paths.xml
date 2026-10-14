@@ -1,7 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- FileProvider roots. Only two narrow folders are shareable: received files on Android 8
-     and 9 (no MediaStore.Downloads there) and the single cached clipboard image. -->
+<!-- FileProvider roots. Only narrow folders are shareable: received files in the shared
+     Download/PlayDrop folder (Android 11 and later write there directly), received files on
+     Android 8 and 9 (no MediaStore.Downloads there) and the single cached clipboard image. -->
 <paths>
+    <!-- "received" is also spelt out in DownloadsSink (RECEIVED_ROOT). -->
+    <external-path name="received" path="Download/PlayDrop/" />
     <external-files-path name="downloads" path="Download/" />
     <files-path name="downloads_internal" path="downloads/" />
     <cache-path name="clipboard" path="clipboard/" />

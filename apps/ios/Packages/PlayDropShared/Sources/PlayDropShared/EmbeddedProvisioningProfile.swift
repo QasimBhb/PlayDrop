@@ -14,16 +14,21 @@ public struct EmbeddedProvisioningProfile: Sendable, Equatable {
     /// Entitlement keys read from the profile.
     static let appGroupsKey = "com.apple.security.application-groups"
     static let applicationIdentifierKey = "application-identifier"
+    static let multicastKey = "com.apple.developer.networking.multicast"
 
     /// `com.apple.security.application-groups`, in the profile's order; empty when the build
     /// has no App Group.
     public let appGroups: [String]
     /// `application-identifier` (`<team id>.<bundle id>`), nil when the profile lacks it.
     public let applicationIdentifier: String?
+    /// `com.apple.developer.networking.multicast` is true: the build may send and join
+    /// multicast, which discovery needs. False on a free-team build.
+    public let hasMulticastEntitlement: Bool
 
-    public init(appGroups: [String], applicationIdentifier: String?) {
+    public init(appGroups: [String], applicationIdentifier: String?, hasMulticastEntitlement: Bool = false) {
         self.appGroups = appGroups
         self.applicationIdentifier = applicationIdentifier
+        self.hasMulticastEntitlement = hasMulticastEntitlement
     }
 
     /// The profile embedded in `bundle`; nil when there is none (App Store and TestFlight
@@ -50,5 +55,6 @@ public struct EmbeddedProvisioningProfile: Sendable, Equatable {
         else { return nil }
         appGroups = entitlements[Self.appGroupsKey] as? [String] ?? []
         applicationIdentifier = entitlements[Self.applicationIdentifierKey] as? String
+        hasMulticastEntitlement = entitlements[Self.multicastKey] as? Bool ?? false
     }
 }

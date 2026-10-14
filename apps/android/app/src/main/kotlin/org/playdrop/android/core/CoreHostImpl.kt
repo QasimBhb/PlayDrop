@@ -86,6 +86,10 @@ internal object CoreHostImpl {
     private var refresher: Job? = null
     private var addDeviceWatch: Job? = null
 
+    /** The receive sink, told when each transfer ends so it can flush and log. */
+    @Volatile
+    private var sink: DownloadsSink? = null
+
     /** The listener must stay referenced for as long as the host lives. */
     private var listener: HostListener? = null
 
@@ -101,9 +105,10 @@ internal object CoreHostImpl {
             initLogging(if (BuildConfig.DEBUG) LogLevel.DEBUG else LogLevel.INFO)
             val settings = Settings.read(app)
             val staging = (app.getExternalFilesDir("staging") ?: File(app.filesDir, "staging")).apply { mkdirs() }
+            val receiveSink = DownloadsSink(app).also { sink = it }
             val config = HostConfig(
                 dataDir = File(app.filesDir, "core").absolutePath,
-                receive = ReceiveTarget.Staged(stagingDir = staging.absolutePath, sink = MediaStoreSink(app)),
+                receive = ReceiveTarget.Staged(stagingDir = staging.absolutePath, sink = receiveSink),
                 deviceName = settings.deviceName,
                 deviceType = DeviceType.PHONE,
                 keepAlive = KeepAliveProfile.MOBILE,
@@ -339,10 +344,12 @@ internal object CoreHostImpl {
             is HostEvent.TransferOffer -> refreshTransfers()
             is HostEvent.TransferComplete -> {
                 UriSource.transferEnded(ev.id)
+                sink?.transferEnded(ev.id)
                 refreshTransfers()
             }
             is HostEvent.TransferFailed -> {
                 UriSource.transferEnded(ev.id)
+                sink?.transferEnded(ev.id)
                 refreshTransfers()
             }
             is HostEvent.Battery -> peerStatus.update { all ->

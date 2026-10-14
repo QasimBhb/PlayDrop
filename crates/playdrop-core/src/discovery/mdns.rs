@@ -29,7 +29,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo};
+use mdns_sd::{ResolvedService, ScopedIp, ServiceDaemon, ServiceEvent, ServiceInfo, TxtProperties};
 use tokio::time::Instant;
 
 use super::advert::{hex, Advert};
@@ -115,8 +115,7 @@ fn reregister(daemon: &ServiceDaemon, shared: &Shared, current: &mut Option<Regi
 /// Parses a resolved record into an advert, then yields one processor input per resolved
 /// address (protocol.md 8.1). Returns `None` if the TXT record is unusable.
 pub fn resolved_advert(svc: &ResolvedService) -> Option<(Advert, Vec<(IpAddr, u32)>)> {
-    let entries = svc.txt_properties.iter().map(|p| (p.key(), p.val()));
-    let advert = Advert::from_txt(entries, svc.port)?;
+    let advert = txt_advert(&svc.txt_properties, svc.port)?;
     let addrs = svc
         .addresses
         .iter()
@@ -127,6 +126,12 @@ pub fn resolved_advert(svc: &ResolvedService) -> Option<(Advert, Vec<(IpAddr, u3
         })
         .collect();
     Some((advert, addrs))
+}
+
+/// Parses decoded TXT properties plus the SRV port into an advert (protocol.md 8.1). Shared
+/// by [`resolved_advert`] and the fuzz entry point, so both read TXT the same way (SR-33).
+pub(crate) fn txt_advert(props: &TxtProperties, srv_port: u16) -> Option<Advert> {
+    Advert::from_txt(props.iter().map(|p| (p.key(), p.val())), srv_port)
 }
 
 fn on_resolved(

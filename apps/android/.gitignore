@@ -7,3 +7,8 @@ local.properties
 captures/
 app/release/
 app/debug/
+
+# Release signing (docs/release/distribution.md). Never commit the key.
+keystore.properties
+*.jks
+*.keystore

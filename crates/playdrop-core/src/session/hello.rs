@@ -8,11 +8,14 @@ use super::util::is_device_id;
 pub const NAME_MAX_CHARS: usize = 64;
 
 /// Strips C0 and C1 controls (and DEL), bidi embeddings, overrides, isolates and marks, and
-/// line and paragraph separators, trims surrounding whitespace and cuts to 64 characters
-/// (protocol.md 5.4, SR-8). The result is display-only and never feeds a trust decision.
+/// line and paragraph separators, cuts to 64 characters and trims surrounding whitespace
+/// (protocol.md 5.4, SR-8). The trim runs after the cut, so a name cut in the middle of
+/// a word never ends in a space (found by the `session_json` fuzz target). The result is
+/// display-only and never feeds a trust decision.
 pub fn sanitize_name(name: &str) -> String {
     let cleaned: String = name.chars().filter(|&c| !is_stripped(c)).collect();
-    cleaned.trim().chars().take(NAME_MAX_CHARS).collect()
+    let cut: String = cleaned.trim().chars().take(NAME_MAX_CHARS).collect();
+    cut.trim_end().to_owned()
 }
 
 fn is_stripped(c: char) -> bool {
@@ -187,6 +190,9 @@ mod tests {
         let long = "é".repeat(100);
         assert_eq!(sanitize_name(&long).chars().count(), NAME_MAX_CHARS);
         assert_eq!(sanitize_name("Pixel 9"), "Pixel 9");
+        // A cut that lands on a space must not leave it behind.
+        let spaced = format!("{} 9", "x".repeat(NAME_MAX_CHARS - 1));
+        assert_eq!(sanitize_name(&spaced), "x".repeat(NAME_MAX_CHARS - 1));
     }
 
     #[test]

@@ -65,6 +65,26 @@ class FileNamesTest {
     }
 
     @Test
+    fun receivedDirsAreCleanedFolderNames() {
+        assertEquals(emptyList<String>(), FileNames.receivedDirs(listOf("a.txt")))
+        assertEquals(listOf("photos", "2026"), FileNames.receivedDirs(listOf("photos", "2026", "a.jpg")))
+        // Separators inside a component can never add a level or climb out (SR-17).
+        assertEquals(listOf("a_b", "c"), FileNames.receivedDirs(listOf("a/b", "..", "c", ".", "x")))
+        assertEquals(emptyList<String>(), FileNames.receivedDirs(emptyList()))
+    }
+
+    @Test
+    fun numberedNamesKeepTheExtension() {
+        assertEquals("a.txt", FileNames.numberedName("a.txt", 0))
+        assertEquals("a (1).txt", FileNames.numberedName("a.txt", 1))
+        assertEquals("a (12).JPG", FileNames.numberedName("a.JPG", 12))
+        assertEquals("archive.tar (2).gz", FileNames.numberedName("archive.tar.gz", 2))
+        assertEquals("noext (3)", FileNames.numberedName("noext", 3))
+        assertEquals(".bashrc (1)", FileNames.numberedName(".bashrc", 1))
+        assertEquals("trailing. (1)", FileNames.numberedName("trailing.", 1))
+    }
+
+    @Test
     fun riskyTypes() {
         assertTrue(FileNames.isRiskyToOpen("app.apk", null))
         assertTrue(FileNames.isRiskyToOpen("run.SH", null))

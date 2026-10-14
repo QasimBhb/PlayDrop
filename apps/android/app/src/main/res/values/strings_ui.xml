@@ -263,6 +263,31 @@
     <string name="ui_issue_other_network">No interface on the same network as %1$s</string>
     <string name="ui_issue_peer">%1$s not reached: %2$s failed (%3$s)</string>
 
+    <!-- Media control refused -->
+    <string name="ui_media_refused">%1$s has not allowed this phone to control its media. Turn on Media for this phone in PlayDrop on %1$s.</string>
+    <string name="ui_media_refused_other">The computer refused the media command: %1$s</string>
+
+    <!-- Can't find your computer -->
+    <string name="ui_help_link">Can\'t find your computer?</string>
+    <string name="ui_help_title">Can\'t find your computer?</string>
+    <string name="ui_help_intro">Pick the line that matches your network. Nothing here needs an account or the internet.</string>
+    <string name="ui_help_start_here">Start here</string>
+    <string name="ui_help_same_title">Same network, but nothing shows up</string>
+    <string name="ui_help_same_body">Mesh Wi-Fi, a VPN or a router that filters multicast can hide your computer even when both are on the same network. Pair without searching: show the QR code on one device and scan it on the other, or type the computer\'s address.</string>
+    <string name="ui_help_same_action">Pair by QR or address</string>
+    <string name="ui_help_hotspot_title">Guest, hotel or campus Wi-Fi</string>
+    <string name="ui_help_hotspot_body">These networks often stop devices from reaching each other, and no app can get around that. Turn on this phone\'s hotspot and connect the computer to it. PlayDrop finds the computer within seconds.</string>
+    <string name="ui_help_hotspot_action">Open hotspot settings</string>
+    <string name="ui_help_usb_title">USB tethering, the fastest fallback</string>
+    <string name="ui_help_usb_body">Plug the phone into the computer with a cable and turn on USB tethering. The computer gets a wired network to the phone, with no Wi-Fi in the way.</string>
+    <string name="ui_help_usb_action">Open tethering settings</string>
+    <string name="ui_help_vpn_title">Using a VPN</string>
+    <string name="ui_help_vpn_body">Turn on local network access in the VPN app, or pause the VPN while you pair and send. Many VPNs block traffic to nearby devices.</string>
+    <string name="ui_help_settings_missing">Could not open the settings screen. Open Settings, then Connections, then Mobile Hotspot and Tethering.</string>
+    <string name="ui_diag_help_suggest_same">Both devices look to be on one network. Pairing by QR or address works without discovery.</string>
+    <string name="ui_diag_help_suggest_other">The devices are on different networks. A hotspot or USB tethering puts them on one.</string>
+    <string name="ui_diag_help_suggest_generic">Still stuck?</string>
+
     <!-- Onboarding -->
     <string name="ui_onboarding_1_title">Your phone and computer, together</string>
     <string name="ui_onboarding_1_body">Send files to your computer in one tap, share the clipboard, ring a lost phone. Everything stays on your own network, with no account.</string>

@@ -127,17 +127,13 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
     }
 
     if let Some(loc) = locations {
-        let autostart_on = effective.autostart;
         let _ = tokio::task::spawn_blocking(move || {
             log_sync("D-Bus service file", autostart::sync_dbus_service(&loc));
-            if first_run {
-                log_sync(
-                    "autostart entry",
-                    autostart::sync_autostart(&loc, autostart_on),
-                );
-            }
         })
         .await;
+        if first_run {
+            daemon.shared.apply_autostart(effective.autostart).await;
+        }
     }
     daemon.shared.sync_clipboard_watcher().await;
     daemon.shared.start_media_watcher().await;
@@ -386,6 +382,9 @@ struct Shared {
     input_runners: Arc<InputRunners>,
     /// The local player watcher, when the platform has one.
     media: tokio::sync::Mutex<Option<media::Watcher>>,
+    /// Why start at login is not in effect (the Background portal refused or failed), for
+    /// `Diagnose`. Cleared by the next successful request.
+    autostart_problem: Mutex<Option<String>>,
 }
 
 impl Daemon {
@@ -430,6 +429,7 @@ impl Daemon {
             media_support: opts.media_support,
             input_runners,
             media: tokio::sync::Mutex::new(None),
+            autostart_problem: Mutex::new(None),
         });
         let weak = Arc::downgrade(&shared);
         shared.input_runners.set_ender(Box::new(move |_peer: &str| {
@@ -557,6 +557,102 @@ impl Shared {
         c.lock_state = Box::new((*self.lock).clone());
         c.accepts_input = self.input_support.supported;
         c
+    }
+
+    /// Puts the "Start at login" setting into effect: the XDG entry or the Run key, or
+    /// inside Flatpak a Background portal request whose answer arrives later
+    /// ([`Shared::autostart_answered`]).
+    async fn apply_autostart(self: &Arc<Self>, on: bool) {
+        let Some(loc) = self.autostart.clone() else {
+            return;
+        };
+        if loc.flatpak {
+            #[cfg(target_os = "linux")]
+            {
+                let weak = Arc::downgrade(self);
+                tokio::spawn(async move {
+                    let answer = autostart::background::request(on).await;
+                    if let Some(s) = weak.upgrade() {
+                        s.autostart_answered(on, answer).await;
+                    }
+                });
+            }
+            return;
+        }
+        let _ = tokio::task::spawn_blocking(move || {
+            log_sync("autostart entry", autostart::sync_autostart(&loc, on));
+        })
+        .await;
+    }
+
+    /// The Background portal's answer. A refusal turns the setting back off, so the switch
+    /// does not claim something the desktop will not do, and says so in a notification
+    /// and in `Diagnose` (anti-pattern 18).
+    #[cfg(target_os = "linux")]
+    async fn autostart_answered(
+        &self,
+        on: bool,
+        answer: anyhow::Result<autostart::background::Answer>,
+    ) {
+        use autostart::background::Answer;
+        let problem = match answer {
+            Ok(Answer::Allowed) => {
+                tracing::info!(on, "start at login set through the Background portal");
+                None
+            }
+            Ok(Answer::Denied(reason)) if on => {
+                tracing::warn!(reason, "start at login was not allowed");
+                self.notifier.info(
+                    "Start at login was not allowed",
+                    "Allow PlayDrop to run in the background in the system settings, then turn Start at login on again.",
+                );
+                self.turn_autostart_off().await;
+                Some(format!("start at login was not allowed: {reason}"))
+            }
+            Ok(Answer::Denied(reason)) => {
+                tracing::warn!(reason, "the login entry could not be removed");
+                Some(format!(
+                    "start at login could not be turned off: {reason}; remove PlayDrop from the startup apps in the system settings"
+                ))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "the Background portal is unavailable");
+                self.notifier
+                    .info("Start at login could not be set up", e.to_string());
+                Some(format!("start at login could not be set up: {e}"))
+            }
+        };
+        *lock_std(&self.autostart_problem) = problem;
+    }
+
+    /// Records "Start at login" as off, on disk and for every UI, without asking the
+    /// portal again.
+    #[cfg(target_os = "linux")]
+    async fn turn_autostart_off(&self) {
+        let _g = self.lifecycle.lock().await;
+        let persisted = {
+            let mut st = lock_std(&self.settings);
+            st.effective.autostart = false;
+            st.persisted.autostart = false;
+            st.persisted.clone()
+        };
+        let dir = self.data_dir.clone();
+        match tokio::task::spawn_blocking(move || settings::save(&dir, &persisted)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "settings not saved"),
+            Err(e) => tracing::warn!(error = %e, "settings not saved"),
+        }
+        self.emit(DaemonEvent::SettingsChanged {
+            settings: self.ipc_settings(),
+        });
+    }
+
+    /// Lines `Diagnose` adds after the network findings: a start-at-login problem, and
+    /// that KDE Connect running alongside is fine.
+    fn diagnose_notes(&self, port: u16) -> Vec<String> {
+        let mut notes: Vec<String> = lock_std(&self.autostart_problem).iter().cloned().collect();
+        notes.extend(probe::coexistence_note(port));
+        notes
     }
 
     /// The settings view a UI reads, with what the platform backends can do.
@@ -1019,13 +1115,7 @@ impl Shared {
         self.notifier.set_enabled(new.notifications);
         self.notifier.set_receive_dir(new.receive_dir.clone());
         if changes.autostart {
-            if let Some(loc) = self.autostart.clone() {
-                let on = new.autostart;
-                let _ = tokio::task::spawn_blocking(move || {
-                    log_sync("autostart entry", autostart::sync_autostart(&loc, on));
-                })
-                .await;
-            }
+            self.apply_autostart(new.autostart).await;
         }
         self.clipboard_images
             .store(new.clipboard_images, Ordering::SeqCst);
@@ -1087,7 +1177,8 @@ impl Shared {
             Request::Diagnose => {
                 let core = host.diagnose();
                 let port = probe::probe(core.port, &core.interfaces).await;
-                let summary = probe::summary(&core, &port);
+                let mut summary = probe::summary(&core, &port);
+                summary.extend(self.diagnose_notes(core.port));
                 Ok(IpcOk::Diagnostics(DiagnosticsReport {
                     core,
                     port,
@@ -1210,6 +1301,15 @@ impl Shared {
                 let ended = host.stop_input_sessions();
                 tracing::info!(count = ended.len(), "remote input stopped from the UI");
                 Ok(IpcOk::Done)
+            }
+            Request::MediaCommand {
+                peer,
+                player,
+                action,
+                value,
+            } => {
+                let id = resolve_online(&host, &peer)?;
+                done(host.send_media_command(&id, &player, action, value))
             }
             _ => Err(err(
                 ErrorCode::BadRequest,

@@ -43,6 +43,7 @@ import androidx.compose.material3.PrimaryTabRow
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Tab
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -81,7 +82,7 @@ import org.playdrop.core.AddDeviceCandidate
 
 /** The Add device screen wired to its view model, the camera permission and the scanner. */
 @Composable
-fun AddDeviceRoute(onBack: () -> Unit, showMessage: (String) -> Unit, vm: AddDeviceViewModel = viewModel()) {
+fun AddDeviceRoute(onBack: () -> Unit, onHelp: () -> Unit, showMessage: (String) -> Unit, vm: AddDeviceViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     CollectMessages(vm.messages, showMessage)
@@ -107,6 +108,7 @@ fun AddDeviceRoute(onBack: () -> Unit, showMessage: (String) -> Unit, vm: AddDev
         onPairTyped = vm::pairTyped,
         onReopen = vm::openWindow,
         onNewQr = vm::showQr,
+        onHelp = onHelp,
         scanner = {
             when {
                 cameraGranted -> QrScanner(
@@ -134,6 +136,7 @@ fun AddDeviceScreen(
     onPairTyped: (String) -> Unit,
     onReopen: () -> Unit,
     onNewQr: () -> Unit,
+    onHelp: () -> Unit,
     scanner: @Composable () -> Unit,
 ) {
     Scaffold(
@@ -164,7 +167,7 @@ fun AddDeviceScreen(
                 }
             }
             when (state.mode) {
-                AddMode.NEARBY -> NearbyTab(state, onPair, onPairTyped, onReopen)
+                AddMode.NEARBY -> NearbyTab(state, onPair, onPairTyped, onReopen, onHelp)
                 AddMode.SHOW_QR -> ShowQrTab(state, onNewQr)
                 AddMode.SCAN_QR -> ScanQrTab(scanner)
             }
@@ -178,6 +181,7 @@ private fun NearbyTab(
     onPair: (AddDeviceCandidate) -> Unit,
     onPairTyped: (String) -> Unit,
     onReopen: () -> Unit,
+    onHelp: () -> Unit,
 ) {
     var typed by rememberSaveable { mutableStateOf("") }
     Column(
@@ -235,6 +239,7 @@ private fun NearbyTab(
                 Text(stringResource(R.string.ui_add_pair))
             }
         }
+        TextButton(onClick = onHelp) { Text(stringResource(R.string.ui_help_link)) }
     }
 }
 
@@ -318,7 +323,7 @@ private const val QR_PIXELS = 720
 @Composable
 private fun AddDeviceNearbyPreview() {
     PlayDropTheme {
-        AddDeviceScreen(Samples.addDeviceState, {}, {}, {}, {}, {}, {}, scanner = {})
+        AddDeviceScreen(Samples.addDeviceState, {}, {}, {}, {}, {}, {}, {}, scanner = {})
     }
 }
 
@@ -328,7 +333,7 @@ private fun AddDeviceQrPreview() {
     PlayDropTheme {
         AddDeviceScreen(
             Samples.addDeviceState.copy(mode = AddMode.SHOW_QR, qrUri = "playdrop://pair?preview", qrSecsLeft = 95),
-            {}, {}, {}, {}, {}, {}, scanner = {},
+            {}, {}, {}, {}, {}, {}, {}, scanner = {},
         )
     }
 }

@@ -1,5 +1,6 @@
 //! Diagnostics screen: run `Diagnose`, show the summary first and the layers after, and
-//! tell the daemon the network changed.
+//! tell the daemon the network changed. A failed layer brings up the "Can't find your
+//! device?" panel with the fix the summary points at first.
 
 use std::rc::Rc;
 
@@ -8,7 +9,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use super::{with, Controller};
 use crate::model;
-use crate::{App, DiagnosticsState};
+use crate::{App, DiagnosticsState, HelpState};
 
 pub(super) fn install(app: &App) {
     let d = app.global::<DiagnosticsState>();
@@ -51,6 +52,13 @@ pub fn refresh(c: &Controller) {
                 match r {
                     Result::Ok(Ok::Diagnostics(report)) => {
                         let (summary, sections) = model::diagnostics_view(&report);
+                        d.set_failed(model::network_failed(&summary));
+                        if let Some(app) = c.app() {
+                            let (focus, fix) = model::help_focus(&summary);
+                            let help = app.global::<HelpState>();
+                            help.set_focus(focus);
+                            help.set_firewall_fix(fix.into());
+                        }
                         let summary: Vec<SharedString> =
                             summary.into_iter().map(SharedString::from).collect();
                         d.set_summary(ModelRc::from(Rc::new(VecModel::from(summary))));

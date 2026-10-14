@@ -8,7 +8,8 @@
 ## One-time setup
 
 ```sh
-flatpak install --user flathub org.flatpak.Builder \
+flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+flatpak install --user -y flathub org.flatpak.Builder \
     org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08 \
     org.freedesktop.Sdk.Extension.rust-stable//25.08
 ```
@@ -16,38 +17,59 @@ flatpak install --user flathub org.flatpak.Builder \
 (A distro `flatpak-builder` package works too; replace `flatpak run org.flatpak.Builder`
 with `flatpak-builder` below.)
 
-## Generate the vendored crate list
+## The vendored crate list (`cargo-sources.json`)
 
-The build runs cargo offline, so every crate in `Cargo.lock` must be listed as a download
-in `cargo-sources.json`. Regenerate it whenever `Cargo.lock` changes, from the repo root:
+The build runs cargo offline, so every crate in `Cargo.lock` is listed as a download in
+`cargo-sources.json`. The file is committed, as Flathub expects, and must be regenerated
+whenever `Cargo.lock` changes:
 
 ```sh
-git clone --depth 1 https://github.com/flatpak/flatpak-builder-tools ../flatpak-builder-tools
-python3 -m pip install --user aiohttp tomlkit
-python3 ../flatpak-builder-tools/cargo/flatpak-cargo-generator.py \
-    Cargo.lock -o packaging/flatpak/cargo-sources.json
+packaging/flatpak/update-sources.sh
 ```
 
-The generated file also writes a cargo config into `CARGO_HOME` that redirects crates.io
-to the vendored copies, which is why the manifest sets `CARGO_HOME`.
+The script clones flatpak-builder-tools into `~/.cache/playdrop/` (never into the repo) and
+runs its `cargo/flatpak-cargo-generator.py`. It needs `aiohttp` and `tomlkit`: with
+[uv](https://docs.astral.sh/uv/) installed it fetches them into uv's cache and installs
+nothing system-wide; without uv, `python3` must already have them. The generated file also
+writes a cargo config into `CARGO_HOME` that redirects crates.io to the vendored copies,
+which is why the manifest sets `CARGO_HOME`.
 
-## Build and install
+## Build, install and run
 
-From `packaging/flatpak/` (the manifest's source path is `../..`, the repo root):
+Run from `packaging/flatpak/` (the manifest's source path is `../..`, the repo root). Keep
+the build and state directories on a Linux filesystem (ext4, btrfs) outside the repo:
+flatpak-builder needs hard links, ownership and extended attributes, which an NTFS or
+exFAT drive does not give it, and on this machine the repo lives on one. `~/.cache` works:
 
 ```sh
 cd packaging/flatpak
-flatpak run org.flatpak.Builder --user --install --force-clean build-dir org.playdrop.PlayDrop.yml
-flatpak run org.playdrop.PlayDrop                              # the window
-flatpak run --command=playdropd org.playdrop.PlayDrop          # the daemon
+B=~/.cache/playdrop-flatpak
+flatpak run org.flatpak.Builder --user --install-deps-from=flathub --force-clean \
+    --state-dir="$B/state" --repo="$B/repo" "$B/build-dir" org.playdrop.PlayDrop.yml
 ```
 
-A single-file bundle for testing on another machine:
+Do not put the state or build directory under `/tmp` when `/tmp` is private to the shell
+that starts the build: `org.flatpak.Builder` runs build commands through the host, which
+then cannot see the directory ("Failed to change to directory").
+
+Single-file bundle, then install it user-level and run:
 
 ```sh
-flatpak run org.flatpak.Builder --repo=repo --force-clean build-dir org.playdrop.PlayDrop.yml
-flatpak build-bundle repo playdrop.flatpak org.playdrop.PlayDrop
+flatpak build-bundle --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
+    "$B/repo" playdrop.flatpak org.playdrop.PlayDrop
+flatpak install --user -y ./playdrop.flatpak
+flatpak run org.playdrop.PlayDrop                              # the window
+flatpak run --command=playdropd org.playdrop.PlayDrop          # the daemon
+flatpak run --command=playdropd org.playdrop.PlayDrop --help   # smoke test, no display needed
 ```
+
+`playdrop.flatpak` lands in `packaging/flatpak/`, which `packaging/.gitignore` ignores
+(`*.flatpak`). To install straight from the build instead, add `--install` to the builder
+command. Remove with `flatpak uninstall --user org.playdrop.PlayDrop`.
+
+CI builds the same bundle for every release in `.github/workflows/release.yml` with
+Flathub's `flatpak-github-actions` image for runtime 25.08; change that image tag together
+with `runtime-version` in the manifest.
 
 Lint before a Flathub submission:
 `flatpak run --command=flatpak-builder-lint org.flatpak.Builder manifest org.playdrop.PlayDrop.yml`.
@@ -64,12 +86,17 @@ The `finish-args` list is fixed. Each entry has a comment in the manifest.
 | `--talk-name=org.freedesktop.Notifications` | Notifications |
 | `--system-talk-name=org.freedesktop.login1` | Suspend and resume signals (system bus) |
 | `--talk-name=org.freedesktop.FileManager1` | "Show in folder" |
+| `--talk-name=org.mpris.MediaPlayer2.*` | Media control (Phase 5): list MPRIS players and send play, pause and next |
 | `--filesystem=xdg-download/PlayDrop:create` | The receive folder, `~/Downloads/PlayDrop` |
 
 No bus permission is needed for the daemon's IPC name `org.playdrop.PlayDrop.Daemon1`:
 Flatpak's default session bus policy lets an app own its own namespace (`$FLATPAK_ID` and
 every name under it), and owning a name includes talking to it, so the window reaches the
 daemon without `--own-name` or `--talk-name`.
+
+Portals need no permission: `org.freedesktop.portal.Desktop` is reachable from every
+sandbox, so the RemoteDesktop portal (remote input; it asks the user for consent itself),
+the Background portal (autostart) and the file chooser portal work without an entry.
 
 Never added: `--socket=session-bus` (PLAN.md anti-pattern 16) and `--filesystem=home`.
 Files to send are chosen through the file chooser portal, which grants access to just the
@@ -107,7 +134,20 @@ so the deb's approach does not carry over:
 
 ## What has been verified
 
-- The manifest parses as YAML, and the desktop and metainfo files pass
-  `desktop-file-validate` and `appstreamcli validate`.
-- Not yet built: `flatpak-builder` was not available on the machine where this was
-  written, and a build needs network access to fetch the runtime and crates.
+On 2026-10-13, on Pop!_OS with Flatpak 1.18.1 and `org.flatpak.Builder`:
+
+- `update-sources.sh` regenerated `cargo-sources.json` (753 crates) byte for byte.
+- The build above finished offline from the vendored crates, `flatpak build-bundle` wrote a
+  12 MB bundle, it installed with `flatpak install --user`, and
+  `flatpak run --command=playdropd org.playdrop.PlayDrop --help` ran inside the sandbox.
+  `flatpak info --show-permissions` listed exactly the `finish-args` above. Flatpak
+  exported the D-Bus activation file with `Exec` rewritten to `flatpak run ...
+  --command=/app/bin/playdropd`.
+- The desktop and metainfo files pass `desktop-file-validate` and
+  `appstreamcli validate --pedantic` (one pedantic note: the app ID has upper-case letters).
+- The window was not opened from the Flatpak, and nothing was sent to or from it yet.
+- `flatpak-builder-lint manifest` reports two errors that only matter for a Flathub
+  submission: `finish-args-login1-system-talk-name` (Flathub wants a justification or the
+  portal's power signals instead) and `appid-url-not-reachable` (Flathub expects the app ID
+  to match a domain the project controls, for example `io.github.qasimbhb.PlayDrop`). Both
+  need a decision before any Flathub submission; GitHub release bundles are unaffected.

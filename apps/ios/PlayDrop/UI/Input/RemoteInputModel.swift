@@ -185,7 +185,7 @@ final class RemoteInputModel {
 
     /// True for a `peerRefused` event about our input frames.
     nonisolated static func isInputRefusal(frameType: String?, code: String) -> Bool {
-        frameType == "input" && code == "forbidden"
+        PeerRefusals.feature(frameType: frameType, code: code) == .input
     }
 
     /// True when a `sendInput` failure means the peer refuses this kind of input.

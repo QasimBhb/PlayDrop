@@ -1,0 +1,1 @@
+{"id":"0123456789abcdef0123456789abcdef","chunkSize":65536,"totalBytes":0,"files":[{"fid":0,"path":["a"],"size":0,"mtime":-1,"inBundle":true},{"fid":1,"path":["b","c"],"size":0,"mtime":0}],"bundle":{"size":1536}}

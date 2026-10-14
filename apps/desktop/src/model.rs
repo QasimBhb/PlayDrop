@@ -16,12 +16,13 @@ use playdrop_core::host::{
     TransferSnapshot, TransferStatus,
 };
 use playdrop_core::pin_store::Grants;
+use playdrop_core::session::types::MediaAction;
 use playdrop_ipc::{
     DaemonEvent, DiagnosticsReport, Event, FirewallHint, PortProbe, Settings, Status,
 };
 use slint::{ModelRc, SharedString, VecModel};
 
-use crate::{CandidateRow, DeviceRow, DiagSection, TransferRow};
+use crate::{CandidateRow, DeviceRow, DiagSection, HelpFocus, MediaRow, TransferRow};
 
 /// The daemon's default port, used when a typed address has none (protocol.md section 1).
 pub const DEFAULT_PORT: u16 = 42187;
@@ -228,7 +229,21 @@ pub struct Store {
     /// Peers with a remote input session open on this desktop (SR-25), as hex Device ID
     /// and label, in the order they started.
     pub input_sessions: Vec<(String, String)>,
+    /// When this window last turned "Start at login" on, Unix seconds. Inside Flatpak the
+    /// daemon asks the Background portal after answering, and turns the setting back off
+    /// when the user or the desktop refuses.
+    pub autostart_asked_at: Option<u64>,
+    /// The daemon turned "Start at login" back off soon after this window turned it on:
+    /// the desktop did not allow it. Shown under the switch until it is flipped again.
+    pub autostart_refused: bool,
 }
+
+/// How long after turning "Start at login" on a switch back to off reads as a refusal
+/// (the portal's dialog waits up to two minutes for an answer).
+const AUTOSTART_ANSWER_SECS: u64 = 300;
+
+/// What the window says when the desktop refused "Start at login".
+pub const AUTOSTART_REFUSED: &str = "Start at login was not allowed. Allow PlayDrop to run in the background in the system settings, then turn it on again.";
 
 impl Store {
     /// Replaces the status, and seeds the remote input sessions from its `input_from`
@@ -257,6 +272,12 @@ impl Store {
         if let Some(s) = self.status.as_mut() {
             s.settings = settings;
         }
+    }
+
+    /// Records that this window turned "Start at login" on or off at `now`.
+    pub fn autostart_set(&mut self, on: bool, now: u64) {
+        self.autostart_asked_at = on.then_some(now);
+        self.autostart_refused = false;
     }
 
     /// Whether the daemon says the desktop is locked (SR-6).
@@ -360,15 +381,29 @@ impl Store {
     pub fn apply(&mut self, event: Event, now: u64) -> Vec<Change> {
         match event {
             Event::Host(e) => self.apply_host(e, now),
-            Event::Daemon(e) => self.apply_daemon(e),
+            Event::Daemon(e) => self.apply_daemon(e, now),
             _ => Vec::new(),
         }
     }
 
-    fn apply_daemon(&mut self, event: DaemonEvent) -> Vec<Change> {
+    fn apply_daemon(&mut self, event: DaemonEvent, now: u64) -> Vec<Change> {
         match event {
             DaemonEvent::SettingsChanged { settings } => {
+                let was_on = self.status.as_ref().is_some_and(|s| s.settings.autostart);
+                let refused = was_on
+                    && !settings.autostart
+                    && self
+                        .autostart_asked_at
+                        .is_some_and(|t| now.saturating_sub(t) <= AUTOSTART_ANSWER_SECS);
                 self.set_settings(settings);
+                if refused {
+                    self.autostart_asked_at = None;
+                    self.autostart_refused = true;
+                    return vec![
+                        Change::Settings,
+                        Change::Notice(AUTOSTART_REFUSED.to_owned(), true),
+                    ];
+                }
                 vec![Change::Settings]
             }
             DaemonEvent::ClipboardPushed { sent_to } => {
@@ -487,13 +522,13 @@ impl Store {
                 code,
                 ..
             } => {
-                let feature = refused_feature(frame_type.as_deref());
                 if code == "forbidden" {
                     vec![Change::Notice(
-                        format!("{} does not allow {feature}", self.peer_name(&peer)),
+                        refusal_text(&self.peer_name(&peer), frame_type.as_deref()),
                         true,
                     )]
                 } else {
+                    let feature = refused_feature(frame_type.as_deref());
                     tracing::debug!(code, feature, "peer refused a frame");
                     Vec::new()
                 }
@@ -734,15 +769,6 @@ pub fn merge_media(players: &mut Vec<MediaState>, state: MediaState) {
     }
 }
 
-/// The player a device row shows: the most recent one that is playing, else the most
-/// recent one.
-pub fn shown_player(players: &[MediaState]) -> Option<&MediaState> {
-    players
-        .iter()
-        .find(|m| m.playing)
-        .or_else(|| players.first())
-}
-
 /// The feature a peer refused, from the type of the frame we sent, for "<peer> does not
 /// allow <feature>".
 pub fn refused_feature(frame_type: Option<&str>) -> String {
@@ -754,6 +780,17 @@ pub fn refused_feature(frame_type: Option<&str>) -> String {
         Some(other) => other.to_owned(),
         None => "that request".to_owned(),
     }
+}
+
+/// The notice for a `forbidden` refusal. Media control says what to do about it, since
+/// the grant lives on the other device and only its user can turn it on.
+pub fn refusal_text(peer: &str, frame_type: Option<&str>) -> String {
+    if frame_type == Some("media") {
+        return format!(
+            "{peer} has not allowed this computer to control its media. Turn on Media for this computer on {peer}."
+        );
+    }
+    format!("{peer} does not allow {}", refused_feature(frame_type))
 }
 
 /// Whether a peer accepts remote input (any `input.*` capability). The desktop does not
@@ -990,7 +1027,11 @@ pub fn device_row(p: &PeerView, now: u64) -> DeviceRow {
         p.last_seen
             .map_or_else(|| "never".to_owned(), |t| format_ago(t, now))
     };
-    let media = shown_player(&p.media);
+    let can_control_media = p.capabilities.iter().any(|c| c == MEDIA_CONTROL);
+    let players: Vec<MediaRow> = ordered_players(&p.media)
+        .into_iter()
+        .map(|m| media_row(m, can_control_media))
+        .collect();
     DeviceRow {
         id: p.device_id.as_str().into(),
         label: p.label.as_str().into(),
@@ -1008,10 +1049,70 @@ pub fn device_row(p: &PeerView, now: u64) -> DeviceRow {
         grant_input: p.grants.input,
         grant_media: p.grants.media,
         can_be_controlled: can_be_controlled(&p.capabilities),
-        media_visible: media.is_some(),
-        media_title: media.map(|m| media_title(m).into()).unwrap_or_default(),
-        media_detail: media.map(|m| media_detail(m).into()).unwrap_or_default(),
-        media_playing: media.is_some_and(|m| m.playing),
+        can_control_media,
+        players: ModelRc::new(VecModel::from(players)),
+    }
+}
+
+/// The capability a peer lists when it takes media commands (protocol.md 5.9).
+pub const MEDIA_CONTROL: &str = "media.control";
+
+/// The players a device row lists: the playing ones first, then the rest, each group most
+/// recently updated first.
+pub fn ordered_players(players: &[MediaState]) -> Vec<&MediaState> {
+    let (mut playing, idle): (Vec<_>, Vec<_>) = players.iter().partition(|m| m.playing);
+    playing.extend(idle);
+    playing
+}
+
+/// One player as a Slint row. Every control is offered only when the player lists the
+/// action and the device takes commands at all (anti-pattern 18: no button that cannot
+/// work).
+pub fn media_row(m: &MediaState, controllable: bool) -> MediaRow {
+    let can = |a: MediaAction| controllable && m.can.contains(&a);
+    let toggle = toggle_action(m).filter(|_| controllable);
+    MediaRow {
+        player: m.player.as_str().into(),
+        title: media_title(m).into(),
+        detail: media_detail(m).into(),
+        playing: m.playing,
+        can_previous: can(MediaAction::Previous),
+        can_next: can(MediaAction::Next),
+        toggle_action: toggle
+            .map(|a| a.as_str().to_owned())
+            .unwrap_or_default()
+            .into(),
+        has_volume: can(MediaAction::Volume) && m.volume.is_some(),
+        volume: i32::from(m.volume.unwrap_or(0).min(100)),
+    }
+}
+
+/// What the play/pause button sends: `playPause` when the player has it, else `pause`
+/// while playing or `play` while paused, when that one is listed.
+pub fn toggle_action(m: &MediaState) -> Option<MediaAction> {
+    if m.can.contains(&MediaAction::PlayPause) {
+        return Some(MediaAction::PlayPause);
+    }
+    let want = if m.playing {
+        MediaAction::Pause
+    } else {
+        MediaAction::Play
+    };
+    m.can.contains(&want).then_some(want)
+}
+
+/// A media command from the UI: the action in wire spelling and, for `volume`, the level.
+/// `None` for an action this window never sends.
+pub fn media_command(action: &str, volume: i32) -> Option<(MediaAction, Option<u64>)> {
+    let action = MediaAction::from_wire(action);
+    match action {
+        MediaAction::Play
+        | MediaAction::Pause
+        | MediaAction::PlayPause
+        | MediaAction::Next
+        | MediaAction::Previous => Some((action, None)),
+        MediaAction::Volume => Some((action, u64::try_from(volume.clamp(0, 100)).ok())),
+        _ => None,
     }
 }
 
@@ -1198,6 +1299,48 @@ pub fn diagnostics_view(report: &DiagnosticsReport) -> (Vec<String>, Vec<DiagSec
         sections.push(firewall_section(fw, report.port.port));
     }
     (report.summary.clone(), sections)
+}
+
+/// The daemon's summary line when nothing is wrong (`playdropd` `probe::ALL_FINE`).
+const ALL_FINE: &str = "all paths fine";
+
+/// Summary lines that are not a discovery problem: information such as KDE Connect being
+/// installed alongside, and the start-at-login refusal. They never open the help panel.
+const NOT_NETWORK: [&str; 2] = ["note: ", "start at login"];
+
+/// Whether the Diagnose summary reports a failed network layer, which shows the "Can't
+/// find your device?" panel on the Diagnostics page.
+pub fn network_failed(summary: &[String]) -> bool {
+    summary
+        .iter()
+        .any(|l| l != ALL_FINE && !NOT_NETWORK.iter().any(|p| l.starts_with(p)))
+}
+
+/// Which way out the help panel puts first, from the Diagnose summary, and the firewall
+/// command when that is the fix. Only unambiguous lines pick one: a firewall that blocks
+/// the port (its own command), multicast blocked (pair by QR or address, then dial
+/// directly), no interface on the peer's network (hotspot or USB tether). Anything else
+/// leaves the panel in its usual order.
+pub fn help_focus(summary: &[String]) -> (HelpFocus, String) {
+    if let Some(line) = summary
+        .iter()
+        .find(|l| l.contains("blocked by the host firewall"))
+    {
+        let fix = line.split('`').nth(1).unwrap_or_default().to_owned();
+        if !fix.is_empty() {
+            return (HelpFocus::Firewall, fix);
+        }
+    }
+    if summary
+        .iter()
+        .any(|l| l.starts_with("no interface on the same network as"))
+    {
+        return (HelpFocus::HotspotOrUsb, String::new());
+    }
+    if summary.iter().any(|l| l.starts_with("multicast blocked")) {
+        return (HelpFocus::QrOrAddress, String::new());
+    }
+    (HelpFocus::None, String::new())
 }
 
 fn interfaces_section(core: &Diagnostics) -> DiagSection {
@@ -1561,6 +1704,19 @@ mod tests {
                 true
             )]
         );
+        let media_refused = HostEvent::PeerRefused {
+            peer: "aa".into(),
+            frame_type: Some("media".into()),
+            code: "forbidden".into(),
+            message: None,
+        };
+        assert_eq!(
+            s.apply(Event::Host(media_refused), 2),
+            vec![Change::Notice(
+                "Phone has not allowed this computer to control its media. Turn on Media for this computer on Phone.".into(),
+                true
+            )]
+        );
         // Other codes are not the user's to act on here.
         let other = HostEvent::PeerRefused {
             peer: "aa".into(),
@@ -1576,7 +1732,7 @@ mod tests {
         let mut s = Store::default();
         s.set_peers(vec![peer("aa", true)], 1000);
         let row = device_row(&s.peers[0], 1000);
-        assert!(!row.media_visible);
+        assert_eq!(row.players.row_count(), 0);
         let ch = s.apply(
             Event::Host(HostEvent::MediaState {
                 peer: "aa".into(),
@@ -1586,9 +1742,12 @@ mod tests {
         );
         assert_eq!(ch, vec![Change::Peer(0)]);
         let row = device_row(&s.peers[0], 1001);
-        assert!(row.media_visible && row.media_playing);
-        assert_eq!(row.media_title, "Song");
-        assert_eq!(row.media_detail, "Band · Spotify · Playing");
+        let m = row.players.row_data(0).unwrap();
+        assert!(m.playing);
+        assert_eq!(m.title, "Song");
+        assert_eq!(m.detail, "Band · Spotify · Playing");
+        // The device does not list `media.control`: state only, no buttons.
+        assert!(!row.can_control_media && m.toggle_action.is_empty());
 
         // Paused but still controllable: kept, shown as paused.
         s.apply(
@@ -1599,8 +1758,9 @@ mod tests {
             1002,
         );
         let row = device_row(&s.peers[0], 1002);
-        assert!(row.media_visible && !row.media_playing);
-        assert_eq!(row.media_detail, "Band · Spotify · Paused");
+        let m = row.players.row_data(0).unwrap();
+        assert!(!m.playing);
+        assert_eq!(m.detail, "Band · Spotify · Paused");
 
         // A reload keeps it while online with the media grant.
         s.set_peers(vec![peer("aa", true)], 1003);
@@ -1612,7 +1772,7 @@ mod tests {
             ..Grants::default()
         };
         s.set_peer_grants(0, no_media);
-        assert!(!device_row(&s.peers[0], 1003).media_visible);
+        assert_eq!(device_row(&s.peers[0], 1003).players.row_count(), 0);
 
         // Going offline drops it too.
         s.set_peer_grants(0, Grants::default());
@@ -1635,13 +1795,17 @@ mod tests {
         assert_eq!(players.len(), 2);
         // Most recent first, but a playing player is the one shown.
         assert_eq!(players[0].player, "b");
-        assert_eq!(shown_player(&players).unwrap().player, "a");
+        let order: Vec<_> = ordered_players(&players)
+            .iter()
+            .map(|m| m.player.as_str())
+            .collect();
+        assert_eq!(order, ["a", "b"]);
         // Not playing and nothing it can do: the player is gone.
         merge_media(&mut players, media("a", false, Vec::new()));
         assert_eq!(players.len(), 1);
-        assert_eq!(shown_player(&players).unwrap().player, "b");
+        assert_eq!(players[0].player, "b");
         merge_media(&mut players, media("b", false, Vec::new()));
-        assert!(players.is_empty() && shown_player(&players).is_none());
+        assert!(players.is_empty() && ordered_players(&players).is_empty());
         // A gone state for a player never seen adds nothing.
         merge_media(&mut players, media("z", false, Vec::new()));
         assert!(players.is_empty());
@@ -1651,6 +1815,55 @@ mod tests {
         untitled.artist = None;
         assert_eq!(media_title(&untitled), "Spotify");
         assert_eq!(media_detail(&untitled), "Spotify · Playing");
+    }
+
+    #[test]
+    fn media_controls_follow_the_actions_the_player_lists() {
+        use MediaAction as A;
+        let all = vec![A::Previous, A::PlayPause, A::Next, A::Volume];
+        let mut m = media("spotify", true, all);
+        m.volume = Some(40);
+        let row = media_row(&m, true);
+        assert!(row.can_previous && row.can_next && row.has_volume);
+        assert_eq!(row.toggle_action, "playPause");
+        assert_eq!(row.volume, 40);
+        // Without `media.control` on the device nothing is offered.
+        let row = media_row(&m, false);
+        assert!(!row.can_previous && !row.can_next && !row.has_volume);
+        assert!(row.toggle_action.is_empty());
+        // Volume needs both the action and a reported level.
+        m.volume = None;
+        assert!(!media_row(&m, true).has_volume);
+
+        // No playPause: pause while playing, play while paused, nothing when not listed.
+        let playing = media("a", true, vec![A::Play, A::Pause]);
+        assert_eq!(toggle_action(&playing), Some(A::Pause));
+        let paused = media("a", false, vec![A::Play, A::Pause]);
+        assert_eq!(toggle_action(&paused), Some(A::Play));
+        let stuck = media("a", true, vec![A::Play, A::Next]);
+        assert_eq!(toggle_action(&stuck), None);
+        let row = media_row(&stuck, true);
+        assert!(row.toggle_action.is_empty() && row.can_next && !row.can_previous);
+
+        // The row turns controls on once the device lists `media.control`.
+        let mut s = Store::default();
+        let mut p = peer("aa", true);
+        p.capabilities = vec![MEDIA_CONTROL.into()];
+        s.set_peers(vec![p], 1000);
+        merge_media(
+            &mut s.peers[0].media,
+            media("spotify", false, vec![A::Play]),
+        );
+        let row = device_row(&s.peers[0], 1000);
+        assert!(row.can_control_media);
+        assert_eq!(row.players.row_data(0).unwrap().toggle_action, "play");
+
+        assert_eq!(media_command("playPause", 0), Some((A::PlayPause, None)));
+        assert_eq!(media_command("next", 0), Some((A::Next, None)));
+        assert_eq!(media_command("volume", 140), Some((A::Volume, Some(100))));
+        assert_eq!(media_command("volume", -3), Some((A::Volume, Some(0))));
+        assert_eq!(media_command("seek", 5), None);
+        assert_eq!(media_command("bogus", 0), None);
     }
 
     #[test]
@@ -2051,6 +2264,51 @@ mod tests {
     }
 
     #[test]
+    fn autostart_switched_back_off_reads_as_refused() {
+        let mut s = Store::default();
+        s.set_status(Status {
+            device_id: "aa".into(),
+            short_id: "K3QD".into(),
+            addr: "0.0.0.0:42187".parse().unwrap(),
+            daemon_version: "0".into(),
+            ipc_version: 1,
+            settings: settings(true, None),
+            add_device_window_open: false,
+            locked: false,
+            input_from: Vec::new(),
+        });
+        let changed = |on: bool| {
+            Event::Daemon(DaemonEvent::SettingsChanged {
+                settings: Settings {
+                    autostart: on,
+                    ..settings(true, None)
+                },
+            })
+        };
+        // This window turned it on; the daemon confirms, then the portal refuses.
+        s.autostart_set(true, 100);
+        assert_eq!(s.apply(changed(true), 101), vec![Change::Settings]);
+        assert_eq!(
+            s.apply(changed(false), 160),
+            vec![
+                Change::Settings,
+                Change::Notice(AUTOSTART_REFUSED.into(), true)
+            ]
+        );
+        assert!(s.autostart_refused);
+        // Flipping it again clears the note.
+        s.autostart_set(false, 200);
+        assert!(!s.autostart_refused);
+        // Turned off long after, or by someone else: not a refusal.
+        s.apply(changed(true), 201);
+        assert_eq!(s.apply(changed(false), 202), vec![Change::Settings]);
+        s.autostart_set(true, 300);
+        s.apply(changed(true), 301);
+        assert_eq!(s.apply(changed(false), 301 + 600), vec![Change::Settings]);
+        assert!(!s.autostart_refused);
+    }
+
+    #[test]
     fn daemon_events() {
         let mut s = Store::default();
         assert_eq!(
@@ -2066,6 +2324,41 @@ mod tests {
             "Clipboard not sent: no online device accepts it"
         );
         assert_eq!(clipboard_sent_text(2), "Clipboard sent to 2 devices");
+    }
+
+    #[test]
+    fn diagnose_summary_picks_the_help_panel_focus() {
+        let lines = |l: &[&str]| l.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(!network_failed(&lines(&["all paths fine"])));
+        assert!(!network_failed(&lines(&[
+            "all paths fine",
+            "note: port 1716 is in use by KDE Connect or GSConnect; that is fine",
+            "start at login was not allowed: the request was denied",
+        ])));
+        assert!(network_failed(&lines(&["mDNS failed: no route"])));
+
+        let fw = lines(&[
+            "multicast blocked on 10.0.0.5: No such device",
+            "port 42187 blocked by the host firewall (ufw): run `sudo ufw allow 42187`",
+        ]);
+        assert_eq!(
+            help_focus(&fw),
+            (HelpFocus::Firewall, "sudo ufw allow 42187".to_owned())
+        );
+        let net = lines(&[
+            "multicast blocked on 10.0.0.5: No such device",
+            "no interface on the same network as Phone",
+        ]);
+        assert_eq!(help_focus(&net), (HelpFocus::HotspotOrUsb, String::new()));
+        let mc = lines(&["multicast blocked on 192.168.1.10: no beacon heard although Laptop is connected on this network"]);
+        assert_eq!(help_focus(&mc), (HelpFocus::QrOrAddress, String::new()));
+        // Ambiguous findings keep the usual order.
+        let other = lines(&["Phone not reached: mDNS failed (connection refused)"]);
+        assert_eq!(help_focus(&other), (HelpFocus::None, String::new()));
+        assert_eq!(
+            help_focus(&lines(&["all paths fine"])),
+            (HelpFocus::None, String::new())
+        );
     }
 
     #[test]

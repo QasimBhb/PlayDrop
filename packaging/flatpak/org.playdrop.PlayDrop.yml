@@ -40,6 +40,15 @@ finish-args:
   - --system-talk-name=org.freedesktop.login1
   # "Show in folder" after a transfer.
   - --talk-name=org.freedesktop.FileManager1
+  # Media control (Phase 5): the daemon lists MPRIS players and forwards play,
+  # pause and next from a paired phone that holds the media grant. Every player
+  # owns a name under org.mpris.MediaPlayer2.*, so the wildcard is the narrowest
+  # rule that reaches them; it grants talking only, never owning.
+  - --talk-name=org.mpris.MediaPlayer2.*
+  # Not listed on purpose: org.freedesktop.portal.Desktop. Portals are reachable
+  # from every sandbox by default, so the RemoteDesktop portal (remote input,
+  # which asks the user for consent itself), the Background portal (autostart)
+  # and the file chooser portal need no permission here.
   # Receive folder. Files to send are picked through the file chooser portal.
   - --filesystem=xdg-download/PlayDrop:create
 
@@ -84,5 +93,16 @@ modules:
           - packaging/flatpak/.flatpak-builder
           - packaging/deb/dist
           - packaging/windows/dist
-      # Generated from Cargo.lock; see the README for the exact command.
+          - packaging/flatpak/repo
+          - apps/android/.gradle
+          - apps/android/app/build
+          - apps/ios/build
+          - apps/ios/xtool
+          - fuzz/target
+          # Where flatpak/flatpak-github-actions keeps its state and output in CI
+          # (the repo root), so the build never copies itself.
+          - .flatpak-builder
+          - flatpak_app
+          - repo
+      # Generated from Cargo.lock by update-sources.sh (committed, as on Flathub).
       - cargo-sources.json

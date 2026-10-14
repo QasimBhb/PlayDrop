@@ -147,8 +147,8 @@ shows what arrives.
 |---|---|---|
 | `crates/playdropd/src/input/linux/portal.rs` | `ConnectToEIS` plus `reis` for lower per-event cost once a trackpad feels laggy on a busy bus | later |
 | `crates/playdropd/src/input/windows.rs`, `media/windows.rs` | Never run; first Windows session links, runs the 30 ms gate and the GSMTC watcher | 6 |
-| `apps/desktop` | Media command buttons need a daemon request (`send_media_command` over IPC); state only today | 6 |
-| `apps/ios`, `apps/android` | A media command refused by the desktop shows no specific message | 6 |
+| `apps/desktop` | Media command buttons need a daemon request (`send_media_command` over IPC); state only today | done in 6: `media_command` request, per-player rows in the window |
+| `apps/ios`, `apps/android` | A media command refused by the desktop shows no specific message | done in 6: both phones name the device and the grant to turn on |
 | `crates/playdrop-core/src/host/input.rs` | Presenter `pointerOn`/`pointerOff` are accepted and ignored by every backend (no OS laser pointer) | later |
 | `crates/playdropd/src/media/linux.rs` | `playerctld` is skipped; album art (`art` blob) not sent | later |
 | Phase 4 carry-over | Share-extension gate needs an App Group (paid team or xtool App Groups) | 6 |

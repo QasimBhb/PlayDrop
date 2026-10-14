@@ -1,8 +1,10 @@
 // Diagnostics: which discovery layer failed and whether the port is blocked, worded for
-// the user first, details after.
+// the user first, details after. When a layer failed, the "Can't find your device?" panel
+// sits right under the summary, with the fix the summary points at first.
 
 import { Button, ScrollView, Palette } from "std-widgets.slint";
-import { DiagnosticsState } from "globals.slint";
+import { DiagnosticsState, HelpState } from "globals.slint";
+import { HelpContent } from "help.slint";
 import { Label, Muted, Heading, Card } from "widgets.slint";
 
 export component DiagnosticsPage inherits Rectangle {
@@ -31,6 +33,13 @@ export component DiagnosticsPage inherits Rectangle {
                     DiagnosticsState.network-changed();
                 }
             }
+
+            if !DiagnosticsState.failed: Button {
+                text: "Can't find your device?";
+                clicked => {
+                    HelpState.visible = true;
+                }
+            }
         }
 
         if DiagnosticsState.loading: Muted {
@@ -49,6 +58,14 @@ export component DiagnosticsPage inherits Rectangle {
                 alignment: start;
                 for line in DiagnosticsState.summary: Label {
                     text: line;
+                    font-weight: 600;
+                }
+                if DiagnosticsState.failed: Heading {
+                    text: "Can't find your device?";
+                }
+                if DiagnosticsState.failed: HelpContent { }
+                if DiagnosticsState.failed: Label {
+                    text: "Details";
                     font-weight: 600;
                 }
                 for section in DiagnosticsState.sections: Card {

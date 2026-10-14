@@ -1,10 +1,90 @@
 // Devices (home): every paired device with one-click send, ping, clipboard, grants,
 // rename and unpair.
 
-import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
-import { DeviceRow } from "types.slint";
-import { DevicesState, Nav } from "globals.slint";
+import { Button, LineEdit, ScrollView, Slider, Palette } from "std-widgets.slint";
+import { DeviceRow, MediaRow } from "types.slint";
+import { DevicesState, Nav, HelpState } from "globals.slint";
 import { Label, Muted, Heading, Card, Chip, Toggle, Dialog } from "widgets.slint";
+
+// One media player on the device: what is playing and, when the device takes commands,
+// the buttons its state lists (protocol.md 5.9). A refusal comes back as a notice.
+component PlayerRow inherits VerticalLayout {
+    in property <string> device-id;
+    in property <MediaRow> media;
+
+    spacing: 4px;
+    accessible-role: groupbox;
+    accessible-label: "Now playing: " + root.media.title + ", " + root.media.detail;
+
+    HorizontalLayout {
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Chip {
+                text: root.media.playing ? "Playing" : "Paused";
+                good: root.media.playing;
+            }
+        }
+
+        VerticalLayout {
+            horizontal-stretch: 1;
+            Label {
+                text: root.media.title;
+                wrap: no-wrap;
+                overflow: elide;
+            }
+
+            Muted {
+                text: root.media.detail;
+                wrap: no-wrap;
+                overflow: elide;
+            }
+        }
+    }
+
+    if root.media.can-previous || root.media.toggle-action != "" || root.media.can-next || root.media.has-volume: HorizontalLayout {
+        spacing: 6px;
+        alignment: start;
+        if root.media.can-previous: Button {
+            text: "Previous";
+            accessible-label: "Previous track";
+            clicked => {
+                DevicesState.media(root.device-id, root.media.player, "previous", 0);
+            }
+        }
+        if root.media.toggle-action != "": Button {
+            text: root.media.toggle-action == "play" ? "Play" : root.media.toggle-action == "pause" ? "Pause" : root.media.playing ? "Pause" : "Play";
+            clicked => {
+                DevicesState.media(root.device-id, root.media.player, root.media.toggle-action, 0);
+            }
+        }
+        if root.media.can-next: Button {
+            text: "Next";
+            accessible-label: "Next track";
+            clicked => {
+                DevicesState.media(root.device-id, root.media.player, "next", 0);
+            }
+        }
+        if root.media.has-volume: HorizontalLayout {
+            spacing: 6px;
+            Muted {
+                text: "Volume";
+            }
+
+            Slider {
+                min-width: 120px;
+                minimum: 0;
+                maximum: 100;
+                step: 5;
+                value: root.media.volume;
+                accessible-label: "Volume";
+                released(v) => {
+                    DevicesState.media(root.device-id, root.media.player, "volume", Math.round(v));
+                }
+            }
+        }
+    }
+}
 
 component DeviceCard inherits Card {
     in property <DeviceRow> device;
@@ -68,30 +148,9 @@ component DeviceCard inherits Card {
             text: root.device.note;
         }
 
-        if root.device.media-visible: HorizontalLayout {
-            spacing: 8px;
-            accessible-role: text;
-            accessible-label: "Now playing: " + root.device.media-title + ", " + root.device.media-detail;
-            Chip {
-                text: root.device.media-playing ? "Playing" : "Paused";
-                good: root.device.media-playing;
-                vertical-stretch: 0;
-            }
-
-            VerticalLayout {
-                horizontal-stretch: 1;
-                Label {
-                    text: root.device.media-title;
-                    wrap: no-wrap;
-                    overflow: elide;
-                }
-
-                Muted {
-                    text: root.device.media-detail;
-                    wrap: no-wrap;
-                    overflow: elide;
-                }
-            }
+        for m in root.device.players: PlayerRow {
+            device-id: root.device.id;
+            media: m;
         }
 
         HorizontalLayout {
@@ -258,12 +317,20 @@ export component DevicesPage inherits Rectangle {
             }
 
             HorizontalLayout {
+                spacing: 8px;
                 alignment: start;
                 Button {
                     text: "Add device";
                     primary: true;
                     clicked => {
                         Nav.page = 1;
+                    }
+                }
+
+                Button {
+                    text: "Can't find your device?";
+                    clicked => {
+                        HelpState.visible = true;
                     }
                 }
             }

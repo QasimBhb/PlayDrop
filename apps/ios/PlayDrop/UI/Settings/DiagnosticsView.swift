@@ -23,6 +23,7 @@ struct DiagnosticsView: View {
                     peerOnlineThisRun: core.peerSeenOnlineThisRun
                 )
                 summary(issues)
+                helpEntry(suggested: ConnectivityHelp.isSuggested(for: issues))
                 if let reason = Self.deniedReason(access) {
                     Section {
                         NavigationLink {
@@ -44,6 +45,11 @@ struct DiagnosticsView: View {
             } else {
                 Section {
                     Text(loading ? L10n.Diag.running : L10n.Diag.unavailable)
+                    NavigationLink {
+                        ConnectivityHelpView()
+                    } label: {
+                        Label(L10n.Connect.title, systemImage: "lifepreserver")
+                    }
                     if !core.running {
                         NavigationLink {
                             LocalNetworkFixItView(reason: core.startError)
@@ -89,6 +95,21 @@ struct DiagnosticsView: View {
                 } icon: {
                     Image(systemName: fine ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
                         .foregroundStyle(fine ? Color.green : Color.orange)
+                }
+            }
+        }
+    }
+
+    /// The link to the connection help; highlighted when the findings point to it.
+    private func helpEntry(suggested: Bool) -> some View {
+        Section {
+            NavigationLink {
+                ConnectivityHelpView(suggested: suggested)
+            } label: {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label(L10n.Connect.title, systemImage: "lifepreserver")
+                        .foregroundStyle(suggested ? Color.orange : Color.primary)
+                    Text(L10n.Connect.entryHint).font(.footnote).foregroundStyle(.secondary)
                 }
             }
         }

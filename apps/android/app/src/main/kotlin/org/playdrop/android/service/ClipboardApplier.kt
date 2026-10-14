@@ -9,7 +9,7 @@ import android.os.PersistableBundle
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.playdrop.android.core.MediaStoreSink
+import org.playdrop.android.core.DownloadsSink
 import java.io.File
 
 /**
@@ -49,7 +49,7 @@ internal object ClipboardApplier {
             dir.listFiles()?.forEach { it.delete() }
             val file = File(dir, "clip-${System.currentTimeMillis()}.$ext")
             file.writeBytes(bytes)
-            FileProvider.getUriForFile(app, MediaStoreSink.fileProviderAuthority(app), file)
+            FileProvider.getUriForFile(app, DownloadsSink.fileProviderAuthority(app), file)
         }
         val clip = ClipData(ClipDescription(LABEL, arrayOf(mime)), ClipData.Item(uri))
         set(app, clip, sensitive)

@@ -1,6 +1,6 @@
 //! Start at login and D-Bus activation.
 //!
-//! Linux, outside Flatpak (packaging owns the Flatpak case, detected by `/.flatpak-info`):
+//! Linux, outside Flatpak:
 //! - `~/.config/autostart/org.playdrop.Daemon.desktop`, the XDG autostart entry, written
 //!   when `autostart` is on and removed when it is off. The daemon syncs it on the first
 //!   run and whenever the setting changes, not on every start, so a user who deletes the
@@ -13,10 +13,16 @@
 //!
 //! Windows: the `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` value `PlayDrop`.
 //!
-//! TODO(Phase 6): inside Flatpak, ask the Background portal (`RequestBackground`) for
-//! autostart instead of relying on packaging alone.
+//! Inside Flatpak (detected by `/.flatpak-info`) none of these files are written: the
+//! sandbox cannot reach them and packaging ships the D-Bus service. Start at login goes
+//! through the Background portal instead ([`background`], Linux only); the daemon asks it
+//! on the same occasions it would write the entry, and a refusal turns the setting back
+//! off with a notification and a `Diagnose` line (PLAN.md anti-pattern 18).
 //!
 //! Every write is idempotent: a file whose content is already right is not touched.
+
+#[cfg(target_os = "linux")]
+pub mod background;
 
 use std::path::{Path, PathBuf};
 
@@ -37,7 +43,7 @@ pub struct Locations {
     pub data_home: PathBuf,
     /// The daemon binary.
     pub exe: PathBuf,
-    /// Running inside Flatpak: packaging owns these files.
+    /// Running inside Flatpak: no files; start at login goes through the portal.
     pub flatpak: bool,
 }
 
@@ -80,7 +86,8 @@ pub enum Outcome {
     Skipped,
 }
 
-/// Writes or removes the login autostart entry.
+/// Writes or removes the login autostart entry. [`Outcome::Skipped`] inside Flatpak, where
+/// the caller asks the Background portal instead.
 pub fn sync_autostart(loc: &Locations, enabled: bool) -> anyhow::Result<Outcome> {
     if loc.flatpak {
         return Ok(Outcome::Skipped);

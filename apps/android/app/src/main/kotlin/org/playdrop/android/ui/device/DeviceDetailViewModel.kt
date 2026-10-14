@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import org.playdrop.android.R
@@ -21,6 +22,7 @@ import org.playdrop.android.ui.devices.DeviceRow
 import org.playdrop.android.ui.devices.DeviceRows
 import org.playdrop.android.ui.input.InputSupport
 import org.playdrop.core.Grants
+import org.playdrop.core.HostEvent
 import org.playdrop.core.MediaAction
 import org.playdrop.core.MediaState
 
@@ -125,6 +127,15 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
             )
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DeviceDetailUiState())
+
+    init {
+        viewModelScope.launch {
+            CoreHost.events.filterIsInstance<HostEvent.PeerRefused>().collect { ev ->
+                if (ev.peer != peerId) return@collect
+                MediaRefusal.message(ev.frameType, ev.code, ev.message, CoreHost.labelOf(peerId))?.let(::post)
+            }
+        }
+    }
 
     /** Sets the local label (the device cannot change it, SR-8). */
     fun rename(label: String) {

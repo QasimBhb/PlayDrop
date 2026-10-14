@@ -108,6 +108,12 @@ export component SettingsPage inherits Rectangle {
                 }
             }
 
+            if SettingsState.autostart-note != "": Muted {
+                text: SettingsState.autostart-note;
+                color: #c42b1c;
+                opacity: 1;
+            }
+
             Toggle {
                 text: "Show notifications";
                 checked: SettingsState.notifications;

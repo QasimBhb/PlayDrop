@@ -19,6 +19,9 @@ struct NowPlayingSection: View {
     @Environment(CoreHost.self) private var core
     @Environment(MessageCenter.self) private var messages
 
+    /// Keeps a burst of refused taps down to one message (every button answers on its own).
+    @State private var throttle = RefusalThrottle()
+
     var body: some View {
         if !players.isEmpty {
             Section(L10n.Media.title) {
@@ -28,14 +31,36 @@ struct NowPlayingSection: View {
                     }
                 }
             }
+            .task { await watchRefusals() }
         }
+    }
+
+    /// Shows the "Media is off" message when the computer refuses a media command. The
+    /// refusal arrives as a `peerRefused` event for a `media` frame (protocol.md 5.3).
+    private func watchRefusals() async {
+        for await event in core.events() {
+            if case let .peerRefused(p, frameType, code, _) = event, p == peerId,
+               PeerRefusals.feature(frameType: frameType, code: code) == .media {
+                showRefused()
+            }
+        }
+    }
+
+    private func showRefused() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard throttle.shouldShow(peer: peerId, feature: .media, now: now) else { return }
+        messages.show(.error(L10n.mediaRefused(core.labelOf(peer: peerId))))
     }
 
     private func command(_ player: String, _ action: MediaAction, _ value: UInt64?) {
         let peer = peerId
         Task {
-            await CoreCall.run(messages) {
+            do {
                 try await core.sendMediaCommand(peer: peer, player: player, action: action, value: value)
+            } catch let e as PlayDropError {
+                if case .Forbidden = e { showRefused() } else { messages.show(error: e) }
+            } catch {
+                messages.show(error: error)
             }
         }
     }

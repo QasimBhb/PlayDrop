@@ -47,6 +47,46 @@ pub async fn probe(port: u16, interfaces: &[InterfaceInfo]) -> PortProbe {
     }
 }
 
+/// The TCP port of KDE Connect and `GSConnect`, the first of their 1714-1764 range.
+pub const KDE_CONNECT_PORT: u16 = 1716;
+
+/// An informational `Diagnose` line when another program (KDE Connect or `GSConnect`)
+/// listens on [`KDE_CONNECT_PORT`]: running both is fine, `PlayDrop` never uses their
+/// ports (protocol.md section 1). Read from the kernel's socket tables, so nothing is
+/// sent to that port. Linux only; `None` elsewhere.
+pub fn coexistence_note(our_port: u16) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let listening = ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|p| std::fs::read_to_string(p).ok())
+        .any(|table| listens_on(&table, KDE_CONNECT_PORT));
+    listening.then(|| {
+        format!(
+            "note: port {KDE_CONNECT_PORT} is used by another program, most likely KDE Connect or GSConnect; that is fine, PlayDrop uses port {our_port} and both can stay installed"
+        )
+    })
+}
+
+/// Whether a `/proc/net/tcp` or `tcp6` table has a socket in `LISTEN` (state `0A`) on
+/// local `port`.
+pub fn listens_on(table: &str, port: u16) -> bool {
+    table.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace().skip(1);
+        let (Some(local), Some(_remote), Some(state)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return false;
+        };
+        state == "0A"
+            && local
+                .rsplit_once(':')
+                .and_then(|(_, p)| u16::from_str_radix(p, 16).ok())
+                == Some(port)
+    })
+}
+
 async fn dial(addr: SocketAddr) -> Result<(), String> {
     match tokio::time::timeout(DIAL_TIMEOUT, tokio::net::TcpStream::connect(addr)).await {
         Ok(Ok(_stream)) => Ok(()),
@@ -564,5 +604,21 @@ mod tests {
         drop(l);
         let p = probe(port, &[]).await;
         assert!(!p.loopback_ok);
+    }
+
+    #[test]
+    fn listening_sockets_are_read_from_the_proc_table() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:06B4 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 4242 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:A4CB 0100007F:06B4 01 00000000:00000000 00:00000000 00000000  1000        0 4243 1 0000000000000000 20 4 30 10 -1
+";
+        assert!(listens_on(table, KDE_CONNECT_PORT));
+        assert!(!listens_on(table, 42187));
+        // A connection to 1716 is not a listener on it.
+        let connected = "header\n   1: 0100007F:A4CB 0100007F:06B4 01 0 0 0 0 0 0\n";
+        assert!(!listens_on(connected, KDE_CONNECT_PORT));
+        let v6 = "header\n   0: 00000000000000000000000000000000:06B4 00000000000000000000000000000000:0000 0A 0\n";
+        assert!(listens_on(v6, KDE_CONNECT_PORT));
+        assert!(!listens_on("", KDE_CONNECT_PORT));
     }
 }

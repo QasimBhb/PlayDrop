@@ -243,6 +243,20 @@ pub enum Request {
     /// End every remote input session this desktop is the target of, now (the SR-25 kill
     /// switch; the tray has the same action). Answers `done` whether or not one was open.
     StopInput,
+    /// Ask a peer to control one of its media players (protocol.md 5.9). Needs the peer
+    /// online with `media.control` in its capabilities; the peer applies it only if it
+    /// granted us `media`, and answers a refusal that arrives as a `PeerRefused` host event.
+    MediaCommand {
+        /// Peer query.
+        peer: String,
+        /// Player ID from the peer's `MediaState` event.
+        player: String,
+        /// What to do.
+        action: playdrop_core::session::types::MediaAction,
+        /// `seek`: absolute position in ms; `volume`: 0 to 100; otherwise `None`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        value: Option<u64>,
+    },
     /// Ask the daemon to exit cleanly.
     Shutdown,
 }
@@ -283,6 +297,7 @@ impl Request {
             Self::ShowInFolder { .. } => "show_in_folder",
             Self::NetworkChanged => "network_changed",
             Self::StopInput => "stop_input",
+            Self::MediaCommand { .. } => "media_command",
             Self::Shutdown => "shutdown",
         }
     }

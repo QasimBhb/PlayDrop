@@ -1,3 +1,4 @@
+import java.util.Properties
 import org.gradle.process.ExecOperations
 import javax.inject.Inject
 
@@ -77,6 +78,51 @@ val generateBindings = tasks.register<GenerateBindingsTask>("generateBindings") 
     outputDir.set(layout.buildDirectory.dir("generated/uniffi/kotlin"))
 }
 
+// ---------------------------------------------------------------------------------------
+// Version and release signing. The version follows [workspace.package] in the root
+// Cargo.toml so the APK, the desktop packages and the core always agree; versionCode is
+// major * 10000 + minor * 100 + patch, which keeps every sideloaded update installable over
+// the last. Release builds are signed with the one PlayDrop release key so updates (by hand
+// or through Obtainium from GitHub releases) install over each other. The key is read from
+// apps/android/keystore.properties (gitignored, see docs/release/distribution.md) or, in CI,
+// from the PLAYDROP_KEYSTORE_* environment variables. Without either, release builds fall
+// back to the debug key and say so.
+// ---------------------------------------------------------------------------------------
+
+val workspaceVersion: String = workspaceDir.resolve("Cargo.toml").readLines()
+    .dropWhile { it.trim() != "[workspace.package]" }
+    .firstOrNull { it.trim().startsWith("version") }
+    ?.substringAfter('"')?.substringBefore('"')
+    ?: error("could not read the workspace version from Cargo.toml")
+val workspaceVersionCode: Int = workspaceVersion.substringBefore('-').split('.')
+    .map { it.toInt() }
+    .let { (major, minor, patch) -> major * 10000 + minor * 100 + patch }
+
+// `-Pplaydrop.signWithDebugKey=true` builds the optimised release variant signed with the
+// debug key, so it installs over a debug build on a test phone without losing its pairing
+// (bench/desktop-to-phone.sh). Never ship such an APK.
+val signWithDebugKey: Boolean = (project.findProperty("playdrop.signWithDebugKey") as String?) == "true"
+
+val releaseKeystore: Map<String, String>? = run {
+    val file = rootProject.projectDir.resolve("keystore.properties")
+    if (signWithDebugKey) {
+        null
+    } else if (file.isFile) {
+        val props = Properties().apply { file.inputStream().use { load(it) } }
+        listOf("storeFile", "storePassword", "keyAlias", "keyPassword")
+            .associateWith { props.getProperty(it) ?: error("keystore.properties lacks $it") }
+            .mapValues { (k, v) -> if (k == "storeFile") rootProject.projectDir.resolve(v).absolutePath else v }
+    } else {
+        val env = mapOf(
+            "storeFile" to System.getenv("PLAYDROP_KEYSTORE_FILE"),
+            "storePassword" to System.getenv("PLAYDROP_KEYSTORE_PASSWORD"),
+            "keyAlias" to System.getenv("PLAYDROP_KEY_ALIAS"),
+            "keyPassword" to System.getenv("PLAYDROP_KEY_PASSWORD"),
+        )
+        if (env.values.all { !it.isNullOrEmpty() }) env.mapValues { it.value!! } else null
+    }
+}
+
 android {
     namespace = "org.playdrop.android"
     compileSdk = 37
@@ -87,11 +133,22 @@ android {
         applicationId = "org.playdrop.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = workspaceVersionCode
+        versionName = workspaceVersion
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters += rustAbis
+        }
+    }
+
+    signingConfigs {
+        if (releaseKeystore != null) {
+            create("release") {
+                storeFile = file(releaseKeystore.getValue("storeFile"))
+                storePassword = releaseKeystore.getValue("storePassword")
+                keyAlias = releaseKeystore.getValue("keyAlias")
+                keyPassword = releaseKeystore.getValue("keyPassword")
+            }
         }
     }
 
@@ -100,9 +157,16 @@ android {
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
-            // Until a release key exists (Phase 6), release builds are signed with the debug
-            // key so the optimised Rust core can be measured on a phone.
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = if (releaseKeystore != null) {
+                signingConfigs.getByName("release")
+            } else {
+                if (signWithDebugKey) {
+                    logger.lifecycle("PlayDrop: release APK signed with the debug key on request (test phones only)")
+                } else {
+                    logger.warn("PlayDrop: no release key found, signing the release APK with the debug key")
+                }
+                signingConfigs.getByName("debug")
+            }
         }
         debug {
             isMinifyEnabled = false

@@ -1,0 +1,83 @@
+# Nightly fuzzing of every decoder that sees bytes from the network before (or without)
+# authentication: beacon, mDNS TXT, manifest, tar bundle, session frames, session frame
+# bodies and QR codes (threat-model.md SR-33, T39). What this proves: about ten minutes per
+# target per night with no crash, building on the corpus from earlier nights. What it
+# cannot prove: the 8 CPU-hours per target the Phase 6 ship gate asks for; that run is done
+# by hand with the command in fuzz/README.md.
+#
+# Runs every night and on demand. A crash fails the job and uploads the reproducing input.
+
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds per target"
+        required: false
+        default: "600"
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [beacon, mdns_txt, manifest, bundle, frame, session_json, qr_uri]
+    env:
+      SECONDS_PER_TARGET: ${{ github.event.inputs.seconds || '600' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nightly Rust and cargo-fuzz
+        run: |
+          rustup toolchain install nightly --profile minimal
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo +nightly --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "fuzz -> target"
+          key: fuzz
+
+      - name: Restore the corpus from earlier nights
+        # Keyed per run so every night saves a new copy; the restore key picks the newest.
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Build
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+
+      - name: Fuzz
+        # The committed seeds are a read-only second corpus; new finds go to fuzz/corpus.
+        run: |
+          mkdir -p fuzz/corpus/${{ matrix.target }}
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
+            -max_total_time="$SECONDS_PER_TARGET" -rss_limit_mb=2048 -timeout=10 \
+            -print_final_stats=1
+
+      - name: Shrink the corpus
+        if: success()
+        run: |
+          cargo +nightly fuzz cmin ${{ matrix.target }} fuzz/corpus/${{ matrix.target }} || true
+
+      - name: Upload crash inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore

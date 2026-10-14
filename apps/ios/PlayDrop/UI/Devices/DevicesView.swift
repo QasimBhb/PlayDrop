@@ -149,6 +149,11 @@ struct DevicesView: View {
                 Text(L10n.Devices.addDevice)
             }
             .buttonStyle(.borderedProminent)
+            NavigationLink {
+                ConnectivityHelpView()
+            } label: {
+                Text(L10n.Connect.title)
+            }
         }
     }
 

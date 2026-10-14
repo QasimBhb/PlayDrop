@@ -1,7 +1,7 @@
 // Shared state between the Rust controller and the screens. Each global belongs to one
 // screen; Rust sets the `in` properties and handles the callbacks (`src/screens/`).
 
-import { ConnPhase, DeviceRow, CandidateRow, TransferRow, DiagSection } from "types.slint";
+import { ConnPhase, DeviceRow, CandidateRow, TransferRow, DiagSection, HelpFocus } from "types.slint";
 
 // Which tab is showing.
 export global Nav {
@@ -49,6 +49,9 @@ export global DevicesState {
     // Device ID, grant name, new value.
     callback set-grant(string, string, bool);
     callback unpair(string);
+    // Device ID, player ID, action in protocol.md 5.9 spelling, volume (0 to 100, used by
+    // "volume" only).
+    callback media(string, string, string, int);
 }
 
 // Add device screen, the pairing prompt and the QR code.
@@ -99,6 +102,8 @@ export global SettingsState {
     in property <bool> notifications;
     // "Remote input: available (...)" or "Remote input: unavailable: <reason>".
     in property <string> remote-input;
+    // Under the "Start at login" switch when the desktop refused it; empty otherwise.
+    in property <string> autostart-note;
     in property <string> short-id;
     in property <string> device-id;
     in property <string> about;
@@ -116,6 +121,18 @@ export global DiagnosticsState {
     in property <string> error;
     in property <[string]> summary;
     in property <[DiagSection]> sections;
+    // A discovery layer failed: the help panel shows on the page itself.
+    in property <bool> failed;
     callback refresh();
     callback network-changed();
+}
+
+// The "Can't find your device?" panel: a dialog from Devices, Add device and Diagnostics,
+// and inline on Diagnostics when a layer failed.
+export global HelpState {
+    in-out property <bool> visible;
+    // Set from the last Diagnose summary.
+    in property <HelpFocus> focus: HelpFocus.none;
+    // The firewall command when `focus` is `firewall`.
+    in property <string> firewall-fix;
 }

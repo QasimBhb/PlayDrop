@@ -2,7 +2,7 @@
 // pairs with one click, takes a typed address, or shows a QR code.
 
 import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
-import { PairingState } from "globals.slint";
+import { PairingState, HelpState } from "globals.slint";
 import { Label, Muted, Heading, Card } from "widgets.slint";
 
 export component AddDevicePage inherits Rectangle {
@@ -48,6 +48,12 @@ export component AddDevicePage inherits Rectangle {
                 text: "Show QR code";
                 clicked => {
                     PairingState.show-qr();
+                }
+            }
+            Button {
+                text: "Can't find your device?";
+                clicked => {
+                    HelpState.visible = true;
                 }
             }
         }

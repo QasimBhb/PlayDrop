@@ -1,5 +1,6 @@
 [workspace]
 resolver = "2"
+exclude = ["fuzz"]
 members = [
     "crates/playdrop-core",
     "crates/playdrop-cli",
@@ -19,6 +20,8 @@ repository = "https://github.com/QasimBhb/PlayDrop"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
+# cargo-fuzz builds with --cfg fuzzing; fuzz/ uses it to reach parser entry points (SR-33).
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }

@@ -40,7 +40,9 @@ foreach ($exe in 'playdropd.exe', 'playdrop-desktop.exe') {
 }
 
 # Find ISCC.exe: PATH first, then the default install folders.
-$iscc = (Get-Command 'iscc.exe' -ErrorAction SilentlyContinue).Source
+# (Reading .Source off a null result throws under Set-StrictMode, so test the command first.)
+$isccCommand = Get-Command 'iscc.exe' -ErrorAction SilentlyContinue
+$iscc = if ($isccCommand) { $isccCommand.Source } else { $null }
 if (-not $iscc) {
     $candidates = @(
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),

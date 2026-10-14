@@ -23,6 +23,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -37,6 +38,7 @@ import org.playdrop.android.R
 import org.playdrop.android.ui.common.CollectMessages
 import org.playdrop.android.ui.common.Format
 import org.playdrop.android.ui.common.Samples
+import org.playdrop.android.ui.help.HelpTopic
 import org.playdrop.android.ui.theme.MonoStyle
 import org.playdrop.android.ui.theme.OnlineGreen
 import org.playdrop.android.ui.theme.PlayDropTheme
@@ -45,16 +47,16 @@ import org.playdrop.core.DiscoveryPath
 
 /** The Diagnostics screen wired to its view model. */
 @Composable
-fun DiagnosticsRoute(onBack: () -> Unit, showMessage: (String) -> Unit, vm: DiagnosticsViewModel = viewModel()) {
+fun DiagnosticsRoute(onBack: () -> Unit, onHelp: (HelpTopic?) -> Unit, showMessage: (String) -> Unit, vm: DiagnosticsViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
     CollectMessages(vm.messages, showMessage)
-    DiagnosticsScreen(state, onBack, vm::refresh)
+    DiagnosticsScreen(state, onBack, vm::refresh, onHelp)
 }
 
 /** The summary first, then each layer: listener, interfaces, multicast, mDNS, paired devices. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DiagnosticsScreen(state: DiagnosticsUiState, onBack: () -> Unit, onRefresh: () -> Unit) {
+fun DiagnosticsScreen(state: DiagnosticsUiState, onBack: () -> Unit, onRefresh: () -> Unit, onHelp: (HelpTopic?) -> Unit) {
     Scaffold(
         topBar = {
             TopAppBar(
@@ -96,9 +98,26 @@ fun DiagnosticsScreen(state: DiagnosticsUiState, onBack: () -> Unit, onRefresh: 
             ) {
                 Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     state.summary.forEach { Text(issueText(it), style = MaterialTheme.typography.bodyMedium) }
+                    val topic = DiagnosticsSummary.helpTopic(state.summary)
+                    if (DiagnosticsSummary.suggestsHelp(state.summary)) {
+                        Text(
+                            stringResource(
+                                when (topic) {
+                                    HelpTopic.SAME_NETWORK -> R.string.ui_diag_help_suggest_same
+                                    HelpTopic.OTHER_NETWORK -> R.string.ui_diag_help_suggest_other
+                                    null -> R.string.ui_diag_help_suggest_generic
+                                },
+                            ),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        TextButton(onClick = { onHelp(topic) }) { Text(stringResource(R.string.ui_help_link)) }
+                    }
                 }
             }
             Sections(report)
+            if (!DiagnosticsSummary.suggestsHelp(state.summary)) {
+                TextButton(onClick = { onHelp(null) }) { Text(stringResource(R.string.ui_help_link)) }
+            }
         }
     }
 }
@@ -213,5 +232,5 @@ private fun issueText(i: DiagIssue): String = when (i) {
 @Preview(showBackground = true, heightDp = 1000)
 @Composable
 private fun DiagnosticsPreview() {
-    PlayDropTheme { DiagnosticsScreen(Samples.diagnosticsState, {}, {}) }
+    PlayDropTheme { DiagnosticsScreen(Samples.diagnosticsState, {}, {}, {}) }
 }

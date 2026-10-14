@@ -2,8 +2,8 @@
 // the Rust controller fills from the IPC, and every action is a callback into Rust.
 
 import { TabWidget, Button, Palette } from "std-widgets.slint";
-import { ConnPhase } from "types.slint";
-import { Nav, ConnState, NoticeState, InputState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState } from "globals.slint";
+import { ConnPhase, HelpFocus } from "types.slint";
+import { Nav, ConnState, NoticeState, InputState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState, HelpState } from "globals.slint";
 import { ConnectionScreen } from "connection.slint";
 import { DevicesPage } from "devices.slint";
 import { AddDevicePage } from "add-device.slint";
@@ -11,8 +11,9 @@ import { TransfersPage } from "transfers.slint";
 import { SettingsPage } from "settings.slint";
 import { DiagnosticsPage } from "diagnostics.slint";
 import { PairingDialog, QrDialog } from "pairing.slint";
+import { HelpDialog } from "help.slint";
 
-export { ConnPhase, Nav, ConnState, NoticeState, InputState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState }
+export { ConnPhase, HelpFocus, Nav, ConnState, NoticeState, InputState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState, HelpState }
 
 component NoticeBar inherits Rectangle {
     background: NoticeState.error ? #c42b1c : Palette.accent-background;
@@ -120,6 +121,8 @@ export component App inherits Window {
 
         if NoticeState.text != "": NoticeBar { }
     }
+
+    if HelpState.visible && ConnState.phase == ConnPhase.connected: HelpDialog { }
 
     if PairingState.prompt-visible: PairingDialog { }
 
