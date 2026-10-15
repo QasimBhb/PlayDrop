@@ -9,24 +9,23 @@ import org.junit.Test
 class MoveTallyTest {
     @Test
     fun countsEveryOutcome() {
-        val t = MoveTally(6)
-        t.record(MoveOutcome.RENAMED)
-        t.record(MoveOutcome.RENAMED, renumbered = true)
+        val t = MoveTally(5)
         t.record(MoveOutcome.COPIED)
+        t.record(MoveOutcome.COPIED, renumbered = true)
         t.record(MoveOutcome.GONE)
         t.record(MoveOutcome.FAILED, renumbered = true) // a failed file is not counted as renumbered
-        assertEquals(5, t.done)
-        assertEquals(3, t.moved)
+        assertEquals(4, t.done)
+        assertEquals(2, t.moved)
         assertEquals(1, t.failed)
         assertEquals(1, t.gone)
         assertEquals(1, t.renumbered)
-        assertEquals("5 of 6 files: 2 renamed, 1 copied, 1 already gone, 1 failed, 1 renumbered", t.line())
+        assertEquals("4 of 5 files: 2 copied, 1 already gone, 1 failed, 1 renumbered", t.line())
     }
 
     @Test
     fun stoppedPassCountsTheRestAsNotMoved() {
         val t = MoveTally(5)
-        t.record(MoveResult(MoveOutcome.RENAMED))
+        t.record(MoveResult(MoveOutcome.COPIED))
         t.record(MoveResult(MoveOutcome.FAILED, stopPass = true))
         t.skipRest()
         assertEquals(5, t.done)

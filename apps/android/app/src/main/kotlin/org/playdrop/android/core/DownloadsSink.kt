@@ -38,17 +38,15 @@ internal data class TransferShape(val fileCount: Long, val totalBytes: Long)
  * Three paths, by Android version:
  * - Android 11 and later (API 30): plain file operations on the public `Download/PlayDrop`
  *   tree. Scoped storage lets an app create and write its own files there without any
- *   permission. The sink first tries to `rename(2)` the staging file into place: staging
- *   (`getExternalFilesDir("staging")`) and Downloads are on the same shared-storage volume,
- *   so if MediaProvider's FUSE layer allows it the file is moved with no copy at all, which
- *   is what a big file needs (a 1 GiB copy took 4.7 s of a 24.7 s receive). The staging path
- *   comes from `readlink` on the delivered descriptor and must lie inside the staging folder.
- *   If the rename fails the file is copied instead; `EXDEV`, `EACCES` or `EPERM` mean the
- *   platform refuses this route, so rename is not tried again in this process ([RenameGate]),
- *   any other errno concerns that file only. The copy is one create, one kernel copy and one
- *   close per file (about 13 ms on the Galaxy A54, nearly all of it MediaProvider adding the
- *   database row behind the create) instead of the MediaStore insert, open, fsync and
- *   `IS_PENDING` update (about 35 ms). The written files are handed to the media scanner in
+ *   permission. Each file is one create, one kernel copy and one close (about 13 ms on the
+ *   Galaxy A54, nearly all of it MediaProvider adding the database row behind the create)
+ *   instead of the MediaStore insert, open, fsync and `IS_PENDING` update (about 35 ms). The
+ *   staging file is never renamed into Downloads: measured on the A54 (2026-10-15),
+ *   `rename(2)` from the app's own folder into `Download` succeeds, but MediaProvider serves
+ *   it as a copy behind the scenes that is slower than the app's own copy (8.0 s against
+ *   4.1 s for 1 GiB, 29 ms against 14 ms per small file) and not atomic: a process killed in
+ *   the middle of one left the file both in place and at the target. See
+ *   `docs/release/throughput.md` section 8. The written files are handed to the media scanner in
  *   batches ([ScanBatcher]) so they show in Downloads, and the returned location is a
  *   [FileProvider] URI. If the platform refuses a direct write the sink falls back to the
  *   MediaStore path for good.
@@ -62,12 +60,16 @@ internal data class TransferShape(val fileCount: Long, val totalBytes: Long)
  * so a flood of small files is bound by it (5,000 files of 4 to 64 KiB arrived at 1.9 MiB/s
  * against 39.8 MiB/s for 100 medium files). A transfer that [LandingPolicy] calls a bulk drop
  * is delivered into `getExternalFilesDir("landing")/<transfer id>/<dirs>/<name>` instead
- * (about 0.2 ms per file, no MediaProvider row), so the transfer runs at engine speed; the
- * same rename-first-then-copy rule applies from staging to there. Each landed file is
+ * (about 0.2 ms per file, no MediaProvider row), so the transfer runs at engine speed. The
+ * staging file is renamed there (same folder tree, a real rename, 0.1 ms per file measured;
+ * the staging path comes from `readlink` on the delivered descriptor and must lie inside the
+ * staging folder) and copied if the rename fails; `EXDEV`, `EACCES` or `EPERM` turn the
+ * rename off for the rest of the process ([RenameGate]), any other errno concerns that file
+ * only. Each landed file is
  * promised its final name in Downloads when it lands ([NameClaims]), and [deliver] returns
  * the `content://` URI of that final place. When the transfer completes, [LandingMover]
- * moves the tree into `Download/PlayDrop` with [moveLanded], which uses the same
- * rename-first-then-copy primitive as direct delivery. The landing tree mirrors the
+ * moves the tree into `Download/PlayDrop` with [moveLanded], a journaled copy of each file
+ * through the same primitive as direct delivery. The landing tree mirrors the
  * Downloads tree, so a process killed half way leaves nothing a fresh start cannot finish:
  * [rebuildClaims] re-promises every landed name once per process before the core first
  * delivers, and the mover sweeps what is left. Files a pass could not move are retried within
@@ -81,9 +83,8 @@ internal data class TransferShape(val fileCount: Long, val totalBytes: Long)
  * connection keeps its landing folder until the core resumes and completes it.
  *
  * Name selection: every path that picks a name in a Downloads folder does it under that
- * folder's lock in [NameClaims], so a rename (which would replace an existing file silently)
- * never races another write of this process, and never takes a name promised to a landed
- * file. The " (n)" numbering is [FileNames.numberedName] everywhere.
+ * folder's lock in [NameClaims], so two writes of this process never pick the same name, and
+ * none takes a name promised to a landed file. The " (n)" numbering is [FileNames.numberedName] everywhere.
  *
  * Received files are never executable by construction (SR-23): shared storage is mounted
  * `noexec`, files are created without an execute bit, and the notification's "open" action
@@ -109,9 +110,7 @@ internal class DownloadsSink(
     /** `<staging>/`, the only place a staging file may be renamed from. */
     private val stagingPrefix = stagingDir.absolutePath.trimEnd('/') + "/"
 
-    private val stagingToDownloads = RenameGate("from staging into Downloads")
     private val stagingToLanding = RenameGate("from staging into the landing folder")
-    private val landingToDownloads = RenameGate("from the landing folder into Downloads")
 
     /** Journal of the mover's copy in progress, on internal storage. */
     private val journal = MoveJournal(File(app.filesDir, "landing-move.journal"))
@@ -149,7 +148,7 @@ internal class DownloadsSink(
                 val location = when {
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !directRefused ->
                         (if (landsFirst(item.transferId)) deliverToLanding(item, name, input, fd) else null)
-                            ?: deliverDirect(item, name, input, fd)
+                            ?: deliverDirect(item, name, input)
                             ?: deliverToMediaStore(item.transferId, item.path, name, mimeOf(item, name), rewound(input))
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ->
                         deliverToMediaStore(item.transferId, item.path, name, mimeOf(item, name), rewound(input))
@@ -292,8 +291,8 @@ internal class DownloadsSink(
     fun landedFiles(transferId: String): List<File> = landingDir(transferId)?.let(LandingTree::files).orEmpty()
 
     /**
-     * Moves one landed file of [transferId] into `Download/PlayDrop`: rename first, else copy
-     * and delete, else MediaStore when direct writes are refused; both copies are journaled.
+     * Moves one landed file of [transferId] into `Download/PlayDrop`: a copy and delete, or
+     * MediaStore when direct writes are refused; both copies are journaled.
      * Blocking. A file that fails stays landed, with its name still promised, for a retry;
      * [MoveOutcome.GONE] when it is no longer there. See [MoveResult] for the flags.
      */
@@ -316,7 +315,7 @@ internal class DownloadsSink(
         }
         try {
             val placed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !directRefused) {
-                placeInDownloads(key, landed.dirs, landed.name, file.path, landingToDownloads, file.path, file.length(), openInput, journaled = true)
+                placeInDownloads(key, landed.dirs, landed.name, file.path, file.length(), openInput, journalFrom = file.path)
             } else {
                 null
             }
@@ -327,26 +326,23 @@ internal class DownloadsSink(
                     journal.write(MoveJournal.Entry(file.path, uri.toString()))
                 }
             }
-            if (placed == null || !placed.renamed) {
-                input?.close()
-                input = null
-                // Delete before forgetting the journal. If the delete fails the entry stays and
-                // the pass stops, so the next pass removes this copy and moves the file again
-                // instead of leaving it twice.
-                if (!file.delete() && file.exists()) {
-                    HostLog.w("landing", "a copied file could not be removed from the landing folder; the move is redone later")
-                    return MoveResult(MoveOutcome.FAILED, stopPass = true)
-                }
-                journal.clear()
+            input?.close()
+            input = null
+            // Delete before forgetting the journal. If the delete fails the entry stays and
+            // the pass stops, so the next pass removes this copy and moves the file again
+            // instead of leaving it twice.
+            if (!file.delete() && file.exists()) {
+                HostLog.w("landing", "a copied file could not be removed from the landing folder; the move is redone later")
+                return MoveResult(MoveOutcome.FAILED, stopPass = true)
             }
+            journal.clear()
             claims.release(target.path, file.path)
             // MediaStore may also rename on a clash; its URI is new either way, so count it.
-            val renumbered = placed == null || placed.file.name != landed.name
+            val renumbered = placed == null || placed.name != landed.name
             if (renumbered) {
                 HostLog.i("landing", "transfer ${transferId.take(8)}: a landed file reached Downloads under another name than promised")
             }
-            val outcome = if (placed != null && placed.renamed) MoveOutcome.RENAMED else MoveOutcome.COPIED
-            return MoveResult(outcome, renumbered)
+            return MoveResult(MoveOutcome.COPIED, renumbered)
         } catch (e: Exception) {
             // A journal entry left by a failed copy points at a copy that was already removed
             // (or a pending MediaStore row); settling it before the next pass is harmless.
@@ -428,98 +424,70 @@ internal class DownloadsSink(
     }
 
     /**
-     * Places the file in `Download/PlayDrop/<dirs>`: rename first, else create and copy.
+     * Places the file in `Download/PlayDrop/<dirs>`: create and copy.
      * Returns null, having read nothing from the input, when the platform refuses the write,
      * so the caller can use MediaStore instead.
      */
     @RequiresApi(Build.VERSION_CODES.R)
-    private fun deliverDirect(item: DeliverItem, name: String, input: FileDescriptor, fd: Int): String? {
+    private fun deliverDirect(item: DeliverItem, name: String, input: FileDescriptor): String? {
         val t = item.transferId
         val dirs = FileNames.receivedDirs(item.path)
-        val src = if (stagingToDownloads.open) stagingPathOf(fd) else null
-        val placed = placeInDownloads(t, dirs, name, src, stagingToDownloads, null, item.size.toLong(), { input }, journaled = false)
-            ?: return null
-        return timed(t, "uri") { receivedUri(placed.file, dirs) }
+        val placed = placeInDownloads(t, dirs, name, null, item.size.toLong(), { input }, journalFrom = null) ?: return null
+        return timed(t, "uri") { receivedUri(placed, dirs) }
     }
 
-    private class Placed(val file: File, val renamed: Boolean)
-
-    private class Claim(val file: File, val out: FileDescriptor?)
+    private class Claim(val file: File, val out: FileDescriptor)
 
     /**
      * The one primitive behind direct delivery and the mover. Under the folder's lock it picks
-     * the first free numbered name that is not promised to anyone but [owner], then renames
-     * [src] there if [src] is given and [gate] is open, else creates the file with `O_EXCL`.
-     * The copy runs outside the lock. With [journaled], the copy is recorded in the
-     * [MoveJournal] between the create and the copy. Returns null when direct writes are
-     * refused (see [refuse]).
+     * the first free numbered name that is not promised to anyone but [owner] and creates the
+     * file there with `O_EXCL`; the copy runs outside the lock. With [journalFrom] (the mover:
+     * the landed file's path) the copy is recorded in the [MoveJournal] between the create
+     * and the copy. Returns the file, or null when direct writes are refused (see [refuse]).
      */
     @RequiresApi(Build.VERSION_CODES.R)
     private fun placeInDownloads(
         t: String,
         dirs: List<String>,
         name: String,
-        src: String?,
-        gate: RenameGate,
         owner: String?,
         size: Long,
         input: () -> FileDescriptor,
-        journaled: Boolean,
-    ): Placed? {
+        journalFrom: String?,
+    ): File? {
         if (Environment.getExternalStorageState() != Environment.MEDIA_MOUNTED) return null
         val dir = File(receiveRoot(), dirs.joinToString("/"))
-        val claim = claims.inFolder(dir.path) { claimInFolder(t, dir, name, src, gate, owner) } ?: return null
+        val claim = claims.inFolder(dir.path) { claimInFolder(t, dir, name, owner) } ?: return null
         val file = claim.file
         val out = claim.out
-        if (out == null) {
-            scans.add(t, file.path)?.let { scan(t, it) }
-            return Placed(file, renamed = true)
-        }
         try {
-            if (journaled && src != null) timed(t, "journal") { journal.write(MoveJournal.Entry(src, file.path)) }
+            if (journalFrom != null) timed(t, "journal") { journal.write(MoveJournal.Entry(journalFrom, file.path)) }
             timed(t, "copy") { copyFromStart(input(), out) }
             if (ReceivePolicy.syncAfterCopy(size)) timed(t, "sync") { Os.fdatasync(out) }
         } catch (e: Exception) {
             runCatching { Os.close(out) }
             if (!file.delete()) HostLog.w("sink", "removing a half-written file failed")
-            if (journaled) journal.clear()
+            if (journalFrom != null) journal.clear()
             throw e
         }
         timed(t, "close") { Os.close(out) }
         scans.add(t, file.path)?.let { scan(t, it) }
-        return Placed(file, renamed = false)
+        return file
     }
 
     /**
-     * Picks the name and renames or creates the file; called holding the folder lock. A
-     * rename is only tried on a name that does not exist (it would replace it); a create uses
-     * `O_EXCL`, so an existing file is never overwritten either way.
+     * Picks the name and creates the file; called holding the folder lock. The create uses
+     * `O_EXCL`, so an existing file is never overwritten.
      */
-    private fun claimInFolder(t: String, dir: File, name: String, src: String?, gate: RenameGate, owner: String?): Claim? {
+    private fun claimInFolder(t: String, dir: File, name: String, owner: String?): Claim? {
         if (!ensureDir(dir)) return refuse("could not create folder ${dir.name}", null, permanent = false)
         var n = 0
         var retriedDir = false
-        var tryRename = src != null
         while (n <= MAX_NUMBERED) {
             val file = File(dir, FileNames.numberedName(name, n))
             if (claims.heldByOther(file.path, owner)) {
                 n++
                 continue
-            }
-            if (tryRename && gate.open && src != null) {
-                if (timed(t, "stat") { file.exists() }) {
-                    n++
-                    continue
-                }
-                try {
-                    timed(t, "rename") { Os.rename(src, file.path) }
-                    if (gate.succeeded()) HostLog.i("sink", "rename ${gate.route} works; files are moved without a copy")
-                    return Claim(file, null)
-                } catch (e: ErrnoException) {
-                    tryRename = false
-                    renameFailed(gate, e)
-                    // Fall through: create this same name and copy instead.
-                }
             }
             try {
                 // 0644: read and write for the owner, read for others, never execute (SR-23).

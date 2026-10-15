@@ -35,16 +35,18 @@ Background portal, KDE Connect coexistence test. 394 Rust tests plus 110 Android
 tests plus 102 Linux-run `PlayDropShared` Swift tests, clippy clean. Licence
 GPL-3.0-or-later. UI native per platform. Build fully agentic. v0.1.0 released from GitHub Releases on 2026-10-15 (five files plus
 checksums). Phase 7 (daily use, v0.2.0) written on 2026-10-14 and 2026-10-15: Android bulk
-drops land in the app folder and a journaled mover puts them in Downloads (rename first,
-copy fallback); `playdrop send|peers|status|transfers|clip|ping|outbox|diagnose` drive the
+drops land in the app folder and a journaled mover copies them into Downloads (a rename
+into Downloads was measured on the A54 as a slower, non-atomic copy by MediaProvider and
+dropped); `playdrop send|peers|status|transfers|clip|ping|outbox|diagnose` drive the
 daemon over IPC (replaces `bench/pd_ipc.py`); README, `docs/guide/`, `CHANGELOG.md` feeding
 the release notes; SR-32 canary test (found and fixed full Device IDs in the diagnostics
 report, `playdrop-ffi` 0.2.1); durable bundle member delivery (`bundle.delivered` log); a
 sender cancel now always reaches the receiver (freed SR-20 slots); `autostart_refused` IPC
 field; SR-30 test; iOS version synced from `Cargo.toml`. 148 Android JUnit tests, 106 Swift
-tests. The phone was unauthorized on adb all session: every Phase 7 live run is owed, listed
-in `docs/phases/phase-7-daily-use.md` section 6. Next: section 6, then tag `v0.2.0`
-(date the changelog heading and the metainfo entry first), then Phase 8 from section 7.
+tests. Phone runs done on 2026-10-15 (`docs/release/throughput.md` section 8): 5,000 small
+files to the A54 at 7 to 9.5 MiB/s (was 1.9), 1 GiB at 44 to 48, resume by force-stop
+passes, all sums verified. Next: tag `v0.2.0` (date the changelog heading and the
+metainfo entry first), then Phase 8 from `docs/phases/phase-7-daily-use.md` section 7.
 
 ## Read first
 

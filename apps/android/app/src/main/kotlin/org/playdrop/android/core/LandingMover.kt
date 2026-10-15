@@ -23,8 +23,10 @@ import java.util.concurrent.ConcurrentHashMap
  * another is what makes the whole thing idempotent without further locking:
  * - before each pass the journal of an unfinished copy is settled
  *   ([DownloadsSink.recoverJournal]); a pass that cannot settle it waits for a retry;
- * - a file is moved by rename (atomic) or by a journaled copy followed by deleting the landed
- *   file, so a pass cut short at any point leaves each file either landed or in Downloads;
+ * - a file is moved by a journaled copy followed by deleting the landed file (never by a
+ *   rename into Downloads: MediaProvider serves that as a copy a kill cuts in half, see
+ *   [DownloadsSink]), so a pass cut short at any point leaves each file either landed or in
+ *   Downloads;
  *   if the landed file cannot be deleted the pass stops so no later copy overwrites that
  *   journal entry;
  * - a second pass over the same transfer finds only what the first one left;

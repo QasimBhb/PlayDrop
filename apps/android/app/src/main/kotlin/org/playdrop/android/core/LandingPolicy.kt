@@ -87,7 +87,7 @@ internal enum class RenameDecision {
 }
 
 /**
- * One rename route (for example staging to Downloads). Starts open; the first refusal that
+ * One rename route (staging to the landing folder). Starts open; the first refusal that
  * says the route can never work ([ErrnoKind.CROSS_DEVICE], [ErrnoKind.ACCESS],
  * [ErrnoKind.PERMISSION]) closes it for the rest of the process, so each later file goes
  * straight to the copy instead of paying a failed rename first. Thread-safe.

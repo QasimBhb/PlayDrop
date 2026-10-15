@@ -47,7 +47,7 @@ when that is all there is.
 |---|---|---|---|---|---|---|
 | A pinned Android device receives with the screen off | Pass | n/a | Owed | **Pass** | n/a (foreground only) | Owed |
 | Multi-file counts match | **Pass** | Owed | Owed | **Pass** | Partial | Owed |
-| Resume works | Pass (loopback) / Owed (phone over Wi-Fi) | Owed | Owed | Owed | Owed | Owed |
+| Resume works | Pass (loopback and phone over Wi-Fi, 2026-10-15) | Owed | Owed | **Pass** | Owed | Owed |
 | Empty device lists are diagnosed | Partial | Owed | Owed | Partial | Partial | Owed |
 | Official KDE Connect installed alongside | Partial | Owed | Owed | Partial | Owed | Owed |
 | Guest Wi-Fi path (QR, hotspot, USB tether) works and is documented | Partial | Owed | Owed | Partial | Partial | Owed |
@@ -61,7 +61,7 @@ when that is all there is.
 |---|---|
 | Screen-off receive, Android 16 | 2026-10-13: with the screen off (`input keyevent 223`, `mWakefulness=Dozing`) the daemon sent `tree` (160 files) and `medium-100` (100 files, 168.8 MiB) to the pinned A54; both complete, every file and sha256 matched on the phone (`bench/desktop-to-phone.sh`). Earlier: Phase 3, 400 MiB with the screen off, SHA-256 equal (`docs/phases/phase-3-android.md` 1.1); forced 10-minute deep idle kept the session (`dumpsys deviceidle force-idle`). Not done: a natural 30-minute Doze, an overnight run |
 | Multi-file counts | 2026-10-13: 1, 100, 160, 1,000 and 5,000 files desktop to phone, all counts and sums matched (`docs/release/throughput.md` 2.2). Desktop to desktop: gate B (`gate_b_many_small_files_hold_throughput`), `playdrop-core` `receiver_full_flow_with_bundle_and_reload`. Empty folders are recreated on Android 11 and later since the sink rewrite (`DownloadsSink.kt`); Android 10 keeps none. iOS: camera-roll dump of 6 photos intact (Phase 4 1.1), no large count run |
-| Resume | Loopback: `gate_a_kill_and_resume_500mib` and `duplex_kill_and_resume_64mib` (hash matches, no re-pair); SR-21 tests `stream_source_resume_check`, `resume_decisions`, `outbox_range_and_prefix`. Owed on a phone: kill the app or drop Wi-Fi mid-transfer on a 1 GiB file and check the hash. Sender-side resume across a sender restart is out of v1 (`docs/core-api.md` 8) |
+| Resume | Loopback: `gate_a_kill_and_resume_500mib` and `duplex_kill_and_resume_64mib` (hash matches, no re-pair); SR-21 tests `stream_source_resume_check`, `resume_decisions`, `outbox_range_and_prefix`. Phone, 2026-10-15: 1 GiB over Wi-Fi, `am force-stop` at 50%, relaunch after 8 s, done 21.6 s later, sha256 equal, one file (`throughput.md` 8.5). A Wi-Fi drop mid-transfer is still owed. Sender-side resume across a sender restart is out of v1 (`docs/core-api.md` 8) |
 | Empty lists diagnosed | Daemon: `probe.rs` tests `ufw_blocking_the_port_is_named_with_the_fix`, `multicast_and_peer_failures_name_the_layer`, `listener_down_comes_first`, `healthy_system_says_all_paths_fine`. Core: diagnostics per peer (`PeerDiagnostic`). Android: `CantFindScreen.kt`, `HelpTopic.kt`. iOS: Local Network fix screen passed on the iPhone 2026-10-12; `DiagnosticsSummaryTests`, `ConnectivityHelpTests`. Owed: the real thing with `ufw` enabled and the port closed (Phase 2 "partially verified"), multicast blocked, client isolation |
 | KDE Connect alongside | Ports: `tests/coexistence.rs` (`constants_stay_clear_of_kde_connect_and_localsend`, `daemon_never_binds_or_dials_kde_connect_or_localsend_ports`) and gate E on the wire (`gate_e_no_kde_ports_and_no_kdeconnect_on_the_wire`). The phone already runs the official KDE Connect app (`org.kde.kdeconnect_tp`) beside the PlayDrop app, and all of 2026-10-13's transfers ran with both installed; the PlayDrop app did not conflict. The desktop `kdeconnect` package is removed (`dpkg` state `rc`). The desktop live run (`sudo apt install kdeconnect`, both daemons up, send with each) was dropped by the user on 2026-10-14 with the incumbents run; `bench/incumbents.md` keeps the steps |
 | Guest Wi-Fi path | Pairing by QR: `qr_pairing_and_single_use_secret`, `full_qr_pairing`, `qr_wrong_secret_and_expiry`; by typed address: used for every iPhone gate. Last-known dial: `verified_uses_source_ip_and_stored_port`. Owed on a real client-isolated network: QR pairing, phone hotspot (desktop joins the phone's hotspot) and USB tether (adb reverse or `usb0` interface) transfers, each timed and written up. The in-app help exists (Android `ui/help`, iOS `ConnectivityHelp`); a user-facing page under `docs/` does not yet |
@@ -95,6 +95,10 @@ when that is all there is.
 | 5 | Trackpad under 30 ms on Windows | Owed | loopback stand-in 0.12 ms release (`gate_input_latency_on_loopback`) |
 | 5 | iOS trackpad, keyboard, presenter on the iPhone | Owed | Linux checks only |
 | 5 | Media control (MPRIS) | Pass (2026-10-12/13 on COSMIC) | `phase-5-companion.md` 1.1; GSMTC on Windows is CI only |
+| 7 | Bulk drop lands at engine speed, counts and sums match | Pass (2026-10-15), gate ratio 0.2 (partial) | `throughput.md` 8.1: `mixed-5000` 7.2 to 9.5 MiB/s (was 1.9), all 15 runs verified |
+| 7 | Rename through FUSE into Downloads | Measured and removed | `throughput.md` 8.3: a copy behind the scenes, slower and not atomic |
+| 7 | 1 GiB resume by force-stop on the phone | Pass (2026-10-15) | `throughput.md` 8.5 |
+| 7 | Landing notification flow | Pass (2026-10-15) | "Moving 202 of 5,000 files into Downloads", survives a force-stop (sweep resumes at "Moving n of 4,779"), ends "4779 received files moved into Downloads"; read from `dumpsys notification` |
 
 ## 4. Windows 11 live items (all owed, need a machine)
 

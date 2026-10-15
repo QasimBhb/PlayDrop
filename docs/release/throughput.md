@@ -150,7 +150,7 @@ protocol.md 7.7). The gate-B test records the same property: `gate_b_many_small_
 |---|---|---|
 | One large file at 50% or more of iperf3 on the same link (floor) | **Pass with the release app** (section 7): 43.7 and 41.4 MiB/s against 44.2, 94 to 99% | The debug app measured 22% (9.9 MiB/s) earlier the same day, section 2.2; the Gradle debug variant compiles the Rust core without optimisation |
 | 80% (stretch) | **Pass** (section 7) | as above |
-| No throughput drop between 100 and 5,000 files | **Pass on the engine, fail to the phone** | desktop to desktop: 5,000 files at 170 to 221 MiB/s vs 100 files at 93 to 105 MiB/s. Desktop to phone after the sink rewrite (section 7): 1.9 vs 39.8 MiB/s, from a 13 ms per-file floor that is one MediaProvider insert per file landing in Downloads; a product decision (section 7.3) |
+| No throughput drop between 100 and 5,000 files | **Pass on the engine, partial to the phone** | desktop to desktop: 5,000 files at 170 to 221 MiB/s vs 100 files at 93 to 105 MiB/s. Desktop to phone with the Phase 7 landing folder (section 8): 7.2 to 9.5 vs 33.9 to 46.0 MiB/s, about 0.2 (was 1.9 vs 39.8, about 0.05, in Phase 6); the floor is now the core's per-member delivery, Phase 8 |
 | Published matrix against LocalSend and KDE Connect | **Dropped** | the user chose on 2026-10-14 not to run the incumbents (section 5 item 6); the claim in PLAN.md stays unmeasured; `bench/incumbents.md` keeps the method if anyone wants it later |
 | Cold send under 1 s, warm clipboard under 50 ms | Not measured here | Phase 2 recorded desktop clipboard to peer at 2 to 5 ms |
 
@@ -184,7 +184,7 @@ protocol.md 7.7). The gate-B test records the same property: `gate_b_many_small_
 
 | Item | How | Needs |
 |---|---|---|
-| Release-app PlayDrop rows | `cd apps/android && ./gradlew :app:assembleRelease`, install, then `bench/desktop-to-phone.sh --runs 3` | release signing key; accept a re-pair if the key differs |
+| Release-app PlayDrop rows | done: sections 7 and 8 | |
 | LocalSend and KDE Connect rows | `bench/incumbents.md` | dropped by the user on 2026-10-14; only if someone else wants the comparison |
 | Wired-desktop rows | same scripts with `eno1` up | Ethernet cable |
 | Phone to desktop PlayDrop rows | share-sheet send with a stopwatch or screen recording, or a future `playdrop` CLI/instrumented path | user at the phone |
@@ -248,4 +248,77 @@ floods of thousands of tiny files are rare in daily use. The two ways below the 
 (receive into the app's own folder and file into Downloads in the background, or send very
 large counts as one archive) are product changes and go to Phase 7. The incumbents run in
 section 2.2 is not run (user choice); LocalSend would pay the same insert plus one
-request per file, so it is expected to sit at or below this floor.
+request per file, so it is expected to sit at or below this floor. Phase 7 took the first
+of those two ways; section 8 has the result.
+
+
+## 8. Phase 7: landing folder and the rename finding (2026-10-15)
+
+Same phone and link (Android 16 now, RSSI -56 dBm, 408 Mbit/s tx, 720 to 1200 Mbit/s rx,
+screen `Dozing`), desktop load average 2.5 to 10, release app from the Phase 7 commit plus
+the rename change below (`assembleRelease -Pplaydrop.signWithDebugKey=true`), daemon
+`0.2.0`, `bench/desktop-to-phone.sh --peer SM-A546U1 --runs 3`. Every row completed with all
+file counts and sha256 sums matching on the phone. A bulk drop (64 files or more, mean under
+1 MiB: `tree`, `small-1000`, `mixed-5000`) lands in the app's own folder and a mover copies
+it into Downloads after the send returns; "In Downloads +s" is how much later the last file
+was there.
+
+### 8.1 Desktop to phone, MiB/s (three runs each)
+
+| Dataset | Phase 6 release app, direct-write sink (section 7.1) | Phase 7 | Wall s | In Downloads +s |
+|---|---|---|---|---|
+| `big-1g` | 41.4 | 43.9, 43.5, 47.6 | 23.3, 23.6, 21.5 | 0 |
+| `medium-100` | 39.8 | 33.9, 39.9, 46.0 | 5.0, 4.2, 3.7 | 0 |
+| `small-1000` | 4.67, 4.52, 5.20, 4.52 | 14.8, 15.4, 20.1 | 6.6, 6.3, 4.9 | 17.9, 17.9, 16.9 |
+| `mixed-5000` | 1.83, 1.91, 1.92 | 9.46, 8.77, 7.20 | 17.5, 18.8, 22.9 | 83.4, 86.4, 85.4 |
+| `tree` | 7.02 | 12.0, 13.5, 12.4 | 1.30, 1.16, 1.26 | 2.2, 2.2, 3.2 |
+
+### 8.2 Where the time goes now (sink debug log)
+
+- Landing, `mixed-5000`: 0.69 ms per file inside the sink (claim 0.47, rename from staging
+  into the landing folder 0.20, URI 0.02), down from 13 ms. The whole delivery of 5,000
+  members still spans 10.1 s, so about 1.3 ms per file is spent outside the sink: the core's
+  per-member staging file, verification, descriptor hand-over and delete. That, plus the
+  7 to 8 s of network and hashing, is the 17 to 23 s wall time.
+- Mover, `mixed-5000`: 84 s for 5,000 files, 14 ms each (create 9.8, journal 1.7, copy 0.4,
+  close 0.3), in the background; the sender is free after 17 to 23 s instead of 86 to 90 s.
+- Direct path, `medium-100`: 16 ms per file (create 11.5, copy 4.4), unchanged.
+- `big-1g`: the copy from staging into Downloads is 4.4 to 5.7 s of the 21.5 to 23.6 s.
+
+### 8.3 The rename finding
+
+Phase 7 was written with a `rename(2)` of the staging file (or the landed file) into
+Downloads ahead of the copy, gated per route on `EXDEV`, `EACCES` or `EPERM`. On this phone
+the rename succeeds, and the first runs of the day used it:
+
+| Route | Rename | The app's own copy |
+|---|---|---|
+| staging into Downloads, 1 GiB | 8.3 s, 8.0 s | 4.4 s, 4.1 s |
+| staging into Downloads, 1.7 MiB files (`medium-100`) | 35 ms per file | 16 ms per file |
+| landing folder into Downloads, `mixed-5000` | 145 s, 124 s (29 and 26 ms per file) | 59 s (14 ms per file) |
+| staging into the landing folder (same tree) | 0.1 to 0.2 ms per file | not needed |
+
+The rename into Downloads scales with the file size at about 8 ms per MiB: MediaProvider's
+FUSE layer serves it as a copy behind the scenes, through a slower path than the app's
+kernel copy. It is also not atomic: a force-stop of the app in the middle of the move left
+`m0221.bin` complete in Downloads and still in the landing folder, so the next pass moved it
+again as `m0221 (1).bin` (5,001 files). The same force-stop with the journaled copy ended
+with exactly 5,000 files and an empty landing folder. The rename into Downloads was removed
+from both routes (`DownloadsSink.kt`); the rename from staging into the landing folder is a
+real rename and stays. Table 8.1 is measured after that change.
+
+### 8.4 Verdict against "no drop between 100 and 5,000 files"
+
+At the sender, `mixed-5000` runs at 7.2 to 9.5 MiB/s against 33.9 to 46.0 for `medium-100`:
+about 0.2, still under the 0.8 gate, but 4 to 5 times the Phase 6 figure, and the floor is
+no longer MediaProvider. The remaining cost is the core's per-member delivery (about 2 ms
+a file including the sink) while the bundle has already fully arrived; delivering members
+while the bundle still streams, or handing the sink several members at once, is the Phase 8
+item. Files reach Downloads 85 s after a 5,000-file drop; the notification shows the move.
+
+### 8.5 Resume over Wi-Fi
+
+`big-1g` with `adb shell am force-stop org.playdrop.android` at 50% and the app relaunched
+8 s later: the transfer finished 21.6 s after the relaunch (the remaining half plus the copy
+tail; a restart from zero would have needed about 35 s), 42.6 s in all, sha256 equal, one
+file, no " (1)" copy.

@@ -44,7 +44,10 @@ downloaded or built tools under `/tmp/pd-bench-tools`.
   bytes over that time. Runs before Phase 7 used a Python helper that polled every
   100 ms, so their wall times can be up to 0.1 s longer for the same transfer.
 - The phone folder is `/sdcard/Download/PlayDrop/<dataset>/` (the app's Downloads sink,
-  `DownloadsSink.kt`). The script deletes the dataset folder before each run.
+  `DownloadsSink.kt`). The script deletes the dataset folder before each run. A bulk drop
+  (64 files or more, mean under 1 MiB) lands in the app's own folder first and is copied
+  into Downloads by a mover after the send returns; the script waits for that mover before
+  it verifies, and the "In Downloads +s" column is that wait (0 for a direct write).
 - A row without "yes ... all sums match" is a failure, whatever its speed.
 - Do not run `iperf3-phone.sh` and `desktop-to-phone.sh` at the same time; they share
   the one radio.

@@ -2,9 +2,6 @@ package org.playdrop.android.core
 
 /** How the move of one landed file into Downloads ended. */
 internal enum class MoveOutcome {
-    /** Renamed in place: no copy, the landed file is gone. */
-    RENAMED,
-
     /** Copied, then the landed file deleted. */
     COPIED,
 
@@ -30,8 +27,6 @@ internal data class MoveResult(val outcome: MoveOutcome, val renumbered: Boolean
  * coroutine.
  */
 internal class MoveTally(val total: Int) {
-    var renamed = 0
-        private set
     var copied = 0
         private set
     var gone = 0
@@ -44,10 +39,10 @@ internal class MoveTally(val total: Int) {
         private set
 
     /** Files handled so far, whatever the outcome. */
-    val done: Int get() = renamed + copied + gone + failed
+    val done: Int get() = copied + gone + failed
 
     /** Files that are in Downloads because of this pass. */
-    val moved: Int get() = renamed + copied
+    val moved: Int get() = copied
 
     /** Records one [MoveResult]. */
     fun record(result: MoveResult) = record(result.outcome, result.renumbered)
@@ -63,17 +58,16 @@ internal class MoveTally(val total: Int) {
     /** Records one file. [renumbered] is true when its promised name had to change. */
     fun record(outcome: MoveOutcome, renumbered: Boolean = false) {
         when (outcome) {
-            MoveOutcome.RENAMED -> renamed++
             MoveOutcome.COPIED -> copied++
             MoveOutcome.GONE -> gone++
             MoveOutcome.FAILED -> failed++
         }
-        if (renumbered && (outcome == MoveOutcome.RENAMED || outcome == MoveOutcome.COPIED)) this.renumbered++
+        if (renumbered && outcome == MoveOutcome.COPIED) this.renumbered++
     }
 
     /** One log line. */
     fun line(): String =
-        "$done of $total files: $renamed renamed, $copied copied, $gone already gone, $failed failed, $renumbered renumbered"
+        "$done of $total files: $copied copied, $gone already gone, $failed failed, $renumbered renumbered"
 }
 
 /**

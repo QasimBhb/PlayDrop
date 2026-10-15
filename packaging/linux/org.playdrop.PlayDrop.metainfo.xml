@@ -62,7 +62,7 @@
         <p>Faster bulk drops to Android, a command line and a user guide.</p>
         <ul>
           <li>The playdrop command can send files and drive the running service</li>
-          <li>Android: many small files arrive at full speed, large files are moved instead of copied</li>
+          <li>Android: many small files arrive at full speed</li>
           <li>Start at login reports exactly why the system refused</li>
           <li>A README and a user guide</li>
         </ul>

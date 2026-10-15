@@ -18,31 +18,34 @@ named per item; do not re-read the whole tree.
 | Rust tests | 435 passed, 0 failed, 8 ignored (`cargo test --workspace --no-fail-fast`, up from 394: the quiet double run counted 434 before the slot test was split out of `offer_names_and_cancel_by_id`); `cargo clippy --workspace --all-targets` zero warnings; `cargo fmt --all --check` clean |
 | Android tests | 148 JUnit (up from 110); `:app:compileDebugKotlin` no warnings; `:app:assembleRelease -Pplaydrop.signWithDebugKey=true` builds (`apps/android/app/build/outputs/apk/release/app-release.apk`) |
 | iOS checks | `apps/ios/scripts/check-linux.sh` exit 0 (now includes the version check); `PlayDropShared` 106 XCTests on Linux (up from 102) |
-| Phone | The Galaxy A54 showed `unauthorized` on adb for the whole session, so nothing in this phase was run on the phone. Section 6 lists the exact runs |
+| Phone | Run on 2026-10-15 after the first commit (the A54 was `unauthorized` on adb during the build): every item in section 6 passed or was measured; the rename into Downloads was removed as a result (section 4). Results in `docs/release/throughput.md` section 8 |
 
 ### 1.1 What landed
 
-**Android: landing folder and rename-first delivery** (`apps/android/.../core/DownloadsSink.kt`,
+**Android: landing folder and background move into Downloads** (`apps/android/.../core/DownloadsSink.kt`,
 `LandingPolicy.kt`, `LandingTree.kt`, `LandingMover.kt`, `NameClaims.kt`, `MoveTally.kt`,
 `FileNames.kt`, `CoreHostImpl.kt`, `service/Notifications.kt`, `NotificationPlan.kt`,
 `ActionReceiver.kt`).
 
-- Direct path (Android 11+): the sink reads the staging path of the delivered fd through
-  `/proc/self/fd`, checks it is inside the staging folder, and tries `rename` into
-  `Download/PlayDrop/<dirs>/<name>` before the old create-and-copy. A target name is claimed
-  under a per-folder lock and checked free before the rename, since `rename(2)` replaces
-  silently. `EXDEV`, `EACCES` or `EPERM` turn rename off for that route for the rest of the
-  process (logged once); any other errno falls back for that one file.
+- Direct path (Android 11+): unchanged from Phase 6 (create with `O_EXCL` in
+  `Download/PlayDrop/<dirs>/<name>` and a kernel copy), except that the target name is now
+  claimed under a per-folder lock shared with the landing path. The phase first tried a
+  `rename(2)` of the staging file into Downloads ahead of the copy; the phone run on
+  2026-10-15 showed MediaProvider serving that rename as a copy behind the scenes, slower than
+  the app's own copy and not atomic (section 6), so the rename into Downloads was removed on
+  both routes before the commit of the live results. The staging path still comes from
+  `/proc/self/fd` for the rename into the landing folder, which is a real rename.
 - Landing (Android 11+): a transfer with at least 64 files and a mean size under 1 MiB
   (`LandingPolicy`) is delivered into `getExternalFilesDir("landing")/<tid>/<dirs>/<name>`
   (about 0.2 ms per file, no MediaProvider row). The decision uses `TransferOffer` when one
   arrives (only when the peer lacks the `files` grant) and otherwise `host.transfers()` on the
   first file; it depends only on count and bytes, so a restarted process decides the same.
   `deliver` returns the FileProvider URI of the promised Downloads name.
-- Mover: a serial queue on the host scope moves landed files into Downloads with the same
-  rename-then-copy primitive, batched media scans, and a "Moving n of m files into Downloads"
-  notification (tagged, cleared in `finally`, stale ones replaced at start). Copy moves are
-  journaled (target created `O_EXCL`, journal written and fsynced, copy, delete landed, clear),
+- Mover: a serial queue on the host scope copies landed files into Downloads with the same
+  create-and-copy primitive as direct delivery, batched media scans, and a "Moving n of m
+  files into Downloads" notification (tagged, cleared in `finally`, stale ones replaced at
+  start). Every move is journaled (target created `O_EXCL`, journal written and fsynced,
+  copy, delete landed, clear),
   the MediaStore fallback journals the row URI; recovery at start removes an unfinished copy.
   Retries inside the process at 1, 5, 30 minutes, 2 h, 6 h, on `ACTION_MEDIA_MOUNTED`, and from
   a "Try again" notification action. Landed files are never discarded: a terminal failure or a
@@ -51,8 +54,7 @@ named per item; do not re-read the whole tree.
   end only when the transfer's state in `host.transfers()` is terminal, because the core also
   emits it for one file's integrity failure while the transfer continues.
 - Known limits (documented in the KDoc): a kill between the `O_EXCL` create and the journal
-  write can leave one empty file in Downloads; another app can take a name between the check
-  and the rename (no no-replace rename on Android); a file renumbered by the mover leaves the
+  write can leave one empty file in Downloads; a file renumbered by the mover leaves the
   location the core stored stale (the notification then opens the folder; the in-app transfer
   list still shows the stored location); a landed file's URI does not open until its move
   finishes.
@@ -195,7 +197,7 @@ Cargo.toml 0.2.0, crates/playdrop-ffi/Cargo.toml 0.2.1, crates/playdrop-cli/Carg
 |---|---|
 | Land bulk drops in the app folder and move later, rather than an archive or `MANAGE_EXTERNAL_STORAGE` | Keeps "no throughput drop between 100 and 5,000 files" true at the sender with no new permission and no user step; the MediaProvider cost is paid off the critical path. Thresholds 64 files and 1 MiB mean are documented in `LandingPolicy` |
 | Landed files are never discarded | The direct path keeps delivered files on every kind of end, and every landed file is root-verified; discarding would lose data the sender believes arrived |
-| Rename first, copy as fallback, per-route gate | A rename saves the 4.7 s copy per GiB if MediaProvider allows it; unverified on the phone, so the fallback is the old path and the gate stops retrying a refused route |
+| Never rename into Downloads; rename only from staging into the landing folder | Measured on the A54 on 2026-10-15 (section 6): `rename(2)` from the app's folder into `Download` succeeds, but MediaProvider serves it as a copy behind the scenes, slower than the app's own copy (8.0 s against 4.1 s for 1 GiB, 29 ms against 14 ms per small file) and not atomic (a force-stop mid-move left one file both landed and in Downloads, then renumbered). The journaled copy is faster and survives a kill. Staging to landing is a real rename (0.1 ms per file) and keeps the per-route gate |
 | Bundle delivery log instead of per-member `.part` promotion | Smallest change that makes "a member leaves staging" durable without touching the wire or the `ReceiveSink` trait |
 | Diagnostics IDs truncated rather than a new redacted export | The report is the export; truncation matches the log rule and nothing matched on the fields |
 | CLI peer order: ID, Short ID prefix, label; ambiguity is an error | A label is the peer's own advertised name and must not capture `--to` meant for another device |
@@ -209,8 +211,9 @@ Cargo.toml 0.2.0, crates/playdrop-ffi/Cargo.toml 0.2.1, crates/playdrop-cli/Carg
 
 | File or area | What | Phase |
 |---|---|---|
-| Phone (A54) | Every live run in section 6: rename through FUSE, bulk and 1 GiB numbers, resume by force-stop, landing notification flow | before `v0.2.0` |
 | `apps/android/.../core/DownloadsSink.kt` | A renumbered landed file leaves the core's stored location stale in the in-app transfer list; a PlayDrop-owned lookup URI would need a `ContentProvider` | 8 |
+| `crates/playdrop-core/src/transfer/receiver.rs` | Bundle members are delivered one at a time after the bundle has fully arrived, about 2 ms each including the sink: 10 s of the 17 to 23 s a 5,000-file drop takes to the phone (`throughput.md` 8.2). Deliver while streaming, or hand the sink a batch | 8 |
+| `apps/android/.../core/LandingPolicy.kt` | The 1 MiB mean threshold saves 11.5 ms per file whatever its size (one MediaProvider row); the data would support a mean up to about 4 MiB at the cost of writing those bytes twice. Left as is | 8 |
 | `crates/playdrop-core/src/transfer/receiver.rs` | Single streamed files still have the window between `place` and `ledger.finish`: a kill there re-downloads the file and it lands as "name (1)". Same treatment as the bundle log | 8 |
 | `crates/playdrop-core/src/transfer/receiver.rs` | A bundle delivery error without a restart (non-sink I/O) still lets the sender restart from 0 and re-download | 8 |
 | `crates/playdrop-core/src/host` | The sender's snapshot flips to `active` and zero-byte progress events arrive while the receiver is still deciding; the CLI works around it. No per-file progress in events or snapshots | 8 |
@@ -223,43 +226,32 @@ Cargo.toml 0.2.0, crates/playdrop-ffi/Cargo.toml 0.2.1, crates/playdrop-cli/Carg
 
 ---
 
-## 6. Owed live runs on the phone (adb was unauthorized all session)
+## 6. Live runs on the phone (2026-10-15, after the first commit)
 
-Accept the USB debugging prompt on the A54, then, with daemon `alpha` running
-(`CLAUDE.md` "Commands") and paired with the phone (label `SM-A546U1`):
+Daemon `alpha` rebuilt from the Phase 7 commit, release app installed over the one on the
+phone (pairing kept), `adb logcat -s playdrop:*` read for the `[sink]` and `[landing]` lines.
+Results in full in `docs/release/throughput.md` section 8.
 
-```
-export PATH="$HOME/.cargo/bin:$PATH"
-cd "/media/calliope/New Volume/projs/PlayDrop"
-adb install -r apps/android/app/build/outputs/apk/release/app-release.apk
-cargo build --release -p playdrop-cli
-adb logcat -c; adb logcat -s playdrop:* | grep -E "\[sink\]|\[landing\]" &
-target/release/playdrop peers
-target/release/playdrop send --to SM-A546U1 /tmp/pd-bench/tree          # direct path, small folder
-target/release/playdrop send --to SM-A546U1 /tmp/pd-bench/big-1g        # rename of a big file
-target/release/playdrop send --to SM-A546U1 /tmp/pd-bench/mixed-5000    # landing plus mover
-bench/desktop-to-phone.sh --peer SM-A546U1 --runs 3                     # the gate table
-```
+| Run | Result |
+|---|---|
+| `tree`, `big-1g`, `medium-100`, `mixed-5000` by hand, then `bench/desktop-to-phone.sh --peer SM-A546U1 --runs 3` | All 15 bench runs verified (counts and sha256). `mixed-5000` 7.2 to 9.5 MiB/s at the sender (was 1.9), `small-1000` 14.8 to 20.1 (was 4.5 to 5.2), `tree` 12.0 to 13.5 (was 7.0), `medium-100` 33.9 to 46.0, `big-1g` 43.5 to 47.6. Files of a bulk drop reach Downloads 2 s (`tree`), 17 s (`small-1000`) or 85 s (`mixed-5000`) after the send returns |
+| Rename through FUSE | Succeeds on this phone, but it is a copy behind the scenes (8 ms per MiB), slower than the app's own copy and not atomic (a force-stop mid-move left a duplicate). Removed on both routes, see section 4; the rename from staging into the landing folder is real (0.1 to 0.2 ms) and stays |
+| Resume by `am force-stop` at 50% of 1 GiB, relaunch after 8 s | Pass: finished 21.6 s after the relaunch, sha256 equal, one file, no " (1)" |
+| Landing notification flow | "Moving 202 of 5,000 files into Downloads" while the mover runs; after a force-stop and relaunch the sweep continues ("Moving 325 of 4,779 files"); ends with "4779 received files moved into Downloads", "Saved in Download/PlayDrop". Read from `dumpsys notification`, not by eye |
+| Gate "`mixed-5000` at or above 0.8x of `medium-100`" | Not met: about 0.2. The floor moved from MediaProvider to the core's per-member delivery (section 5, Phase 8) |
 
-Read in logcat: "rename from staging into Downloads works" or "rename ... refused (EXDEV|
-EACCES|EPERM) ...; copying from now on"; the per-transfer timing line (`rename`/`stat` or
-`create`/`copy`, `claim`, `land-rename`/`land-copy`); "[landing] transfer ...: moved into
-Downloads in N ms: ... renamed, ... copied". Gates: `mixed-5000` at or above 0.8x of
-`medium-100` at the sender; `big-1g` without the 4.7 s copy tail if rename is allowed;
-counts and sha256 sums on the phone match (the script checks). Then resume over Wi-Fi: send
-`big-1g`, `adb shell am force-stop org.playdrop.android` at about half, reopen the app, and
-check the hash matches with no " (1)" copy. Then the landing notification flow by eye:
-"Moving n of m", then "Received", and a force-stop during the move followed by a reopen
-("Moving received files was interrupted", then the sweep finishes it). Record the numbers
-in `docs/release/throughput.md` section 3 and the results in `docs/release/test-matrix.md`.
+Not run: a Wi-Fi drop (instead of a force-stop) mid-transfer; the thresholds were left as
+they are (section 5).
 
 ---
 
 ## 7. Phase 8 kickoff brief
 
-Finish section 6 first; the numbers decide whether the landing thresholds move. Then, from
-section 5 by value: single-file placement durability (same log idea as the bundle), the
-sender's early `active` state and per-file progress, and the stale-location gap on Android.
+Section 6 is done and the thresholds stay. From section 5 by value: bundle members
+delivered while the bundle streams (or in batches to the sink), which is what now bounds a
+5,000-file drop to the phone; single-file placement durability (same log idea as the
+bundle); the sender's early `active` state and per-file progress; and the stale-location
+gap on Android. Tag `v0.2.0` first (date the changelog heading and the metainfo entry).
 PLAN.md row 7 items (iroh, Local Push Connectivity, Wi-Fi Aware, libcosmic applet, MSIX)
 stay behind flags and each wants a design note before code.
 
