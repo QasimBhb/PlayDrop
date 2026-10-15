@@ -80,6 +80,14 @@ ignore it). `PeerSummary` gains `capabilities` (the peer's
 `caps.in` while online, empty offline): a UI shows remote input, media control or image
 clips only when the matching capability is listed. `unsupported` is no longer emitted.
 
+### 1.3 Settings field added in Phase 7
+
+`IPC_VERSION` stays 1 (additions only).
+
+| Settings field | Default | Meaning |
+|---|---|---|
+| `autostart_refused` | absent | Why start at login is off although it was asked for: a sentence worded for the user (the Background portal or the desktop refused, or the login entry could not be written). Absent when it was never refused or the setting was turned on again successfully. The daemon stores it with the settings, so a window started later still sees it, and clears it when `SetSettings` carries any `autostart` value. A refusal also arrives as a `settings_changed` event with `autostart: false` and this field set. Missing from an older daemon's answer reads as absent |
+
 Requests are independent and may be issued concurrently. Events are broadcast to every
 connected client from the moment it connects; there is no replay. A UI that starts late
 rebuilds its view from `Status`, `Peers` and `Transfers` and then applies events.

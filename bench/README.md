@@ -9,8 +9,7 @@ downloaded or built tools under `/tmp/pd-bench-tools`.
 | `make-dataset.sh` | Builds the five datasets and prints counts, bytes and manifest checksums. Seeded, so the bytes are identical on every machine. | python3, an ext4 directory |
 | `loopback.sh` | PlayDrop HTTP/2 and raw framing against iperf3 on 127.0.0.1. Protocol and crypto cost only, no radio. | `cargo build --release -p playdrop-cli`, iperf3 |
 | `iperf3-phone.sh` | The Wi-Fi ceiling: desktop to phone and phone to desktop, 1 and 4 streams. | adb, iperf3, an arm64 Android iperf3 (the script header says how to build it) |
-| `desktop-to-phone.sh` | PlayDrop end to end, desktop to phone, per dataset, then checks file count and sha256 of every file on the phone. | `playdropd` running and paired, adb, python3-gi |
-| `pd_ipc.py` | Helper for the script above: passes files to the daemon as file descriptors (`SendFiles`) and polls `transfers`. | python3-gi |
+| `desktop-to-phone.sh` | PlayDrop end to end, desktop to phone, per dataset, then checks file count and sha256 of every file on the phone. Sends with `playdrop send --to <peer> --json`. | `playdropd` running and paired, `cargo build --release -p playdrop-cli`, adb, python3 |
 | `incumbents.md` | Manual steps to time LocalSend and KDE Connect on the same datasets. | the user |
 
 ## Order of a full run
@@ -38,9 +37,12 @@ downloaded or built tools under `/tmp/pd-bench-tools`.
 
 ## Reading the numbers
 
-- `desktop-to-phone.sh` wall time starts just before `SendFiles` and ends at the first
-  100 ms poll that sees the transfer finished. It includes manifest building, BLAKE3 on
-  both sides and the phone's Downloads writes. MiB/s is file bytes over that time.
+- `desktop-to-phone.sh` wall time starts just before `playdrop send` and ends when it
+  exits, which is when the daemon reports the transfer finished (the completion event,
+  no polling step). It includes manifest building, BLAKE3 on both sides and the phone's
+  Downloads writes, plus the CLI's start and daemon connect (a few ms). MiB/s is file
+  bytes over that time. Runs before Phase 7 used a Python helper that polled every
+  100 ms, so their wall times can be up to 0.1 s longer for the same transfer.
 - The phone folder is `/sdcard/Download/PlayDrop/<dataset>/` (the app's Downloads sink,
   `DownloadsSink.kt`). The script deletes the dataset folder before each run.
 - A row without "yes ... all sums match" is a failure, whatever its speed.

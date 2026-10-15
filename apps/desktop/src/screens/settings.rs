@@ -6,7 +6,7 @@ use slint::ComponentHandle;
 
 use super::{with, Controller};
 use crate::ipc::post;
-use crate::model::{self, remote_input_line, remote_input_reason, AUTOSTART_REFUSED};
+use crate::model::{remote_input_line, remote_input_reason};
 use crate::{App, DevicesState, SettingsState};
 
 pub(super) fn install(app: &App) {
@@ -53,7 +53,6 @@ pub(super) fn install(app: &App) {
     });
     s.on_set_autostart(|on| {
         with(|c| {
-            c.store.borrow_mut().autostart_set(on, model::unix_now());
             patch(
                 c,
                 SettingsPatch {
@@ -90,11 +89,7 @@ pub(super) fn refresh(c: &Controller) {
     s.set_clipboard_images(set.clipboard_images);
     s.set_clipboard_watch_supported(set.clipboard_watch_supported);
     s.set_autostart(set.autostart);
-    s.set_autostart_note(if store.autostart_refused {
-        AUTOSTART_REFUSED.into()
-    } else {
-        "".into()
-    });
+    s.set_autostart_note(set.autostart_refused.as_deref().unwrap_or("").into());
     s.set_notifications(set.notifications);
     s.set_remote_input(remote_input_line(set).into());
     let d = app.global::<DevicesState>();

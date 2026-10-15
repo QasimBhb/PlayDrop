@@ -23,6 +23,7 @@ import org.playdrop.android.share.ClipboardSendActivity
 import org.playdrop.android.share.PickAndSendActivity
 import org.playdrop.core.HostEvent
 import org.playdrop.core.TransferDirection
+import java.text.NumberFormat
 
 /**
  * Every notification the host layer posts. Channels: `service` (low, the persistent
@@ -126,15 +127,17 @@ internal object Notifications {
 
     /**
      * Posts whatever [event] calls for. [labelOf] maps a hex Device ID to the local label
-     * (falling back to the Short ID). Clipboard events are applied here too.
+     * (falling back to the Short ID). Clipboard events are applied here too. With
+     * [deferReceived] a completed receive posts nothing yet: its files are still being moved
+     * into Downloads and [moveFinished] posts the notification.
      */
-    suspend fun onEvent(context: Context, event: HostEvent, labelOf: (String) -> String) {
+    suspend fun onEvent(context: Context, event: HostEvent, labelOf: (String) -> String, deferReceived: Boolean = false) {
         when (event) {
             is HostEvent.Paired -> paired(context, event)
             is HostEvent.TransferOffer -> offer(context, event, labelOf(event.peer))
             is HostEvent.TransferComplete -> {
                 cancel(context, NotificationPlan.notificationId(NotificationPlan.Kind.OFFER, event.id))
-                if (event.direction == TransferDirection.RECEIVE) received(context, event, labelOf(event.peer))
+                if (event.direction == TransferDirection.RECEIVE && !deferReceived) received(context, event, labelOf(event.peer))
             }
             is HostEvent.TransferFailed -> {
                 cancel(context, NotificationPlan.notificationId(NotificationPlan.Kind.OFFER, event.id))
@@ -151,6 +154,115 @@ internal object Notifications {
             else -> Unit
         }
     }
+
+    /**
+     * "Moving 1,200 of 5,000 files into Downloads", silent and ongoing, under the transfer's
+     * "received" ID with the [NotificationPlan.MOVING_TAG] tag. The final notice of the move
+     * removes it ([moveFinished]); a start removes any a killed process left ([clearStaleMoving]).
+     * The caller throttles it.
+     */
+    fun moving(context: Context, transferId: String, done: Int, total: Int) {
+        val fmt = NumberFormat.getIntegerInstance()
+        val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
+            .setSmallIcon(R.drawable.ic_stat_playdrop)
+            .setContentTitle(context.getString(R.string.moving_title))
+            .setContentText(context.resources.getQuantityString(R.plurals.moving_text, total, fmt.format(done), fmt.format(total)))
+            .setProgress(total, done, false)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setContentIntent(openApp(context))
+            .build()
+        post(context, NotificationPlan.notificationId(NotificationPlan.Kind.RECEIVED, transferId), n, NotificationPlan.MOVING_TAG)
+    }
+
+    /**
+     * Replaces every "Moving" notification a killed process left with a plain notice that the
+     * files are in Download/PlayDrop (the sweep that follows moves anything still landed and
+     * posts its own notice under the same ID).
+     */
+    fun clearStaleMoving(context: Context) {
+        val nm = context.getSystemService(NotificationManager::class.java)
+        val stale = try {
+            nm.activeNotifications.filter { it.tag == NotificationPlan.MOVING_TAG }
+        } catch (e: Exception) {
+            HostLog.w("notify", "could not list active notifications", e)
+            return
+        }
+        for (sbn in stale) {
+            nm.cancel(sbn.tag, sbn.id)
+            val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
+                .setSmallIcon(R.drawable.ic_stat_playdrop)
+                .setContentTitle(context.getString(R.string.moved_interrupted_title))
+                .setContentText(context.getString(R.string.moved_interrupted_text))
+                .setContentIntent(downloadsIntent(context, sbn.id))
+                .setSilent(true)
+                .setAutoCancel(true)
+                .build()
+            post(context, sbn.id, n)
+        }
+    }
+
+    /**
+     * Ends a move pass: always removes the ongoing "Moving" notice first. For a completed
+     * transfer ([completed] not null) it then posts the normal "received" notification (with
+     * [forceFolder], one that opens the Downloads list). For a transfer that failed or was
+     * cancelled ([endedEarly]) it says how many files arrived before it stopped; the failure
+     * keeps its own notification with the reason. For leftovers and retries it says how many
+     * files reached Downloads. While files are left behind ([failed]) a separate notice says
+     * how many, that they are moved automatically, and offers "Try again" (anti-pattern 18:
+     * nothing fails silently); once none are left, that notice is removed.
+     */
+    fun moveFinished(
+        context: Context,
+        transferId: String,
+        completed: HostEvent.TransferComplete?,
+        endedEarly: Boolean,
+        label: String?,
+        moved: Int,
+        failed: Int,
+        forceFolder: Boolean,
+    ) {
+        val receivedId = NotificationPlan.notificationId(NotificationPlan.Kind.RECEIVED, transferId)
+        NotificationManagerCompat.from(context).cancel(NotificationPlan.MOVING_TAG, receivedId)
+        when (NotificationPlan.moveNotice(completed != null, endedEarly, moved)) {
+            NotificationPlan.MoveNotice.RECEIVED ->
+                completed?.let { received(context, it, label ?: it.peer.take(8), forceFolder) }
+            NotificationPlan.MoveNotice.ARRIVED_BEFORE_END, NotificationPlan.MoveNotice.MOVED_AFTER_RESTART -> {
+                val title = if (endedEarly) R.plurals.moved_before_end else R.plurals.moved_after_restart
+                val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
+                    .setSmallIcon(R.drawable.ic_stat_playdrop)
+                    .setContentTitle(context.resources.getQuantityString(title, moved, moved))
+                    .setContentText(context.getString(R.string.moved_after_restart_text))
+                    .setContentIntent(downloadsIntent(context, receivedId))
+                    .setAutoCancel(true)
+                    .build()
+                post(context, receivedId, n)
+            }
+            NotificationPlan.MoveNotice.NONE -> Unit
+        }
+        val incompleteId = NotificationPlan.notificationId(NotificationPlan.Kind.MOVE_INCOMPLETE, transferId)
+        if (failed <= 0) {
+            cancel(context, incompleteId)
+            return
+        }
+        val text = context.getString(R.string.move_failed_text)
+        val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
+            .setSmallIcon(R.drawable.ic_stat_playdrop)
+            .setContentTitle(context.resources.getQuantityString(R.plurals.move_failed_title, failed, failed))
+            .setContentText(text)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setContentIntent(downloadsIntent(context, incompleteId))
+            .addAction(0, context.getString(R.string.action_retry_move), broadcast(context, NotificationPlan.retryMoveAction(incompleteId)))
+            .setOnlyAlertOnce(true)
+            .setAutoCancel(true)
+            .build()
+        post(context, incompleteId, n)
+    }
+
+    /** Opens the system Downloads list; [requestCode] keeps it apart from other notifications' intents. */
+    private fun downloadsIntent(context: Context, requestCode: Int): PendingIntent =
+        PendingIntent.getActivity(context, requestCode, downloads(), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
 
     /** Removes a notification. */
     fun cancel(context: Context, id: Int) {
@@ -191,10 +303,10 @@ internal object Notifications {
         post(context, id, b.build())
     }
 
-    private fun received(context: Context, e: HostEvent.TransferComplete, label: String) {
+    private fun received(context: Context, e: HostEvent.TransferComplete, label: String, forceFolder: Boolean = false) {
         val delivered = e.delivered.map { NotificationPlan.Delivered(it.path, it.location) }
         if (delivered.isEmpty()) return
-        val plan = NotificationPlan.received(delivered) { DownloadsSink.guessMime(it) }
+        val plan = NotificationPlan.received(delivered, forceFolder) { DownloadsSink.guessMime(it) }
         val (title, tap) = when (plan) {
             is NotificationPlan.Received.One -> context.getString(R.string.received_one, plan.name) to
                 Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(plan.uri), plan.mime)
@@ -304,7 +416,7 @@ internal object Notifications {
         post(context, NotificationPlan.notificationId(NotificationPlan.Kind.CLIPBOARD, peer), n)
     }
 
-    private fun post(context: Context, id: Int, n: Notification) {
+    private fun post(context: Context, id: Int, n: Notification, tag: String? = null) {
         val granted = Build.VERSION.SDK_INT < 33 ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
         if (!granted || !NotificationManagerCompat.from(context).areNotificationsEnabled()) {
@@ -315,7 +427,7 @@ internal object Notifications {
             return
         }
         try {
-            NotificationManagerCompat.from(context).notify(id, n)
+            NotificationManagerCompat.from(context).notify(tag, id, n)
         } catch (e: SecurityException) {
             HostLog.w("notify", "posting a notification was refused", e)
         }

@@ -484,6 +484,7 @@ mod tests {
                 remote_input_supported: false,
                 remote_input_reason: None,
                 autostart: false,
+                autostart_refused: None,
                 notifications: true,
             },
             add_device_window_open: false,

@@ -8,6 +8,32 @@ import org.junit.Test
 /** Notification IDs, action specs and the "received" tap decision. */
 class NotificationPlanTest {
     @Test
+    fun moveNoticeKeepsWhatArrivedBeforeAFailure() {
+        assertEquals(NotificationPlan.MoveNotice.RECEIVED, NotificationPlan.moveNotice(completed = true, endedEarly = false, moved = 0))
+        assertEquals(NotificationPlan.MoveNotice.RECEIVED, NotificationPlan.moveNotice(completed = true, endedEarly = false, moved = 5))
+        assertEquals(NotificationPlan.MoveNotice.ARRIVED_BEFORE_END, NotificationPlan.moveNotice(completed = false, endedEarly = true, moved = 3))
+        assertEquals(NotificationPlan.MoveNotice.NONE, NotificationPlan.moveNotice(completed = false, endedEarly = true, moved = 0))
+        assertEquals(NotificationPlan.MoveNotice.MOVED_AFTER_RESTART, NotificationPlan.moveNotice(completed = false, endedEarly = false, moved = 1))
+        assertEquals(NotificationPlan.MoveNotice.NONE, NotificationPlan.moveNotice(completed = false, endedEarly = false, moved = 0))
+    }
+
+    @Test
+    fun renumberedLandingOpensTheFolderNotAFile() {
+        val one = listOf(NotificationPlan.Delivered("a.jpg", "content://x/received/a.jpg"))
+        assertTrue(NotificationPlan.received(one) { "image/jpeg" } is NotificationPlan.Received.One)
+        assertEquals(NotificationPlan.Received.Many(1), NotificationPlan.received(one, forceFolder = true) { "image/jpeg" })
+    }
+
+    @Test
+    fun retryActionIsExplicitAndDistinct() {
+        val a = NotificationPlan.retryMoveAction(1_006)
+        assertEquals(NotificationPlan.ACTION_RETRY_MOVE, a.action)
+        assertTrue(a.extras.isEmpty())
+        val offers = NotificationPlan.offerActions("t", 1_006).map { it.requestCode }
+        assertTrue(a.requestCode !in offers)
+    }
+
+    @Test
     fun idsAreStableAndKindsDoNotCollide() {
         val a = NotificationPlan.notificationId(NotificationPlan.Kind.OFFER, "t1")
         assertEquals(a, NotificationPlan.notificationId(NotificationPlan.Kind.OFFER, "t1"))

@@ -273,3 +273,13 @@ Capabilities (section 6): `caps.out` now always lists `input.pointer`, `input.ke
 
 Nearby discovery: while "Add device" is open and no candidate has been seen, the host sends
 a fresh beacon burst every 10 s (Phase 3 handoff section 7).
+
+## 10. Phase 7 note (content change, `playdrop-ffi` 0.2.1, 2026-10-14)
+
+No type changed. `Diagnostics.device_id` and `PeerDiagnostic.peer` now carry the first 8 hex
+characters of the Device ID instead of all 64, the same truncation every log line uses
+(SR-32: the diagnostics report is meant to be pasted into bug reports). `short_id` and
+`label` are unchanged and are what every screen matches on; the SR-32 canary test
+(`crates/playdrop-core/tests/sr32_canary.rs`) checks the report for full IDs. A receiver
+also logs one line at DEBUG when it places a verified file (file names are allowed at
+DEBUG and below only).

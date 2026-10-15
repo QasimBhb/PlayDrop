@@ -34,6 +34,9 @@ done
 command -v xtool >/dev/null 2>&1 || die "xtool not found: install it from https://xtool.sh and run 'xtool setup'."
 command -v python3 >/dev/null 2>&1 || die "python3 not found: it is needed to prepare the plists."
 
+# Keep project.yml's MARKETING_VERSION in step with the workspace version in Cargo.toml.
+python3 "$here/sync-version.py"
+
 if [ "$rebuild_core" -eq 1 ] \
     || [ ! -d "$core_pkg/PlayDropCoreFFI.xcframework/ios-arm64" ] \
     || [ ! -f "$core_pkg/Sources/PlayDropCore/PlayDropCore.swift" ]; then

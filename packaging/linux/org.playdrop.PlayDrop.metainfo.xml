@@ -57,7 +57,18 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.1.0" date="2026-10-08" type="development">
+    <release version="0.2.0" date="2026-10-16" type="development">
+      <description>
+        <p>Faster bulk drops to Android, a command line and a user guide.</p>
+        <ul>
+          <li>The playdrop command can send files and drive the running service</li>
+          <li>Android: many small files arrive at full speed, large files are moved instead of copied</li>
+          <li>Start at login reports exactly why the system refused</li>
+          <li>A README and a user guide</li>
+        </ul>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-10-15" type="development">
       <description>
         <p>First public release.</p>
         <ul>

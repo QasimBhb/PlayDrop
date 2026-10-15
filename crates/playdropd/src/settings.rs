@@ -40,6 +40,10 @@ pub struct Settings {
     pub clipboard_images: bool,
     /// Start the daemon at login.
     pub autostart: bool,
+    /// Why start at login is off although it was asked for (see
+    /// `playdrop_ipc::Settings::autostart_refused`). Kept on disk so a window started
+    /// later still shows it.
+    pub autostart_refused: Option<String>,
     /// Show desktop notifications.
     pub notifications: bool,
     /// mDNS and the beacon; off means last-known dial only.
@@ -55,6 +59,7 @@ impl Default for Settings {
             clipboard_sync: true,
             clipboard_images: true,
             autostart: true,
+            autostart_refused: None,
             notifications: true,
             discovery: true,
         }
@@ -75,6 +80,9 @@ pub struct Changes {
     pub clipboard_images: bool,
     /// `autostart` changed.
     pub autostart: bool,
+    /// The refusal reason was cleared by a patch that carried `autostart`, so open
+    /// windows must hear about it even when the value itself did not change.
+    pub autostart_refused: bool,
     /// `notifications` changed.
     pub notifications: bool,
 }
@@ -86,6 +94,7 @@ impl Changes {
             || self.clipboard_sync
             || self.clipboard_images
             || self.autostart
+            || self.autostart_refused
             || self.notifications
     }
 }
@@ -114,6 +123,7 @@ impl Settings {
             remote_input_supported: false,
             remote_input_reason: None,
             autostart: self.autostart,
+            autostart_refused: self.autostart_refused.clone(),
             notifications: self.notifications,
         }
     }
@@ -164,6 +174,10 @@ impl Settings {
         if let Some(v) = patch.autostart {
             c.autostart = v != self.autostart;
             self.autostart = v;
+            // A new ask (on) starts a fresh attempt and a switch off is the user's own
+            // choice: either way the old refusal no longer applies. A failed attempt
+            // sets it again.
+            c.autostart_refused = self.autostart_refused.take().is_some();
         }
         if let Some(v) = patch.notifications {
             c.notifications = v != self.notifications;
@@ -384,6 +398,7 @@ mod tests {
             clipboard_sync: true,
             clipboard_images: true,
             autostart: true,
+            autostart_refused: None,
             notifications: true,
             discovery: true,
         }
@@ -508,6 +523,72 @@ mod tests {
             Err(PatchError::EmptyName)
         );
         assert_eq!(s, before);
+    }
+
+    #[test]
+    fn autostart_refusal_is_persisted_shown_and_cleared() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = sample();
+        assert_eq!(s.to_ipc(false).autostart_refused, None);
+
+        s.autostart = false;
+        s.autostart_refused = Some("Start at login was not allowed.".into());
+        assert_eq!(
+            s.to_ipc(false).autostart_refused.as_deref(),
+            Some("Start at login was not allowed.")
+        );
+        // A window started later reads it back from disk.
+        save(tmp.path(), &s).unwrap();
+        assert_eq!(load(tmp.path()).unwrap().settings, s);
+
+        // A patch that leaves autostart alone keeps the reason.
+        let c = s
+            .apply_patch(&SettingsPatch {
+                notifications: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!c.autostart);
+        assert!(s.autostart_refused.is_some());
+
+        // Asking again starts a fresh attempt.
+        let c = s
+            .apply_patch(&SettingsPatch {
+                autostart: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(c.autostart);
+        assert_eq!(s.autostart_refused, None);
+
+        // Same value as now, but a reason is cleared: that is a change to announce.
+        s.autostart = true;
+        s.autostart_refused = Some("stale".into());
+        let c = s
+            .apply_patch(&SettingsPatch {
+                autostart: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!c.autostart && c.autostart_refused && c.any());
+        assert_eq!(s.autostart_refused, None);
+        // Nothing to clear and nothing changed: no event.
+        let c = s
+            .apply_patch(&SettingsPatch {
+                autostart: Some(true),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!c.any());
+
+        // Turning it off by hand clears a reason too.
+        s.autostart_refused = Some("x".into());
+        s.apply_patch(&SettingsPatch {
+            autostart: Some(false),
+            ..SettingsPatch::default()
+        })
+        .unwrap();
+        assert_eq!(s.autostart_refused, None);
     }
 
     #[test]

@@ -13,8 +13,8 @@ enum URLSchemeHandler {
     /// Returns true when `url` uses our scheme (and starts a drain), false for anything else.
     @discardableResult
     static func handle(_ url: URL) -> Bool {
-        guard url.scheme?.lowercased() == PlayDropIdentifiers.urlScheme else { return false }
-        // SR-30: deliberately no look at url.host, url.path or url.query.
+        // SR-30: the rule looks at the scheme only; see URLSchemeRule.
+        guard URLSchemeRule.shouldHandle(url) else { return false }
         let drain = OutgoingDrain.shared
         drain.refresh()
         Task { await drain.drainIfPossible() }

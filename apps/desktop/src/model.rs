@@ -229,21 +229,7 @@ pub struct Store {
     /// Peers with a remote input session open on this desktop (SR-25), as hex Device ID
     /// and label, in the order they started.
     pub input_sessions: Vec<(String, String)>,
-    /// When this window last turned "Start at login" on, Unix seconds. Inside Flatpak the
-    /// daemon asks the Background portal after answering, and turns the setting back off
-    /// when the user or the desktop refuses.
-    pub autostart_asked_at: Option<u64>,
-    /// The daemon turned "Start at login" back off soon after this window turned it on:
-    /// the desktop did not allow it. Shown under the switch until it is flipped again.
-    pub autostart_refused: bool,
 }
-
-/// How long after turning "Start at login" on a switch back to off reads as a refusal
-/// (the portal's dialog waits up to two minutes for an answer).
-const AUTOSTART_ANSWER_SECS: u64 = 300;
-
-/// What the window says when the desktop refused "Start at login".
-pub const AUTOSTART_REFUSED: &str = "Start at login was not allowed. Allow PlayDrop to run in the background in the system settings, then turn it on again.";
 
 impl Store {
     /// Replaces the status, and seeds the remote input sessions from its `input_from`
@@ -272,12 +258,6 @@ impl Store {
         if let Some(s) = self.status.as_mut() {
             s.settings = settings;
         }
-    }
-
-    /// Records that this window turned "Start at login" on or off at `now`.
-    pub fn autostart_set(&mut self, on: bool, now: u64) {
-        self.autostart_asked_at = on.then_some(now);
-        self.autostart_refused = false;
     }
 
     /// Whether the daemon says the desktop is locked (SR-6).
@@ -381,30 +361,28 @@ impl Store {
     pub fn apply(&mut self, event: Event, now: u64) -> Vec<Change> {
         match event {
             Event::Host(e) => self.apply_host(e, now),
-            Event::Daemon(e) => self.apply_daemon(e, now),
+            Event::Daemon(e) => self.apply_daemon(e),
             _ => Vec::new(),
         }
     }
 
-    fn apply_daemon(&mut self, event: DaemonEvent, now: u64) -> Vec<Change> {
+    fn apply_daemon(&mut self, event: DaemonEvent) -> Vec<Change> {
         match event {
             DaemonEvent::SettingsChanged { settings } => {
-                let was_on = self.status.as_ref().is_some_and(|s| s.settings.autostart);
-                let refused = was_on
-                    && !settings.autostart
-                    && self
-                        .autostart_asked_at
-                        .is_some_and(|t| now.saturating_sub(t) <= AUTOSTART_ANSWER_SECS);
+                // The daemon says why "Start at login" is off; a reason that is new
+                // (not the one already on screen) is also announced once.
+                let before = self
+                    .status
+                    .as_ref()
+                    .and_then(|s| s.settings.autostart_refused.clone());
+                let reason = settings.autostart_refused.clone();
                 self.set_settings(settings);
-                if refused {
-                    self.autostart_asked_at = None;
-                    self.autostart_refused = true;
-                    return vec![
-                        Change::Settings,
-                        Change::Notice(AUTOSTART_REFUSED.to_owned(), true),
-                    ];
+                match reason {
+                    Some(text) if before.as_ref() != Some(&text) => {
+                        vec![Change::Settings, Change::Notice(text, true)]
+                    }
+                    _ => vec![Change::Settings],
                 }
-                vec![Change::Settings]
             }
             DaemonEvent::ClipboardPushed { sent_to } => {
                 vec![Change::Notice(clipboard_sent_text(sent_to.len()), false)]
@@ -1507,6 +1485,7 @@ mod tests {
             remote_input_supported: supported,
             remote_input_reason: reason.map(str::to_owned),
             autostart: false,
+            autostart_refused: None,
             notifications: true,
         }
     }
@@ -2266,7 +2245,7 @@ mod tests {
     }
 
     #[test]
-    fn autostart_switched_back_off_reads_as_refused() {
+    fn autostart_refusal_comes_from_the_daemon_field() {
         let mut s = Store::default();
         s.set_status(Status {
             device_id: "aa".into(),
@@ -2279,35 +2258,39 @@ mod tests {
             locked: false,
             input_from: Vec::new(),
         });
-        let changed = |on: bool| {
+        let changed = |on: bool, refused: Option<&str>| {
             Event::Daemon(DaemonEvent::SettingsChanged {
                 settings: Settings {
                     autostart: on,
+                    autostart_refused: refused.map(str::to_owned),
                     ..settings(true, None)
                 },
             })
         };
-        // This window turned it on; the daemon confirms, then the portal refuses.
-        s.autostart_set(true, 100);
-        assert_eq!(s.apply(changed(true), 101), vec![Change::Settings]);
+        // Off without a reason (the user's own choice, however long after): no notice.
+        assert_eq!(s.apply(changed(false, None), 1), vec![Change::Settings]);
+        // The daemon reports a refusal: announced once and kept for the settings screen.
         assert_eq!(
-            s.apply(changed(false), 160),
-            vec![
-                Change::Settings,
-                Change::Notice(AUTOSTART_REFUSED.into(), true)
-            ]
+            s.apply(changed(false, Some("not allowed")), 2),
+            vec![Change::Settings, Change::Notice("not allowed".into(), true)]
         );
-        assert!(s.autostart_refused);
-        // Flipping it again clears the note.
-        s.autostart_set(false, 200);
-        assert!(!s.autostart_refused);
-        // Turned off long after, or by someone else: not a refusal.
-        s.apply(changed(true), 201);
-        assert_eq!(s.apply(changed(false), 202), vec![Change::Settings]);
-        s.autostart_set(true, 300);
-        s.apply(changed(true), 301);
-        assert_eq!(s.apply(changed(false), 301 + 600), vec![Change::Settings]);
-        assert!(!s.autostart_refused);
+        assert_eq!(
+            s.status
+                .as_ref()
+                .unwrap()
+                .settings
+                .autostart_refused
+                .as_deref(),
+            Some("not allowed")
+        );
+        // The same reason again (another setting changed): no second notice.
+        assert_eq!(
+            s.apply(changed(false, Some("not allowed")), 3),
+            vec![Change::Settings]
+        );
+        // Turned on again successfully: the reason is gone.
+        assert_eq!(s.apply(changed(true, None), 4), vec![Change::Settings]);
+        assert_eq!(s.status.as_ref().unwrap().settings.autostart_refused, None);
     }
 
     #[test]

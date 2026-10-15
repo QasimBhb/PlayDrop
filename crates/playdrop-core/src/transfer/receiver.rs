@@ -12,6 +12,7 @@
 //!     <fid>.hashes         append-only chunk hashes (32 bytes each)
 //!     bundle.json, bundle.hashes   the same for the bundle stream
 //!     <fid>.part           staged bytes of each bundle member
+//!     bundle.delivered     delivery log of a verified bundle (see `DeliveryLog`)
 //! ```
 //!
 //! A file leaves staging only after its root verifies, through an exclusive create of the
@@ -352,10 +353,24 @@ enum Dest {
 }
 
 impl Dest {
+    /// Where verified files of transfer `transfer_id` go: `sink` when bound, else beneath
+    /// `root`.
+    fn new(root: &Path, sink: Option<&SinkBinding>, transfer_id: &str) -> Self {
+        match sink {
+            Some(binding) => Dest::Sink {
+                binding: binding.clone(),
+                transfer_id: transfer_id.to_owned(),
+            },
+            None => Dest::Directory(root.to_path_buf()),
+        }
+    }
+
     /// Places or delivers one verified staged file and says where it went. In `Staged`
     /// mode the staging file is deleted afterwards whatever the sink did, and a sink
     /// failure becomes [`Error::Sink`].
     fn put(&self, staged: &Path, entry: &FileEntry) -> Result<SavedFile> {
+        // File names are allowed at DEBUG and below only (SR-32).
+        tracing::debug!(fid = entry.fid, path = %entry.path.join("/"), "verified file placed");
         match self {
             Dest::Directory(root) => {
                 let rel = place(staged, root, &entry.path)?;
@@ -365,24 +380,171 @@ impl Dest {
                 binding,
                 transfer_id,
             } => {
-                // Opened so that the delete below works on Windows even if the sink
-                // keeps the handle (FILE_SHARE_DELETE, see `fsx::open_shared_read`).
-                let file = fsx::open_shared_read(staged)?;
-                let item = DeliverItem {
-                    transfer_id: transfer_id.clone(),
-                    peer: binding.peer.clone(),
-                    path: entry.path.clone(),
-                    size: entry.size,
-                    mtime_ms: entry.mtime,
-                    mime: entry.mime.clone(),
-                };
-                let res = binding.sink.deliver(item, file);
+                let res = hand_to_sink(binding, transfer_id, staged, entry);
                 fsx::remove_if_exists(staged)?;
                 res.map(|loc| SavedFile::delivered(entry.fid, loc))
-                    .map_err(|e| Error::Sink(e.message))
             }
         }
     }
+}
+
+/// Hands one verified staged file to the sink and returns the sink's location string. The
+/// staging file is left in place; a sink failure becomes [`Error::Sink`].
+fn hand_to_sink(
+    binding: &SinkBinding,
+    transfer_id: &str,
+    staged: &Path,
+    entry: &FileEntry,
+) -> Result<String> {
+    // Opened so that a later delete works on Windows even if the sink keeps the handle
+    // (FILE_SHARE_DELETE, see `fsx::open_shared_read`).
+    let file = fsx::open_shared_read(staged)?;
+    let item = DeliverItem {
+        transfer_id: transfer_id.to_owned(),
+        peer: binding.peer.clone(),
+        path: entry.path.clone(),
+        size: entry.size,
+        mtime_ms: entry.mtime,
+        mime: entry.mime.clone(),
+    };
+    binding
+        .sink
+        .deliver(item, file)
+        .map_err(|e| Error::Sink(e.message))
+}
+
+/// File name of the bundle's delivery log in the staging folder.
+const DELIVERY_LOG: &str = "bundle.delivered";
+
+/// Members handed over between two flushes of the delivery log. In `Staged` mode the
+/// staging files of a batch are deleted only after its flush.
+const DELIVERY_BATCH: usize = 256;
+
+/// First line of the delivery log: the bundle root that verified.
+#[derive(Debug, Serialize, Deserialize)]
+struct DeliveryHeader {
+    v: u32,
+    root: String,
+}
+
+/// What a delivery log holds after a restart.
+#[derive(Debug)]
+struct DeliveryRecord {
+    /// The verified bundle root.
+    root: ChunkHash,
+    /// Members recorded as delivered (or, in `Directory` mode, about to be renamed onto
+    /// the recorded placeholder), by fid; a later line for the same fid wins.
+    done: HashMap<u32, SavedFile>,
+    /// Length of the complete lines; a torn last line is cut off before appending.
+    valid_len: u64,
+}
+
+/// Append-only record of a bundle's member delivery, so a kill in the middle of handing
+/// thousands of members over neither loses the verified bundle nor delivers a member twice.
+///
+/// `bundle.delivered` holds newline-terminated JSON lines. Line 1 is
+/// `{"v":1,"root":"<hex>"}`, written atomically and durably once the root verified, after
+/// every member's data and the bundle's chunk hashes are durable and before any member
+/// leaves staging. Each following line is one [`SavedFile`]:
+/// `{"fid":3,"path":"T/f3 (1).dat"}` in `Directory` mode, written after the placeholder
+/// is reserved and before the rename onto it; `{"fid":3,"path":"","location":"..."}` in
+/// `Staged` mode, written after the sink returned. The log is flushed every
+/// [`DELIVERY_BATCH`] members and at the end; the ledger's terminal record then lists
+/// every destination, and the log is cleared with the rest of the staging folder.
+#[derive(Debug)]
+struct DeliveryLog {
+    file: File,
+}
+
+impl DeliveryLog {
+    fn path(staging: &Path) -> PathBuf {
+        staging.join(DELIVERY_LOG)
+    }
+
+    /// Starts the log for a bundle whose root just verified.
+    fn create(staging: &Path, root: &ChunkHash) -> Result<Self> {
+        let mut header = serde_json::to_vec(&DeliveryHeader {
+            v: 1,
+            root: hash_to_hex(root),
+        })?;
+        header.push(b'\n');
+        let path = Self::path(staging);
+        fsx::write_atomic(&path, &header)?;
+        Self::open(&path, header.len() as u64)
+    }
+
+    /// Reopens the log for appending after its last complete line.
+    fn open(path: &Path, valid_len: u64) -> Result<Self> {
+        let mut file = fsx::open_existing_regular(path)?;
+        file.set_len(valid_len)?;
+        file.seek(SeekFrom::End(0))?;
+        Ok(Self { file })
+    }
+
+    /// Reads the log left by an earlier run. `None` when there is none or its header is
+    /// unreadable (then no member had left staging).
+    fn read(staging: &Path) -> Result<Option<DeliveryRecord>> {
+        let bytes = match std::fs::read(Self::path(staging)) {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let mut lines = bytes.split_inclusive(|&b| b == b'\n');
+        let Some(first) = lines.next().filter(|l| l.ends_with(b"\n")) else {
+            return Ok(None);
+        };
+        let Some(root) = serde_json::from_slice::<DeliveryHeader>(first)
+            .ok()
+            .filter(|h| h.v == 1)
+            .and_then(|h| super::hash_from_hex(&h.root).ok())
+        else {
+            return Ok(None);
+        };
+        let mut valid_len = first.len() as u64;
+
+        let mut done = HashMap::new();
+        for line in lines {
+            // A line torn by a power loss ends the log; it is cut off before appending.
+            let Some(entry) = line
+                .ends_with(b"\n")
+                .then(|| serde_json::from_slice::<SavedFile>(line).ok())
+                .flatten()
+            else {
+                break;
+            };
+            done.insert(entry.fid, entry);
+            valid_len += line.len() as u64;
+        }
+        Ok(Some(DeliveryRecord {
+            root,
+            done,
+            valid_len,
+        }))
+    }
+
+    /// Appends one line. Not flushed: a killed process still leaves it in the page cache,
+    /// and [`sync`](Self::sync) makes batches durable against a power loss.
+    fn append(&mut self, saved: &SavedFile) -> Result<()> {
+        let mut line = serde_json::to_vec(saved)?;
+        line.push(b'\n');
+        self.file.write_all(&line).map_err(fsx::map_io)
+    }
+
+    fn sync(&self) -> Result<()> {
+        self.file.sync_data().map_err(fsx::map_io)
+    }
+}
+
+/// Test-only kill points inside bundle member delivery. The count is of members handed
+/// over by this run.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Crash {
+    /// Stop once this many members were handed over, before the next one starts.
+    Before(usize),
+    /// Stop in the middle of member number n: in `Directory` mode after its log line and
+    /// before its rename, in `Staged` mode after the sink took it and before its log line.
+    Inside(usize),
 }
 
 /// Durable verified offset plus chunk hashes for one stream (a file or the bundle).
@@ -945,6 +1107,8 @@ struct BundleInner {
     reader: Option<BundleReader>,
     current: Option<(u32, File)>,
     dirty: Vec<u32>,
+    #[cfg(test)]
+    crash: Option<Crash>,
 }
 
 impl BundleInner {
@@ -993,6 +1157,7 @@ impl BundleInner {
         for m in self.layout.members() {
             fsx::remove_if_exists(&self.member_path(m.fid))?;
         }
+        fsx::remove_if_exists(&DeliveryLog::path(&self.staging))?;
         Ok(())
     }
 
@@ -1094,33 +1259,117 @@ impl BundleInner {
             .map(|fid| self.member_path(fid))
             .collect();
         fsx::sync_files(&self.staging, &dirty)?;
-        let saved = match dest {
-            Dest::Directory(dest_root) => self.place_members(dest_root, manifest)?,
-            Dest::Sink { .. } => {
-                let mut saved = Vec::with_capacity(self.layout.members().len());
-                let members: Vec<u32> = self.layout.members().iter().map(|m| m.fid).collect();
-                for fid in members {
-                    if self.is_skipped(fid) {
-                        continue;
-                    }
-                    match dest.put(&self.member_path(fid), &manifest.files[fid as usize]) {
-                        Ok(s) => saved.push(s),
-                        Err(e) => {
-                            self.fail()?;
-                            return Err(e);
-                        }
-                    }
-                }
-                saved
-            }
+        // The verified offset and every chunk hash are durable before the log says the
+        // root verified, so a restart can check that root again from disk.
+        self.checkpoint()?;
+        let log = DeliveryLog::create(&self.staging, claimed)?;
+        self.deliver(claimed, dest, manifest, log, &HashMap::new())
+    }
+
+    /// Reopens an unfinished bundle after a restart. A bundle whose root verified before
+    /// the process stopped resumes handing its members over (only while the transfer is
+    /// still `resumable`); anything else is brought in line with its durable offset.
+    /// Returns the sink's message when the sink failed the resumed delivery.
+    fn restore(
+        &mut self,
+        dest: &Dest,
+        manifest: &Manifest,
+        resumable: bool,
+    ) -> Result<Option<String>> {
+        let resumed = if resumable {
+            self.resume_delivery(dest, manifest)
+        } else {
+            Ok(None)
         };
+        match resumed {
+            Ok(Some(_)) => Ok(None),
+            Ok(None) => self.reconcile().map(|()| None),
+            Err(Error::Sink(why)) => Ok(Some(why)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// After a restart, finishes handing over the members of a bundle whose root had
+    /// verified when the process stopped, without asking the sender for anything again.
+    /// `None` when no delivery was under way.
+    fn resume_delivery(
+        &mut self,
+        dest: &Dest,
+        manifest: &Manifest,
+    ) -> Result<Option<Vec<SavedFile>>> {
+        let Some(rec) = DeliveryLog::read(&self.staging)? else {
+            return Ok(None);
+        };
+        if !self.ledger.root_matches(&rec.root) {
+            // Cannot happen with a log this module wrote (its header follows a durable
+            // checkpoint at the full size); without a trusted root nothing is delivered.
+            fsx::remove_if_exists(&DeliveryLog::path(&self.staging))?;
+            return Ok(None);
+        }
+        tracing::info!(
+            delivered = rec.done.len(),
+            "resuming delivery of a verified bundle"
+        );
+        let log = DeliveryLog::open(&DeliveryLog::path(&self.staging), rec.valid_len)?;
+        self.deliver(&rec.root, dest, manifest, log, &rec.done)
+            .map(Some)
+    }
+
+    /// Hands over every member not in `done`, then records the bundle as verified. A sink
+    /// failure fails the bundle; any other error leaves the log so a restart resumes.
+    fn deliver(
+        &mut self,
+        root: &ChunkHash,
+        dest: &Dest,
+        manifest: &Manifest,
+        mut log: DeliveryLog,
+        done: &HashMap<u32, SavedFile>,
+    ) -> Result<Vec<SavedFile>> {
+        let saved = match dest {
+            Dest::Directory(dest_root) => {
+                self.place_members(dest_root, manifest, &mut log, done)?
+            }
+            Dest::Sink {
+                binding,
+                transfer_id,
+            } => match self.hand_members(binding, transfer_id, manifest, &mut log, done) {
+                Ok(saved) => saved,
+                Err(e @ Error::Sink(_)) => {
+                    self.fail()?;
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            },
+        };
+        // The log stays until the transfer settles and clears the staging folder: once
+        // this record is written it is no longer read.
         self.ledger.saved.clone_from(&saved);
-        self.ledger.finish(FileState::Verified, Some(*claimed))?;
+        self.ledger.finish(FileState::Verified, Some(*root))?;
         Ok(saved)
     }
 
-    /// Renames every member beneath `dest_root` (SR-18).
-    fn place_members(&self, dest_root: &Path, manifest: &Manifest) -> Result<Vec<SavedFile>> {
+    /// Test hook: fails like a killed process at `at`.
+    #[cfg(test)]
+    fn crash_at(&self, at: Crash) -> Result<()> {
+        if self.crash == Some(at) {
+            return Err(Error::Io(io::Error::other("simulated kill")));
+        }
+        Ok(())
+    }
+
+    /// Renames every member not in `done` beneath `dest_root` (SR-18).
+    ///
+    /// Per member: the final name is reserved exclusively (" (n)" on collision), a log
+    /// line names it, then the staged file is renamed onto it. After a kill, a member with
+    /// a log line whose staging file is gone was delivered there; one whose staging file
+    /// remains is renamed onto its reserved, still empty placeholder.
+    fn place_members(
+        &self,
+        dest_root: &Path,
+        manifest: &Manifest,
+        log: &mut DeliveryLog,
+        done: &HashMap<u32, SavedFile>,
+    ) -> Result<Vec<SavedFile>> {
         // One rename per member, then one sync per destination folder instead of one per
         // file: thousands of small files must not cost thousands of journal commits. Each
         // folder is walked once (SR-18) and its handle reused for every member in it.
@@ -1128,10 +1377,13 @@ impl BundleInner {
         let root = fsx::open_root(dest_root)?;
         let mut dirs: HashMap<&[String], cap_std::fs::Dir> = HashMap::new();
         let mut saved = Vec::with_capacity(self.layout.members().len());
+        let mut fresh = 0usize;
         for m in self.layout.members() {
             if self.is_skipped(m.fid) {
                 continue;
             }
+            let staged_name = member_name(m.fid);
+            let staged_exists = exists(&self.member_path(m.fid))?;
             let (name, parents) = split_path(&manifest.files[m.fid as usize].path)?;
             let dir = match dirs.entry(parents) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
@@ -1139,16 +1391,143 @@ impl BundleInner {
                     e.insert(fsx::safe_dir(&root, parents, false)?)
                 }
             };
-            let final_name = fsx::place_into(&staging, &member_name(m.fid), dir, name)?;
-            saved.push(SavedFile::placed(
-                m.fid,
-                relative_path(parents, &final_name),
-            ));
+            match done.get(&m.fid) {
+                Some(prev) if !staged_exists => {
+                    saved.push(prev.clone());
+                    continue;
+                }
+                Some(prev) => {
+                    if let Some(reserved) = reserved_placeholder(dir, parents, &prev.path)? {
+                        staging
+                            .rename(&staged_name, dir, &reserved)
+                            .map_err(fsx::map_io)?;
+                        saved.push(prev.clone());
+                        continue;
+                    }
+                    // The placeholder is gone (a power loss lost it): place afresh.
+                }
+                None if !staged_exists => {
+                    // Only after a power loss that kept the rename but lost its log line
+                    // (not possible on a filesystem that orders a file's appended data
+                    // before a later rename, like ext4). The member was delivered once;
+                    // its " (n)" name cannot be known, so the manifest name is reported.
+                    saved.push(SavedFile::placed(m.fid, relative_path(parents, name)));
+                    continue;
+                }
+                None => {}
+            }
+            #[cfg(test)]
+            self.crash_at(Crash::Before(fresh))?;
+            let (final_name, placeholder) = fsx::create_unique(dir, name)?;
+            drop(placeholder);
+            let entry = SavedFile::placed(m.fid, relative_path(parents, &final_name));
+            log.append(&entry)?;
+            #[cfg(test)]
+            self.crash_at(Crash::Inside(fresh))?;
+            staging
+                .rename(&staged_name, dir, &final_name)
+                .map_err(fsx::map_io)?;
+            saved.push(entry);
+            fresh += 1;
+            if fresh.is_multiple_of(DELIVERY_BATCH) {
+                log.sync()?;
+            }
         }
         for dir in dirs.values() {
             fsx::sync_dir_handle(dir)?;
         }
+        log.sync()?;
         Ok(saved)
+    }
+
+    /// Hands every member not in `done` to the sink (`Staged` mode).
+    ///
+    /// Per member: the sink takes the staged file, then a log line records its location.
+    /// Staging files are deleted a batch at a time, only after the log lines naming them
+    /// are durable, so a member whose staging file is gone is always in the log. A kill
+    /// after the sink took a member but before its line was written hands that one member
+    /// to the sink once more on restart (the sink trait cannot make the two atomic); no
+    /// member is ever delivered more than twice, and only the one in flight can be.
+    fn hand_members(
+        &self,
+        binding: &SinkBinding,
+        transfer_id: &str,
+        manifest: &Manifest,
+        log: &mut DeliveryLog,
+        done: &HashMap<u32, SavedFile>,
+    ) -> Result<Vec<SavedFile>> {
+        let mut saved = Vec::with_capacity(self.layout.members().len());
+        let mut handed: Vec<PathBuf> = Vec::new();
+        #[cfg(test)]
+        let mut fresh = 0usize;
+        for m in self.layout.members() {
+            if self.is_skipped(m.fid) {
+                continue;
+            }
+            let staged = self.member_path(m.fid);
+            if let Some(prev) = done.get(&m.fid) {
+                // Delivered before a restart; its staging file may still wait for deletion.
+                handed.push(staged);
+                saved.push(prev.clone());
+                continue;
+            }
+            #[cfg(test)]
+            self.crash_at(Crash::Before(fresh))?;
+            let entry = &manifest.files[m.fid as usize];
+            tracing::debug!(fid = entry.fid, path = %entry.path.join("/"), "verified file placed");
+            let location = hand_to_sink(binding, transfer_id, &staged, entry)?;
+            #[cfg(test)]
+            self.crash_at(Crash::Inside(fresh))?;
+            let s = SavedFile::delivered(m.fid, location);
+            log.append(&s)?;
+            saved.push(s);
+            handed.push(staged);
+            #[cfg(test)]
+            {
+                fresh += 1;
+            }
+            if handed.len() >= DELIVERY_BATCH {
+                log.sync()?;
+                for p in handed.drain(..) {
+                    fsx::remove_if_exists(&p)?;
+                }
+            }
+        }
+        log.sync()?;
+        for p in handed {
+            fsx::remove_if_exists(&p)?;
+        }
+        Ok(saved)
+    }
+}
+
+/// True when `path` exists (without following a symlink at it).
+fn exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The name of the placeholder a delivery log line reserved in `dir`, when it is still
+/// there as an empty regular file (so renaming onto it overwrites nothing, SR-18).
+fn reserved_placeholder(
+    dir: &cap_std::fs::Dir,
+    parents: &[String],
+    recorded: &Path,
+) -> Result<Option<String>> {
+    let Some(name) = recorded.file_name().and_then(|n| n.to_str()) else {
+        return Ok(None);
+    };
+    if relative_path(parents, name) != recorded {
+        return Ok(None);
+    }
+    match dir.symlink_metadata(name) {
+        Ok(meta) if meta.is_file() && meta.len() == 0 => Ok(Some(name.to_owned())),
+        Ok(_) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1395,6 +1774,7 @@ impl TransferReceiver {
         let m = &rec.manifest;
         let cs = rec.chunk_size;
         let mask = skip_mask(&rec.skip, m.files.len());
+        let mut resume_failure = None;
         let mut files = Vec::with_capacity(m.files.len());
         for f in &m.files {
             let skipped = mask[f.fid as usize];
@@ -1442,6 +1822,8 @@ impl TransferReceiver {
                     reader: None,
                     current: None,
                     dirty: Vec::new(),
+                    #[cfg(test)]
+                    crash: None,
                 };
                 if from_disk
                     && !matches!(
@@ -1449,7 +1831,10 @@ impl TransferReceiver {
                         FileState::Verified | FileState::Failed
                     )
                 {
-                    inner.reconcile()?;
+                    let resumable =
+                        matches!(rec.state, TransferState::Accepted | TransferState::Active);
+                    resume_failure =
+                        inner.restore(&Dest::new(&root, sink.as_ref(), &m.id), m, resumable)?;
                 }
                 Some(Slot {
                     progress,
@@ -1476,7 +1861,7 @@ impl TransferReceiver {
                 status: StdMutex::new((rec.state, SystemTime::now())),
                 saved: StdMutex::new(saved),
                 sink,
-                failure: StdMutex::new(None),
+                failure: StdMutex::new(resume_failure),
                 settle_gate: StdMutex::new(()),
             }),
         };
@@ -1806,6 +2191,8 @@ fn placeholder_bundle() -> BundleInner {
         reader: None,
         current: None,
         dirty: Vec::new(),
+        #[cfg(test)]
+        crash: None,
     }
 }
 
@@ -1914,13 +2301,7 @@ impl Shared {
 
     /// Where verified files go.
     fn dest(&self) -> Dest {
-        match &self.sink {
-            Some(binding) => Dest::Sink {
-                binding: binding.clone(),
-                transfer_id: self.manifest.id.clone(),
-            },
-            None => Dest::Directory(self.root.clone()),
-        }
+        Dest::new(&self.root, self.sink.as_ref(), &self.manifest.id)
     }
 
     /// Remembers why the transfer failed (the first reason wins).
@@ -3082,5 +3463,201 @@ pub(crate) mod tests {
     /// A one-file manifest with a fixed ID, for the ID reuse tests.
     fn manifest_for_reuse() -> Manifest {
         manifest(&[(1000, false)]).0
+    }
+
+    /// A bundle-only manifest of five members (one empty) for the delivery kill tests.
+    fn bundle_members() -> (Manifest, Vec<Vec<u8>>) {
+        manifest(&[
+            (300, true),
+            (0, true),
+            (70_000, true),
+            (5, true),
+            (1000, true),
+        ])
+    }
+
+    /// Arms a kill point in the bundle's member delivery.
+    fn set_crash(rx: &TransferReceiver, crash: Crash) {
+        let slot = rx.shared.bundle.as_ref().expect("manifest has a bundle");
+        let mut io = slot.io.try_lock().expect("no upload running");
+        let SlotIo::Bundle(inner) = &mut *io else {
+            panic!("bundle slot holds the bundle");
+        };
+        inner.crash = Some(crash);
+    }
+
+    /// Receives the whole bundle of `m` under `root`, "kills" the process at `crash` while
+    /// the verified members are handed over, then reopens the transfer from disk the way a
+    /// restarted host does. Nothing is sent again after the reopen.
+    async fn receive_kill_reload(
+        root: &Path,
+        m: &Manifest,
+        contents: &[Vec<u8>],
+        sink: Option<SinkBinding>,
+        crash: Crash,
+    ) -> TransferReceiver {
+        let opts = AcceptOptions {
+            sink: sink.clone(),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let btok = rx.state().bundle.unwrap().token.unwrap();
+        let bundle = bundle_of(m, contents).await;
+        let bsize = bundle.len() as u64;
+        set_crash(&rx, crash);
+        let mut up = rx.begin_bundle(&btok, 0, bsize - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, bsize).await[..])
+            .await
+            .unwrap();
+        let r = up.finish(Some(root_of(&bundle))).await;
+        assert!(
+            matches!(r, Err(PutError::Core(Error::Io(ref e))) if e.to_string() == "simulated kill"),
+            "{r:?}"
+        );
+        assert_eq!(rx.transfer_state(), TransferState::Active);
+        assert!(
+            rx.staging_dir().join(DELIVERY_LOG).exists(),
+            "the delivery log outlives the kill"
+        );
+        drop(rx);
+        let rx = TransferReceiver::load_with(
+            root,
+            &m.id,
+            FakeSpace::plenty(),
+            SyncPolicy::default(),
+            sink,
+        )
+        .await
+        .unwrap();
+        // Delivery finished during the reopen: no byte was asked for again.
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        assert_eq!(rx.state().bundle.unwrap().state, FileState::Verified);
+        rx
+    }
+
+    /// `Directory` mode: a kill after k of n members were renamed into place, or in the
+    /// middle of member k (log line written, rename not done), resumes on reopen and
+    /// leaves every member exactly once at its own name, with no " (1)" duplicates.
+    #[tokio::test]
+    async fn bundle_delivery_survives_a_kill_in_directory_mode() {
+        let (_, sample) = bundle_members();
+        let n = sample.len();
+        let mut crashes: Vec<Crash> = [0, 1, n - 1].map(Crash::Before).to_vec();
+        crashes.extend([0, 1, n - 1].map(Crash::Inside));
+        for crash in crashes {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("Downloads");
+            let (m, contents) = bundle_members();
+            let rx = receive_kill_reload(&root, &m, &contents, None, crash).await;
+            let t = root.join("T");
+            let mut names: Vec<String> = std::fs::read_dir(&t)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .collect();
+            names.sort();
+            let mut want: Vec<String> = (0..n).map(|i| format!("f{i}.dat")).collect();
+            want.push("empty".to_owned());
+            want.sort();
+            assert_eq!(names, want, "{crash:?}: each member once, no duplicates");
+            for (i, c) in contents.iter().enumerate() {
+                assert_eq!(&std::fs::read(t.join(format!("f{i}.dat"))).unwrap(), c);
+            }
+            assert_eq!(
+                rx.saved_paths(),
+                (0..n)
+                    .map(|i| t.join(format!("f{i}.dat")))
+                    .collect::<Vec<_>>(),
+                "{crash:?}: every member listed once, in order"
+            );
+            let delivered = rx.delivered();
+            assert_eq!(delivered.len(), n, "{crash:?}");
+            let staged: Vec<_> = std::fs::read_dir(rx.staging_dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(staged, [std::ffi::OsString::from("transfer.json")]);
+        }
+    }
+
+    /// `Staged` mode: a kill after k of n members reached the sink resumes on reopen and
+    /// the sink sees every member exactly once. A kill after the sink took member k but
+    /// before its log line hands that member over once more (documented on
+    /// `BundleInner::hand_members`) and no other.
+    #[tokio::test]
+    async fn bundle_delivery_survives_a_kill_in_staged_mode() {
+        let (_, sample) = bundle_members();
+        let n = sample.len();
+        let mut crashes: Vec<Crash> = [0, 1, n - 1].map(Crash::Before).to_vec();
+        crashes.extend([0, 1, n - 1].map(Crash::Inside));
+        for crash in crashes {
+            let tmp = tempfile::tempdir().unwrap();
+            let (m, contents) = bundle_members();
+            let sink = Arc::new(MemSink::default());
+            let binding = SinkBinding {
+                sink: sink.clone(),
+                peer: "ef".repeat(32),
+            };
+            let rx = receive_kill_reload(tmp.path(), &m, &contents, Some(binding), crash).await;
+            let got = lock(&sink.got);
+            let mut counts = vec![0usize; n];
+            for (item, bytes) in got.iter() {
+                let fid: usize = item.path[1][1..2].parse().unwrap();
+                assert_eq!(bytes, &contents[fid], "{crash:?}: {:?}", item.path);
+                counts[fid] += 1;
+            }
+            let mut want = vec![1usize; n];
+            if let Crash::Inside(k) = crash {
+                want[k] = 2;
+            }
+            assert_eq!(counts, want, "{crash:?}: deliveries per member");
+            let mut paths: Vec<String> = rx.delivered().into_iter().map(|d| d.path).collect();
+            assert_eq!(
+                paths.len(),
+                n,
+                "{crash:?}: delivered lists every member once"
+            );
+            paths.sort();
+            paths.dedup();
+            assert_eq!(paths.len(), n, "{crash:?}");
+            let staged: Vec<_> = std::fs::read_dir(rx.staging_dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(staged, [std::ffi::OsString::from("transfer.json")]);
+        }
+    }
+
+    /// A torn last line in the delivery log (power loss mid-append) is ignored and cut off
+    /// before the next append.
+    #[test]
+    fn delivery_log_drops_a_torn_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = [7u8; 32];
+        let mut log = DeliveryLog::create(tmp.path(), &root).unwrap();
+        log.append(&SavedFile::placed(2, PathBuf::from("T/a.dat")))
+            .unwrap();
+        log.append(&SavedFile::delivered(3, "content://x".into()))
+            .unwrap();
+        drop(log);
+        let path = DeliveryLog::path(tmp.path());
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, [&full[..], b"{\"fid\":4,\"pa"].concat()).unwrap();
+        let rec = DeliveryLog::read(tmp.path()).unwrap().unwrap();
+        assert_eq!(rec.root, root);
+        assert_eq!(rec.valid_len, full.len() as u64);
+        assert_eq!(rec.done.len(), 2);
+        assert_eq!(rec.done[&2].path, PathBuf::from("T/a.dat"));
+        assert_eq!(rec.done[&3].location.as_deref(), Some("content://x"));
+        let mut log = DeliveryLog::open(&path, rec.valid_len).unwrap();
+        log.append(&SavedFile::placed(4, PathBuf::from("T/b.dat")))
+            .unwrap();
+        drop(log);
+        let rec = DeliveryLog::read(tmp.path()).unwrap().unwrap();
+        assert_eq!(rec.done.len(), 3);
+        // No header, no log.
+        std::fs::write(&path, b"{\"fid\":4").unwrap();
+        assert!(DeliveryLog::read(tmp.path()).unwrap().is_none());
     }
 }

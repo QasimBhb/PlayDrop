@@ -11,10 +11,12 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
+import org.playdrop.android.core.CoreHostImpl
 import org.playdrop.android.core.HostLog
 
 /**
- * Handles notification actions: accept or decline an offer, stop the find ringer. Not
+ * Handles notification actions: accept or decline an offer, stop the find ringer, retry moving
+ * landed files into Downloads. Not
  * exported; only our own immutable PendingIntents reach it (SR-29).
  */
 class ActionReceiver : BroadcastReceiver() {
@@ -23,6 +25,7 @@ class ActionReceiver : BroadcastReceiver() {
         val app = context.applicationContext
         when (intent.action) {
             NotificationPlan.ACTION_STOP_FIND -> FindRinger.stop(app)
+            NotificationPlan.ACTION_RETRY_MOVE -> CoreHostImpl.retryLanding()
             NotificationPlan.ACTION_ACCEPT_OFFER, NotificationPlan.ACTION_DECLINE_OFFER -> {
                 val id = intent.getStringExtra(NotificationPlan.EXTRA_TRANSFER_ID) ?: return
                 val notificationId = intent.getStringExtra(NotificationPlan.EXTRA_NOTIFICATION_ID)?.toIntOrNull()

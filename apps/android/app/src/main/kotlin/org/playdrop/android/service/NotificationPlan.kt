@@ -27,6 +27,12 @@ internal object NotificationPlan {
     /** Action: stop the find ringer. */
     const val ACTION_STOP_FIND = "org.playdrop.android.action.STOP_FIND"
 
+    /** Action: retry moving landed files into Downloads now. */
+    const val ACTION_RETRY_MOVE = "org.playdrop.android.action.RETRY_MOVE"
+
+    /** Tag of the ongoing "Moving N of M files" notifications, so a start can find leftovers. */
+    const val MOVING_TAG = "moving"
+
     /** Transfer ID extra on offer actions. */
     const val EXTRA_TRANSFER_ID = "org.playdrop.android.extra.TRANSFER_ID"
 
@@ -55,6 +61,9 @@ internal object NotificationPlan {
 
         /** A sensitive clipboard notice. */
         CLIPBOARD(5),
+
+        /** Landed files that could not be moved into Downloads. */
+        MOVE_INCOMPLETE(6),
     }
 
     /**
@@ -83,6 +92,9 @@ internal object NotificationPlan {
         ActionSpec(ACTION_DECLINE_OFFER, offerExtras(transferId, notificationId), notificationId * 4 + 2),
     )
 
+    /** The "Try again" action of the notice about files that could not be moved. */
+    fun retryMoveAction(notificationId: Int): ActionSpec = ActionSpec(ACTION_RETRY_MOVE, emptyMap(), notificationId * 4 + 3)
+
     /** The Stop action of the find notification. */
     fun stopFindAction(): ActionSpec = ActionSpec(ACTION_STOP_FIND, emptyMap(), FIND_ID * 4 + 3)
 
@@ -106,13 +118,43 @@ internal object NotificationPlan {
         data class Many(val count: Int) : Received()
     }
 
-    /** Decides the "received" notification for a completed receive. */
-    fun received(delivered: List<Delivered>, mimeOf: (String) -> String?): Received {
-        if (delivered.size != 1) return Received.Many(delivered.size)
+    /**
+     * Decides the "received" notification for a completed receive. With [forceFolder] it
+     * opens the Downloads list even for one file: the location the core holds may name the
+     * wrong file (a landed file that got another name when it was moved).
+     */
+    fun received(delivered: List<Delivered>, forceFolder: Boolean = false, mimeOf: (String) -> String?): Received {
+        if (delivered.size != 1 || forceFolder) return Received.Many(delivered.size)
         val d = delivered.single()
         val name = FileNames.sanitize(d.path.substringAfterLast('/')) ?: FileNames.FALLBACK_NAME
         val mime = mimeOf(name)
         return if (FileNames.isRiskyToOpen(name, mime)) Received.OneRisky(name) else Received.One(name, d.location, mime)
+    }
+
+    /** Which notification ends a move of landed files. */
+    enum class MoveNotice {
+        /** The transfer completed: its normal "received" notification. */
+        RECEIVED,
+
+        /** The transfer failed or was cancelled: "N files arrived before the transfer stopped". */
+        ARRIVED_BEFORE_END,
+
+        /** Leftovers of a killed process: "N received files moved into Downloads". */
+        MOVED_AFTER_RESTART,
+
+        /** Nothing reached Downloads in this pass and nothing completed: no notice (a stale one is removed). */
+        NONE,
+    }
+
+    /**
+     * Decides the notice after a move pass. Landed files are kept whatever way the transfer
+     * ended, so a failed or cancelled one still says how many of its files arrived.
+     */
+    fun moveNotice(completed: Boolean, endedEarly: Boolean, moved: Int): MoveNotice = when {
+        completed -> MoveNotice.RECEIVED
+        moved <= 0 -> MoveNotice.NONE
+        endedEarly -> MoveNotice.ARRIVED_BEFORE_END
+        else -> MoveNotice.MOVED_AFTER_RESTART
     }
 
     /** Human size, binary units with one decimal ("1.5 MiB"). */

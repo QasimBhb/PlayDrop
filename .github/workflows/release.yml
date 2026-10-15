@@ -5,6 +5,11 @@
 # then tag that commit `v<version>` and push the tag. The version job refuses a tag that
 # does not match Cargo.toml.
 #
+# Release notes: the body of the GitHub release is the `## [<version>]` section of
+# CHANGELOG.md. Before tagging, rename the `## [<version>] - Unreleased` heading to carry the
+# release date. The version job stops the run, before anything is built, when the section is
+# missing or empty.
+#
 # Run it by hand (workflow_dispatch) for a dry run: every job builds and uploads its file
 # as a workflow artifact, but no release is created.
 #
@@ -49,6 +54,7 @@ jobs:
     outputs:
       version: ${{ steps.read.outputs.version }}
       prerelease: ${{ steps.read.outputs.prerelease }}
+      notes: ${{ steps.notes.outputs.notes }}
     steps:
       - uses: actions/checkout@v7
       - name: Read [workspace.package] version and check the tag
@@ -66,6 +72,31 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "Version $version (prerelease: $prerelease)"
+
+      - name: Read the release notes from CHANGELOG.md
+        id: notes
+        env:
+          VERSION: ${{ steps.read.outputs.version }}
+        run: |
+          # Lines between "## [<version>]" and the next "## [" heading, without the link
+          # reference lines at the bottom of the file.
+          notes="$(awk -v heading="## [$VERSION]" '
+            index($0, heading) == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found && $0 !~ /^\[[^]]+\]: / { print }
+          ' CHANGELOG.md)"
+          # Drop leading blank lines ($(...) already dropped the trailing ones).
+          notes="$(printf '%s\n' "$notes" | sed -e '/./,$!d')"
+          if [ -z "$notes" ]; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section, or it is empty. Add the release notes for $VERSION to CHANGELOG.md, commit, and tag again."
+            exit 1
+          fi
+          {
+            echo "notes<<CHANGELOG_EOF"
+            printf '%s\n' "$notes"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+          printf 'Release notes for %s:\n%s\n' "$VERSION" "$notes"
 
   linux-deb:
     name: Debian package
@@ -409,6 +440,6 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: PlayDrop ${{ needs.version.outputs.version }}
           prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
-          generate_release_notes: true
+          body: ${{ needs.version.outputs.notes }}
           fail_on_unmatched_files: true
           files: dist/*

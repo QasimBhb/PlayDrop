@@ -39,6 +39,7 @@ import org.playdrop.core.MediaState
 import org.playdrop.core.PeerSummary
 import org.playdrop.core.PlayDropHost
 import org.playdrop.core.ReceiveTarget
+import org.playdrop.core.TransferDirection
 import org.playdrop.core.TransferSnapshot
 import org.playdrop.core.initLogging
 import java.io.File
@@ -86,9 +87,17 @@ internal object CoreHostImpl {
     private var refresher: Job? = null
     private var addDeviceWatch: Job? = null
 
-    /** The receive sink, told when each transfer ends so it can flush and log. */
+    /**
+     * The receive sink, told when each transfer ends so it can flush and log. Made once per
+     * process and reused across core restarts, so its name claims and the one [LandingMover]
+     * are never duplicated.
+     */
     @Volatile
     private var sink: DownloadsSink? = null
+
+    /** Moves landed transfers into Downloads; one per process, like [sink]. */
+    @Volatile
+    private var mover: LandingMover? = null
 
     /** The listener must stay referenced for as long as the host lives. */
     private var listener: HostListener? = null
@@ -105,7 +114,18 @@ internal object CoreHostImpl {
             initLogging(if (BuildConfig.DEBUG) LogLevel.DEBUG else LogLevel.INFO)
             val settings = Settings.read(app)
             val staging = (app.getExternalFilesDir("staging") ?: File(app.filesDir, "staging")).apply { mkdirs() }
-            val receiveSink = DownloadsSink(app).also { sink = it }
+            val reused = sink
+            val receiveSink = reused ?: DownloadsSink(app, staging, ::shapeOf).also { sink = it }
+            val landingMover = mover ?: LandingMover(app, receiveSink, scope).also { mover = it }
+            if (reused == null) {
+                // First start of the process, before the host delivers anything: promise the
+                // names of files a killed process left landed, then let the mover finish them.
+                landingMover.sweep(receiveSink.rebuildClaims())
+            } else {
+                // A restart in the same process: the claims in memory are right (rebuilding
+                // could race a running pass); just make sure nothing landed is forgotten.
+                landingMover.retryNow()
+            }
             val config = HostConfig(
                 dataDir = File(app.filesDir, "core").absolutePath,
                 receive = ReceiveTarget.Staged(stagingDir = staging.absolutePath, sink = receiveSink),
@@ -297,22 +317,57 @@ internal object CoreHostImpl {
         return p?.label?.takeIf { it.isNotBlank() } ?: p?.shortId ?: peer.take(8)
     }
 
+    /** See [LandingMover.retryNow]; the "Try again" action of the move notice. */
+    fun retryLanding() {
+        mover?.retryNow()
+    }
+
+    /**
+     * True when a `TransferFailed` for [ev] ended its transfer. The core also reports a single
+     * file's failed integrity check that way while the transfer goes on; sends only report the
+     * end.
+     */
+    private fun endedForGood(ev: HostEvent.TransferFailed): Boolean {
+        if (ev.direction == TransferDirection.SEND) return true
+        val status = try {
+            host?.transfers()?.firstOrNull { it.id == ev.id }?.state
+        } catch (e: Exception) {
+            HostLog.w("events", "reading the transfer list failed; treating the failure as final", e)
+            null
+        }
+        return TransferEnds.isTerminal(status)
+    }
+
+    /** File count and size of a live transfer, from the core's transfer list. */
+    private fun shapeOf(id: String): TransferShape? =
+        host?.transfers()?.firstOrNull { it.id == id }?.let { TransferShape(it.fileCount.toLong(), it.total.toLong()) }
+
     /** Handles one event, in order. Never throws: one bad event must not stop the stream. */
     private suspend fun handle(app: Context, ev: HostEvent) {
+        // A landed receive gets its "received" notification from the mover, once the files
+        // are in Downloads. Read once here and passed down, so the routing and the
+        // notification can never disagree (a mover pass may clear it in between).
+        val moving = ev is HostEvent.TransferComplete && ev.direction == TransferDirection.RECEIVE &&
+            sink?.hasLanded(ev.id) == true
+        val ended = ev is HostEvent.TransferFailed && withContext(Dispatchers.IO) { endedForGood(ev) }
         try {
-            route(ev)
+            route(ev, moving, ended)
         } catch (e: Exception) {
             HostLog.w("events", "updating state for ${ev.javaClass.simpleName} failed", e)
         }
         eventsFlow.emit(ev)
         try {
-            Notifications.onEvent(app, ev, ::labelOf)
+            Notifications.onEvent(app, ev, ::labelOf, deferReceived = moving)
         } catch (e: Exception) {
             HostLog.w("events", "notification for ${ev.javaClass.simpleName} failed", e)
         }
     }
 
-    private suspend fun route(ev: HostEvent) {
+    /**
+     * Updates state for [ev]. [landed]: a completed receive whose files the mover must move.
+     * [ended]: a `TransferFailed` that really ended its transfer.
+     */
+    private suspend fun route(ev: HostEvent, landed: Boolean, ended: Boolean) {
         when (ev) {
             is HostEvent.Listening -> identity.value = OwnIdentity(ev.deviceId, ev.shortId, ev.addr)
             is HostEvent.PeerOnline -> refreshPeers()
@@ -341,15 +396,23 @@ internal object CoreHostImpl {
                 addDeviceCandidates.value = withContext(Dispatchers.IO) { h.addDeviceList() }
             }
             is HostEvent.TransferProgress -> transferRefresh.tryEmit(Unit)
-            is HostEvent.TransferOffer -> refreshTransfers()
+            is HostEvent.TransferOffer -> {
+                sink?.noteOffer(ev.id, ev.fileCount.toLong(), ev.totalBytes.toLong())
+                refreshTransfers()
+            }
             is HostEvent.TransferComplete -> {
                 UriSource.transferEnded(ev.id)
                 sink?.transferEnded(ev.id)
+                if (landed) mover?.afterComplete(ev, labelOf(ev.peer))
                 refreshTransfers()
             }
             is HostEvent.TransferFailed -> {
-                UriSource.transferEnded(ev.id)
-                sink?.transferEnded(ev.id)
+                if (ended) {
+                    UriSource.transferEnded(ev.id)
+                    sink?.transferEnded(ev.id)
+                    // Files that landed before the end are kept, like directly delivered ones.
+                    mover?.afterEnded(ev, labelOf(ev.peer))
+                }
                 refreshTransfers()
             }
             is HostEvent.Battery -> peerStatus.update { all ->

@@ -358,6 +358,12 @@ pub struct Settings {
     pub remote_input_reason: Option<String>,
     /// Start the daemon at login.
     pub autostart: bool,
+    /// Why start at login is off although it was asked for: a sentence worded for the
+    /// user (the Background portal or the desktop refused, or the login entry could not
+    /// be written). `None` when it was never refused or the setting was turned on again
+    /// successfully. Missing from an older daemon's answer reads as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autostart_refused: Option<String>,
     /// Show desktop notifications.
     pub notifications: bool,
 }

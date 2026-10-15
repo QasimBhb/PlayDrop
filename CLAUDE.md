@@ -34,7 +34,17 @@ at one MediaProvider insert per file, shipped as is, revisit in Phase 7), Flatpa
 Background portal, KDE Connect coexistence test. 394 Rust tests plus 110 Android JUnit
 tests plus 102 Linux-run `PlayDropShared` Swift tests, clippy clean. Licence
 GPL-3.0-or-later. UI native per platform. Build fully agentic. v0.1.0 released from GitHub Releases on 2026-10-15 (five files plus
-checksums). Next: Phase 7, starting from `docs/phases/phase-6-ship-gate.md` sections 5, 6 and 8.
+checksums). Phase 7 (daily use, v0.2.0) written on 2026-10-14 and 2026-10-15: Android bulk
+drops land in the app folder and a journaled mover puts them in Downloads (rename first,
+copy fallback); `playdrop send|peers|status|transfers|clip|ping|outbox|diagnose` drive the
+daemon over IPC (replaces `bench/pd_ipc.py`); README, `docs/guide/`, `CHANGELOG.md` feeding
+the release notes; SR-32 canary test (found and fixed full Device IDs in the diagnostics
+report, `playdrop-ffi` 0.2.1); durable bundle member delivery (`bundle.delivered` log); a
+sender cancel now always reaches the receiver (freed SR-20 slots); `autostart_refused` IPC
+field; SR-30 test; iOS version synced from `Cargo.toml`. 148 Android JUnit tests, 106 Swift
+tests. The phone was unauthorized on adb all session: every Phase 7 live run is owed, listed
+in `docs/phases/phase-7-daily-use.md` section 6. Next: section 6, then tag `v0.2.0`
+(date the changelog heading and the metainfo entry first), then Phase 8 from section 7.
 
 ## Read first
 
@@ -132,6 +142,7 @@ Run `export PATH="$HOME/.cargo/bin:$PATH"` first.
   user config untouched): `HOME=/tmp/pd-home target/release/playdropd --data-dir /tmp/pd-a --receive-dir /tmp/pd-a-in --port 42187 --name alpha --no-tray --no-autostart`
   then `target/release/playdrop-desktop` (`--page <tab>` opens a tab; `PLAYDROP_SNAPSHOT=<png>` renders the window to a file and exits); drive the daemon from a shell with
   `busctl --user call org.playdrop.PlayDrop.Daemon1 /org/playdrop/PlayDrop/Daemon1 org.playdrop.PlayDrop.Daemon1 Request s '{"op":"status"}'`
+- Drive a running daemon from the shell (Phase 7, Linux and Windows): `target/release/playdrop send <paths> [--to <peer>] [--json]`, `playdrop peers|status|transfers|outbox|diagnose [--json]`, `playdrop clip <text>|--stdin`, `playdrop ping`; exit 0 ok, 1 failed, 2 usage or unknown peer, 3 daemon not running (`docs/guide/cli.md`)
 - Live tests against a running daemon: `PD_PEER=<peer> cargo test -p playdrop-ipc --test live_daemon -- --ignored`, `cargo test -p playdropd -- --ignored clipboard`
 - Two hosts for a manual transfer, one per terminal:
   `cargo run -p playdrop-cli -- host --data-dir /tmp/pd-a --receive-dir /tmp/pd-a-in --port 42187 --name alpha`

@@ -129,7 +129,7 @@ running. Loopback iperf3 has no encryption or hashing, so the "share of iperf3" 
 ### 3.2 Daemon to a second host on the same machine (the transfer engine without the phone)
 
 `alpha` (daemon) to `bravo` (`playdrop host`) over loopback, receive dir on ext4,
-`bench/pd_ipc.py run bravo <dataset>`, 2026-10-13:
+`bench/pd_ipc.py run bravo <dataset>` (a D-Bus shim since replaced by `playdrop send --to bravo --json`), 2026-10-13:
 
 | Dataset | MiB/s | Wall s |
 |---|---|---|

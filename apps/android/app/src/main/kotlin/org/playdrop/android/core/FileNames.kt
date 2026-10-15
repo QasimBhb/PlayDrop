@@ -12,7 +12,7 @@ internal object FileNames {
     const val RECEIVE_FOLDER = "PlayDrop"
 
     /** Longest name we pass on; ext4 and FAT both stop at 255 bytes. */
-    private const val MAX_NAME_CHARS = 200
+    const val MAX_NAME_CHARS = 200
 
     /**
      * Extensions that run code or install something when opened. Tapping a received file of
@@ -32,23 +32,29 @@ internal object FileNames {
     fun sendName(displayName: String?, lastPathSegment: String?): String =
         sanitize(displayName) ?: sanitize(lastPathSegment?.substringAfterLast('/')) ?: FALLBACK_NAME
 
-    /** Cleans one name, or null if nothing usable is left. */
+    /**
+     * Cleans one name, or null if nothing usable is left. Cut to [MAX_NAME_CHARS] first and
+     * trimmed after, so the result never ends in a space and cleaning it again changes nothing.
+     */
     fun sanitize(raw: String?): String? {
         if (raw == null) return null
         val cleaned = buildString {
-            for (ch in raw) {
-                append(
-                    when {
-                        ch == '/' || ch == '\\' -> '_'
-                        ch.isISOControl() -> '_'
-                        ch in '‪'..'‮' || ch in '⁦'..'⁩' || ch == '‎' || ch == '‏' -> '_'
-                        else -> ch
-                    },
-                )
-            }
-        }.trim().take(MAX_NAME_CHARS)
+            for (ch in raw) append(if (isBadChar(ch)) '_' else ch)
+        }.take(MAX_NAME_CHARS).trim()
         return cleaned.takeUnless { it.isEmpty() || it == "." || it == ".." }
     }
+
+    /**
+     * True when [name] is one plain path component by the receive rules (SR-17): not empty,
+     * not `.` or `..`, at most [MAX_NAME_CHARS] characters, and no separator, control or bidi
+     * character. Every name [sanitize] or [numberedName] produces passes.
+     */
+    fun isCleanName(name: String): Boolean =
+        name.isNotEmpty() && name != "." && name != ".." && name.length <= MAX_NAME_CHARS && name.none(::isBadChar)
+
+    private fun isBadChar(ch: Char): Boolean =
+        ch == '/' || ch == '\\' || ch.isISOControl() ||
+            ch in '‪'..'‮' || ch in '⁦'..'⁩' || ch == '‎' || ch == '‏'
 
     /** Lower-case extension without the dot, or null when the name has none. */
     fun extension(name: String): String? {
@@ -74,12 +80,33 @@ internal object FileNames {
 
     /**
      * The [n]th name tried when [name] is taken: `name`, `name (1)`, `name (2)`... with the
-     * number before the extension (`a.txt` -> `a (1).txt`). [n] 0 is the name itself.
+     * number before the extension (`a.txt` -> `a (1).txt`). [n] 0 is the name itself. A
+     * long name is cut before the number so the result stays within [MAX_NAME_CHARS].
      */
     fun numberedName(name: String, n: Int): String {
         if (n <= 0) return name
-        val ext = extension(name) ?: return "$name ($n)"
-        return "${name.dropLast(ext.length + 1)} ($n).${name.takeLast(ext.length)}"
+        val tag = " ($n)"
+        val ext = extension(name)
+        // The dot and extension are kept when they leave room for some of the stem.
+        val suffix = if (ext != null && tag.length + ext.length + 1 < MAX_NAME_CHARS) ".${name.takeLast(ext.length)}" else ""
+        val stem = if (suffix.isEmpty()) name else name.dropLast(suffix.length)
+        // Cut the stem so the whole name stays within MAX_NAME_CHARS; trim so no space is left before the tag.
+        val room = MAX_NAME_CHARS - tag.length - suffix.length
+        val cut = if (stem.length > room) stem.take(room).trimEnd() else stem
+        return "$cut$tag$suffix"
+    }
+
+    /**
+     * The first of `name`, `name (1)`, `name (2)`... up to [maxTries] numbers for which
+     * [taken] is false, or null when every one is taken. [taken] is asked in that order and
+     * stops being asked at the first free name.
+     */
+    fun firstFree(name: String, maxTries: Int, taken: (String) -> Boolean): String? {
+        for (n in 0..maxTries) {
+            val candidate = numberedName(name, n)
+            if (!taken(candidate)) return candidate
+        }
+        return null
     }
 
     /** Display name for a received file: the last manifest component, cleaned. */

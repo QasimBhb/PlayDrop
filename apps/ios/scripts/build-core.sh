@@ -42,6 +42,9 @@ core_pkg="$ios_root/Packages/PlayDropCore"
 bindings_dir="$core_pkg/Sources/PlayDropCore"
 xcframework="$core_pkg/PlayDropCoreFFI.xcframework"
 
+# Keep project.yml's MARKETING_VERSION in step with the workspace version in Cargo.toml.
+python3 "$here/sync-version.py"
+
 # The deployment target must match project.yml and Package.swift, or the linker warns about
 # every object built for a newer iOS than the app.
 export IPHONEOS_DEPLOYMENT_TARGET=17.0

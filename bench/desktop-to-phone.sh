@@ -6,14 +6,15 @@
 #                                  [--datasets "big-1g small-1000 ..."] [--no-verify]
 #
 # Needs: playdropd running and paired with the phone (CLAUDE.md "Commands" has the start
-# line), the phone on adb and online in `peers`, bench/make-dataset.sh already run,
-# python3-gi (D-Bus file descriptor passing, see bench/pd_ipc.py), adb.
+# line), the phone on adb and online in `playdrop peers`, bench/make-dataset.sh already
+# run, the release CLI (`cargo build --release -p playdrop-cli`), python3, adb.
 #
-# Files cannot travel in the JSON `Request`; SendFiles takes open fds (docs/ipc.md
-# section 2), so bench/pd_ipc.py does the call and polls `transfers`. Wall time runs from
-# just before SendFiles to the first poll (100 ms steps) that sees the transfer finished,
-# so it includes manifest building, hashing on both sides and the Android MediaStore
-# writes. MiB/s is total file bytes over that wall time.
+# Each run is `playdrop send --to <peer> --json <dataset>`, which hands the folder to the
+# daemon (as a file descriptor on Linux, docs/ipc.md section 2), follows the daemon's
+# events until the transfer ends and prints the final transfer snapshot. Wall time runs
+# from just before that call to its exit, so it includes manifest building, hashing on
+# both sides and the Android MediaStore writes (plus the CLI's start and connect, a few
+# ms). MiB/s is total file bytes over that wall time.
 #
 # The Android app puts files in /sdcard/Download/PlayDrop/<dataset>/... (MediaStore
 # Downloads, apps/android .../core/FileNames.kt). The script clears that dataset folder
@@ -28,7 +29,7 @@ runs=1
 datasets="tree small-1000 mixed-5000 medium-100 big-1g"
 verify=1
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ipc="$repo/bench/pd_ipc.py"
+playdrop="$repo/target/release/playdrop"
 phone_dir="/sdcard/Download/PlayDrop"
 
 while [[ $# -gt 0 ]]; do
@@ -38,19 +39,18 @@ while [[ $# -gt 0 ]]; do
         --runs) runs="$2"; shift 2 ;;
         --datasets) datasets="$2"; shift 2 ;;
         --no-verify) verify=0; shift ;;
-        -h | --help) sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        -h | --help) sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
 
-pd() { python3 -I "$ipc" "$@"; }
-
+[[ -x "$playdrop" ]] || { echo "missing $playdrop: cargo build --release -p playdrop-cli" >&2; exit 1; }
 adb get-state >/dev/null 2>&1 || { echo "no adb device" >&2; exit 1; }
-pd request '{"op":"status"}' >/dev/null || { echo "daemon not reachable on the session bus" >&2; exit 1; }
+"$playdrop" status >/dev/null || exit 1
 
 if [[ -z "$peer" ]]; then
     # First online peer that advertises file transfer and is not another desktop host.
-    peer="$(pd request '{"op":"peers"}' | python3 -I -c '
+    peer="$("$playdrop" peers --json | python3 -I -c '
 import json, sys
 for p in json.load(sys.stdin)["data"]:
     if p["online"] and "transfer" in p["capabilities"]:
@@ -72,7 +72,7 @@ if adb shell dumpsys package org.playdrop.android | grep -q 'pkgFlags=.*DEBUGGAB
 else
     echo "App build: release" >&2
 fi
-echo "Daemon: $(pd request '{"op":"status"}' | python3 -I -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d["daemon_version"], d["addr"])')" >&2
+echo "Daemon: $("$playdrop" status --json | python3 -I -c 'import json,sys; d=json.load(sys.stdin)["data"]; print(d["daemon_version"], d["addr"])')" >&2
 
 echo
 echo "| Dataset | Files | MiB | Run | State | Wall s | MiB/s | Verified on phone |"
@@ -86,8 +86,10 @@ for name in $datasets; do
         adb shell "rm -rf '$phone_dir/$name'"
         sleep 1
         set +e
-        out="$(pd run "$peer" "$dir")"
+        t0="$(date +%s%N)"
+        out="$("$playdrop" send --to "$peer" --json "$dir")"
         rc=$?
+        t1="$(date +%s%N)"
         set -e
         if [[ -z "$out" ]]; then
             echo "| $name | | | $run | error | | | |"
@@ -106,12 +108,14 @@ for name in $datasets; do
                 verdict="NO: $got of $expect_files files, sums differ"
             fi
         fi
-        python3 -I - "$name" "$run" "$verdict" "$out" <<'PY'
+        python3 -I - "$name" "$run" "$verdict" "$out" "$((t1 - t0))" <<'PY'
 import json, sys
-name, run, verdict, line = sys.argv[1:5]
+name, run, verdict, line, wall_ns = sys.argv[1:6]
 d = json.loads(line)
-print(f"| {name} | {d['files']} | {d['total'] / 1048576:.1f} | {run} | {d['state']} "
-      f"| {d['wall_s']} | {d['mib_s']} | {verdict} |")
+wall = int(wall_ns) / 1e9
+mib = d["total"] / 1048576
+print(f"| {name} | {d['file_count']} | {mib:.1f} | {run} | {d['state']} "
+      f"| {wall:.3f} | {mib / wall:.2f} | {verdict} |")
 PY
     done
 done

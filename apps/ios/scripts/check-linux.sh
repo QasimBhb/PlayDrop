@@ -42,6 +42,11 @@ if [ -n "${SWIFT_TOOLCHAIN:-}" ]; then
     export PATH="$SWIFT_TOOLCHAIN/usr/bin:$PATH"
 fi
 
+# project.yml must carry the workspace version (fix with scripts/sync-version.py).
+if [ "$mode" != list ]; then
+    python3 "$here/sync-version.py" --check
+fi
+
 # Prints, NUL-separated, every Swift file under the given paths (default: the whole app),
 # skipping build output and the generated bindings.
 swift_files() {

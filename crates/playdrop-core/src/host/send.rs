@@ -512,7 +512,17 @@ async fn run(job: Arc<Job>) -> Outcome {
                 tracing::info!(peer = %short(&job.peer), error = %e, "transfer connection lost; resuming");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(Step::Fatal(e)) => return Err(e),
+            Err(Step::Fatal(e)) => {
+                // A local cancel that landed while waiting for the decision or mid-stream
+                // ends the round as a fatal step; tell the receiver on the connection we
+                // still hold, or it keeps the offer pending (or the transfer active,
+                // waiting for a resume) and counts it against the 4 per peer (SR-20)
+                // until its 24 h sweep.
+                if *job.cancel.borrow() && !job.remote_cancelled.load(Ordering::Acquire) {
+                    cancel_remote(&conn, &id, "user").await;
+                }
+                return Err(e);
+            }
         }
     }
 }

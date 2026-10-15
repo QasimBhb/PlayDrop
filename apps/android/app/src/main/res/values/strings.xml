@@ -54,6 +54,28 @@
     <string name="transfer_failed_send">Sending to %1$s failed</string>
     <string name="transfer_failed_receive">Receiving from %1$s failed</string>
     <string name="offer_answer_failed">Could not answer the offer: %1$s</string>
+    <string name="moving_title">Moving received files into Downloads</string>
+    <plurals name="moving_text">
+        <item quantity="one">Moving %1$s of %2$s file into Downloads</item>
+        <item quantity="other">Moving %1$s of %2$s files into Downloads</item>
+    </plurals>
+    <plurals name="moved_after_restart">
+        <item quantity="one">%d received file moved into Downloads</item>
+        <item quantity="other">%d received files moved into Downloads</item>
+    </plurals>
+    <plurals name="moved_before_end">
+        <item quantity="one">%d file arrived before the transfer stopped</item>
+        <item quantity="other">%d files arrived before the transfer stopped</item>
+    </plurals>
+    <string name="moved_after_restart_text">Saved in Download/PlayDrop</string>
+    <plurals name="move_failed_title">
+        <item quantity="one">%d file could not be moved into Downloads</item>
+        <item quantity="other">%d files could not be moved into Downloads</item>
+    </plurals>
+    <string name="move_failed_text">They are safe in PlayDrop\'s own storage and are moved automatically. Tap Try again to retry now.</string>
+    <string name="action_retry_move">Try again</string>
+    <string name="moved_interrupted_title">Moving received files was interrupted</string>
+    <string name="moved_interrupted_text">PlayDrop finishes it now. Files already moved are in Download/PlayDrop.</string>
 
     <!-- Find my phone -->
     <string name="find_title">%1$s is looking for this phone</string>

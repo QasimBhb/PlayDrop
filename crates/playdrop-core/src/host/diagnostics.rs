@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use super::events::DiscoveryPath;
 use super::{lock, Inner};
+use crate::net::connection::short;
 
 /// How recent a received beacon must be to count as "multicast works".
 pub const BEACON_RECENT: Duration = Duration::from_secs(60);
@@ -26,7 +27,8 @@ pub const BEACON_RECENT: Duration = Duration::from_secs(60);
 pub struct Diagnostics {
     /// The bound address.
     pub addr: SocketAddr,
-    /// This device's ID (hex).
+    /// This device's ID, truncated to its first 8 hex characters like every log line
+    /// (SR-32: the report is meant to be shared in bug reports).
     pub device_id: String,
     /// This device's Short ID (SR-8).
     pub short_id: String,
@@ -97,7 +99,7 @@ pub struct MdnsStatus {
 /// One paired peer's reachability.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PeerDiagnostic {
-    /// Device ID (hex).
+    /// The peer's Device ID, truncated to its first 8 hex characters (SR-32).
     pub peer: String,
     /// Short ID.
     pub short_id: String,
@@ -179,7 +181,7 @@ pub(crate) fn build(inner: &Inner) -> Diagnostics {
         .map(|p| {
             let r = reach.get(&p.device_id);
             PeerDiagnostic {
-                peer: p.device_id.to_hex(),
+                peer: short(&p.device_id),
                 short_id: p.device_id.short_id(),
                 label: p.label.clone(),
                 online: inner.registry.session(&p.device_id).is_some(),
@@ -192,7 +194,7 @@ pub(crate) fn build(inner: &Inner) -> Diagnostics {
         .collect();
     Diagnostics {
         addr: inner.local_addr,
-        device_id: inner.local_id.to_hex(),
+        device_id: short(&inner.local_id),
         short_id: inner.local_id.short_id(),
         port: inner.port(),
         bind_ok,

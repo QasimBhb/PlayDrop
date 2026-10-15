@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv6Addr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -385,6 +385,9 @@ struct Shared {
     /// Why start at login is not in effect (the Background portal refused or failed), for
     /// `Diagnose`. Cleared by the next successful request.
     autostart_problem: Mutex<Option<String>>,
+    /// Counts "Start at login" requests. A late answer or deferred write belongs to the
+    /// request it captured and is dropped when a newer request has started since.
+    autostart_attempt: AtomicU64,
 }
 
 impl Daemon {
@@ -430,6 +433,7 @@ impl Daemon {
             input_runners,
             media: tokio::sync::Mutex::new(None),
             autostart_problem: Mutex::new(None),
+            autostart_attempt: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&shared);
         shared.input_runners.set_ender(Box::new(move |_peer: &str| {
@@ -563,6 +567,7 @@ impl Shared {
     /// inside Flatpak a Background portal request whose answer arrives later
     /// ([`Shared::autostart_answered`]).
     async fn apply_autostart(self: &Arc<Self>, on: bool) {
+        let attempt = self.autostart_attempt.fetch_add(1, Ordering::SeqCst) + 1;
         let Some(loc) = self.autostart.clone() else {
             return;
         };
@@ -573,16 +578,34 @@ impl Shared {
                 tokio::spawn(async move {
                     let answer = autostart::background::request(on).await;
                     if let Some(s) = weak.upgrade() {
-                        s.autostart_answered(on, answer).await;
+                        s.autostart_answered(attempt, on, answer).await;
                     }
                 });
             }
             return;
         }
-        let _ = tokio::task::spawn_blocking(move || {
-            log_sync("autostart entry", autostart::sync_autostart(&loc, on));
+        let result = tokio::task::spawn_blocking(move || {
+            let r = autostart::sync_autostart(&loc, on);
+            match &r {
+                Ok(o) => tracing::debug!(?o, "autostart entry synced"),
+                Err(e) => tracing::warn!(error = %e, "autostart entry not synced"),
+            }
+            r.map(|_| ())
         })
         .await;
+        if let (true, Ok(Err(e))) = (on, result) {
+            // `SetSettings` calls this while holding the lifecycle lock that
+            // `turn_autostart_off` takes, so the write waits for it in its own task.
+            let shared = Arc::clone(self);
+            tokio::spawn(async move {
+                shared
+                    .turn_autostart_off(
+                        attempt,
+                        Some(format!("Start at login could not be set up: {e:#}")),
+                    )
+                    .await;
+            });
+        }
     }
 
     /// The Background portal's answer. A refusal turns the setting back off, so the switch
@@ -591,6 +614,7 @@ impl Shared {
     #[cfg(target_os = "linux")]
     async fn autostart_answered(
         &self,
+        attempt: u64,
         on: bool,
         answer: anyhow::Result<autostart::background::Answer>,
     ) {
@@ -598,6 +622,7 @@ impl Shared {
         let problem = match answer {
             Ok(Answer::Allowed) => {
                 tracing::info!(on, "start at login set through the Background portal");
+                self.set_autostart_refused(attempt, None).await;
                 None
             }
             Ok(Answer::Denied(reason)) if on => {
@@ -606,7 +631,11 @@ impl Shared {
                     "Start at login was not allowed",
                     "Allow PlayDrop to run in the background in the system settings, then turn Start at login on again.",
                 );
-                self.turn_autostart_off().await;
+                self.turn_autostart_off(attempt, Some(
+                    "Start at login was not allowed. Allow PlayDrop to run in the background in the system settings, then turn it on again."
+                        .to_owned(),
+                ))
+                .await;
                 Some(format!("start at login was not allowed: {reason}"))
             }
             Ok(Answer::Denied(reason)) => {
@@ -619,21 +648,62 @@ impl Shared {
                 tracing::warn!(error = %e, "the Background portal is unavailable");
                 self.notifier
                     .info("Start at login could not be set up", e.to_string());
+                if on {
+                    self.turn_autostart_off(
+                        attempt,
+                        Some(format!("Start at login could not be set up: {e}")),
+                    )
+                    .await;
+                }
                 Some(format!("start at login could not be set up: {e}"))
             }
         };
         *lock_std(&self.autostart_problem) = problem;
     }
 
-    /// Records "Start at login" as off, on disk and for every UI, without asking the
-    /// portal again.
-    #[cfg(target_os = "linux")]
-    async fn turn_autostart_off(&self) {
+    /// Records "Start at login" as off with the reason it could not be on, on disk and
+    /// for every UI, without asking the portal again.
+    ///
+    /// Does nothing when a newer request has started since `attempt` (its answer is
+    /// stale) or when the setting is already off.
+    async fn turn_autostart_off(&self, attempt: u64, refused: Option<String>) {
         let _g = self.lifecycle.lock().await;
         let persisted = {
             let mut st = lock_std(&self.settings);
+            if self.autostart_attempt.load(Ordering::SeqCst) != attempt || !st.persisted.autostart {
+                return;
+            }
             st.effective.autostart = false;
             st.persisted.autostart = false;
+            st.effective.autostart_refused.clone_from(&refused);
+            st.persisted.autostart_refused = refused;
+            st.persisted.clone()
+        };
+        let dir = self.data_dir.clone();
+        match tokio::task::spawn_blocking(move || settings::save(&dir, &persisted)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!(error = %e, "settings not saved"),
+            Err(e) => tracing::warn!(error = %e, "settings not saved"),
+        }
+        self.emit(DaemonEvent::SettingsChanged {
+            settings: self.ipc_settings(),
+        });
+    }
+
+    /// Sets or clears the start-at-login refusal reason, saving it and telling every UI
+    /// only when it changed.
+    #[cfg(target_os = "linux")]
+    async fn set_autostart_refused(&self, attempt: u64, refused: Option<String>) {
+        let _g = self.lifecycle.lock().await;
+        let persisted = {
+            let mut st = lock_std(&self.settings);
+            if self.autostart_attempt.load(Ordering::SeqCst) != attempt
+                || st.effective.autostart_refused == refused
+            {
+                return;
+            }
+            st.effective.autostart_refused.clone_from(&refused);
+            st.persisted.autostart_refused = refused;
             st.persisted.clone()
         };
         let dir = self.data_dir.clone();
@@ -1443,6 +1513,7 @@ mod tests {
             clipboard_sync: true,
             clipboard_images: true,
             autostart: true,
+            autostart_refused: None,
             notifications: false,
             discovery: false,
         };
@@ -1476,6 +1547,47 @@ mod tests {
 
     async fn call(h: &Arc<dyn RequestHandler>, r: Request) -> Result<IpcOk, IpcError> {
         h.handle(r).await.into()
+    }
+
+    #[tokio::test]
+    async fn stale_autostart_answers_are_dropped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon(tmp.path());
+        let sh = Arc::clone(&d.shared);
+        let mut events = d.events().subscribe();
+        let reason = || Some("Start at login was not allowed.".to_owned());
+
+        // The user asks twice; an answer for the first ask lands late and is ignored.
+        sh.autostart_attempt.store(2, Ordering::SeqCst);
+        sh.turn_autostart_off(1, reason()).await;
+        assert!(sh.effective().autostart && sh.effective().autostart_refused.is_none());
+        assert!(events.try_recv().is_err(), "a stale answer emits nothing");
+        let on_disk = settings::load(&tmp.path().join("data")).unwrap();
+        assert!(!on_disk.existed, "a stale answer saves nothing");
+
+        // The current ask refuses: off, with the reason, saved and announced.
+        sh.turn_autostart_off(2, reason()).await;
+        let e = sh.effective();
+        assert!(!e.autostart && e.autostart_refused == reason());
+        assert!(events.try_recv().is_ok());
+        let saved = settings::load(&tmp.path().join("data")).unwrap().settings;
+        assert!(!saved.autostart && saved.autostart_refused == reason());
+
+        // Already off: another refusal for the same ask changes nothing.
+        sh.turn_autostart_off(2, Some("other".into())).await;
+        assert_eq!(sh.effective().autostart_refused, reason());
+        assert!(events.try_recv().is_err());
+
+        // A late "allowed" or clear from an older ask cannot erase the reason.
+        #[cfg(target_os = "linux")]
+        {
+            sh.set_autostart_refused(1, None).await;
+            assert_eq!(sh.effective().autostart_refused, reason());
+            assert!(events.try_recv().is_err());
+            sh.set_autostart_refused(2, None).await;
+            assert_eq!(sh.effective().autostart_refused, None);
+            assert!(events.try_recv().is_ok());
+        }
     }
 
     #[tokio::test]

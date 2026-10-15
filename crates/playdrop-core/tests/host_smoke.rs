@@ -356,6 +356,12 @@ async fn offer_names_and_cancel_by_id() {
     write_random_file(&other, 100, 3);
     let mut handle = a.host.send(&b.host.device_id(), vec![other]).await.unwrap();
     let id = handle.id().to_owned();
+    b.events
+        .wait_for(
+            Duration::from_secs(10),
+            |e| matches!(e, HostEvent::TransferOffer { id: oid, .. } if *oid == id),
+        )
+        .await;
     a.host.cancel_transfer(&id).await.unwrap();
     let r = tokio::time::timeout(Duration::from_secs(10), handle.wait())
         .await
@@ -364,10 +370,117 @@ async fn offer_names_and_cancel_by_id() {
     let t = a.host.transfers().into_iter().find(|t| t.id == id).unwrap();
     assert_eq!(t.state, TransferStatus::Cancelled);
     assert!(a.host.cancel_transfer("nope").await.is_err());
+    // The receiver hears about it too (a sender cancel while the offer waits for the
+    // decision used to end the sender loop without the DELETE), so the pending offer
+    // stops counting against the 4 transfers per peer (SR-20).
+    wait_receiver_state(&b, &id, TransferStatus::Cancelled).await;
 
     a.host.shutdown().await;
+    b.host.shutdown().await;
+}
+
+/// SR-20: a sender cancel of a pending offer or of a streaming transfer always reaches the
+/// receiver, so cancelled transfers never fill the 4 slots per peer. Without the `DELETE`
+/// on the fatal-step path of the sender loop, the fifth offer below got `429 rate_limited`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(clippy::many_single_char_names, reason = "a, b are the hosts")]
+async fn sender_cancels_free_the_receiver_slots() {
+    common::init_logs();
+    let root = temp_root();
+    let mut a = start_host(root.path(), "alpha", 0).await;
+    let mut b = start_host(root.path(), "bravo", 0).await;
+    pair(&mut a, &mut b).await;
+    let a_id = a.host.device_id();
+    let mut g = b.host.grants(&a_id).unwrap();
+    g.files = false;
+    b.host.set_grants(&a_id, g).await.unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+
+    // Four pending offers cancelled by the sender, then a fifth is still accepted.
+    for n in 0..4u64 {
+        let p = root.path().join("src").join(format!("p{n}.bin"));
+        write_random_file(&p, 100, 10 + n);
+        let mut h = a.host.send(&b.host.device_id(), vec![p]).await.unwrap();
+        let pid = h.id().to_owned();
+        b.events
+            .wait_for(
+                Duration::from_secs(10),
+                |e| matches!(e, HostEvent::TransferOffer { id, .. } if *id == pid),
+            )
+            .await;
+        a.host.cancel_transfer(&pid).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(10), h.wait())
+            .await
+            .expect("sender stopped in time");
+        wait_receiver_state(&b, &pid, TransferStatus::Cancelled).await;
+    }
+    let fifth = root.path().join("src").join("fifth.bin");
+    write_random_file(&fifth, 100, 20);
+    let mut h = a.host.send(&b.host.device_id(), vec![fifth]).await.unwrap();
+    let fid = h.id().to_owned();
+    b.events
+        .wait_for(
+            Duration::from_secs(10),
+            |e| matches!(e, HostEvent::TransferOffer { id, .. } if *id == fid),
+        )
+        .await;
+    assert_eq!(
+        a.host
+            .transfers()
+            .into_iter()
+            .find(|t| t.id == fid)
+            .unwrap()
+            .state,
+        TransferStatus::Offered,
+        "a fifth offer after four sender cancels must not be rate limited"
+    );
+    a.host.cancel_transfer(&fid).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(10), h.wait()).await;
+
+    // A sender cancel mid-stream (auto-accept on) also reaches the receiver.
+    let a_id = a.host.device_id();
+    let mut g = b.host.grants(&a_id).unwrap();
+    g.files = true;
+    b.host.set_grants(&a_id, g).await.unwrap();
+    let big = root.path().join("src").join("big.bin");
+    write_random_file(&big, 384 * 1024 * 1024, 21);
+    let mut h = a.host.send(&b.host.device_id(), vec![big]).await.unwrap();
+    let bid = h.id().to_owned();
+    a.events
+        .wait_for(Duration::from_secs(20), |e| {
+            matches!(e, HostEvent::TransferProgress { id, bytes, .. } if *id == bid && *bytes > 0)
+        })
+        .await;
+    a.host.cancel_transfer(&bid).await.unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(10), h.wait())
+        .await
+        .expect("sender stopped in time");
+    assert!(r.is_err());
+    wait_receiver_state(&b, &bid, TransferStatus::Cancelled).await;
+
     a.host.shutdown().await;
     b.host.shutdown().await;
+}
+
+/// Polls the receiver's transfer list until `id` reaches `want` (10 s).
+async fn wait_receiver_state(b: &common::TestHost, id: &str, want: TransferStatus) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = b
+            .host
+            .transfers()
+            .into_iter()
+            .find(|t| t.id == id)
+            .map(|t| t.state);
+        if state == Some(want) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "receiver never reached {want:?} for {id}: {state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Gap 5: one clipboard change goes to every online peer with `clipboardOut`, the echo
@@ -438,12 +551,13 @@ async fn clipboard_push_to_all_with_echo_rule() {
     let d = a.host.diagnose();
     assert!(d.bind_ok);
     assert_eq!(d.port, a.host.local_addr().port());
-    assert_eq!(d.device_id, a_id.to_hex());
+    // Device IDs in the report are truncated to 8 hex characters (SR-32).
+    assert_eq!(d.device_id, a_id.to_hex()[..8]);
     assert!(!d.multicast.enabled, "discovery is off in loopback tests");
     assert!(!d.mdns.enabled);
     assert_eq!(d.peers.len(), 1);
     assert!(d.peers[0].online);
-    assert_eq!(d.peers[0].peer, b_id.to_hex());
+    assert_eq!(d.peers[0].peer, b_id.to_hex()[..8]);
     let json = serde_json::to_string(&d).unwrap();
     let back: playdrop_core::host::Diagnostics = serde_json::from_str(&json).unwrap();
     assert_eq!(back, d);
