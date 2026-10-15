@@ -222,8 +222,10 @@ No change to `docs/core-api.md`; `playdrop-ffi` stays 0.2.0. IPC adds one reques
 3. Set the four secrets (`docs/release/distribution.md`), run `Release` by hand as a dry
    run. Done 2026-10-14: secrets set, the fourth dry run (38649458337) built all five
    artifacts (installer, Flatpak, signed APK, deb, iOS archive) with no release created.
-4. Tag `v0.1.0`: `git tag v0.1.0 && git push origin v0.1.0`. The tag push runs `Release`
-   for real and publishes the five files.
+4. Tag `v0.1.0`: `git tag v0.1.0 && git push origin v0.1.0`. Done 2026-10-15 00:07 UTC:
+   https://github.com/QasimBhb/PlayDrop/releases/tag/v0.1.0 holds the five files plus
+   `SHA256SUMS`. The release notes are GitHub's automatic ones; write real ones for the
+   next tag.
 
 The incumbents run (`bench/incumbents.md`) was dropped by the user on 2026-10-14.
 

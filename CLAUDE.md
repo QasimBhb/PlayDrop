@@ -33,8 +33,8 @@ buttons in the window, "Can't find your device?" help on all three platforms, th
 at one MediaProvider insert per file, shipped as is, revisit in Phase 7), Flatpak autostart through the
 Background portal, KDE Connect coexistence test. 394 Rust tests plus 110 Android JUnit
 tests plus 102 Linux-run `PlayDropShared` Swift tests, clippy clean. Licence
-GPL-3.0-or-later. UI native per platform. Build fully agentic. Next: close the owed items in
-`docs/phases/phase-6-ship-gate.md` sections 6 and 7, then Phase 7.
+GPL-3.0-or-later. UI native per platform. Build fully agentic. v0.1.0 released from GitHub Releases on 2026-10-15 (five files plus
+checksums). Next: Phase 7, starting from `docs/phases/phase-6-ship-gate.md` sections 5, 6 and 8.
 
 ## Read first
 
