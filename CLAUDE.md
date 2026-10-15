@@ -45,8 +45,8 @@ sender cancel now always reaches the receiver (freed SR-20 slots); `autostart_re
 field; SR-30 test; iOS version synced from `Cargo.toml`. 148 Android JUnit tests, 106 Swift
 tests. Phone runs done on 2026-10-15 (`docs/release/throughput.md` section 8): 5,000 small
 files to the A54 at 7 to 9.5 MiB/s (was 1.9), 1 GiB at 44 to 48, resume by force-stop
-passes, all sums verified. Next: tag `v0.2.0` (date the changelog heading and the
-metainfo entry first), then Phase 8 from `docs/phases/phase-7-daily-use.md` section 7.
+passes, all sums verified. Next: tag `v0.2.0` (changelog and metainfo dated 2026-10-15), then Phase 8 from
+`docs/phases/phase-7-daily-use.md` section 7.
 
 ## Read first
 

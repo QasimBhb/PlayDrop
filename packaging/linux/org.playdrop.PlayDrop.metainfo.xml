@@ -57,7 +57,7 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="0.2.0" date="2026-10-16" type="development">
+    <release version="0.2.0" date="2026-10-15" type="development">
       <description>
         <p>Faster bulk drops to Android, a command line and a user guide.</p>
         <ul>
