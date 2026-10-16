@@ -41,7 +41,8 @@ Before tagging, give the version's heading its release date in place of "Unrelea
 - A file being saved at the moment the app is killed no longer comes back as "name (1)" or
   gets downloaded again.
 - A temporary disk error while saving received files no longer makes the sender start over:
-  the receiver keeps the data and finishes saving on the next try.
+  the receiver keeps the data and finishes saving on the next try. The sender keeps trying
+  for at least 10 seconds before it gives up, instead of about one second.
 - Android: if a received file had to be renamed because its name was already taken in
   Downloads, tapping the notification or "Open" in the Transfers tab now opens the renamed
   file, and the notice says how many files were renamed.

@@ -627,7 +627,9 @@ async fn receiver_storage_failure_fails_the_send_promptly() {
     write_random_file(&src, 2 * 1024 * 1024, 11);
     let peer = b.host.device_id();
     let mut handle = a.host.send(&peer, vec![src]).await.unwrap();
-    let err = tokio::time::timeout(Duration::from_secs(15), handle.wait())
+    // The sender keeps re-planning for at least 10 s without progress (MIN_STALL_TIME in
+    // host/send.rs) before it gives up; 30 s leaves room for a slow CI runner.
+    let err = tokio::time::timeout(Duration::from_secs(30), handle.wait())
         .await
         .expect("the send ends instead of retrying forever")
         .expect_err("the receiver could not store the file");

@@ -54,27 +54,53 @@ const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 /// retrying it forever only hides that from the user.
 const MAX_STALLED_ROUNDS: u32 = 8;
 
-/// Counts connected rounds that ended without the receiver verifying anything new.
-#[derive(Debug, Default)]
+/// The least time a send keeps re-planning without progress before it fails, however many
+/// rounds that takes. *Choice:* rounds come about 100 ms apart, so the round count alone
+/// gave up after about a second; a receiver whose placement fails for a few seconds (a
+/// full disk being emptied, a folder being moved back, an antivirus holding a file) must
+/// get the chance to finish.
+const MIN_STALL_TIME: Duration = Duration::from_secs(10);
+
+/// Counts connected rounds that ended without the receiver verifying anything new, and
+/// since when.
+#[derive(Debug)]
 struct Stall {
     best: u64,
     rounds: u32,
+    since: Instant,
+}
+
+impl Default for Stall {
+    fn default() -> Self {
+        Self {
+            best: 0,
+            rounds: 0,
+            since: Instant::now(),
+        }
+    }
 }
 
 impl Stall {
     /// Notes the receiver's verified byte count at the start of a round; any growth
-    /// clears the count.
+    /// clears the count and the clock.
     fn observe(&mut self, verified: u64) {
         if verified > self.best {
             self.best = verified;
             self.rounds = 0;
+            self.since = Instant::now();
         }
     }
 
-    /// Counts one round lost to a dropped stream; true once too many came in a row.
+    /// Counts one round lost to a dropped stream; true once too many came in a row and
+    /// [`MIN_STALL_TIME`] has passed without progress.
     fn lost_round(&mut self) -> bool {
+        self.lost_round_at(Instant::now())
+    }
+
+    fn lost_round_at(&mut self, now: Instant) -> bool {
         self.rounds += 1;
         self.rounds > MAX_STALLED_ROUNDS
+            && now.saturating_duration_since(self.since) >= MIN_STALL_TIME
     }
 }
 
@@ -1094,6 +1120,14 @@ mod tests {
             assert!(!s.lost_round());
         }
         s.observe(10);
-        assert!(s.lost_round(), "no progress for too many rounds");
+        assert!(
+            !s.lost_round(),
+            "enough rounds, but not yet the minimum time without progress"
+        );
+        let later = Instant::now() + MIN_STALL_TIME;
+        assert!(
+            s.lost_round_at(later),
+            "no progress for too many rounds and long enough"
+        );
     }
 }

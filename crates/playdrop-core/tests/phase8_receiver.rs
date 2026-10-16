@@ -700,20 +700,26 @@ async fn a_send_survives_a_placement_failure_on_the_receiver() {
         .send(&b.host.device_id(), vec![dir.clone()])
         .await
         .unwrap();
-    // Wait until the sender has handed over every byte (its own counter, no event lag), so
-    // the receiver's placement runs into the obstacle, then leave a couple of re-plan rounds
-    // before clearing it. A fixed delay raced a slow runner: the obstacle went before the
-    // bundle finished and nothing failed. The sender re-plans every 100 ms or so and gives
-    // up after 8 rounds without progress, so the wait after the last byte stays short.
+    // Wait until the receiver reports every byte verified (its progress reading comes
+    // once a second), so placement has run into the obstacle, then clear it. A fixed delay
+    // or the sender's own byte counter raced slow runners (Defender on Windows): the
+    // obstacle went before the receiver tried to place anything. The sender keeps
+    // re-planning for at least 10 s without progress, far longer than this wait.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while handle.bytes_sent() < handle.total_bytes() {
+    loop {
+        let full = b.host.transfers().iter().any(|t| {
+            t.direction == TransferDirection::Receive && t.total > 0 && t.bytes == t.total
+        });
+        if full {
+            break;
+        }
         assert!(
             std::time::Instant::now() < deadline,
-            "the sender never sent every byte"
+            "the receiver never held every byte"
         );
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
     std::fs::remove_file(b.recv_dir.join("Batch")).unwrap();
     let summary = tokio::time::timeout(Duration::from_secs(30), handle.wait())
         .await
