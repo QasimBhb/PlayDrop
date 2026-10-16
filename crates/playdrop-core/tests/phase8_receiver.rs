@@ -486,7 +486,10 @@ async fn files_done_counts_each_kind_of_file() {
 
 /// `Directory` mode: the destination folder is deleted while the bundle streams, so the
 /// worker's kept folder handle fails at the last members, found only when `finish` drains.
-/// `finish` retries once with a fresh worker and the transfer completes.
+/// `finish` retries once with a fresh worker and the transfer completes. Not on Windows:
+/// a folder with an open handle cannot be deleted there (sharing violation), so the
+/// situation the test builds cannot happen on that platform.
+#[cfg(not(windows))]
 #[tokio::test]
 async fn a_worker_failure_found_late_in_finish_is_retried_there() {
     let tmp = tempfile::tempdir().unwrap();
@@ -697,8 +700,20 @@ async fn a_send_survives_a_placement_failure_on_the_receiver() {
         .send(&b.host.device_id(), vec![dir.clone()])
         .await
         .unwrap();
-    // The sender re-plans every 100 ms or so and gives up after 8 rounds without progress.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Wait until the sender has handed over every byte (its own counter, no event lag), so
+    // the receiver's placement runs into the obstacle, then leave a couple of re-plan rounds
+    // before clearing it. A fixed delay raced a slow runner: the obstacle went before the
+    // bundle finished and nothing failed. The sender re-plans every 100 ms or so and gives
+    // up after 8 rounds without progress, so the wait after the last byte stays short.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while handle.bytes_sent() < handle.total_bytes() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the sender never sent every byte"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
     std::fs::remove_file(b.recv_dir.join("Batch")).unwrap();
     let summary = tokio::time::timeout(Duration::from_secs(30), handle.wait())
         .await
