@@ -40,6 +40,10 @@ data class TransferRow(
     val etaSecs: Long?,
     /** Files in the transfer. */
     val fileCount: Long,
+    /** Files finished so far (sent whole, or verified and placed); 0 when the core does not say. */
+    val filesDone: Long,
+    /** The row reads "N of M files" next to bytes and rate, see [Format.showFilesDone]. */
+    val showFilesDone: Boolean,
     /** First file names of an offer, with the count of the rest. */
     val offeredNames: List<String>,
     /** Files not listed in [offeredNames]. */
@@ -68,9 +72,10 @@ object TransferRows {
         snapshots: List<TransferSnapshot>,
         peers: List<PeerSummary>,
         offers: Map<String, OfferInfo>,
+        relocate: (transferId: String, location: String) -> String = { _, location -> location },
     ): List<TransferRow> {
         val labels = peers.associate { it.deviceId to it.label }
-        return snapshots.map { s -> row(s, labels[s.peer] ?: s.shortId, offers[s.id]) }
+        return snapshots.map { s -> row(s, labels[s.peer] ?: s.shortId, offers[s.id], relocate) }
             .withIndex()
             .sortedWith(
                 compareByDescending<IndexedValue<TransferRow>> { it.value.canRespond }
@@ -83,7 +88,16 @@ object TransferRows {
     fun pendingOffers(snapshots: List<TransferSnapshot>): Int =
         snapshots.count { it.direction == TransferDirection.RECEIVE && it.state == TransferStatus.OFFERED }
 
-    private fun row(s: TransferSnapshot, label: String, offer: OfferInfo?): TransferRow {
+    /**
+     * [relocate] maps a stored location to where the file really is: the mover may have given
+     * a landed file another name than the one promised to the core (see `Relocations`).
+     */
+    private fun row(
+        s: TransferSnapshot,
+        label: String,
+        offer: OfferInfo?,
+        relocate: (String, String) -> String,
+    ): TransferRow {
         val receive = s.direction == TransferDirection.RECEIVE
         val bytes = s.bytes.toLong()
         val total = s.total.toLong().takeIf { it > 0 } ?: offer?.totalBytes ?: 0L
@@ -94,6 +108,7 @@ object TransferRows {
             s.state == TransferStatus.CANCELLED
         val offered = s.state == TransferStatus.OFFERED
         val fileCount = s.fileCount.toLong().takeIf { it > 0 } ?: offer?.fileCount ?: 0L
+        val filesDone = s.filesDone.toLong()
         val names = offer?.names?.take(NAMES_SHOWN).orEmpty()
         val delivered = if (receive && s.state == TransferStatus.COMPLETE) s.delivered else emptyList()
         return TransferRow(
@@ -107,12 +122,14 @@ object TransferRows {
             fraction = Format.fraction(bytes, total),
             etaSecs = if (active) Format.etaSeconds(total - bytes, rate) else null,
             fileCount = fileCount,
+            filesDone = filesDone,
+            showFilesDone = active && Format.showFilesDone(filesDone, fileCount),
             offeredNames = names,
             moreNames = (fileCount - names.size).coerceAtLeast(0).takeIf { names.isNotEmpty() } ?: 0,
             note = s.note ?: offer?.note,
             canCancel = !finished && !(receive && offered),
             canRespond = receive && offered,
-            openUri = delivered.firstOrNull()?.location,
+            openUri = delivered.firstOrNull()?.let { relocate(s.id, it.location) },
             openName = delivered.firstOrNull()?.path,
             showFolder = delivered.size > 1,
         )

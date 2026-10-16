@@ -5,9 +5,9 @@
 //! line; once a second the command also asks the daemon for its transfer list, which
 //! covers a lagged event stream and fills in the file count.
 //!
-//! Ctrl-C cancels the transfer. The handler is installed before the send call and stays
-//! armed for the whole command, so a Ctrl-C that lands while a request is in flight is
-//! acted on as soon as that request returns, and one pressed before the daemon has
+//! Ctrl-C cancels the transfer. The handler is installed before the first call to the
+//! daemon and stays armed for the whole command, so a Ctrl-C that lands while a request is
+//! in flight is acted on as soon as that request returns, and one pressed before the daemon has
 //! answered "transfer started" cancels the transfer once its ID is known. A second Ctrl-C
 //! while cancelling or reading the final state gives up with exit code 1.
 
@@ -99,16 +99,28 @@ fn lost(id: &str) -> Failure {
 /// Runs `playdrop send`.
 pub async fn run(args: SendArgs) -> Result<(), Failure> {
     let paths = absolute_paths(&args.paths)?;
-    let client = connect().await?;
-    // Subscribe first: events from here on are buffered until read.
-    let mut events = client.events();
-    let peers = peers(&client).await?;
-    let peer = pick_peer(&peers, args.to.as_deref())?;
-    let label = peer.label.clone();
-
+    // Armed before the first call to the daemon: a Ctrl-C in the first few milliseconds
+    // would otherwise end the process by signal (exit 130) instead of cleanly.
     let mut ctrl_c = CtrlC::armed().await;
+    let setup = async {
+        let client = connect().await?;
+        // Subscribe first: events from here on are buffered until read.
+        let events = client.events();
+        let peers = peers(&client).await?;
+        let peer = pick_peer(&peers, args.to.as_deref())?;
+        let target = (peer.device_id.clone(), peer.label.clone());
+        Ok::<_, Failure>((client, events, target))
+    };
+    // Nothing has been sent yet, so there is nothing to cancel: stop with a plain message.
+    let (client, mut events, (device_id, label)) = tokio::select! {
+        r = setup => r?,
+        () = ctrl_c.fired() => {
+            return Err(Failure::new(Exit::Failed, "interrupted before the transfer started"));
+        }
+    };
+
     let started = Instant::now();
-    let sending = client.send_files(&peer.device_id, paths);
+    let sending = client.send_files(&device_id, paths);
     tokio::pin!(sending);
     let (answer, interrupted) = tokio::select! {
         r = &mut sending => (r, false),
@@ -234,13 +246,15 @@ async fn follow<E>(
                 Some(Ok(ev)) => match ev {
                     Event::Host(HostEvent::TransferProgress {
                         id: i, direction: TransferDirection::Send,
-                        bytes, total, bytes_per_sec, ..
+                        bytes, total, bytes_per_sec, files_done, ..
                     }) if i == id => {
                         progress.bytes = bytes;
                         progress.total = total;
                         progress.bytes_per_sec = bytes_per_sec;
-                        // The core reports zero-byte progress while the receiver
-                        // decides, so only moved bytes end the wait.
+                        progress.files_done = files_done;
+                        // A daemon that still reports zero-byte progress while the
+                        // receiver decides must not end the wait; current ones send no
+                        // progress until bytes move.
                         progress.waiting &= bytes == 0;
                         meter.event(&output::progress_line(&progress, label));
                     }
@@ -277,6 +291,7 @@ async fn follow<E>(
                     progress.bytes = progress.bytes.max(t.bytes);
                     progress.total = t.total;
                     progress.files = t.file_count;
+                    progress.files_done = progress.files_done.max(t.files_done);
                     progress.waiting = t.state == TransferStatus::Offered
                         || (progress.waiting && t.bytes == 0);
                     if progress.bytes_per_sec == 0 || t.bytes_per_sec > 0 {
@@ -356,14 +371,25 @@ fn settle(mut t: TransferSnapshot, end: &End) -> TransferSnapshot {
     t
 }
 
-/// Columns the in-place progress line may use: one less than `COLUMNS` when the shell
-/// exports it (writing the last column makes some terminals wrap), 79 otherwise. The CLI
-/// has no terminal-size dependency, so `COLUMNS` is the only portable source.
-fn line_width(columns: Option<&str>) -> usize {
-    columns
-        .and_then(|c| c.trim().parse::<usize>().ok())
+/// Columns the in-place progress line may use: one less than the terminal is wide
+/// (writing the last column makes some terminals wrap). The width comes from the
+/// operating system first, then from `COLUMNS` when the shell exports it, else 79.
+fn line_width(os_columns: Option<u16>, columns_env: Option<&str>) -> usize {
+    // A width of 0 or 1 is a terminal that does not know its size.
+    os_columns
+        .map(usize::from)
         .filter(|c| *c > 1)
+        .or_else(|| {
+            columns_env
+                .and_then(|c| c.trim().parse::<usize>().ok())
+                .filter(|c| *c > 1)
+        })
         .map_or(79, |c| c - 1)
+}
+
+/// The width of the terminal on standard error, if it is one.
+fn os_columns() -> Option<u16> {
+    terminal_size::terminal_size_of(std::io::stderr()).map(|(terminal_size::Width(w), _)| w)
 }
 
 /// `line` cut to at most `width` characters.
@@ -387,7 +413,7 @@ impl Meter {
     fn new(tty: bool) -> Self {
         Self {
             tty,
-            width: line_width(std::env::var("COLUMNS").ok().as_deref()),
+            width: line_width(os_columns(), std::env::var("COLUMNS").ok().as_deref()),
             last_draw: None,
             drawn_width: 0,
         }
@@ -449,6 +475,7 @@ mod tests {
             bytes: 10,
             total: 100,
             bytes_per_sec: 5,
+            files_done: 0,
             started_at: 0,
             file_count: 1,
             note: note.map(str::to_owned),
@@ -511,11 +538,16 @@ mod tests {
 
     #[test]
     fn progress_line_fits_the_terminal() {
-        assert_eq!(line_width(None), 79);
-        assert_eq!(line_width(Some("120")), 119);
-        assert_eq!(line_width(Some(" 40 ")), 39);
-        assert_eq!(line_width(Some("wide")), 79);
-        assert_eq!(line_width(Some("0")), 79);
+        assert_eq!(line_width(None, None), 79);
+        assert_eq!(line_width(None, Some("120")), 119);
+        assert_eq!(line_width(None, Some(" 40 ")), 39);
+        assert_eq!(line_width(None, Some("wide")), 79);
+        assert_eq!(line_width(None, Some("0")), 79);
+        // The operating system's answer wins over a stale COLUMNS.
+        assert_eq!(line_width(Some(100), Some("40")), 99);
+        // A terminal that reports no width (0) falls back to COLUMNS, then 79.
+        assert_eq!(line_width(Some(0), Some("40")), 39);
+        assert_eq!(line_width(Some(1), None), 79);
         assert_eq!(truncate("abcdef", 4), "abcd");
         assert_eq!(truncate("abc", 4), "abc");
         assert_eq!(truncate("añbñc", 3), "añb");

@@ -1,8 +1,9 @@
 //! Receiving without paths (`docs/core-api.md` section 2, PLAN.md anti-pattern 20): a
 //! mobile host stages and verifies under its private staging directory, then hands each
 //! verified file to a [`ReceiveSink`] (an Android `content://` URI, a path, or any string
-//! its UI can open). Integrity rules are unchanged: a file reaches the sink only after its
-//! root verifies (protocol.md 7.4, SR-22).
+//! its UI can open). A streamed file reaches the sink only after its root verifies
+//! (protocol.md 7.4, SR-22); a bundle member as soon as its own bytes are chunk-verified and
+//! durable, before the bundle root (protocol.md 11.1).
 
 use std::fmt;
 
@@ -10,11 +11,15 @@ use serde::{Deserialize, Serialize};
 
 /// Receives verified files in `Staged` mode. Implemented by the host.
 pub trait ReceiveSink: Send + Sync + fmt::Debug {
-    /// Called once per verified file (and once per empty file), after the root hash check,
-    /// from a blocking thread. `file` is the verified staging file, open read-only at
-    /// offset 0. The sink copies or moves it to its final place and returns where it went
-    /// (an Android `content://` URI, a path, or any string the UI can open). The core
-    /// deletes the staging file afterwards whatever the sink did.
+    /// Called once per verified file (and once per empty file), from a blocking thread:
+    /// after the root hash check for a streamed file; for a bundle member after the
+    /// member's bytes are chunk-verified and durable, before the bundle root (so while the
+    /// bundle still streams, from the core's own delivery thread). After a process kill
+    /// the one file in flight may be delivered a second time. `file` is the verified
+    /// staging file, open read-only at offset 0. The sink copies or moves it to its final
+    /// place and returns where it went (an Android `content://` URI, a path, or any string
+    /// the UI can open). The core deletes the staging file afterwards whatever the sink
+    /// did.
     fn deliver(&self, item: DeliverItem, file: std::fs::File) -> Result<String, SinkError>;
 
     /// Called once per empty directory in the manifest (`dirs`).

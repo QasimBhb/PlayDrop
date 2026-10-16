@@ -1,0 +1,123 @@
+# Compiles and unit-tests the Android app on GitHub's Ubuntu runner. What this proves: the
+# UniFFI Kotlin bindings regenerate from the Rust core, the Kotlin and Compose code compiles
+# against them, and the JUnit tests pass. The Gradle build also cross-compiles the Rust FFI
+# library with cargo-ndk for the ABIs in `playdrop.rustAbis` (arm64-v8a and x86_64), so a
+# change that breaks the Android Rust build fails here. What it cannot prove: anything on a
+# device or emulator (the foreground service, Doze, screen-off receive, MediaProvider speed,
+# the share sheet, pairing; see docs/release/test-matrix.md). It does not build the release
+# APK or sign anything; release.yml does that.
+#
+# Versions are the ones apps/android/app/build.gradle.kts pins: JDK 17 (Java 17 source and
+# target), compileSdk 37 (platform android-37.0), NDK 27.1.12297006, cargo-ndk with `-P 26`.
+# local.properties and keystore.properties are gitignored and absent here: the SDK is found
+# through ANDROID_HOME, and the debug build never reads the signing settings.
+#
+# Build time: the Rust part builds the host library plus two Android targets, so a cold run
+# is long. The Rust and Gradle caches make later runs much shorter. Changing
+# `playdrop.rustAbis` needs a Gradle edit, so CI builds both ABIs; if the cold run is too
+# slow, drop x86_64 there (it is only for the emulator).
+#
+# Runs on pushes to main and pull requests that touch the Android app or the Rust it uses,
+# and on demand.
+
+name: Android
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/android/**"
+      - "crates/playdrop-ffi/**"
+      - "crates/playdrop-core/**"
+      - "crates/uniffi-bindgen/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/android.yml"
+  pull_request:
+    paths:
+      - "apps/android/**"
+      - "crates/playdrop-ffi/**"
+      - "crates/playdrop-core/**"
+      - "crates/uniffi-bindgen/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/android.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental builds only waste cache space on CI.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  android:
+    name: Compile and unit-test (Android)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: apps/android
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install the Android SDK platform and NDK
+        # Same packages as release.yml. The NDK version must match ndkVersion in
+        # app/build.gradle.kts.
+        uses: android-actions/setup-android@v4
+        with:
+          packages: "platform-tools platforms;android-37.0 ndk;27.1.12297006"
+
+      - name: Point cargo-ndk at the pinned NDK
+        run: |
+          ndk="$ANDROID_HOME/ndk/27.1.12297006"
+          test -d "$ndk"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+      - name: Install Rust targets
+        # rust-toolchain.toml selects the stable channel; rustup installs it on first use.
+        # Targets are added to that toolchain.
+        run: |
+          rustup show active-toolchain
+          rustup target add aarch64-linux-android x86_64-linux-android
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+          key: android
+
+      - name: Install cargo-ndk
+        # Same pin as release.yml. rust-cache restores ~/.cargo/bin, so this is a no-op on a
+        # warm run.
+        run: |
+          if ! command -v cargo-ndk >/dev/null; then
+            cargo install cargo-ndk --locked --version "^4.1"
+          fi
+          cargo ndk --version
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: Compile Kotlin and run the unit tests
+        # compileDebugKotlin regenerates the UniFFI bindings and builds the FFI library;
+        # testDebugUnitTest runs the JUnit suite. Called through bash like release.yml, so
+        # a lost executable bit cannot break it.
+        run: bash ./gradlew :app:compileDebugKotlin :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Upload the JUnit reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-junit-reports
+          path: |
+            apps/android/app/build/test-results/testDebugUnitTest/*.xml
+            apps/android/app/build/reports/tests/testDebugUnitTest
+          if-no-files-found: ignore

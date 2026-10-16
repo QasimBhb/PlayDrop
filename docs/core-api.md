@@ -61,9 +61,12 @@ pub enum ReceiveTarget {
 }
 
 pub trait ReceiveSink: Send + Sync + fmt::Debug {
-    /// Called once per verified file (and once per empty file), after the root hash check,
-    /// from a blocking thread. `file` is the verified staging file, open read-only at
-    /// offset 0. The sink copies or moves it to its final place and returns where it went
+    /// Called once per verified file (and once per empty file), from a blocking thread:
+    /// for a streamed file after the root hash check; for a bundle member as soon as the
+    /// member's bytes are chunk-verified and durable, before the bundle root arrives (so
+    /// while the bundle still streams, from the core's own delivery thread; Phase 8,
+    /// section 11). After a process kill the one file in flight may be delivered a second
+    /// time. `file` is the verified staging file, open read-only at offset 0. The sink copies or moves it to its final place and returns where it went
     /// (an Android `content://` URI, a path, or any string the UI can open). The core
     /// deletes the staging file afterwards whatever the sink did.
     fn deliver(&self, item: DeliverItem, file: std::fs::File) -> Result<String, SinkError>;
@@ -283,3 +286,30 @@ characters of the Device ID instead of all 64, the same truncation every log lin
 (`crates/playdrop-core/tests/sr32_canary.rs`) checks the report for full IDs. A receiver
 also logs one line at DEBUG when it places a verified file (file names are allowed at
 DEBUG and below only).
+
+## 11. Phase 8 note (`playdrop-ffi` 0.3.0, 2026-10-15)
+
+Additive type change and two behaviour changes.
+
+- `HostEvent::TransferProgress` and `TransferSnapshot` gain `files_done` (unsigned, files
+  finished so far; `#[serde(default)]`, so an older host reads as 0). Send side: a streamed
+  file counts once its `PUT` came back `verified` or the receiver skipped it; every bundled
+  file counts once the bundle `PUT` came back `verified`; a zero-length file counts only when
+  the transfer completes. After a reconnect the count is rebuilt from the receiver's
+  `GET /v1/transfers/{id}`; within one connection it never goes down. A successful send
+  always ends with one reading where `bytes == total` and `files_done == file_count`, just
+  before `TransferComplete`. Receive side: streamed files verified or skipped, bundle members
+  placed (live, from the delivery thread), zero-length files once created. On
+  `TransferSnapshot` it is the same count as the last progress event, and `file_count` once
+  `complete`.
+- A send is `offered` from the moment it starts until its first file or bundle `PUT` starts
+  moving bytes, including while the receiver decides. It is `active` from then on and stays
+  `active` across reconnects. No `TransferProgress` is emitted for a send while it is
+  `offered`; a declined or expired offer goes to `cancelled` or `failed` with no progress
+  event. A send with nothing to stream passes through `active` on its final reading, so the
+  order is always offered, active, complete. A progress reading never changes the state.
+- A finished snapshot stays in `transfers()` for at least 60 s (`KEEP_AT_LEAST`), then until
+  it is older than 10 minutes or more than 64 newer finished ones exist (never more than
+  1,024 in all).
+- `ReceiveSink::deliver` is called for a bundle member before the bundle root arrives
+  (section 2, protocol.md 11.1). The trait is unchanged.

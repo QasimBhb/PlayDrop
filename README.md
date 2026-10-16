@@ -1,5 +1,10 @@
 # PlayDrop
 
+[![Linux](https://github.com/QasimBhb/PlayDrop/actions/workflows/linux.yml/badge.svg)](https://github.com/QasimBhb/PlayDrop/actions/workflows/linux.yml)
+[![Android](https://github.com/QasimBhb/PlayDrop/actions/workflows/android.yml/badge.svg)](https://github.com/QasimBhb/PlayDrop/actions/workflows/android.yml)
+[![Windows](https://github.com/QasimBhb/PlayDrop/actions/workflows/windows.yml/badge.svg)](https://github.com/QasimBhb/PlayDrop/actions/workflows/windows.yml)
+[![iOS](https://github.com/QasimBhb/PlayDrop/actions/workflows/ios.yml/badge.svg)](https://github.com/QasimBhb/PlayDrop/actions/workflows/ios.yml)
+
 PlayDrop links your phone and your computer over the local network. It does two jobs: an
 always-on companion link (clipboard, ping and find, battery, media control, remote input) and a
 fast file drop that resumes after a dropped connection and holds its speed for thousands of small

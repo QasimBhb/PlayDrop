@@ -2,7 +2,7 @@
 
 use std::io::Read as _;
 
-use playdrop_ipc::{Ok as Answer, Request};
+use playdrop_ipc::{ClipSkip, Ok as Answer, Request};
 
 use super::{
     absolute_paths, ask, connect, output, peers as list_peers, pick_peer, unexpected, ClipArgs,
@@ -97,15 +97,25 @@ pub async fn clip(args: ClipArgs) -> Result<(), Failure> {
         Answer::ClipboardPushed { sent_to, .. } if !sent_to.is_empty() => {
             println!("clipboard sent to {}", peer.label);
         }
-        Answer::ClipboardPushed { .. } => {
-            println!(
-                "not sent: {} already has this text (it matches the last clip sent or received)",
-                peer.label
-            );
-        }
+        Answer::ClipboardPushed { skipped, .. } => match clip_reason(skipped) {
+            ClipSkip::Echo => println!("{}", output::clip_not_sent(&peer.label, ClipSkip::Echo)),
+            other => {
+                return Err(Failure::new(
+                    Exit::Failed,
+                    output::clip_not_sent(&peer.label, other),
+                ))
+            }
+        },
         other => return Err(unexpected("send_clipboard", &other)),
     }
     Ok(())
+}
+
+/// Why a clip was not sent, from the daemon's answer. An older daemon sends only
+/// `skipped_echo`, and for `send_clipboard` (what `clip` uses) an echo was its only "nothing
+/// sent" case, so a missing reason reads as an echo skip.
+fn clip_reason(skipped: Option<ClipSkip>) -> ClipSkip {
+    skipped.unwrap_or(ClipSkip::Echo)
 }
 
 /// Reads clipboard text from `reader`, at most one byte over the limit so an endless pipe
@@ -207,6 +217,16 @@ async fn outbox_add(args: OutboxAddArgs) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_reason_from_an_older_daemon_reads_as_echo() {
+        assert_eq!(clip_reason(None), ClipSkip::Echo);
+        assert_eq!(clip_reason(Some(ClipSkip::NoPeers)), ClipSkip::NoPeers);
+        assert_eq!(
+            clip_reason(Some(ClipSkip::Unsupported)),
+            ClipSkip::Unsupported
+        );
+    }
 
     #[test]
     fn clip_from_a_reader_is_bounded() {

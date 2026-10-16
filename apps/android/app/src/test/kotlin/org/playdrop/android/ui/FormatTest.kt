@@ -1,7 +1,9 @@
 package org.playdrop.android.ui
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.playdrop.android.ui.common.Ago
 import org.playdrop.android.ui.common.Format
@@ -58,5 +60,20 @@ class FormatTest {
         assertEquals(Ago.Days(3), Ago.of(0, 3 * 86_400))
         assertEquals(Ago.Never, Ago.of(null, 10))
         assertEquals(Ago.JustNow, Ago.of(200, 100))
+    }
+
+    @Test
+    fun countsAreGroupedForTheRow() {
+        assertEquals("1,204", Format.count(1204, java.util.Locale.US))
+        assertEquals("5,000", Format.count(5000, java.util.Locale.US))
+        assertEquals("0", Format.count(-3, java.util.Locale.US))
+    }
+
+    @Test
+    fun filesDoneNeedsSeveralFilesAndAReportedCount() {
+        assertTrue(Format.showFilesDone(1204, 5000))
+        assertFalse(Format.showFilesDone(0, 5000))
+        assertFalse(Format.showFilesDone(1, 1))
+        assertFalse(Format.showFilesDone(0, 0))
     }
 }

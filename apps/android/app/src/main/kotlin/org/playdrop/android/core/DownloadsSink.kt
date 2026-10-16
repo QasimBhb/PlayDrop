@@ -101,6 +101,8 @@ internal class DownloadsSink(
     stagingDir: File,
     /** Looks up a transfer's file count and size when no offer event carried them. */
     private val shapeOf: (String) -> TransferShape?,
+    /** Called when the relocation table gained or lost entries, so screens showing locations refresh. */
+    private val onRelocationsChanged: () -> Unit = {},
 ) : ReceiveSink {
     private val app = context.applicationContext
     private val timings = SinkTimings()
@@ -111,6 +113,18 @@ internal class DownloadsSink(
     private val stagingPrefix = stagingDir.absolutePath.trimEnd('/') + "/"
 
     private val stagingToLanding = RenameGate("from staging into the landing folder")
+
+    /**
+     * Where renamed landed files really are, on internal storage; see [Relocations]. The core's
+     * stored location of such a file is stale, so every reader goes through [relocated].
+     */
+    private val relocations = Relocations(File(app.filesDir, "landing-relocations.txt"))
+
+    /**
+     * Set when a move changed [relocations]; [moveEnded] then flushes the table and tells the
+     * screens once, so a renamed 5,000-file drop re-derives the transfer rows once, not 5,000 times.
+     */
+    private val relocationsDirty = java.util.concurrent.atomic.AtomicBoolean(false)
 
     /** Journal of the mover's copy in progress, on internal storage. */
     private val journal = MoveJournal(File(app.filesDir, "landing-move.journal"))
@@ -287,6 +301,20 @@ internal class DownloadsSink(
         return true
     }
 
+    /**
+     * The real location of a delivered file: [location] as the core stored it, unless the
+     * mover gave the file another name (see [Relocations]). Cheap; safe on any thread.
+     */
+    fun relocated(transferId: String, location: String): String = relocations.resolve(transferId, location)
+
+    /** True when [location] of [transferId] was moved to another name. */
+    fun isRelocated(transferId: String, location: String): Boolean = relocations.lookup(transferId, location) != null
+
+    /** Forgets the relocations of transfers the core no longer lists ([live] are the IDs it does). */
+    fun pruneRelocations(live: Set<String>) {
+        if (relocations.prune(live) > 0) onRelocationsChanged()
+    }
+
     /** Every file in the landing folder of [transferId]. */
     fun landedFiles(transferId: String): List<File> = landingDir(transferId)?.let(LandingTree::files).orEmpty()
 
@@ -313,6 +341,7 @@ internal class DownloadsSink(
         val openInput: () -> FileDescriptor = {
             (input ?: ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).also { input = it }).fileDescriptor
         }
+        var mediaStoreUri: String? = null
         try {
             val placed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !directRefused) {
                 placeInDownloads(key, landed.dirs, landed.name, file.path, file.length(), openInput, journalFrom = file.path)
@@ -322,12 +351,28 @@ internal class DownloadsSink(
             if (placed == null) {
                 // Direct writes were refused (now or earlier): MediaStore picks the name. The
                 // row is journaled before it is written and published, like a direct copy.
-                deliverToMediaStore(key, landed.downloadsRel, landed.name, guessMime(landed.name), rewound(openInput())) { uri ->
+                mediaStoreUri = deliverToMediaStore(key, landed.downloadsRel, landed.name, guessMime(landed.name), rewound(openInput())) { uri ->
                     journal.write(MoveJournal.Entry(file.path, uri.toString()))
                 }
             }
             input?.close()
             input = null
+            // MediaStore may also rename on a clash; its URI is new either way, so count it.
+            val renumbered = placed == null || placed.name != landed.name
+            // Before the landed file is deleted: a kill after the delete must not lose where the
+            // file went, and a file that got its promised name must drop any older entry (a
+            // redone move). If the table cannot be updated the file stays landed and the pass
+            // stops (the journal entry is kept, the next pass removes this copy and redoes it):
+            // deleting it would leave a stale location that could open someone else's file.
+            val promisedUri = receivedUri(target, landed.dirs)
+            val actual = placed?.let { receivedUri(it, landed.dirs) } ?: mediaStoreUri
+            if (renumbered || !relocations.isEmpty()) {
+                if (!relocations.noteMove(transferId, promisedUri, actual, renumbered)) {
+                    HostLog.w("landing", "could not update the relocation table; the move is redone later")
+                    return MoveResult(MoveOutcome.FAILED, stopPass = true)
+                }
+                relocationsDirty.set(true)
+            }
             // Delete before forgetting the journal. If the delete fails the entry stays and
             // the pass stops, so the next pass removes this copy and moves the file again
             // instead of leaving it twice.
@@ -337,8 +382,6 @@ internal class DownloadsSink(
             }
             journal.clear()
             claims.release(target.path, file.path)
-            // MediaStore may also rename on a clash; its URI is new either way, so count it.
-            val renumbered = placed == null || placed.name != landed.name
             if (renumbered) {
                 HostLog.i("landing", "transfer ${transferId.take(8)}: a landed file reached Downloads under another name than promised")
             }
@@ -355,6 +398,10 @@ internal class DownloadsSink(
 
     /** Called by the mover after a pass: flushes the scans and logs the cost of the pass. */
     fun moveEnded(transferId: String) {
+        if (relocationsDirty.getAndSet(false)) {
+            relocations.sync()
+            onRelocationsChanged()
+        }
         val key = moveKey(transferId)
         scan(transferId, scans.drain(key))
         timings.finish(key)?.let { HostLog.d("landing", "transfer ${transferId.take(8)} move: ${it.line()}") }

@@ -57,6 +57,11 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.3.0" date="2026-12-31" type="development">
+      <description>
+        <p>Phase 8: bulk drops place files while they still arrive, placement survives a kill, and the sender reports files done.</p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-10-15" type="development">
       <description>
         <p>Faster bulk drops to Android, a command line and a user guide.</p>

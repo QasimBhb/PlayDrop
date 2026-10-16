@@ -20,6 +20,19 @@ object Format {
         return String.format(java.util.Locale.ROOT, "%.1f %s", value, UNITS[unit])
     }
 
+    /**
+     * A count with the locale's digit grouping: "1,204", "5,000". Used for file counts, so a
+     * row and a notification show the same figure. [locale] is a parameter for tests.
+     */
+    fun count(n: Long, locale: java.util.Locale = java.util.Locale.getDefault()): String =
+        java.text.NumberFormat.getIntegerInstance(locale).format(n.coerceAtLeast(0))
+
+    /**
+     * True when a row should say "N of M files": the transfer has several files and at least
+     * one is finished. A core that does not report files done (0) gets only the count.
+     */
+    fun showFilesDone(filesDone: Long, fileCount: Long): Boolean = fileCount > 1 && filesDone > 0
+
     /** A rate: "30.0 MiB/s". */
     fun rate(bytesPerSec: Long): String = "${bytes(bytesPerSec)}/s"
 

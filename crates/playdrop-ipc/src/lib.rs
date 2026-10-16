@@ -521,7 +521,12 @@ pub enum Ok {
         /// Hex Device IDs the clip was sent to.
         sent_to: Vec<String>,
         /// It matched the last clip applied or sent, so nothing was sent (protocol.md 5.7).
+        /// Kept for older clients; it is true exactly when `skipped` is [`ClipSkip::Echo`].
         skipped_echo: bool,
+        /// Why nothing was sent; `None` when something was. Absent from an older daemon
+        /// reads as `None`: use `skipped_echo` then.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        skipped: Option<ClipSkip>,
     },
     /// [`Request::GetSettings`] and [`Request::SetSettings`].
     Settings {
@@ -530,6 +535,38 @@ pub enum Ok {
         /// The host was restarted to apply them.
         restarted: bool,
     },
+}
+
+/// Why a clipboard push sent nothing, in [`Ok::ClipboardPushed`]. Only reasons the host can
+/// tell apart are listed. A reason from a newer daemon that this build does not know reads
+/// as [`ClipSkip::Other`], so the answer still decodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipSkip {
+    /// The text matches the last clip applied from a peer or sent (protocol.md 5.7).
+    Echo,
+    /// No connected device has clipboard sharing turned on for this computer: peers are
+    /// offline, or their clipboard grant is off.
+    NoPeers,
+    /// Devices are connected but cannot take this clip (an image to a device without image
+    /// support, or long text to one that cannot fetch it).
+    Unsupported,
+    /// A reason added by a newer daemon.
+    #[serde(other)]
+    Other,
+}
+
+impl ClipSkip {
+    /// A plain-words reason, shared by the window, the CLI and the daemon's notices.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Echo => "it matches the last clip sent or received",
+            Self::NoPeers => "no connected device has clipboard sharing turned on",
+            Self::Unsupported => "the connected devices cannot receive this kind of clip",
+            Self::Other => "the daemon gave a reason this version does not know",
+        }
+    }
 }
 
 /// Why a request failed. `code` is stable and machine-readable; `message` is for the user.
@@ -739,6 +776,12 @@ mod tests {
             Ok::ClipboardPushed {
                 sent_to: vec!["ab".into()],
                 skipped_echo: false,
+                skipped: None,
+            },
+            Ok::ClipboardPushed {
+                sent_to: vec![],
+                skipped_echo: false,
+                skipped: Some(ClipSkip::NoPeers),
             },
         ];
         for ok in oks {
@@ -748,6 +791,52 @@ mod tests {
             let back: Response = serde_json::from_str(&json).expect("parse");
             assert_eq!(back, r);
         }
+    }
+
+    #[test]
+    fn clip_skip_is_a_snake_case_string_and_optional() {
+        let json = serde_json::to_string(&Ok::ClipboardPushed {
+            sent_to: vec![],
+            skipped_echo: false,
+            skipped: Some(ClipSkip::NoPeers),
+        })
+        .expect("serialise");
+        assert!(json.contains(r#""skipped":"no_peers""#), "{json}");
+        for (skip, name) in [
+            (ClipSkip::Echo, "echo"),
+            (ClipSkip::Unsupported, "unsupported"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&skip).expect("json"),
+                format!("\"{name}\"")
+            );
+        }
+        // A reason from a newer daemon still decodes.
+        assert_eq!(
+            serde_json::from_str::<ClipSkip>("\"battery_saver\"").expect("json"),
+            ClipSkip::Other
+        );
+        // A sent clip carries no reason at all.
+        let sent = serde_json::to_string(&Ok::ClipboardPushed {
+            sent_to: vec!["ab".into()],
+            skipped_echo: false,
+            skipped: None,
+        })
+        .expect("serialise");
+        assert!(!sent.contains("skipped\""), "{sent}");
+        // An older daemon's answer has no `skipped`.
+        let old: Ok = serde_json::from_str(
+            r#"{"kind":"clipboard_pushed","data":{"sent_to":[],"skipped_echo":true}}"#,
+        )
+        .expect("old answer");
+        assert_eq!(
+            old,
+            Ok::ClipboardPushed {
+                sent_to: vec![],
+                skipped_echo: true,
+                skipped: None
+            }
+        );
     }
 
     #[test]

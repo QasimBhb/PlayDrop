@@ -4571,7 +4571,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playdrop-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4584,6 +4584,7 @@ dependencies = [
  "playdrop-ipc",
  "serde",
  "serde_json",
+ "terminal_size",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -4591,7 +4592,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "blake3",
@@ -4629,7 +4630,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4650,7 +4651,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ffi"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "android_logger",
  "jni",
@@ -4668,7 +4669,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ipc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "playdrop-core",
@@ -4688,7 +4689,7 @@ dependencies = [
 
 [[package]]
 name = "playdropd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6089,6 +6090,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "terminal_size"
+version = "0.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
+dependencies = [
+ "rustix 1.1.5",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "text-size"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6651,7 +6662,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "uniffi",
 ]

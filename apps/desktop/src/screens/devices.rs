@@ -6,12 +6,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
 
-use playdrop_ipc::{Ok, Request};
+use playdrop_ipc::{ClipSkip, Ok, Request};
 use slint::{ComponentHandle, Model, ModelRc};
 
 use super::{with, Controller};
 use crate::ipc::post;
-use crate::model::{self, clipboard_sent_text};
+use crate::model::{self, clipboard_sent_text, clipboard_skipped_text};
 use crate::{App, DevicesState};
 
 /// Largest clipboard text the daemon sends (SR-24: 1 MiB; over 32 KiB it travels as a blob,
@@ -220,9 +220,21 @@ fn send_clipboard(c: &Controller, peer: &str, text: &str) {
         },
         |r| {
             with(|c| match r {
+                Result::Ok(
+                    Ok::ClipboardPushed {
+                        skipped: Some(ClipSkip::Echo),
+                        ..
+                    }
+                    | Ok::ClipboardPushed {
+                        skipped: None,
+                        skipped_echo: true,
+                        ..
+                    },
+                ) => c.notice("That text was just synced; nothing new to send.", false),
                 Result::Ok(Ok::ClipboardPushed {
-                    skipped_echo: true, ..
-                }) => c.notice("That text was just synced; nothing new to send.", false),
+                    skipped: Some(skip),
+                    ..
+                }) => c.notice(&clipboard_skipped_text(skip), true),
                 Result::Ok(Ok::ClipboardPushed { sent_to, .. }) => {
                     c.notice(&clipboard_sent_text(sent_to.len()), sent_to.is_empty());
                 }

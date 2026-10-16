@@ -75,7 +75,11 @@ pub(crate) struct Incoming {
     state: OfferState,
     started: Instant,
     reported: bool,
+    /// When the last progress reading went out and the bytes it carried.
     last: (Instant, u64),
+    /// Files done in the last progress reading, so a reading also goes out when a file is
+    /// placed without new bytes (the tail of a bundle delivery).
+    last_files_done: usize,
 }
 
 impl Incoming {
@@ -87,6 +91,7 @@ impl Incoming {
             started: Instant::now(),
             reported: false,
             last: (Instant::now(), 0),
+            last_files_done: 0,
         }
     }
 
@@ -1073,7 +1078,8 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                     }
                     OfferState::Accepted(rx) if !e.reported => {
                         let bytes = rx.state().bytes_verified;
-                        if bytes != e.last.1 {
+                        let files_done = rx.files_done();
+                        if bytes != e.last.1 || files_done != e.last_files_done {
                             let dt = now.duration_since(e.last.0).as_secs_f64().max(0.001);
                             #[allow(
                                 clippy::cast_precision_loss,
@@ -1082,12 +1088,14 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                             )] // display rate only
                             let rate = (bytes.saturating_sub(e.last.1) as f64 / dt) as u64;
                             e.last = (now, bytes);
+                            e.last_files_done = files_done;
                             progress.push((
                                 id.clone(),
                                 e.owner,
                                 bytes,
                                 e.manifest.total_bytes,
                                 rate,
+                                files_done,
                             ));
                         }
                     }
@@ -1095,8 +1103,18 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                 }
             }
         }
-        for (id, owner, bytes, total, rate) in progress {
-            inner.transfer_progress(&id, &owner, TransferDirection::Receive, bytes, total, rate);
+        for (id, owner, bytes, total, rate, files_done) in progress {
+            inner.transfer_progress(
+                &id,
+                &owner,
+                TransferDirection::Receive,
+                super::transfers::ProgressReading {
+                    bytes,
+                    total,
+                    bytes_per_sec: rate,
+                    files_done,
+                },
+            );
         }
         for (id, owner) in expired {
             inner.transfer_ended(

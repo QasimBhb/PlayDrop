@@ -83,4 +83,36 @@ class TransferRowsTest {
     fun pendingOffersCountsIncomingOffersOnly() {
         assertEquals(1, TransferRows.pendingOffers(Samples.transfers))
     }
+
+    @Test
+    fun aRelocatedFileOpensWhereItReallyIs() {
+        val relocate = { id: String, loc: String ->
+            if (id == "t2" && loc == "content://media/external/downloads/42") "content://media/external/downloads/43" else loc
+        }
+        val rows = TransferRows.derive(Samples.transfers, peers, emptyMap(), relocate).associateBy { it.id }
+        assertEquals("content://media/external/downloads/43", rows.getValue("t2").openUri)
+        // Unknown keys keep the stored location.
+        val plain = TransferRows.derive(Samples.transfers, peers, emptyMap()).associateBy { it.id }
+        assertEquals("content://media/external/downloads/42", plain.getValue("t2").openUri)
+    }
+
+    @Test
+    fun filesDoneShowsOnlyOnActiveMultiFileRows() {
+        fun row(state: TransferStatus, files: Int, done: Int) = TransferRows.derive(
+            listOf(
+                Samples.snapshot("f", TransferDirection.SEND, state, 10, 100, 5, files.toLong())
+                    .copy(filesDone = done.toULong()),
+            ),
+            peers,
+            emptyMap(),
+        ).single()
+        val mid = row(TransferStatus.ACTIVE, 5000, 1204)
+        assertTrue(mid.showFilesDone)
+        assertEquals(1204L, mid.filesDone)
+        // The core reports no count: the row keeps showing only the file count.
+        assertFalse(row(TransferStatus.ACTIVE, 5000, 0).showFilesDone)
+        // One file, or a finished row, has no "N of M".
+        assertFalse(row(TransferStatus.ACTIVE, 1, 1).showFilesDone)
+        assertFalse(row(TransferStatus.COMPLETE, 5000, 5000).showFilesDone)
+    }
 }

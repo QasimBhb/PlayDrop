@@ -380,6 +380,8 @@ pub struct TransferSnapshot {
     pub total: u64,
     /// Recent rate.
     pub bytes_per_sec: u64,
+    /// Files finished so far (sent whole, or verified; bundled files when placed).
+    pub files_done: u64,
     /// Start time, Unix seconds.
     pub started_at: u64,
     /// Files in the manifest.
@@ -401,6 +403,7 @@ impl From<host::TransferSnapshot> for TransferSnapshot {
             bytes: t.bytes,
             total: t.total,
             bytes_per_sec: t.bytes_per_sec,
+            files_done: t.files_done as u64,
             started_at: t.started_at,
             file_count: t.file_count as u64,
             note: t.note,

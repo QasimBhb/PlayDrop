@@ -10,7 +10,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use playdrop_core::host::{
     MdnsStatus, MulticastStatus, OutboxItem, PeerSummary, TransferSnapshot, TransferStatus,
 };
-use playdrop_ipc::{DiagnosticsReport, PortProbe, Status};
+use playdrop_ipc::{ClipSkip, DiagnosticsReport, PortProbe, Status};
 use serde::Serialize;
 
 const KIB: f64 = 1024.0;
@@ -262,7 +262,7 @@ pub fn transfers(list: &[TransferSnapshot], peers: &[PeerSummary], now: u64) -> 
                 peer_name(peers, &t.peer, &t.short_id),
                 state_name(t.state).to_owned(),
                 format!("{} of {}", size(t.bytes), size(t.total)),
-                t.file_count.to_string(),
+                files_column(t),
                 ago(now, Some(t.started_at)),
                 t.note.clone().unwrap_or_default(),
             ]
@@ -274,6 +274,16 @@ pub fn transfers(list: &[TransferSnapshot], peers: &[PeerSummary], now: u64) -> 
         ],
         &rows,
     )
+}
+
+/// The FILES column: "done/total" while a bundle is moving, the total otherwise. A daemon
+/// that does not report finished files (0) shows the total only.
+fn files_column(t: &TransferSnapshot) -> String {
+    if t.state == TransferStatus::Active && t.file_count > 1 && t.files_done > 0 {
+        format!("{}/{}", t.files_done, t.file_count)
+    } else {
+        t.file_count.to_string()
+    }
 }
 
 /// `playdrop outbox`.
@@ -465,6 +475,8 @@ pub struct Progress {
     pub total: u64,
     /// Files in the manifest; 0 until the daemon lists the transfer.
     pub files: usize,
+    /// Files finished so far; 0 until the daemon reports it (an older one never does).
+    pub files_done: usize,
     /// Most recent rate.
     pub bytes_per_sec: u64,
     /// The receiver has not accepted yet.
@@ -485,10 +497,11 @@ pub fn progress_line(p: &Progress, to: &str) -> String {
     } else {
         p.bytes as f64 * 100.0 / p.total as f64
     };
-    let files = match p.files {
-        0 => String::new(),
-        1 => "  1 file".to_owned(),
-        n => format!("  {n} files"),
+    let files = match (p.files, p.files_done) {
+        (0, _) => String::new(),
+        (1, _) => "  1 file".to_owned(),
+        (n, 0) => format!("  {} files", grouped(n)),
+        (n, done) => format!("  {} of {} files", grouped(done), grouped(n)),
     };
     format!(
         "to {to}: {} of {}  {percent:.0}%{files}  {}",
@@ -496,6 +509,29 @@ pub fn progress_line(p: &Progress, to: &str) -> String {
         size(p.total),
         mib_per_sec(p.bytes_per_sec as f64)
     )
+}
+
+/// A count with a comma between thousands: 5000 is "5,000".
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What `playdrop clip` says when nothing was sent to `to`.
+pub fn clip_not_sent(to: &str, skip: ClipSkip) -> String {
+    match skip {
+        ClipSkip::Echo => format!(
+            "not sent: {to} already has this text (it matches the last clip sent or received)"
+        ),
+        other => format!("not sent to {to}: {}", other.reason()),
+    }
 }
 
 /// The closing line of a successful `playdrop send`.
@@ -591,6 +627,7 @@ mod tests {
             bytes: 512 * 1024,
             total: 1024 * 1024,
             bytes_per_sec: 0,
+            files_done: 0,
             started_at: 990,
             file_count: 3,
             note: None,
@@ -620,11 +657,51 @@ mod tests {
     }
 
     #[test]
+    fn counts_get_thousands_separators() {
+        let got: Vec<String> = [0, 7, 999, 1000, 12_345, 1_234_567].map(grouped).into();
+        assert_eq!(got, ["0", "7", "999", "1,000", "12,345", "1,234,567"]);
+    }
+
+    #[test]
+    fn files_column_shows_progress_only_for_a_moving_bundle() {
+        let mut t = snapshot(TransferStatus::Active);
+        t.file_count = 40;
+        assert_eq!(files_column(&t), "40");
+        t.files_done = 12;
+        assert_eq!(files_column(&t), "12/40");
+        t.file_count = 1;
+        assert_eq!(files_column(&t), "1");
+        t.file_count = 40;
+        t.state = TransferStatus::Complete;
+        assert_eq!(files_column(&t), "40");
+        t.state = TransferStatus::Active;
+        let out = transfers(&[t], &[], 1_000);
+        assert!(out.contains("12/40"), "{out}");
+    }
+
+    #[test]
+    fn clip_not_sent_says_why() {
+        assert_eq!(
+            clip_not_sent("bravo", ClipSkip::Echo),
+            "not sent: bravo already has this text (it matches the last clip sent or received)"
+        );
+        assert_eq!(
+            clip_not_sent("bravo", ClipSkip::NoPeers),
+            "not sent to bravo: no connected device has clipboard sharing turned on"
+        );
+        assert_eq!(
+            clip_not_sent("bravo", ClipSkip::Unsupported),
+            "not sent to bravo: the connected devices cannot receive this kind of clip"
+        );
+    }
+
+    #[test]
     fn progress_and_summary_lines() {
         let p = Progress {
             bytes: 512 * 1024 * 1024,
             total: 1024 * 1024 * 1024,
             files: 2,
+            files_done: 0,
             bytes_per_sec: 80 * 1024 * 1024,
             waiting: false,
         };
@@ -632,6 +709,21 @@ mod tests {
             progress_line(&p, "bravo"),
             "to bravo: 512.0 MiB of 1.0 GiB  50%  2 files  80.0 MiB/s"
         );
+        let bundle = Progress {
+            files: 5000,
+            files_done: 1204,
+            ..p
+        };
+        assert_eq!(
+            progress_line(&bundle, "bravo"),
+            "to bravo: 512.0 MiB of 1.0 GiB  50%  1,204 of 5,000 files  80.0 MiB/s"
+        );
+        // Nothing finished yet (or an older daemon): just the total.
+        let counting = Progress {
+            files_done: 0,
+            ..bundle
+        };
+        assert!(progress_line(&counting, "bravo").contains("  5,000 files  "));
         let waiting = Progress {
             waiting: true,
             total: 2048,

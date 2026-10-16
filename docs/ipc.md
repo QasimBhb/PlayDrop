@@ -18,7 +18,8 @@ One JSON contract on both platforms:
 `IPC_VERSION` is a single integer. A daemon answers a client of a different version with
 `ErrorCode::BadRequest` on the hello (pipe) or refuses the method call (D-Bus), and the
 client shows "update PlayDrop". The contract enums are `#[non_exhaustive]`; a client must
-treat unknown variants as ignorable, not fatal.
+treat unknown variants as ignorable, not fatal. (`clipboard_pushed.skipped` instead
+decodes an unknown value as `other`, because it travels inside a response, which must decode.)
 
 Peer arguments are queries resolved by `Host::resolve_peer`: a hex Device ID, a Short ID
 prefix (hyphens optional) or an exact label. An ambiguous query answers
@@ -87,6 +88,35 @@ clips only when the matching capability is listed. `unsupported` is no longer em
 | Settings field | Default | Meaning |
 |---|---|---|
 | `autostart_refused` | absent | Why start at login is off although it was asked for: a sentence worded for the user (the Background portal or the desktop refused, or the login entry could not be written). Absent when it was never refused or the setting was turned on again successfully. The daemon stores it with the settings, so a window started later still sees it, and clears it when `SetSettings` carries any `autostart` value. A refusal also arrives as a `settings_changed` event with `autostart: false` and this field set. Missing from an older daemon's answer reads as absent |
+
+### 1.4 Clipboard answers and transfer progress added in 0.3.0
+
+`IPC_VERSION` stays 1 (additions only).
+
+| Answer or field | Meaning |
+|---|---|
+| `clipboard_pushed.skipped` | Why nothing was sent: `echo`, `no_peers` or `unsupported`. Absent when something was sent. Missing from an older daemon's answer reads as absent. For `send_clipboard` (one device) that daemon set `skipped_echo` for its only "nothing sent" case, so a missing reason there means echo; for `push_clipboard`, `skipped_echo: false` with an empty `sent_to` means the reason is unknown. A value this client does not know decodes as `other` and means "not sent" |
+| `clipboard_pushed.skipped_echo` | Kept for older clients. A current daemon sets it exactly when `skipped` is `echo` |
+| `files_done` on a transfer snapshot and on `transfer_progress` | Files finished so far, filled on the send side too. Missing from an older daemon reads as 0, which clients show as "no count yet" |
+
+`skipped` values, and what the daemon can honestly tell apart:
+
+- `echo`: the text equals the last clip applied from a peer or the last one sent
+  (protocol.md 5.7). For `send_clipboard` to one device this is the only "nothing sent"
+  answer; no grant, an offline device and a clip that is too large are errors.
+- `no_peers`: no connected device has clipboard sharing on for this computer. The host
+  counts offline devices and devices without the `clipboardOut` grant separately but both
+  mean nobody to send to, so they share this value (and so does having no paired device).
+- `unsupported`: devices are connected and have the grant, but none can take the clip (an
+  image to a device without image support, or long text to one that cannot fetch it). It
+  wins over `no_peers` when both apply.
+
+There is no reason for a clip marked sensitive: the host sends those, flagged, so a
+sensitive clip is never "blocked" at this layer.
+
+A send stays `offered` and sends no `transfer_progress` until bytes stream, so progress
+with `bytes: 0` means the receiver has not decided yet only on an older daemon. A client
+that must work with both treats `bytes == 0` as still waiting and does not rely on it.
 
 Requests are independent and may be issued concurrently. Events are broadcast to every
 connected client from the moment it connects; there is no replay. A UI that starts late

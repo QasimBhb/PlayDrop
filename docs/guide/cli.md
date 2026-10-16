@@ -34,19 +34,22 @@ playdrop send ~/Pictures/trip --to pixel
 playdrop send report.pdf notes.txt
 ```
 
-It waits for the transfer to finish and prints progress to standard error. With `--no-wait` it
+It waits for the transfer to finish and prints progress to standard error: bytes, rate and, for several files, how many are done (`1,204 of 5,000 files`). The line is cut to the width of your terminal. With `--no-wait` it
 starts the transfer and returns at once. Check on it with `playdrop transfers`.
 
 **`peers`** lists paired devices, whether each is online, and its short ID.
 
 **`status`** shows the daemon's state, the same as the window's status.
 
-**`transfers`** lists current and recent transfers with their progress.
+**`transfers`** lists current and recent transfers with their progress. For a transfer of many
+files that is moving, the FILES column shows how many are done, like `1204/5000`.
 
 **`clip`** sends text to a device's clipboard. `playdrop clip "hello"` sends that text.
 `playdrop clip --stdin` reads the text from standard input, for example
 `pwd | playdrop clip --stdin`. The same grants apply as in the window: the device must accept
-clipboard text from you.
+clipboard text from you. When nothing is sent it says why: the text matches the last clip sent
+or received (exit code 0, nothing to do), nothing could receive it, or the device cannot take
+it (exit code 1 for both).
 
 **`ping`** pings a device, which makes it show a notification. An optional message is shown with
 it.

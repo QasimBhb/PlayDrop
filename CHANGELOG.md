@@ -8,6 +8,45 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.3.0] - Unreleased
+
+### Added
+
+- Continuous checks for Linux and Android: every push now formats, lints, builds and tests the
+  Rust code on Ubuntu, and compiles and unit-tests the Android app (including regenerating the
+  Kotlin bindings), so breakage shows up before a release.
+- Transfers report how many files are done next to the byte count: `playdrop send` and
+  `playdrop transfers` show "1,204 of 5,000 files", and the window and the Android app show it
+  on active transfer rows.
+- `playdrop clip` now says why nothing was sent: the text matches the last clip, no connected
+  device has clipboard sharing on, or the connected devices cannot take it. The window and the
+  daemon's notifications use the same words.
+
+### Changed
+
+- Folders with many small files land while the transfer is still running instead of all at
+  the end, so big drops finish much sooner, most of all on phones.
+- A send now shows as "offered" until data actually starts moving, instead of jumping to
+  "active" with zero progress while the other device is still deciding. A declined offer no
+  longer reports any progress.
+- A finished transfer stays in the transfer list for at least a minute, even after a burst of
+  other transfers, so a late client always sees how it ended.
+- The send progress line now fits the real terminal width.
+- Going back to a 0.2.x build in the middle of a transfer is not fully safe: a 0.2.x build does
+  not understand the new delivery log, so files already saved early in a large folder transfer
+  can be saved a second time as "name (1)".
+
+### Fixed
+
+- A file being saved at the moment the app is killed no longer comes back as "name (1)" or
+  gets downloaded again.
+- A temporary disk error while saving received files no longer makes the sender start over:
+  the receiver keeps the data and finishes saving on the next try.
+- Android: if a received file had to be renamed because its name was already taken in
+  Downloads, tapping the notification or "Open" in the Transfers tab now opens the renamed
+  file, and the notice says how many files were renamed.
+- Pressing Ctrl-C right as `playdrop send` starts now stops it cleanly.
+
 ## [0.2.0] - 2026-10-15
 
 ### Added

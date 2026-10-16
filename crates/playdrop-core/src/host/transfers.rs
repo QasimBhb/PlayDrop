@@ -3,7 +3,8 @@
 //!
 //! Live transfers stay until they end. Finished ones (complete, failed, cancelled) are kept
 //! for late UIs, bounded by [`KEEP_FINISHED`] entries and [`KEEP_FOR`] age, whichever drops
-//! an entry first.
+//! an entry first, except that an entry younger than [`KEEP_AT_LEAST`] is never dropped for
+//! the count (only past the hard ceiling of 1,024 entries).
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -22,6 +23,16 @@ pub const KEEP_FINISHED: usize = 64;
 /// the daemon holding history that belongs in a UI-side log.
 pub const KEEP_FOR: Duration = Duration::from_mins(10);
 
+/// Shortest time a finished snapshot is kept, even past [`KEEP_FINISHED`]. *Choice:* a
+/// client that started a send and polls the list once a second (`playdrop send`) must
+/// still find its outcome after a burst of other transfers ended at the same moment, or
+/// it cannot tell a finished send from a lost one.
+pub const KEEP_AT_LEAST: Duration = Duration::from_mins(1);
+
+/// Hard ceiling on finished snapshots, young or not, so a flood of tiny transfers cannot
+/// grow the book without bound.
+const MAX_FINISHED: usize = 1024;
+
 /// Where a transfer stands, as a UI shows it. Coarser than the wire states of
 /// protocol.md 7.5: `declined` and `expired` are reported as `cancelled` and `failed`
 /// with a note.
@@ -30,7 +41,9 @@ pub const KEEP_FOR: Duration = Duration::from_mins(10);
 pub enum TransferStatus {
     /// Waiting for the receiving user to accept (protocol.md 7.3).
     Offered,
-    /// Accepted and streaming, or waiting to resume (protocol.md 7.6).
+    /// Accepted and streaming, or waiting to resume (protocol.md 7.6). A send becomes
+    /// `active` when its first file or bundle `PUT` starts moving bytes, not when the
+    /// receiver accepts.
     Active,
     /// Every file verified or skipped.
     Complete,
@@ -66,6 +79,9 @@ pub struct TransferSnapshot {
     pub total: u64,
     /// Most recent rate; 0 once finished.
     pub bytes_per_sec: u64,
+    /// Files finished so far, as in `HostEvent::TransferProgress`.
+    #[serde(default)]
+    pub files_done: usize,
     /// When the transfer was offered or reloaded, Unix seconds.
     pub started_at: u64,
     /// Number of files in the manifest.
@@ -108,6 +124,7 @@ impl TransferSnapshot {
             bytes: 0,
             total,
             bytes_per_sec: 0,
+            files_done: 0,
             started_at: unix_now(),
             file_count,
             note,
@@ -126,6 +143,19 @@ fn unix_now() -> u64 {
 }
 
 type Key = (String, TransferDirection);
+
+/// One progress reading of a live transfer, as reported to the book and the event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct ProgressReading {
+    /// File bytes moved (sent) or verified (received).
+    pub bytes: u64,
+    /// Total file bytes.
+    pub total: u64,
+    /// Recent rate.
+    pub bytes_per_sec: u64,
+    /// Files finished so far.
+    pub files_done: usize,
+}
 
 /// Live and recently finished transfers.
 #[derive(Debug, Default)]
@@ -147,14 +177,14 @@ impl TransferBook {
         }
     }
 
-    /// Records progress of a live transfer.
-    pub(crate) fn progress(&mut self, id: &str, dir: TransferDirection, bytes: u64, rate: u64) {
+    /// Records progress of a live transfer. The state is left alone: each side moves it
+    /// with [`set_state`](Self::set_state) at the moment it really changes, so a reading
+    /// never makes a send look `active` while the receiver is still deciding.
+    pub(crate) fn progress(&mut self, id: &str, dir: TransferDirection, r: ProgressReading) {
         if let Some(s) = self.live.get_mut(&(id.to_owned(), dir)) {
-            s.bytes = bytes;
-            s.bytes_per_sec = rate;
-            if s.state == TransferStatus::Offered {
-                s.state = TransferStatus::Active;
-            }
+            s.bytes = r.bytes;
+            s.bytes_per_sec = r.bytes_per_sec;
+            s.files_done = r.files_done;
         }
     }
 
@@ -193,6 +223,7 @@ impl TransferBook {
         s.bytes_per_sec = 0;
         if state == TransferStatus::Complete {
             s.bytes = s.total;
+            s.files_done = s.file_count;
         }
         if note.is_some() {
             s.note = note;
@@ -207,14 +238,26 @@ impl TransferBook {
         self.live.contains_key(&(id.to_owned(), dir))
     }
 
+    /// Drops finished snapshots, oldest first: past the hard ceiling, past the count once
+    /// they are older than [`KEEP_AT_LEAST`], and past [`KEEP_FOR`] age. The queue is in
+    /// finishing order, so the front is always the oldest.
     fn prune(&mut self, now: Instant) {
-        while self.finished.len() > KEEP_FINISHED {
+        let age = |at: &Instant| now.saturating_duration_since(*at);
+        while self.finished.len() > MAX_FINISHED {
+            self.finished.pop_front();
+        }
+        while self.finished.len() > KEEP_FINISHED
+            && self
+                .finished
+                .front()
+                .is_some_and(|(at, _)| age(at) > KEEP_AT_LEAST)
+        {
             self.finished.pop_front();
         }
         while self
             .finished
             .front()
-            .is_some_and(|(at, _)| now.duration_since(*at) > KEEP_FOR)
+            .is_some_and(|(at, _)| age(at) > KEEP_FOR)
         {
             self.finished.pop_front();
         }
@@ -222,7 +265,12 @@ impl TransferBook {
 
     /// Every live transfer and every retained finished one, oldest first.
     pub(crate) fn list(&mut self) -> Vec<TransferSnapshot> {
-        self.prune(Instant::now());
+        self.list_at(Instant::now())
+    }
+
+    /// [`list`](Self::list) as of `now`, so tests can look ahead in time.
+    fn list_at(&mut self, now: Instant) -> Vec<TransferSnapshot> {
+        self.prune(now);
         let mut out: Vec<TransferSnapshot> = self
             .finished
             .iter()
@@ -255,10 +303,26 @@ mod tests {
     fn lifecycle_and_bounds() {
         let mut b = TransferBook::default();
         b.begin(snap(0));
-        b.progress("t0", TransferDirection::Receive, 40, 10);
+        b.progress(
+            "t0",
+            TransferDirection::Receive,
+            ProgressReading {
+                bytes: 40,
+                total: 100,
+                bytes_per_sec: 10,
+                files_done: 1,
+            },
+        );
         let l = b.list();
-        assert_eq!(l[0].state, TransferStatus::Active);
+        assert_eq!(
+            l[0].state,
+            TransferStatus::Offered,
+            "a reading alone does not change the state"
+        );
         assert_eq!(l[0].bytes, 40);
+        assert_eq!(l[0].files_done, 1);
+        b.set_state("t0", TransferDirection::Receive, TransferStatus::Active);
+        assert_eq!(b.list()[0].state, TransferStatus::Active);
         b.finish(
             "t0",
             TransferDirection::Receive,
@@ -269,10 +333,23 @@ mod tests {
         assert_eq!(l.len(), 1);
         assert_eq!(l[0].state, TransferStatus::Complete);
         assert_eq!(l[0].bytes, 100);
+        assert_eq!(
+            l[0].files_done, 2,
+            "a complete transfer has every file done"
+        );
         assert_eq!(l[0].bytes_per_sec, 0);
         assert_eq!(l[0].note.as_deref(), Some("hi"));
         // The wrong direction is a different transfer.
-        b.progress("t0", TransferDirection::Send, 1, 1);
+        b.progress(
+            "t0",
+            TransferDirection::Send,
+            ProgressReading {
+                bytes: 1,
+                total: 1,
+                bytes_per_sec: 1,
+                files_done: 0,
+            },
+        );
         assert!(!b.is_live("t0", TransferDirection::Send));
 
         for n in 1..=100 {
@@ -284,11 +361,76 @@ mod tests {
                 Some("why".into()),
             );
         }
-        let l = b.list();
+        // All of them finished just now, so none is dropped for the count yet.
+        assert_eq!(b.list().len(), 101);
+        let l = b.list_at(Instant::now() + KEEP_AT_LEAST + Duration::from_secs(1));
         assert_eq!(l.len(), KEEP_FINISHED);
         assert!(l.iter().all(|s| s.note.as_deref() == Some("why")));
         assert!(l.iter().any(|s| s.id == "t100"));
         assert!(!l.iter().any(|s| s.id == "t0"));
+        assert_eq!(
+            b.list_at(Instant::now() + KEEP_FOR + Duration::from_secs(1)),
+            Vec::new()
+        );
+    }
+
+    /// A finished send stays listed for at least a minute, however many other transfers
+    /// end right after it, so a client polling once a second (`playdrop send`) always
+    /// finds its outcome. Only the hard ceiling can drop it sooner.
+    #[test]
+    fn finished_send_is_listed_for_at_least_a_minute() {
+        const { assert!(KEEP_FOR.as_secs() >= KEEP_AT_LEAST.as_secs()) };
+        const { assert!(KEEP_AT_LEAST.as_secs() >= 60) };
+        let peer: DeviceId = "cd".repeat(32).parse().unwrap();
+        let mut b = TransferBook::default();
+        let send = |n: usize| {
+            TransferSnapshot::new(
+                &format!("s{n}"),
+                &peer,
+                TransferDirection::Send,
+                TransferStatus::Active,
+                10,
+                1,
+                None,
+            )
+        };
+        let t0 = Instant::now();
+        b.begin(send(0));
+        b.finish(
+            "s0",
+            TransferDirection::Send,
+            TransferStatus::Complete,
+            None,
+        );
+        for n in 1..=200 {
+            b.begin(send(n));
+            b.finish(
+                &format!("s{n}"),
+                TransferDirection::Send,
+                TransferStatus::Complete,
+                None,
+            );
+        }
+        let at = t0 + Duration::from_secs(KEEP_AT_LEAST.as_secs() - 1);
+        let l = b.list_at(at);
+        let s0 = l.iter().find(|s| s.id == "s0").expect("still listed");
+        assert_eq!(s0.state, TransferStatus::Complete);
+        assert_eq!(l.len(), 201);
+        // After the minute the count applies again.
+        let l = b.list_at(Instant::now() + KEEP_AT_LEAST + Duration::from_secs(1));
+        assert_eq!(l.len(), KEEP_FINISHED);
+        assert!(!l.iter().any(|s| s.id == "s0"));
+        // The ceiling holds even for young entries.
+        for n in 201..=1200 {
+            b.begin(send(n));
+            b.finish(
+                &format!("s{n}"),
+                TransferDirection::Send,
+                TransferStatus::Failed,
+                None,
+            );
+        }
+        assert!(b.list().len() <= MAX_FINISHED);
     }
 
     #[test]

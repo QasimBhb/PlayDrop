@@ -18,7 +18,7 @@ use playdrop_core::host::{
 use playdrop_core::pin_store::Grants;
 use playdrop_core::session::types::MediaAction;
 use playdrop_ipc::{
-    DaemonEvent, DiagnosticsReport, Event, FirewallHint, PortProbe, Settings, Status,
+    ClipSkip, DaemonEvent, DiagnosticsReport, Event, FirewallHint, PortProbe, Settings, Status,
 };
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -111,6 +111,8 @@ pub struct TransferView {
     pub bytes_per_sec: u64,
     /// Files in the manifest.
     pub file_count: usize,
+    /// Files finished so far; 0 from an older daemon.
+    pub files_done: usize,
     /// First offered names, for the offer prompt.
     pub names: Vec<String>,
     /// Sender's note, or the failure reason once failed.
@@ -134,6 +136,7 @@ impl TransferView {
             total: s.total,
             bytes_per_sec: s.bytes_per_sec,
             file_count: s.file_count,
+            files_done: s.files_done,
             names: Vec::new(),
             note: s.note,
             saved: s.saved,
@@ -152,6 +155,7 @@ impl TransferView {
             total: 0,
             bytes_per_sec: 0,
             file_count: 0,
+            files_done: 0,
             names: Vec::new(),
             note: None,
             saved: Vec::new(),
@@ -636,11 +640,14 @@ impl Store {
                 bytes,
                 total,
                 bytes_per_sec,
+                files_done,
+                ..
             } => self.upsert_transfer(&id, &peer, direction, |t| {
                 t.state = TransferStatus::Active;
                 t.bytes = bytes;
                 t.total = total;
                 t.bytes_per_sec = bytes_per_sec;
+                t.files_done = files_done;
             }),
             HostEvent::TransferComplete {
                 id,
@@ -855,10 +862,15 @@ fn count_files(n: usize) -> String {
     }
 }
 
+/// "Clipboard not sent: <reason>", with the daemon's own wording of the reason.
+pub fn clipboard_skipped_text(skip: ClipSkip) -> String {
+    format!("Clipboard not sent: {}", skip.reason())
+}
+
 /// "Clipboard sent to 2 devices" or the reason nothing was sent.
 pub fn clipboard_sent_text(n: usize) -> String {
     match n {
-        0 => "Clipboard not sent: no online device accepts it".to_owned(),
+        0 => clipboard_skipped_text(ClipSkip::NoPeers),
         1 => "Clipboard sent to 1 device".to_owned(),
         n => format!("Clipboard sent to {n} devices"),
     }
@@ -1224,6 +1236,10 @@ pub fn transfer_row(t: &TransferView, peer_name: &str) -> TransferRow {
     let detail = match t.state {
         TransferStatus::Active => {
             let mut d = format!("{} of {}", format_bytes(t.bytes), format_bytes(t.total));
+            // A single file has nothing to count, and 0 means the host sent no count.
+            if t.file_count > 1 && t.files_done > 0 {
+                let _ = write!(d, " · {} of {} files", t.files_done, t.file_count);
+            }
             if t.bytes_per_sec > 0 {
                 d.push_str(" · ");
                 d.push_str(&format_rate(t.bytes_per_sec));
@@ -2164,6 +2180,7 @@ mod tests {
                 bytes: 1024,
                 total: 2048,
                 bytes_per_sec: 512,
+                files_done: 0,
             }),
             0,
         );
@@ -2212,6 +2229,33 @@ mod tests {
 
         s.clear_finished();
         assert!(s.transfers.is_empty());
+    }
+
+    #[test]
+    fn active_row_counts_files_only_for_a_bundle_that_has_started() {
+        let mut s = Store::default();
+        s.set_peers(vec![peer("aa", true)], 0);
+        let progress = |files_done| {
+            Event::Host(HostEvent::TransferProgress {
+                id: "t1".into(),
+                peer: "aa".into(),
+                direction: TransferDirection::Send,
+                bytes: 1024,
+                total: 2048,
+                bytes_per_sec: 0,
+                files_done,
+            })
+        };
+        let tv = |s: &mut Store, files_done, file_count| {
+            s.apply(progress(files_done), 0);
+            s.transfers[0].file_count = file_count;
+            transfer_row(&s.transfers[0], "Phone").detail.to_string()
+        };
+        // Nothing finished yet, or an older daemon that sends no count.
+        assert_eq!(tv(&mut s, 0, 40), "1.0 KiB of 2.0 KiB");
+        assert_eq!(tv(&mut s, 12, 40), "1.0 KiB of 2.0 KiB · 12 of 40 files");
+        // One file has nothing to count.
+        assert_eq!(tv(&mut s, 1, 1), "1.0 KiB of 2.0 KiB");
     }
 
     #[test]
@@ -2306,7 +2350,11 @@ mod tests {
         );
         assert_eq!(
             clipboard_sent_text(0),
-            "Clipboard not sent: no online device accepts it"
+            "Clipboard not sent: no connected device has clipboard sharing turned on"
+        );
+        assert_eq!(
+            clipboard_skipped_text(ClipSkip::Unsupported),
+            "Clipboard not sent: the connected devices cannot receive this kind of clip"
         );
         assert_eq!(clipboard_sent_text(2), "Clipboard sent to 2 devices");
     }

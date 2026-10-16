@@ -46,6 +46,16 @@ object CoreHost {
      */
     val media: StateFlow<Map<String, List<MediaState>>> get() = CoreHostImpl.media
 
+    /**
+     * The real location of a delivered file: [location] from `TransferSnapshot.delivered`,
+     * unless the Downloads mover had to give the file another name (see [Relocations]). Every
+     * reader that shows or opens a delivered location goes through this.
+     */
+    fun relocated(transferId: String, location: String): String = CoreHostImpl.relocated(transferId, location)
+
+    /** Counts up whenever [relocated] may answer differently, so rows can be derived again. */
+    val relocationChanges: StateFlow<Int> get() = CoreHostImpl.relocationChanges
+
     /** Every event, in order, for screens that need more than the flows above. */
     val events: SharedFlow<HostEvent> get() = CoreHostImpl.events
 

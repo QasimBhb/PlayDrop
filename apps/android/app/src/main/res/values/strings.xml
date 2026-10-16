@@ -67,6 +67,14 @@
         <item quantity="one">%d file arrived before the transfer stopped</item>
         <item quantity="other">%d files arrived before the transfer stopped</item>
     </plurals>
+    <plurals name="received_from_renamed">
+        <item quantity="one">From %1$s, saved in Download/PlayDrop\n%2$d file was renamed because the name was taken</item>
+        <item quantity="other">From %1$s, saved in Download/PlayDrop\n%2$d files were renamed because the name was taken</item>
+    </plurals>
+    <plurals name="moved_saved_renamed">
+        <item quantity="one">Saved in Download/PlayDrop. %d file was renamed because the name was taken</item>
+        <item quantity="other">Saved in Download/PlayDrop. %d files were renamed because the name was taken</item>
+    </plurals>
     <string name="moved_after_restart_text">Saved in Download/PlayDrop</string>
     <plurals name="move_failed_title">
         <item quantity="one">%d file could not be moved into Downloads</item>

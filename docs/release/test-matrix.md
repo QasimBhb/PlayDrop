@@ -12,9 +12,9 @@ Status words: **Pass** (run, passed), **Partial** (part run, the rest named), **
 
 | Platform | Hardware here | Coverage |
 |---|---|---|
-| Pop!_OS COSMIC (Wayland) | This desktop, 16 cores, Wi-Fi client | Full: daemon, window, tray, clipboard, input portal, MPRIS |
+| Pop!_OS COSMIC (Wayland) | This desktop, 16 cores, Wi-Fi client | Full: daemon, window, tray, clipboard, input portal, MPRIS; GitHub Actions `ubuntu-24.04` also runs format, clippy, build and tests on every push (`.github/workflows/linux.yml`: proves the Linux code compiles and its non-desktop tests pass, nothing that needs a screen) |
 | Windows 11 | None. GitHub Actions `windows-latest` only (`.github/workflows/windows.yml`: build, test, clippy, Inno Setup compile) | **CI only.** The first real test run on 2026-10-14 failed (file delivery `Access is denied`, one send timed out, two gates hung); fixed the same day, the fourth run is green with gate B ignored there (`phase-6-ship-gate.md` section 6). Everything that needs a person at the screen is owed (section 4) |
-| Android 16 (API 36) | Galaxy A54 (SM-A546U1), on adb, same Wi-Fi | Real device |
+| Android 16 (API 36) | Galaxy A54 (SM-A546U1), on adb, same Wi-Fi | Real device; GitHub Actions (`.github/workflows/android.yml`) regenerates the UniFFI bindings, compiles the Kotlin and runs the JUnit tests on every push, nothing on a device |
 | Android 15 (API 35) | None | Owed. See 1.1 |
 | Android 14 (API 34) | None | Owed. See 1.1 |
 | iOS | An iPhone, built and installed from Linux with xtool on a free personal team (no App Group, no multicast; pair by address or QR). GitHub macOS CI for compile and unit tests | Partial: four of five Phase 4 gates passed 2026-10-12 |

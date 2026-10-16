@@ -62,7 +62,7 @@ pub use lock::{AlwaysUnlocked, LockFlag, LockState};
 pub use outbox::OutboxItem;
 pub use send::{SendSource, TransferHandle, TransferSummary};
 pub use status::MediaState;
-pub use transfers::{TransferSnapshot, TransferStatus, KEEP_FINISHED, KEEP_FOR};
+pub use transfers::{TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISHED, KEEP_FOR};
 
 use crate::discovery::{BeaconSchedule, DialLimiter, Discovery, DiscoveryConfig, InterfaceSource};
 use crate::identity::{DeviceId, DeviceIdentity};
@@ -507,18 +507,17 @@ impl Inner {
         id: &str,
         peer: &DeviceId,
         direction: TransferDirection,
-        bytes: u64,
-        total: u64,
-        bytes_per_sec: u64,
+        reading: transfers::ProgressReading,
     ) {
-        lock(&self.transfers).progress(id, direction, bytes, bytes_per_sec);
+        lock(&self.transfers).progress(id, direction, reading);
         self.emit(HostEvent::TransferProgress {
             id: id.to_owned(),
             peer: peer.to_hex(),
             direction,
-            bytes,
-            total,
-            bytes_per_sec,
+            bytes: reading.bytes,
+            total: reading.total,
+            bytes_per_sec: reading.bytes_per_sec,
+            files_done: reading.files_done,
         });
     }
 
@@ -1078,8 +1077,9 @@ impl Host {
     }
 
     /// Live transfers in both directions plus recently finished ones (the last
-    /// [`KEEP_FINISHED`], none older than [`KEEP_FOR`]), oldest first, so a UI that
-    /// connects late can rebuild its view.
+    /// [`KEEP_FINISHED`], none older than [`KEEP_FOR`], and every one that ended less than
+    /// [`KEEP_AT_LEAST`] ago), oldest first, so a UI that connects late can rebuild its
+    /// view.
     pub fn transfers(&self) -> Vec<TransferSnapshot> {
         lock(&self.inner.transfers).list()
     }

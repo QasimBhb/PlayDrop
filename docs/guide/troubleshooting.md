@@ -40,6 +40,14 @@ treats KDE Connect or GSConnect holding port 1716 as fine.
 
 Running PlayDrop and KDE Connect on the same desktop at once has not been tried by a person.
 
+## "Clipboard not sent"
+
+The message names the reason. "No connected device has clipboard sharing turned on" means every
+device that accepts your clipboard is offline right now, or you switched sending off for it. Open
+**Devices** to see which are online and what each may receive. "It matches the last clip sent or
+received" is not a problem: the other device already has that text. The three reasons are
+explained in [clipboard.md](clipboard.md).
+
 ## Logs
 
 PlayDrop's logs never contain keys, pairing secrets or the contents of what you send. File names

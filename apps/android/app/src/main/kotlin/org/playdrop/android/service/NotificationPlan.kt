@@ -131,6 +131,27 @@ internal object NotificationPlan {
         return if (FileNames.isRiskyToOpen(name, mime)) Received.OneRisky(name) else Received.One(name, d.location, mime)
     }
 
+    /**
+     * True when a "received" notification must open the Downloads list instead of the file.
+     * Several files always do; a single file does too when the mover renamed it ([renamed]
+     * above 0) and the new place is unknown ([relocated] false, for example the relocation
+     * table could not be written). When the new place is known, the file opens directly.
+     */
+    fun needsFolder(deliveredCount: Int, renamed: Int, relocated: Boolean): Boolean =
+        deliveredCount != 1 || (renamed > 0 && !relocated)
+
+    /** The second line of the notice that ends a move: where the files are, and whether names changed. */
+    enum class MoveDetail {
+        /** Nothing unusual: the usual "saved in Download/PlayDrop" text. */
+        SAVED,
+
+        /** Some files got another name because theirs was taken: say how many. */
+        RENAMED,
+    }
+
+    /** Which detail line a finished move shows, given how many files got a new name. */
+    fun moveDetail(renamed: Int): MoveDetail = if (renamed > 0) MoveDetail.RENAMED else MoveDetail.SAVED
+
     /** Which notification ends a move of landed files. */
     enum class MoveNotice {
         /** The transfer completed: its normal "received" notification. */

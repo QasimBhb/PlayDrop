@@ -207,6 +207,7 @@ object Samples {
         bytes = bytes.toULong(),
         total = total.toULong(),
         bytesPerSec = rate.toULong(),
+        filesDone = 0u,
         startedAt = NOW.toULong(),
         fileCount = files.toULong(),
         note = note,

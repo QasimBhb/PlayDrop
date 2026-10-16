@@ -17,7 +17,7 @@ use tokio::sync::watch;
 
 use super::events::{FileRoot, TransferDirection};
 use super::receive::{CHUNK_SIZE_HEADER, ROOT_TRAILER, TOKEN_HEADER};
-use super::transfers::{TransferSnapshot, TransferStatus};
+use super::transfers::{ProgressReading, TransferSnapshot, TransferStatus};
 use super::{connect, lock, Inner, TransferEnd};
 use crate::constants::DEFAULT_CHUNK_SIZE;
 use crate::identity::DeviceId;
@@ -199,6 +199,83 @@ struct Job {
     /// Set when the receiver reported the transfer cancelled (a `410 cancelled`, a
     /// `cancelled` state or a `transfer` frame), so the end is reported as a cancel.
     remote_cancelled: AtomicBool,
+    /// Set when the first file or bundle `PUT` starts moving bytes. Until then the send is
+    /// `offered` and no progress is reported, so a UI never shows a running transfer while
+    /// the receiver is still deciding. It stays set across reconnects.
+    streaming: AtomicBool,
+    /// Which files the receiver has finished, for `files_done`.
+    done: std::sync::Mutex<DoneFiles>,
+    /// The rate of the last progress reading, reused for the final one.
+    rate: AtomicU64,
+}
+
+/// Files the receiver has finished, by fid: a streamed file once its `PUT` came back
+/// `verified`, every bundle member once the bundle did, a skipped file always, and a
+/// zero-length file only when the whole transfer is complete (it is made at completion,
+/// protocol.md 7.2).
+#[derive(Debug, Default)]
+struct DoneFiles {
+    done: Vec<bool>,
+    count: usize,
+}
+
+impl DoneFiles {
+    fn new(files: usize) -> Self {
+        Self {
+            done: vec![false; files],
+            count: 0,
+        }
+    }
+
+    fn mark(&mut self, fid: u32) {
+        if let Some(d) = self.done.get_mut(fid as usize) {
+            if !*d {
+                *d = true;
+                self.count += 1;
+            }
+        }
+    }
+
+    fn mark_all(&mut self) {
+        self.done.fill(true);
+        self.count = self.done.len();
+    }
+
+    /// Rebuilds the set from the receiver's `GET` view (protocol.md 7.5), so a resumed
+    /// send counts what the receiver really holds, not what an earlier round saw.
+    fn from_view(manifest: &Manifest, view: &TransferStateView) -> Self {
+        let mut out = Self::new(manifest.files.len());
+        if view.state == TransferState::Complete {
+            out.mark_all();
+            return out;
+        }
+        let mut states = vec![None; manifest.files.len()];
+        for f in &view.files {
+            if let Some(slot) = states.get_mut(f.fid as usize) {
+                *slot = Some(f.state);
+            }
+        }
+        let bundle_verified = view
+            .bundle
+            .as_ref()
+            .is_some_and(|b| b.state == FileState::Verified);
+        for f in &manifest.files {
+            let state = states.get(f.fid as usize).copied().flatten();
+            let done = if state == Some(FileState::Skipped) {
+                true
+            } else if f.in_bundle {
+                bundle_verified
+            } else if f.size == 0 {
+                false
+            } else {
+                state == Some(FileState::Verified)
+            };
+            if done {
+                out.mark(f.fid);
+            }
+        }
+        out
+    }
 }
 
 impl Job {
@@ -219,6 +296,49 @@ impl Job {
 
     fn mark_remote_cancel(&self) {
         self.remote_cancelled.store(true, Ordering::Release);
+    }
+
+    /// Notes that bytes are moving; the first call turns the snapshot `active`.
+    fn mark_streaming(&self) {
+        if !self.streaming.load(Ordering::Acquire) && !self.streaming.swap(true, Ordering::AcqRel) {
+            lock(&self.inner.transfers).set_state(
+                &self.manifest.id,
+                TransferDirection::Send,
+                TransferStatus::Active,
+            );
+        }
+    }
+
+    fn files_done(&self) -> usize {
+        lock(&self.done).count
+    }
+
+    /// Counts the files a `PUT` that came back `verified` finished.
+    fn target_verified(&self, target: Target) {
+        let mut done = lock(&self.done);
+        match target {
+            Target::File(fid) => done.mark(fid),
+            Target::Bundle => {
+                for f in self.manifest.files.iter().filter(|f| f.in_bundle) {
+                    done.mark(f.fid);
+                }
+            }
+        }
+    }
+
+    /// Resets the count from the receiver's view at the start of a connected round.
+    fn sync_done(&self, view: &TransferStateView) {
+        *lock(&self.done) = DoneFiles::from_view(&self.manifest, view);
+    }
+
+    /// The reading the progress ticker and the final report send.
+    fn reading(&self, bytes: u64, bytes_per_sec: u64) -> ProgressReading {
+        ProgressReading {
+            bytes: bytes.min(self.manifest.total_bytes),
+            total: self.manifest.total_bytes,
+            bytes_per_sec,
+            files_done: self.files_done(),
+        }
     }
 }
 
@@ -255,6 +375,7 @@ pub(crate) async fn start(
         },
     );
     let sent = Arc::new(AtomicU64::new(0));
+    let file_count = manifest.files.len();
     let job = Arc::new(Job {
         inner: Arc::clone(inner),
         peer,
@@ -266,6 +387,9 @@ pub(crate) async fn start(
         cancel: cancel.subscribe(),
         decision: decision_rx,
         remote_cancelled: AtomicBool::new(false),
+        streaming: AtomicBool::new(false),
+        done: std::sync::Mutex::new(DoneFiles::new(file_count)),
+        rate: AtomicU64::new(0),
     });
     let (done_tx, done_rx) = watch::channel(None);
     let i2 = Arc::clone(inner);
@@ -277,6 +401,22 @@ pub(crate) async fn start(
             () = ticker => Err("progress ticker ended".into()),
         };
         lock(&i2.outgoing).remove(&id2);
+        if outcome.is_ok() {
+            // One last reading at 100 %, so the event stream and the snapshot both end
+            // with every file counted before `TransferComplete` (the ticker may not have
+            // run since the last file finished). A send with nothing to stream (only empty
+            // files, or everything skipped) passes through `active` here, so the order is
+            // always offered, active, complete.
+            job.mark_streaming();
+            lock(&job.done).mark_all();
+            let rate = job.rate.load(Ordering::Relaxed);
+            i2.transfer_progress(
+                &id2,
+                &peer,
+                TransferDirection::Send,
+                job.reading(job.manifest.total_bytes, rate),
+            );
+        }
         let end = match &outcome {
             Ok(s) => TransferEnd::Complete {
                 bytes: s.bytes,
@@ -301,12 +441,19 @@ pub(crate) async fn start(
     })
 }
 
+/// Reports progress every [`PROGRESS_EVERY`] once bytes are moving. Nothing is reported
+/// while the offer waits for the receiver, so a reading always means a running transfer.
 async fn progress_ticker(job: Arc<Job>) {
     let mut last = (Instant::now(), 0u64);
     loop {
         tokio::time::sleep(PROGRESS_EVERY).await;
         let bytes = job.sent.load(Ordering::Relaxed);
         let now = Instant::now();
+        if !job.streaming.load(Ordering::Acquire) {
+            // The first rate is measured from when streaming began, not from the offer.
+            last = (now, bytes);
+            continue;
+        }
         let dt = now.duration_since(last.0).as_secs_f64().max(0.001);
         #[allow(
             clippy::cast_precision_loss,
@@ -315,13 +462,12 @@ async fn progress_ticker(job: Arc<Job>) {
         )] // display rate only
         let rate = (bytes.saturating_sub(last.1) as f64 / dt) as u64;
         last = (now, bytes);
+        job.rate.store(rate, Ordering::Relaxed);
         job.inner.transfer_progress(
             &job.manifest.id,
             &job.peer,
             TransferDirection::Send,
-            bytes.min(job.manifest.total_bytes),
-            job.manifest.total_bytes,
-            rate,
+            job.reading(bytes, rate),
         );
     }
 }
@@ -546,7 +692,7 @@ async fn attempt(
         if !accepted {
             wait_decision(job).await.map_err(Step::Fatal)?;
         }
-        lock(&job.inner.transfers).set_state(&id, TransferDirection::Send, TransferStatus::Active);
+        // The snapshot stays `offered` until the first `PUT` moves bytes (`mark_streaming`).
     }
     let view = get_state(conn, &id).await?;
     stall.observe(view.bytes_verified);
@@ -570,6 +716,7 @@ async fn attempt(
         }
         TransferState::Accepted | TransferState::Active => {}
     }
+    job.sync_done(&view);
     {
         let mut guard = job.sender.lock().await;
         if guard.is_none() {
@@ -696,7 +843,10 @@ async fn stream_target(
             return TargetOutcome::Fatal("cancelled".into());
         }
         match put_once(job, conn, target, &token, from).await {
-            PutResult::Ok(r) if r.state == FileState::Verified => return TargetOutcome::Done,
+            PutResult::Ok(r) if r.state == FileState::Verified => {
+                job.target_verified(target);
+                return TargetOutcome::Done;
+            }
             PutResult::Ok(r) => {
                 return TargetOutcome::Failed(format!("{target:?} ended {:?}", r.state));
             }
@@ -710,6 +860,16 @@ async fn stream_target(
             PutResult::Refused(_, ErrorCode::OffsetMismatch, _) => {
                 // The receiver's offset moved (another stream or a restart): re-plan.
                 return TargetOutcome::Conn("offset mismatch; re-planning".into());
+            }
+            PutResult::Refused(s, ErrorCode::Internal, msg) => {
+                // A local failure on the receiver (its disk, while placing verified data).
+                // The receiver keeps what it verified, so re-plan: the next round asks
+                // for its state and resumes or retries the placement. The stall counter
+                // ends the send if the failure does not clear.
+                return TargetOutcome::Conn(format!(
+                    "{target:?}: {s} {} {msg}; re-planning",
+                    ErrorCode::Internal
+                ));
             }
             PutResult::Refused(s, code, msg)
                 if matches!(
@@ -793,7 +953,7 @@ async fn put_once(
                     )
                 }
             };
-            let r = put_body(conn, req, &mut enc, size, &job.sent, &job.cancel).await;
+            let r = put_body(conn, req, &mut enc, size, job).await;
             if let Some(s) = job.sender.lock().await.as_mut() {
                 s.record_hashes(fid, enc.into_hashes());
             }
@@ -817,7 +977,7 @@ async fn put_once(
                     )
                 }
             };
-            let r = put_body(conn, req, &mut enc, size, &job.sent, &job.cancel).await;
+            let r = put_body(conn, req, &mut enc, size, job).await;
             if let Some(s) = job.sender.lock().await.as_mut() {
                 s.record_bundle_hashes(enc.into_hashes());
             }
@@ -829,14 +989,15 @@ async fn put_once(
 /// Sends the chunk records and the `pd-root` trailer while reading the response, so a
 /// `422` that arrives mid-body stops the upload (protocol.md 7.4). A local cancel resets
 /// the stream at the next chunk, so a large file stops at once instead of at its end.
+/// The first record handed to the connection turns the send `active`.
 async fn put_body<R: AsyncRead + Unpin + Send>(
     conn: &Connection,
     req: Request<()>,
     enc: &mut ChunkEncoder<R>,
     size: u64,
-    sent: &AtomicU64,
-    cancel: &watch::Receiver<bool>,
+    job: &Job,
 ) -> PutResult {
+    let (sent, cancel) = (&job.sent, &job.cancel);
     let (resp, mut upload) = match conn.request(req, false).await {
         Ok(v) => v,
         Err(e) => return PutResult::Conn(e.to_string()),
@@ -853,6 +1014,7 @@ async fn put_body<R: AsyncRead + Unpin + Send>(
                 .await
                 .map_err(|e| e.to_string())?;
             sent.fetch_add(n, Ordering::Relaxed);
+            job.mark_streaming();
         }
         let root = enc.root(size).ok_or("root unknown after the last chunk")?;
         let mut trailers = HeaderMap::new();

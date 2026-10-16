@@ -1,0 +1,100 @@
+# Builds and tests PlayDrop on GitHub's Ubuntu runner, so the Linux code paths get the same
+# check the Windows ones do. What this proves: the whole workspace (core, CLI, IPC, daemon,
+# Slint window, FFI, uniffi-bindgen) is formatted, compiles with no clippy warnings, and the
+# unit and loopback tests pass on Linux. What it cannot prove: anything that needs someone at
+# a desktop (the COSMIC or GNOME tray and notifications, the RemoteDesktop portal consent
+# dialog, Wayland clipboard, MPRIS players, autostart, the Flatpak and .deb packages; see
+# docs/release/test-matrix.md).
+#
+# Nothing is excluded. The tests that need a LAN interface with multicast or a running
+# daemon are already #[ignore] in the code and stay ignored, as do the clipboard, portal and
+# MPRIS tests that need a desktop session. If a test fails on the runner only because it has
+# no desktop, add `--skip <exact name>` to the test step with a comment saying why; do not
+# skip whole crates.
+#
+# D-Bus: the playdrop-ipc round trip starts its own private dbus-daemon, and some playdropd
+# code opens the session bus. The runner has no session bus, so the test command runs inside
+# `dbus-run-session --` (package `dbus`), which starts a throwaway one for the run.
+#
+# Clippy runs with -D warnings. The runner installs the current stable Rust (the channel in
+# rust-toolchain.toml), which can be a release behind or ahead of the development machine
+# (1.98 against 1.99 was seen in Phase 6), so a new or removed lint can fail here while it
+# passes locally. Fix the code, or pin the channel in rust-toolchain.toml; do not drop the flag.
+#
+# Runs on pushes to main and pull requests that touch the Rust code, and on demand.
+
+name: Linux
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "apps/desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/linux.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "apps/desktop/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/linux.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental builds only waste cache space on CI.
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: Format, lint, build and test (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Show toolchain versions
+        # rust-toolchain.toml pins the stable channel with clippy and rustfmt; rustup installs
+        # it on first use.
+        run: |
+          rustup show
+          rustc --version --verbose
+          cargo --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux
+
+      - name: Install system packages
+        # Slint window: fontconfig, xkbcommon, GL headers (same list as release.yml, plus
+        # libwayland-dev for winit). dbus provides dbus-daemon and dbus-run-session. zbus is
+        # pure Rust, so libdbus-1-dev is not needed.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfontconfig1-dev libxkbcommon-dev libgl1-mesa-dev libwayland-dev dbus
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Build (debug)
+        run: cargo build --workspace --locked
+
+      - name: Test
+        # A hung test must not eat the job's 60 minutes (the Windows run had two gates hang
+        # for an hour on 2026-10-14), so the step has its own limit.
+        timeout-minutes: 25
+        run: dbus-run-session -- cargo test --workspace --locked --no-fail-fast

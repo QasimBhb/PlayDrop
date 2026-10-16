@@ -118,6 +118,8 @@ pub enum HostEvent {
         total: u64,
         /// Recent rate.
         bytes_per_sec: u64,
+        /// Files finished so far (sent whole, or verified; bundled files when placed).
+        files_done: u64,
     },
     /// Every file verified or skipped.
     TransferComplete {
@@ -372,6 +374,7 @@ impl From<CoreEvent> for HostEvent {
                 bytes,
                 total,
                 bytes_per_sec,
+                files_done,
             } => Self::TransferProgress {
                 id,
                 peer,
@@ -379,6 +382,7 @@ impl From<CoreEvent> for HostEvent {
                 bytes,
                 total,
                 bytes_per_sec,
+                files_done: files_done as u64,
             },
             CoreEvent::TransferComplete {
                 id,

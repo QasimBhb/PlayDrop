@@ -115,7 +115,7 @@ internal object CoreHostImpl {
             val settings = Settings.read(app)
             val staging = (app.getExternalFilesDir("staging") ?: File(app.filesDir, "staging")).apply { mkdirs() }
             val reused = sink
-            val receiveSink = reused ?: DownloadsSink(app, staging, ::shapeOf).also { sink = it }
+            val receiveSink = reused ?: DownloadsSink(app, staging, ::shapeOf) { relocationChanges.update { it + 1 } }.also { sink = it }
             val landingMover = mover ?: LandingMover(app, receiveSink, scope).also { mover = it }
             if (reused == null) {
                 // First start of the process, before the host delivers anything: promise the
@@ -227,7 +227,11 @@ internal object CoreHostImpl {
     private suspend fun refreshTransfers() {
         val h = host ?: return
         try {
-            transfers.value = withContext(Dispatchers.IO) { h.transfers() }
+            val list = withContext(Dispatchers.IO) { h.transfers() }
+            transfers.value = list
+            // The core's list is the truth about which transfers still exist: relocations of
+            // forgotten ones are dead weight. Cheap when there are none.
+            sink?.pruneRelocations(list.mapTo(HashSet()) { it.id })
         } catch (e: Exception) {
             HostLog.w("core", "transfer list refresh failed", e)
         }
@@ -310,6 +314,12 @@ internal object CoreHostImpl {
         HostLog.i("send", "transfer ${id.take(8)}: ${uris.size} items, ${prepared.totalBytes} bytes")
         return id
     }
+
+    /** See [CoreHost.relocated]. */
+    fun relocated(transferId: String, location: String): String = sink?.relocated(transferId, location) ?: location
+
+    /** See [CoreHost.relocationChanges]. */
+    val relocationChanges = MutableStateFlow(0)
 
     /** See [CoreHost.labelOf]. */
     fun labelOf(peer: String): String {

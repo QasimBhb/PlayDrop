@@ -1,6 +1,7 @@
 package org.playdrop.android.service
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -98,5 +99,28 @@ class NotificationPlanTest {
         assertEquals("512 B", NotificationPlan.humanBytes(512))
         assertEquals("1.5 KiB", NotificationPlan.humanBytes(1536))
         assertEquals("500.0 MiB", NotificationPlan.humanBytes(500L * 1024 * 1024))
+    }
+
+    @Test
+    fun aRenamedSingleFileOpensDirectlyOnlyWhenItsNewPlaceIsKnown() {
+        assertFalse(NotificationPlan.needsFolder(deliveredCount = 1, renamed = 0, relocated = false))
+        assertFalse(NotificationPlan.needsFolder(deliveredCount = 1, renamed = 1, relocated = true))
+        assertTrue(NotificationPlan.needsFolder(deliveredCount = 1, renamed = 1, relocated = false))
+        assertTrue(NotificationPlan.needsFolder(deliveredCount = 3, renamed = 0, relocated = false))
+        assertTrue(NotificationPlan.needsFolder(deliveredCount = 3, renamed = 3, relocated = true))
+    }
+
+    @Test
+    fun aRenamedMoveSaysSoInItsFinalNotice() {
+        assertEquals(NotificationPlan.MoveDetail.SAVED, NotificationPlan.moveDetail(0))
+        assertEquals(NotificationPlan.MoveDetail.RENAMED, NotificationPlan.moveDetail(1))
+        assertEquals(NotificationPlan.MoveDetail.RENAMED, NotificationPlan.moveDetail(3))
+    }
+
+    @Test
+    fun aRenamedSingleFileWithAKnownPlaceStillOpensItsRelocatedUri() {
+        val moved = listOf(NotificationPlan.Delivered("a.jpg", "content://x/received/a%20(1).jpg"))
+        val plan = NotificationPlan.received(moved, NotificationPlan.needsFolder(1, 1, true)) { "image/jpeg" }
+        assertEquals(NotificationPlan.Received.One("a.jpg", "content://x/received/a%20(1).jpg", "image/jpeg"), plan)
     }
 }

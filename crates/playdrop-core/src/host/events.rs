@@ -243,6 +243,10 @@ pub enum HostEvent {
         total: u64,
         /// Recent rate.
         bytes_per_sec: u64,
+        /// Files finished so far: sent whole (send side) or verified (receive side).
+        /// Bundled files count once the bundle is verified. Absent from older hosts.
+        #[serde(default)]
+        files_done: usize,
     },
     /// A transfer completed with every file verified or skipped.
     TransferComplete {

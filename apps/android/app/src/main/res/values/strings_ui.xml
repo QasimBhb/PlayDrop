@@ -173,9 +173,11 @@
     <string name="ui_transfers_open_folder">Open folder</string>
     <string name="ui_transfers_no_viewer">No app on this phone can open that.</string>
     <string name="ui_transfers_risky">This file type could install or run code, so it opens in Downloads instead.</string>
+    <!-- Shown only for transfers of several files, so no plural. -->
+    <string name="ui_transfers_files_done">%1$s of %2$s files</string>
     <plurals name="ui_files">
-        <item quantity="one">%d file</item>
-        <item quantity="other">%d files</item>
+        <item quantity="one">%1$s file</item>
+        <item quantity="other">%1$s files</item>
     </plurals>
     <string name="ui_state_waiting_you">Waiting for you</string>
     <string name="ui_state_waiting_peer">Waiting for the other device</string>

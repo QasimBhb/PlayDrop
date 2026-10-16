@@ -356,8 +356,13 @@ fn decide(
     if offset == 0 {
         return ResumeAction::Resume { from: 0 };
     }
-    // An offset at the size means the bytes arrived but the root was never confirmed; a
-    // range cannot start there, so the only safe move is a restart.
+    // An offset at the size means every byte arrived but nothing was placed yet: either
+    // the root never reached the receiver, or it verified and placing the files stopped
+    // on an I/O error. A range cannot start at the size, so the request is a restart at 0
+    // (the only start the wire allows). A receiver that holds a verified root does not
+    // discard anything for it: it finishes placing the files and answers
+    // `offset_mismatch` at the full size, and the next plan finds the stream verified.
+    // Without a root the receiver starts again from 0.
     if offset >= size || !offset.is_multiple_of(u64::from(chunk_size)) {
         return ResumeAction::Restart;
     }

@@ -322,3 +322,69 @@ item. Files reach Downloads 85 s after a 5,000-file drop; the notification shows
 8 s later: the transfer finished 21.6 s after the relaunch (the remaining half plus the copy
 tail; a restart from zero would have needed about 35 s), 42.6 s in all, sha256 equal, one
 file, no " (1)" copy.
+
+## 9. Phase 8: members placed while the bundle streams (2026-10-16)
+
+Same phone and link (Android 16, RSSI -46 to -53 dBm, 408 Mbit/s tx, 720 to 1200 Mbit/s
+rx, screen off), desktop load average 1.6 to 1.9, release app from the Phase 8 tree
+(`assembleRelease -Pplaydrop.signWithDebugKey=true`), daemon `0.3.0`,
+`bench/desktop-to-phone.sh --peer SM-A546U1 --runs 3`. Every row completed with all file
+counts and sha256 sums matching on the phone. The receiver now hands each bundle member to
+the sink as soon as its chunks are verified and durable, on a delivery thread, instead of
+all members after the `pd-root` trailer (`docs/phases/phase-8-fast-bulk.md` section 1.1,
+protocol.md 11.1).
+
+### 9.1 Desktop to phone, MiB/s (three runs each)
+
+| Dataset | Phase 7 (section 8.1) | Phase 8 | Wall s | In Downloads +s |
+|---|---|---|---|---|
+| `big-1g` | 43.9, 43.5, 47.6 | 35.4, 44.5, 41.6 | 28.9, 23.0, 24.6 | 0.1 |
+| `medium-100` | 33.9, 39.9, 46.0 | 47.5, 52.1, 54.1 | 3.6, 3.2, 3.1 | 0.0, 0.1, 0.1 |
+| `small-1000` | 14.8, 15.4, 20.1 | 31.4, 42.6, 31.7 | 3.1, 2.3, 3.1 | 11.7, 10.7, 10.7 |
+| `mixed-5000` | 9.46, 8.77, 7.20 | 22.6, 22.6, 21.9 | 7.3, 7.3, 7.5 | 52.2, 51.1, 53.3 |
+| `tree` | 12.0, 13.5, 12.4 | 14.6, 15.9, 6.9 | 1.1, 1.0, 2.3 | 2.2 |
+
+A first `mixed-5000` run before the three above, with the desktop still settling after
+the install, took 9.3 s at 17.8 MiB/s.
+
+### 9.2 Where the time goes now (sink debug log)
+
+- `mixed-5000`: the sink's first-to-last delivery now spans 5.9 to 6.4 s, inside the 7.3 s
+  the send takes, at 0.45 to 0.50 ms per file in the sink (claim 0.27 to 0.28, rename from
+  staging into the landing folder 0.16 to 0.21, URI 0.01). In Phase 7 the same delivery
+  started after the stream and spanned 10.1 s on its own. The tail after the last byte is
+  under 1 s.
+- `small-1000`: delivery 1.5 to 2.2 s inside a 2.3 to 3.1 s send, 0.43 to 0.62 ms per file.
+- Mover (landing folder into Downloads, in the background): 52 s for 5,000 files, about
+  10 ms each, unchanged in kind (MediaProvider insert per file); the sender is free after
+  7.3 s instead of 17 to 23 s.
+- `medium-100` direct path: 9.6 to 12.6 ms per file (create 7.4 to 8.5, copy 2.0 to 4.0),
+  the same floor as before.
+- `big-1g`: the copy from staging into Downloads is 4.0 to 4.1 s of the 23 to 29 s. Run 1 at
+  35.4 MiB/s was the first large run after the install; runs 2 and 3 sit in the Phase 7
+  band.
+
+### 9.3 Verdict against "no drop between 100 and 5,000 files"
+
+At the sender, `mixed-5000` runs at 21.9 to 22.6 MiB/s against 47.5 to 54.1 for
+`medium-100`: a ratio of about 0.43, up from 0.2 in Phase 7 and still under the 0.8 gate.
+The serial delivery floor is gone; what remains is per-member work on both ends while the
+bytes stream (the sender's open and read per source file, the receiver's staging file per
+member, the hashing of 4 to 64 KiB members at 1 MiB chunks) plus the sink's 0.45 ms. The
+next measurement belongs in Phase 9: time the sender's per-file open and the receiver's
+per-member staging create and close separately before designing anything.
+
+### 9.4 Resume by Wi-Fi drop (owed from Phase 7)
+
+`big-1g` with `adb shell svc wifi disable` at about 50 % and `svc wifi enable` 10 s later:
+the phone came back with the same address and reached the router, but phone and desktop
+could not reach each other at all afterwards (ping failed both ways, the phone's ARP entry
+for the desktop stuck in `PROBE`, both sides dialling every last-known address and timing
+out). The sender waited its 10 minute reconnect window at 859 MiB and failed with
+"receiver unreachable: every candidate failed"; a second Wi-Fi toggle did not clear it.
+This is the mesh network isolating the rejoined client, not the app: the listener was up
+and the desktop reached another LAN device meanwhile. The receiver kept its verified
+859 MiB under the old transfer id; a fresh `playdrop send` creates a new id and starts from
+0 (sender persistence is receiver-only, protocol.md 11.1), so that staging folder waits for
+the 24 h sweep. The gate is still owed; run it again after the phone rejoins the network
+from its own settings, with a shorter outage, and record the resume offset and the sha256.

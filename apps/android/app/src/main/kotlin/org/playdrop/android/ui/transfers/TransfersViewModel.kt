@@ -22,8 +22,15 @@ class TransfersViewModel(application: Application) : CoreViewModel(application) 
     private val offers = MutableStateFlow<Map<String, OfferInfo>>(emptyMap())
 
     /** Rows, newest first, offers waiting for an answer on top. */
-    val rows: StateFlow<List<TransferRow>> = combine(CoreHost.transfers, CoreHost.peers, offers) { t, p, o ->
-        TransferRows.derive(t, p, o)
+    val rows: StateFlow<List<TransferRow>> = combine(
+        CoreHost.transfers,
+        CoreHost.peers,
+        offers,
+        CoreHost.relocationChanges,
+    ) { t, p, o, _ ->
+        // The last flow only says "ask the relocation table again": the mover may rename a
+        // landed file after the transfer's row was already derived.
+        TransferRows.derive(t, p, o, CoreHost::relocated)
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
     /** Incoming offers waiting for Accept or Decline, for the navigation badge. */

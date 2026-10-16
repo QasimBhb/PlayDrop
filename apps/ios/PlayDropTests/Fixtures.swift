@@ -30,7 +30,7 @@ enum Fixtures {
     ) -> TransferSnapshot {
         TransferSnapshot(
             id: id, peer: peer, shortId: "S-\(peer)", direction: direction, state: state,
-            bytes: bytes, total: total, bytesPerSec: bytesPerSec, startedAt: startedAt,
+            bytes: bytes, total: total, bytesPerSec: bytesPerSec, filesDone: 0, startedAt: startedAt,
             fileCount: 1, note: note, delivered: delivered
         )
     }

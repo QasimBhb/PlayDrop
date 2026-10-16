@@ -141,7 +141,7 @@ private fun TransferCard(
                 Text(stateText(row), style = MaterialTheme.typography.labelLarge, color = stateColor(row.state))
             }
             val files = if (row.fileCount > 0) {
-                pluralStringResource(R.plurals.ui_files, row.fileCount.toInt(), row.fileCount.toInt()) + ", " + Format.bytes(row.total)
+                pluralStringResource(R.plurals.ui_files, row.fileCount.toInt(), Format.count(row.fileCount)) + ", " + Format.bytes(row.total)
             } else {
                 Format.bytes(row.total)
             }
@@ -154,6 +154,15 @@ private fun TransferCard(
                 LinearProgressIndicator(progress = { row.fraction }, modifier = Modifier.fillMaxWidth())
                 val detail = buildString {
                     append(stringResource(R.string.ui_transfers_of, Format.bytes(row.bytes), Format.bytes(row.total)))
+                    if (row.showFilesDone) {
+                        append(" · ").append(
+                            stringResource(
+                                R.string.ui_transfers_files_done,
+                                Format.count(row.filesDone),
+                                Format.count(row.fileCount),
+                            ),
+                        )
+                    }
                     if (row.bytesPerSec > 0) append(" · ").append(Format.rate(row.bytesPerSec))
                     row.etaSecs?.let { append(" · ").append(stringResource(R.string.ui_transfers_left, Format.duration(it))) }
                 }

@@ -47,8 +47,18 @@ tests. Phone runs done on 2026-10-15 (`docs/release/throughput.md` section 8): 5
 files to the A54 at 7 to 9.5 MiB/s (was 1.9), 1 GiB at 44 to 48, resume by force-stop
 passes, all sums verified. v0.2.0 released from GitHub Releases on 2026-10-15 (five files plus checksums). The repo
 went public the same day: GitHub Actions on a private repo ran out of free minutes and the
-release, Windows, iOS and fuzz runs all failed to start until it was flipped. Next: Phase 8
-from `docs/phases/phase-7-daily-use.md` section 7.
+release, Windows, iOS and fuzz runs all failed to start until it was flipped. Phase 8 (fast
+bulk and durable placement, v0.3.0) written on 2026-10-15 and 2026-10-16: bundle members are
+placed while the bundle still streams (own delivery thread, eligibility at the durable
+offset, delivery log v2, a user-approved deviation from protocol 7.7 noted in 11.1 and
+SR-22), single-file placement survives a kill, a placement I/O error answers `409` at the
+full size instead of killing the send, a send is `offered` until bytes move and reports
+`files_done` (`playdrop-ffi` 0.3.0), Android relocation table for renumbered moves,
+`playdrop clip` says why nothing was sent, CLI width and early Ctrl-C, Linux and Android CI
+workflows. 466 Rust tests, 168 Android JUnit, 106 Swift. Phone bench on 2026-10-16: 5,000
+small files to the A54 at 22 MiB/s in 7.3 s (was 7 to 9.5 MiB/s, 17 to 23 s), all sums
+verified; the Wi-Fi drop gate is still owed (the mesh isolates the phone after a toggle).
+Not tagged. Next: Phase 9 from `docs/phases/phase-8-fast-bulk.md` section 7.
 
 ## Read first
 

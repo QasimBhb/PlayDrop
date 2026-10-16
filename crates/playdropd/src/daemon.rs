@@ -33,7 +33,7 @@ use playdrop_core::session::types::PresenceState;
 use playdrop_core::Error as CoreError;
 use playdrop_ipc::server::{ServeError, Server};
 use playdrop_ipc::{
-    DaemonEvent, DiagnosticsReport, ErrorCode, Event, IpcError, Ok as IpcOk, Request,
+    ClipSkip, DaemonEvent, DiagnosticsReport, ErrorCode, Event, IpcError, Ok as IpcOk, Request,
     RequestHandler, Response, Status, IPC_VERSION,
 };
 use tokio::sync::{broadcast, mpsc, watch, Notify};
@@ -1121,17 +1121,11 @@ impl Shared {
                     );
                 }
             }
-            Ok(p) if p.skipped_echo => {
-                self.notifier.info("Clipboard already sent", "");
-            }
-            Ok(p) if p.skipped_unsupported > 0 => self.notifier.info(
-                "Clipboard not sent",
-                "The connected devices cannot receive clipboard images.",
-            ),
-            Ok(_) => self.notifier.info(
-                "Clipboard not sent",
-                "No connected device has clipboard sharing turned on.",
-            ),
+            Ok(p) => match clip_skip(&p) {
+                Some(ClipSkip::Echo) => self.notifier.info("Clipboard already sent", ""),
+                Some(skip) => self.notifier.info("Clipboard not sent", skip_notice(skip)),
+                None => {}
+            },
             Err(e) => self.notifier.info("Clipboard not sent", e.to_string()),
         }
     }
@@ -1325,10 +1319,7 @@ impl Shared {
                         sent_to: sent_to.clone(),
                     });
                 }
-                Ok(IpcOk::ClipboardPushed {
-                    sent_to,
-                    skipped_echo: p.skipped_echo,
-                })
+                Ok(clip_answer(sent_to, clip_skip(&p)))
             }
             Request::SendClipboard {
                 peer,
@@ -1345,10 +1336,9 @@ impl Shared {
                         sent_to: sent_to.clone(),
                     });
                 }
-                Ok(IpcOk::ClipboardPushed {
-                    sent_to,
-                    skipped_echo: !sent,
-                })
+                // `send_clipboard` has one "false" case: the echo rule. Every other
+                // refusal (no grant, offline, too large) is an error above.
+                Ok(clip_answer(sent_to, (!sent).then_some(ClipSkip::Echo)))
             }
             Request::OpenReceived { path } => {
                 let dir = self.effective().receive_dir;
@@ -1387,6 +1377,40 @@ impl Shared {
             )),
         }
     }
+}
+
+/// Why a push sent nothing, from what the host counted. `None` when it sent to someone.
+///
+/// The host cannot say more than this: a peer that is offline and one with the grant off
+/// both mean "nobody to send to", and it has no separate outcome for sensitive clips.
+fn clip_skip(p: &playdrop_core::host::ClipboardPush) -> Option<ClipSkip> {
+    if !p.sent_to.is_empty() {
+        None
+    } else if p.skipped_echo {
+        Some(ClipSkip::Echo)
+    } else if p.skipped_unsupported > 0 {
+        Some(ClipSkip::Unsupported)
+    } else {
+        Some(ClipSkip::NoPeers)
+    }
+}
+
+/// The IPC answer for a push; `skipped_echo` stays for older clients.
+fn clip_answer(sent_to: Vec<String>, skipped: Option<ClipSkip>) -> IpcOk {
+    IpcOk::ClipboardPushed {
+        sent_to,
+        skipped_echo: skipped == Some(ClipSkip::Echo),
+        skipped,
+    }
+}
+
+/// The notification body for a skipped push: the shared reason as a sentence.
+fn skip_notice(skip: ClipSkip) -> String {
+    let reason = skip.reason();
+    let mut chars = reason.chars();
+    chars.next().map_or_else(String::new, |first| {
+        format!("{}{}.", first.to_uppercase(), chars.as_str())
+    })
 }
 
 /// Pushes a local clip to every eligible peer: text as text (a blob over 32 KiB), an image
@@ -1504,6 +1528,70 @@ mod tests {
     use playdrop_ipc::SettingsPatch;
 
     use super::*;
+
+    #[test]
+    fn clip_skip_maps_every_core_outcome() {
+        use playdrop_core::host::ClipboardPush;
+        let id = DeviceId::from_spki_hash([7; 32]);
+        let sent = ClipboardPush {
+            sent_to: vec![id],
+            // Counters on a sent push are irrelevant.
+            skipped_unsupported: 1,
+            ..ClipboardPush::default()
+        };
+        assert_eq!(clip_skip(&sent), None);
+        let echo = ClipboardPush {
+            skipped_echo: true,
+            ..ClipboardPush::default()
+        };
+        assert_eq!(clip_skip(&echo), Some(ClipSkip::Echo));
+        let unsupported = ClipboardPush {
+            skipped_unsupported: 2,
+            skipped_offline: 1,
+            ..ClipboardPush::default()
+        };
+        assert_eq!(clip_skip(&unsupported), Some(ClipSkip::Unsupported));
+        for (offline, no_grant) in [(0, 0), (1, 0), (0, 1), (2, 3)] {
+            let none = ClipboardPush {
+                skipped_offline: offline,
+                skipped_no_grant: no_grant,
+                ..ClipboardPush::default()
+            };
+            assert_eq!(clip_skip(&none), Some(ClipSkip::NoPeers));
+        }
+    }
+
+    #[test]
+    fn notice_is_the_shared_reason_as_a_sentence() {
+        assert_eq!(
+            skip_notice(ClipSkip::NoPeers),
+            "No connected device has clipboard sharing turned on."
+        );
+        assert_eq!(
+            skip_notice(ClipSkip::Echo),
+            "It matches the last clip sent or received."
+        );
+    }
+
+    #[test]
+    fn clip_answer_derives_the_old_echo_flag() {
+        for (skip, echo) in [
+            (None, false),
+            (Some(ClipSkip::Echo), true),
+            (Some(ClipSkip::NoPeers), false),
+            (Some(ClipSkip::Unsupported), false),
+        ] {
+            let IpcOk::ClipboardPushed {
+                skipped_echo,
+                skipped,
+                ..
+            } = clip_answer(Vec::new(), skip)
+            else {
+                panic!("wrong answer");
+            };
+            assert_eq!((skipped_echo, skipped), (echo, skip));
+        }
+    }
 
     fn test_daemon(tmp: &std::path::Path) -> Daemon {
         let s = Settings {

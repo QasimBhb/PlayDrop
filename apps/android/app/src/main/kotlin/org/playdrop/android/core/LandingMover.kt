@@ -119,7 +119,7 @@ internal class LandingMover(
         if (!sink.recoverJournal()) {
             // An unfinished copy could not be settled: no file may be copied until it is.
             val left = sink.landedFiles(tid).size
-            Notifications.moveFinished(app, tid, job.completed, job.ended != null, job.label, 0, left, forceFolder = true)
+            Notifications.moveFinished(app, tid, job.completed, job.ended != null, job.label, 0, left, renamed = 0, forceFolder = true)
             if (left > 0) scheduleRetry(job)
             return
         }
@@ -127,7 +127,7 @@ internal class LandingMover(
         if (files.isEmpty()) {
             sink.pruneLanding(tid)
             sink.moveEnded(tid)
-            if (job.completed != null) Notifications.moveFinished(app, tid, job.completed, false, job.label, 0, 0, forceFolder = false)
+            if (job.completed != null) Notifications.moveFinished(app, tid, job.completed, false, job.label, 0, 0, renamed = 0)
             return
         }
         val t0 = System.nanoTime()
@@ -156,7 +156,7 @@ internal class LandingMover(
             }
             Notifications.moveFinished(
                 app, tid, job.completed, job.ended != null, job.label, tally.moved, tally.failed,
-                forceFolder = tally.renumbered > 0,
+                renamed = tally.renumbered,
             )
             if (tally.failed > 0) scheduleRetry(job)
         }

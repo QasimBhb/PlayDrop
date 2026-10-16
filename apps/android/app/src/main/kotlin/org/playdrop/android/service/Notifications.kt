@@ -17,8 +17,9 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import org.playdrop.android.R
-import org.playdrop.android.core.HostLog
+import org.playdrop.android.core.CoreHost
 import org.playdrop.android.core.DownloadsSink
+import org.playdrop.android.core.HostLog
 import org.playdrop.android.share.ClipboardSendActivity
 import org.playdrop.android.share.PickAndSendActivity
 import org.playdrop.core.HostEvent
@@ -206,12 +207,15 @@ internal object Notifications {
     /**
      * Ends a move pass: always removes the ongoing "Moving" notice first. For a completed
      * transfer ([completed] not null) it then posts the normal "received" notification (with
-     * [forceFolder], one that opens the Downloads list). For a transfer that failed or was
+     * [renamed] above 0, one that also says how many files got another name because theirs was
+     * taken, and opens the Downloads list unless it is a single file whose new place is known
+     * ([Relocations]). For a transfer that failed or was
      * cancelled ([endedEarly]) it says how many files arrived before it stopped; the failure
      * keeps its own notification with the reason. For leftovers and retries it says how many
      * files reached Downloads. While files are left behind ([failed]) a separate notice says
      * how many, that they are moved automatically, and offers "Try again" (anti-pattern 18:
-     * nothing fails silently); once none are left, that notice is removed.
+     * nothing fails silently); once none are left, that notice is removed. [forceFolder] opens
+     * the Downloads list whatever else is known (files may not be in place yet).
      */
     fun moveFinished(
         context: Context,
@@ -221,19 +225,20 @@ internal object Notifications {
         label: String?,
         moved: Int,
         failed: Int,
-        forceFolder: Boolean,
+        renamed: Int,
+        forceFolder: Boolean = false,
     ) {
         val receivedId = NotificationPlan.notificationId(NotificationPlan.Kind.RECEIVED, transferId)
         NotificationManagerCompat.from(context).cancel(NotificationPlan.MOVING_TAG, receivedId)
         when (NotificationPlan.moveNotice(completed != null, endedEarly, moved)) {
             NotificationPlan.MoveNotice.RECEIVED ->
-                completed?.let { received(context, it, label ?: it.peer.take(8), forceFolder) }
+                completed?.let { received(context, it, label ?: it.peer.take(8), renamed, forceFolder) }
             NotificationPlan.MoveNotice.ARRIVED_BEFORE_END, NotificationPlan.MoveNotice.MOVED_AFTER_RESTART -> {
                 val title = if (endedEarly) R.plurals.moved_before_end else R.plurals.moved_after_restart
                 val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
                     .setSmallIcon(R.drawable.ic_stat_playdrop)
                     .setContentTitle(context.resources.getQuantityString(title, moved, moved))
-                    .setContentText(context.getString(R.string.moved_after_restart_text))
+                    .setContentText(moveDetailText(context, renamed))
                     .setContentIntent(downloadsIntent(context, receivedId))
                     .setAutoCancel(true)
                     .build()
@@ -303,10 +308,20 @@ internal object Notifications {
         post(context, id, b.build())
     }
 
-    private fun received(context: Context, e: HostEvent.TransferComplete, label: String, forceFolder: Boolean = false) {
-        val delivered = e.delivered.map { NotificationPlan.Delivered(it.path, it.location) }
+    /** "Saved in Download/PlayDrop", or how many files were renamed because the name was taken. */
+    private fun moveDetailText(context: Context, renamed: Int): String = when (NotificationPlan.moveDetail(renamed)) {
+        NotificationPlan.MoveDetail.SAVED -> context.getString(R.string.moved_after_restart_text)
+        NotificationPlan.MoveDetail.RENAMED ->
+            context.resources.getQuantityString(R.plurals.moved_saved_renamed, renamed, renamed)
+    }
+
+    private fun received(context: Context, e: HostEvent.TransferComplete, label: String, renamed: Int = 0, forceFolder: Boolean = false) {
+        // The core's stored locations may be stale after a renamed move; ask the table.
+        val delivered = e.delivered.map { NotificationPlan.Delivered(it.path, CoreHost.relocated(e.id, it.location)) }
         if (delivered.isEmpty()) return
-        val plan = NotificationPlan.received(delivered, forceFolder) { DownloadsSink.guessMime(it) }
+        val relocated = e.delivered.size == 1 && delivered.single().location != e.delivered.single().location
+        val folder = forceFolder || NotificationPlan.needsFolder(delivered.size, renamed, relocated)
+        val plan = NotificationPlan.received(delivered, folder) { DownloadsSink.guessMime(it) }
         val (title, tap) = when (plan) {
             is NotificationPlan.Received.One -> context.getString(R.string.received_one, plan.name) to
                 Intent(Intent.ACTION_VIEW).setDataAndType(Uri.parse(plan.uri), plan.mime)
@@ -325,11 +340,20 @@ internal object Notifications {
         val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
             .setSmallIcon(R.drawable.ic_stat_playdrop)
             .setContentTitle(title)
-            .setContentText(context.getString(R.string.received_from, label))
+            .setContentText(receivedText(context, label, renamed))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(receivedText(context, label, renamed)))
             .setContentIntent(pi)
             .setAutoCancel(true)
             .build()
         post(context, NotificationPlan.notificationId(NotificationPlan.Kind.RECEIVED, e.id), n)
+    }
+
+    private fun receivedText(context: Context, label: String, renamed: Int): String {
+        return when (NotificationPlan.moveDetail(renamed)) {
+            NotificationPlan.MoveDetail.SAVED -> context.getString(R.string.received_from, label)
+            NotificationPlan.MoveDetail.RENAMED ->
+                context.resources.getQuantityString(R.plurals.received_from_renamed, renamed, label, renamed)
+        }
     }
 
     private fun failed(context: Context, e: HostEvent.TransferFailed, label: String) {

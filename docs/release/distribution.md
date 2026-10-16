@@ -150,6 +150,12 @@ not set up. What the installer does: `packaging/windows/README.md`.
 The Windows build is produced and tested on GitHub's Windows runner
 (`.github/workflows/windows.yml`); no physical Windows machine has run it yet.
 
+Two more workflows check the code on every push, and neither publishes anything:
+`.github/workflows/linux.yml` formats, lints, builds and tests the Rust workspace on Ubuntu, and
+`.github/workflows/android.yml` regenerates the UniFFI bindings, compiles the Kotlin and runs
+the Android JUnit tests. Both prove the code builds and the unit tests pass; neither can prove
+anything about a device or a desktop session.
+
 ## iPhone
 
 ### Why there is no free way to distribute

@@ -42,3 +42,16 @@ Password managers mark what they copy as secret. PlayDrop respects that mark.
 - Images are sent with the clipboard where the system gives them to PlayDrop. An iPhone image
   goes to every device that accepts clipboards, not just one.
 - A clip that came from another device is not sent back again.
+
+## "Clipboard not sent"
+
+When you send by hand (the window's button, the tray, or `playdrop clip`), PlayDrop says why
+nothing went out:
+
+- **It matches the last clip sent or received.** The device already has this text, or sent it to
+  you a moment ago. Copy something else to send again.
+- **No connected device has clipboard sharing turned on.** Every paired device is offline, or the
+  clipboard permission for them is off. Check **Devices**, and see
+  [troubleshooting.md](troubleshooting.md).
+- **The connected devices cannot receive this kind of clip.** For example an image sent to a
+  device that does not take images.
