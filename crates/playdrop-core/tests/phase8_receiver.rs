@@ -530,12 +530,24 @@ struct SlowSink {
     delay: Duration,
     count: std::sync::atomic::AtomicUsize,
     inside: std::sync::atomic::AtomicBool,
+    /// Members after this many wait inside `deliver` until `released` is set, so a test
+    /// can hold a member in flight with the rest queued, whatever the runner's speed.
+    hold_after: Option<usize>,
+    released: std::sync::atomic::AtomicBool,
 }
 
 impl ReceiveSink for SlowSink {
     fn deliver(&self, item: DeliverItem, _file: std::fs::File) -> Result<String, SinkError> {
         use std::sync::atomic::Ordering;
         self.inside.store(true, Ordering::SeqCst);
+        if self
+            .hold_after
+            .is_some_and(|n| self.count.load(Ordering::SeqCst) >= n)
+        {
+            while !self.released.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         std::thread::sleep(self.delay);
         self.count.fetch_add(1, Ordering::SeqCst);
         self.inside.store(false, Ordering::SeqCst);
@@ -568,8 +580,12 @@ async fn cancel_with_thousands_queued_returns_after_the_member_in_flight() {
     const N: usize = 3_000;
     let tmp = tempfile::tempdir().unwrap();
     let (m, contents) = manifest(&vec![(200, true); N]);
+    // Three members go through, the fourth is held inside the sink: one member in flight
+    // and the rest queued however slowly the runner stores the upload (the Windows runner
+    // once took long enough that 2,437 of 3,000 had gone out before the cancel).
     let sink = Arc::new(SlowSink {
         delay: Duration::from_millis(5),
+        hold_after: Some(3),
         ..SlowSink::default()
     });
     let rx = TransferReceiver::accept(tmp.path(), m.clone(), plenty(), slow_staged(sink.clone()))
@@ -583,9 +599,14 @@ async fn cancel_with_thousands_queued_returns_after_the_member_in_flight() {
         .await
         .unwrap();
     drop(up);
-    until(|| sink.count.load(Ordering::SeqCst) >= 3).await;
+    until(|| sink.count.load(Ordering::SeqCst) == 3 && sink.inside.load(Ordering::SeqCst)).await;
     let t0 = Instant::now();
-    rx.cancel().await.unwrap();
+    let rx2 = rx.clone();
+    let cancel = tokio::spawn(async move { rx2.cancel().await });
+    // The cancel must wait for the member in flight, so let it start waiting first.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    sink.released.store(true, Ordering::SeqCst);
+    cancel.await.unwrap().unwrap();
     let took = t0.elapsed();
     assert!(
         !sink.inside.load(Ordering::SeqCst),
@@ -593,9 +614,9 @@ async fn cancel_with_thousands_queued_returns_after_the_member_in_flight() {
     );
     let at_cancel = sink.count.load(Ordering::SeqCst);
     assert!(took < Duration::from_secs(1), "cancel waited {took:?}");
-    assert!(
-        at_cancel < N / 2,
-        "{at_cancel} members went out before the cancel"
+    assert_eq!(
+        at_cancel, 4,
+        "only the member in flight finished after the cancel"
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(
