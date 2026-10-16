@@ -36,7 +36,7 @@ enum End {
     /// `TransferFailed` arrived (failed, declined or cancelled) with its reason.
     Failed(String),
     /// The transfer list shows a finished state.
-    Listed(TransferSnapshot),
+    Listed(Box<TransferSnapshot>),
     /// The user pressed Ctrl-C and a cancel was requested.
     Interrupted,
 }
@@ -286,7 +286,7 @@ async fn follow<E>(
                 }
                 if let Some(t) = found {
                     if t.state.is_finished() {
-                        break End::Listed(t);
+                        break End::Listed(Box::new(t));
                     }
                     progress.bytes = progress.bytes.max(t.bytes);
                     progress.total = t.total;
@@ -320,7 +320,7 @@ async fn listed(client: &Client, id: &str) -> Result<Option<TransferSnapshot>, F
 /// state, so look a few times; if the list never catches up, take the event's word for it.
 async fn final_snapshot(client: &Client, id: &str, end: End) -> Result<TransferSnapshot, Failure> {
     if let End::Listed(t) = end {
-        return Ok(t);
+        return Ok(*t);
     }
     let mut last = None;
     for _ in 0..20 {
