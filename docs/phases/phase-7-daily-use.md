@@ -1,7 +1,7 @@
 # Phase 7 handoff: daily use (v0.2.0)
 
-Reader: a fresh session that must finish the owed live gates below, tag `v0.2.0`, or start
-Phase 8. Read `CLAUDE.md`, `PLAN.md` ("Build phases" row 7, "Anti-patterns"),
+Reader: a fresh session that starts Phase 8 (v0.2.0 is tagged and released; one live gate,
+the Wi-Fi drop on the phone, is still owed, see section 6). Read `CLAUDE.md`, `PLAN.md` ("Build phases" row 7, "Anti-patterns"),
 `docs/phases/phase-6-ship-gate.md` sections 5, 6 and 8, then this file. Code to read is
 named per item; do not re-read the whole tree.
 
@@ -18,6 +18,7 @@ named per item; do not re-read the whole tree.
 | Rust tests | 435 passed, 0 failed, 8 ignored (`cargo test --workspace --no-fail-fast`, up from 394: the quiet double run counted 434 before the slot test was split out of `offer_names_and_cancel_by_id`); `cargo clippy --workspace --all-targets` zero warnings; `cargo fmt --all --check` clean |
 | Android tests | 148 JUnit (up from 110); `:app:compileDebugKotlin` no warnings; `:app:assembleRelease -Pplaydrop.signWithDebugKey=true` builds (`apps/android/app/build/outputs/apk/release/app-release.apk`) |
 | iOS checks | `apps/ios/scripts/check-linux.sh` exit 0 (now includes the version check); `PlayDropShared` 106 XCTests on Linux (up from 102) |
+| Release | `v0.2.0` tagged and published on 2026-10-15 from `f650a5f` (commits `2a509e5`, `5b25796`, `f650a5f`); all five assets plus `SHA256SUMS` built by the Release workflow after the repo went public (private-repo Actions minutes had run out and every run failed to start) |
 | Phone | Run on 2026-10-15 after the first commit (the A54 was `unauthorized` on adb during the build): every item in section 6 passed or was measured; the rename into Downloads was removed as a result (section 4). Results in `docs/release/throughput.md` section 8 |
 
 ### 1.1 What landed
@@ -220,7 +221,6 @@ Cargo.toml 0.2.0, crates/playdrop-ffi/Cargo.toml 0.2.1, crates/playdrop-cli/Carg
 | `crates/playdropd` | The daemon's clip answer sets `skipped_echo` for every "nothing sent" case, so a client cannot tell an echo skip from another reason | 8 |
 | `crates/playdrop-cli` | Terminal width from the OS once a dependency is allowed; a Ctrl-C in the first tens of ms (before the listener) still exits 130 | 8 |
 | `docs/release/sr-checklist.md` | SR-32 is Partial: daemon and app logs and log file modes are left to a reviewer; SR-34 external review and hostile-LAN run not done | 8 |
-| `CHANGELOG.md`, `metainfo.xml` | Put the release date on the 0.2.0 heading and entry before tagging | before `v0.2.0` |
 | Windows | Every live item from Phase 6, plus gate B in release on a real machine | when a machine exists |
 | Phase 4 carry-over | Share-extension gate needs an App Group | later |
 
@@ -251,7 +251,7 @@ Section 6 is done and the thresholds stay. From section 5 by value: bundle membe
 delivered while the bundle streams (or in batches to the sink), which is what now bounds a
 5,000-file drop to the phone; single-file placement durability (same log idea as the
 bundle); the sender's early `active` state and per-file progress; and the stale-location
-gap on Android. Tag `v0.2.0` first (date the changelog heading and the metainfo entry).
+gap on Android. `v0.2.0` is already tagged and released.
 PLAN.md row 7 items (iroh, Local Push Connectivity, Wi-Fi Aware, libcosmic applet, MSIX)
 stay behind flags and each wants a design note before code.
 
