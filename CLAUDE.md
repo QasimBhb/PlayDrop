@@ -58,7 +58,7 @@ full size instead of killing the send, a send is `offered` until bytes move and 
 workflows. 466 Rust tests, 168 Android JUnit, 106 Swift. Phone bench on 2026-10-16: 5,000
 small files to the A54 at 22 MiB/s in 7.3 s (was 7 to 9.5 MiB/s, 17 to 23 s), all sums
 verified; the Wi-Fi drop gate is still owed (the mesh isolates the phone after a toggle).
-Not tagged. Next: Phase 9 from `docs/phases/phase-8-fast-bulk.md` section 7.
+v0.3.0 tagged on 2026-10-17 (GitHub Releases, the release workflow builds the five files). Next: Phase 9 from `docs/phases/phase-8-fast-bulk.md` section 7.
 
 ## Read first
 

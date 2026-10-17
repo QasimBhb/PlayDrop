@@ -18,7 +18,7 @@ file. Code to read is named per item; do not re-read the whole tree.
 | Rust tests | 466 passed, 0 failed, 9 ignored (`cargo test --workspace --no-fail-fast`, up from 435); `cargo clippy --workspace --all-targets -- -D warnings` zero warnings; `cargo fmt --all --check` clean |
 | Android tests | 168 JUnit (up from 148); `:app:compileDebugKotlin` no warnings; `:app:assembleRelease -Pplaydrop.signWithDebugKey=true` builds |
 | iOS checks | `apps/ios/scripts/check-linux.sh` exit 0; `PlayDropShared` 106 XCTests on Linux; strict type check clean with `filesDone` in the fixtures |
-| Release | Not tagged. `CHANGELOG.md` has `0.3.0 - Unreleased`; `metainfo.xml` has a 0.3.0 entry with a placeholder date (`2026-12-31`): date both before tagging, as the release workflow requires |
+| Release | v0.3.0 tagged on 2026-10-17 from `c3a7542`; the release workflow publishes the five files plus checksums to GitHub Releases |
 | Phone | Bench run on 2026-10-16 (section 6, `docs/release/throughput.md` section 9): all 15 runs verified, `mixed-5000` 21.9 to 22.6 MiB/s (was 7.2 to 9.5), wall 7.3 s (was 17.5 to 22.9). The Wi-Fi drop gate is still owed: every Wi-Fi toggle left the phone isolated from the desktop on the mesh network |
 
 ### 1.1 What landed
