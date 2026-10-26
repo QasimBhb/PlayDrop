@@ -12,9 +12,13 @@
 //!   `openat2`) through `cap-std`, which keeps every open beneath the root, after refusing a
 //!   component that is a symlink. A race there can at worst redirect within the root.
 //!
-//! Final names are created with `create_new` relative to the folder handle (fails on any
-//! existing name, symlinks included) and the staged file is renamed onto that name with
-//! `renameat` between the two handles.
+//! A staged file reaches its final name through a rename that never replaces anything
+//! (SR-18): `renameat2(RENAME_NOREPLACE)` on Linux and Android, `renameatx_np(RENAME_EXCL)`
+//! on Apple platforms, both between the two folder handles. It fails on any existing name,
+//! symlinks included, and the next " (n)" name is tried. Where that rename is not
+//! available (Windows, or a filesystem that refuses the flag) the final name is first
+//! created exclusively with `create_new` relative to the folder handle, and the staged
+//! file is renamed onto that empty placeholder.
 //!
 //! The staging folder `<root>/.playdrop-partial/<id>` is created the same way, owner-only;
 //! files inside it (`.part`, ledgers) are then used by path, since nothing in it is named
@@ -283,22 +287,171 @@ pub(crate) fn create_unique(dir: &Dir, name: &str) -> Result<(String, File)> {
     )))
 }
 
-/// Moves `staged_name` from the `staging` folder to `name` (or its " (n)" form) in `dir`
-/// without overwriting anything (SR-18): the final name is created exclusively, then the
-/// staged file is renamed onto that placeholder between the two handles. Returns the name
-/// used. The caller syncs `dir`.
+/// True where this build has a rename that never replaces its target (see
+/// [`rename_noreplace`]). Elsewhere [`place_unique`] reserves names with placeholders.
+/// On Android, `renameat2` is in bionic's app seccomp allowlist from API 26 and rustix
+/// issues the raw syscall.
+pub(crate) const RENAME_NOREPLACE: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_vendor = "apple"
+));
+
+/// Renames `from` in `from_dir` to `to` in `to_dir` only if `to` does not exist, between
+/// the two handles: the kernel checks and renames in one step, so nothing at `to`, a
+/// symlink included, is ever replaced (SR-18).
+///
+/// Errors: [`io::ErrorKind::AlreadyExists`] when `to` exists;
+/// [`io::ErrorKind::Unsupported`] where there is no such rename (Windows, a kernel without
+/// `renameat2`, or a filesystem that refuses the flag); `EPERM` comes back as
+/// [`io::ErrorKind::PermissionDenied`].
+pub(crate) fn rename_noreplace(
+    from_dir: &Dir,
+    from: &str,
+    to_dir: &Dir,
+    to: &str,
+) -> io::Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+    {
+        use rustix::fs::{renameat_with, RenameFlags};
+        use rustix::io::Errno;
+        match renameat_with(from_dir, from, to_dir, to, RenameFlags::NOREPLACE) {
+            Ok(()) => Ok(()),
+            Err(Errno::EXIST) => Err(io::ErrorKind::AlreadyExists.into()),
+            // ENOSYS: no renameat2 (Linux before 3.15). EINVAL, ENOTSUP: a filesystem
+            // without the flag (some FUSE and network filesystems on Linux, non-APFS
+            // volumes on Apple platforms). EPERM stays a permission error here: it may also
+            // be a sandbox hiding the call, which `place_unique` tells apart.
+            Err(Errno::NOSYS | Errno::INVAL | Errno::NOTSUP) => {
+                Err(io::ErrorKind::Unsupported.into())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        // Windows: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` takes paths, and
+        // `cap-std` itself turns folder handles back into paths there; a handle-relative
+        // rename (`SetFileInformationByHandle` with `FILE_RENAME_INFO.RootDirectory`) has
+        // not been tried on a real Windows machine. The placeholder path stays.
+        let _ = (from_dir, from, to_dir, to);
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// What [`place_unique`] tells its caller about a candidate name, so the caller can
+/// record it before anything happens to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Step {
+    /// The name was free a moment ago and the staged file is about to be renamed to it
+    /// without replacing anything. A record of it is an intent: after a kill, a staged
+    /// file still there was not renamed; one that is gone went to the last name recorded.
+    Rename,
+    /// There is no rename that never replaces here (Windows, or a filesystem that refuses
+    /// the flag): the name, free a moment ago, is about to be reserved with an empty
+    /// placeholder and the staged file renamed onto it. A record of it must say so, so
+    /// that recovery renames onto an empty file at that name instead of placing again.
+    Reserve,
+    /// The placeholder now exists and the rename onto it comes next. Callers record
+    /// nothing here; it exists so tests can stop between the two.
+    Reserved,
+}
+
+/// Moves `staged_name` from the `staging` folder to `name`, or the first free " (n)" form
+/// of it, in `dir`, never replacing anything and never following a symlink at the final
+/// name (SR-18). Returns the name used. The caller syncs `dir`.
+///
+/// A name that already exists (checked without following a symlink) is skipped before the
+/// caller hears of it, so a record only ever names a name believed free; the kernel's
+/// no-replace check (or the exclusive create) still guards a name taken in between, and
+/// the next name is then noted before the next attempt.
+///
+/// `note` is told each candidate with its [`Step`], and its error stops the move.
+///
+/// `noreplace` is the caller's memory of whether the no-replace rename is worth trying in
+/// this folder: false skips it (tests set it to reach the placeholder path), and this
+/// function sets it false once the rename proves unavailable, so later members go
+/// straight to placeholders. It is never tried where [`RENAME_NOREPLACE`] is false.
+/// `Unsupported` (ENOSYS, EINVAL, ENOTSUP) proves it at once. `EPERM` is ambiguous (a
+/// sandbox that hides `renameat2`, or a real permission refusal): the same name is then
+/// reserved and the plain rename onto that placeholder is tried, and only if that
+/// succeeds is the flag judged unavailable; if it fails, its error is returned.
+pub(crate) fn place_unique(
+    staging: &Dir,
+    staged_name: &str,
+    dir: &Dir,
+    name: &str,
+    noreplace: &mut bool,
+    mut note: impl FnMut(&str, Step) -> Result<()>,
+) -> Result<String> {
+    check_component(name)?;
+    if !RENAME_NOREPLACE {
+        *noreplace = false;
+    }
+    for n in 0..MAX_COLLISIONS {
+        let candidate = collision_name(name, n);
+        if is_taken(dir, &candidate)? {
+            continue;
+        }
+        let mut refused = false;
+        if *noreplace {
+            note(&candidate, Step::Rename)?;
+            match rename_noreplace(staging, staged_name, dir, &candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                // The same name is reserved below, under a record that says so.
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => *noreplace = false,
+                Err(e) if e.kind() == io::ErrorKind::PermissionDenied => refused = true,
+                Err(e) => return Err(map_io(e)),
+            }
+        }
+        note(&candidate, Step::Reserve)?;
+        if !reserve(dir, &candidate)? {
+            continue;
+        }
+        note(&candidate, Step::Reserved)?;
+        staging
+            .rename(staged_name, dir, &candidate)
+            .map_err(map_io)?;
+        if refused {
+            // The plain rename was allowed where the flagged one was not: a sandbox
+            // hides `renameat2`, not a permission problem.
+            *noreplace = false;
+        }
+        return Ok(candidate);
+    }
+    Err(Error::PathInvalid(format!(
+        "{name}: too many existing files with this name"
+    )))
+}
+
+/// True when `name` exists in `dir`, a symlink included (not followed).
+fn is_taken(dir: &Dir, name: &str) -> Result<bool> {
+    match dir.symlink_metadata(name) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(map_io(e)),
+    }
+}
+
+/// Creates `name` in `dir` exclusively as an empty placeholder. False when the name is
+/// taken (symlinks included).
+fn reserve(dir: &Dir, name: &str) -> Result<bool> {
+    match dir.open_with(name, &private_create_new()) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(map_io(e)),
+    }
+}
+
+/// [`place_unique`] for a caller that keeps no record of the name.
 pub(crate) fn place_into(
     staging: &Dir,
     staged_name: &str,
     dir: &Dir,
     name: &str,
 ) -> Result<String> {
-    let (final_name, placeholder) = create_unique(dir, name)?;
-    drop(placeholder);
-    staging
-        .rename(staged_name, dir, &final_name)
-        .map_err(map_io)?;
-    Ok(final_name)
+    place_unique(staging, staged_name, dir, name, &mut true, |_, _| Ok(()))
 }
 
 /// Opens an existing regular file for writing without following a symlink: the path must
@@ -391,22 +544,102 @@ pub(crate) fn map_io(e: io::Error) -> Error {
     }
 }
 
-/// Makes the data of many staged files durable at once (protocol.md 7.6). On Linux one
-/// `syncfs` on the filesystem holding `dir` replaces an `fdatasync` per file, which keeps
-/// thousands of small bundle members from costing thousands of flushes. Elsewhere each
-/// file is reopened writable and flushed, since Windows refuses to flush a read-only
-/// handle.
-pub(crate) fn sync_files(dir: &Path, files: &[PathBuf]) -> Result<()> {
-    #[cfg(target_os = "linux")]
-    if files.len() > 4 {
+/// Makes the data of many staged files durable at once (protocol.md 7.6). On Linux and
+/// Android one `syncfs` on the filesystem holding `dir` replaces an `fdatasync` per file,
+/// which keeps thousands of small bundle members from costing thousands of flushes
+/// (Phase 9 benchmark, `tests/phase9_receiver.rs`, checkpoint time per 4 to 64 KiB
+/// member: 0.53 ms with a flush each against 0.05 ms with `syncfs` on ext4, 0.8 to 1.4 ms
+/// against 0.25 to 0.5 ms on the test phone's f2fs). Elsewhere, and where `syncfs` is
+/// refused, each file is reopened writable and flushed, since Windows refuses to flush a
+/// read-only handle.
+///
+/// `syncfs` is used only where [`Flush::for_dir`] found a local block filesystem: on a
+/// stacked or remote one (Android's sdcardfs on API 26 to 29, FUSE, NFS) it can return
+/// success without flushing the data underneath, and a checkpoint would then call bytes
+/// durable that are not. Kernels before 5.8 do not report writeback errors through
+/// `syncfs`; that is accepted, as the bytes are verified again on resume.
+///
+/// Android: `syncfs` is in bionic's app seccomp allowlist from API 26 and rustix issues
+/// the raw syscall. It flushes the whole data partition, other apps' dirty pages
+/// included; at one call per checkpoint (16 MiB or 1 s) that is still far cheaper than a
+/// flush per member.
+pub(crate) fn sync_files(dir: &Path, files: &[PathBuf], flush: Flush) -> Result<()> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if files.len() > 4 && flush == Flush::Syncfs {
         let d = File::open(dir)?;
-        return rustix::fs::syncfs(&d).map_err(|e| map_io(io::Error::from(e)));
+        match rustix::fs::syncfs(&d) {
+            Ok(()) => return Ok(()),
+            // An old kernel or a sandbox without it: flush file by file below.
+            Err(rustix::io::Errno::NOSYS | rustix::io::Errno::PERM) => {}
+            Err(e) => return Err(map_io(io::Error::from(e))),
+        }
     }
-    let _ = dir;
+    let _ = (dir, flush);
     for f in files {
         open_for_sync(f)?.sync_data().map_err(map_io)?;
     }
     Ok(())
+}
+
+/// How [`sync_files`] makes many files durable on one filesystem. Decided once per
+/// staging folder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "android")),
+    allow(dead_code, reason = "syncfs is used on Linux and Android only")
+)]
+pub(crate) enum Flush {
+    /// One `syncfs` flushes every file on it (a local block filesystem, Linux and Android).
+    Syncfs,
+    /// One `fdatasync` per file: every other filesystem and platform.
+    PerFile,
+}
+
+impl Flush {
+    /// Looks at the filesystem holding `dir` (`fstatfs`). Anything not known to flush its
+    /// own data on `syncfs`, or not identifiable, gets [`Flush::PerFile`].
+    pub(crate) fn for_dir(dir: &Path) -> Self {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let magic = File::open(dir)
+                .ok()
+                .and_then(|d| rustix::fs::fstatfs(&d).ok())
+                // Filesystem magic numbers are 32 bits; the field is wider on 64-bit
+                // targets and may be signed (and is already `u32` on 32-bit Arm).
+                .map(|st| {
+                    #[allow(
+                        clippy::cast_possible_truncation,
+                        clippy::cast_sign_loss,
+                        clippy::unnecessary_cast
+                    )]
+                    let m = st.f_type as u32;
+                    m
+                });
+            magic.map_or(Flush::PerFile, Self::for_fs_type)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let _ = dir;
+            Flush::PerFile
+        }
+    }
+
+    /// The decision for a filesystem magic number (`statfs.f_type`, `linux/magic.h`).
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "android")),
+        allow(dead_code, reason = "syncfs is used on Linux and Android only")
+    )]
+    fn for_fs_type(magic: u32) -> Self {
+        const EXT2_3_4: u32 = 0xEF53;
+        const F2FS: u32 = 0xF2F5_2010;
+        const XFS: u32 = 0x5846_5342;
+        const BTRFS: u32 = 0x9123_683E;
+        match magic {
+            EXT2_3_4 | F2FS | XFS | BTRFS => Flush::Syncfs,
+            // sdcardfs (0x5DCA2DF5), FUSE (0x65735546), NFS (0x6969), tmpfs and the rest.
+            _ => Flush::PerFile,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -440,8 +673,10 @@ mod tests {
                 p
             })
             .collect();
-        sync_files(dir.path(), &files[..2]).unwrap();
-        sync_files(dir.path(), &files).unwrap();
+        let flush = Flush::for_dir(dir.path());
+        sync_files(dir.path(), &files[..2], flush).unwrap();
+        sync_files(dir.path(), &files, flush).unwrap();
+        sync_files(dir.path(), &files, Flush::PerFile).unwrap();
         // A reader still holding a file does not stop its deletion (FILE_SHARE_DELETE).
         let reader = open_shared_read(&files[0]).unwrap();
         remove_if_exists(&files[0]).unwrap();
@@ -465,6 +700,132 @@ mod tests {
             safe_dir(&d, &["..".into()], false),
             Err(Error::PathInvalid(_))
         ));
+    }
+
+    /// A staging folder with `0.part` and a receive root holding `a.txt` ("keep").
+    fn place_fixture() -> (tempfile::TempDir, Dir, Dir) {
+        let dir = tempfile::tempdir().unwrap();
+        let d = open_root(dir.path()).unwrap();
+        let staging = safe_dir(&d, &[".staging".into()], true).unwrap();
+        std::fs::write(dir.path().join(".staging").join("0.part"), b"new").unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"keep").unwrap();
+        (dir, d, staging)
+    }
+
+    /// A name that exists is skipped before it is noted, so a record only names a name
+    /// believed free; where the no-replace rename exists it refuses a taken name. Nothing
+    /// is overwritten (SR-18).
+    #[test]
+    fn place_unique_notes_only_free_names_and_never_overwrites() {
+        let (dir, d, staging) = place_fixture();
+        if RENAME_NOREPLACE {
+            let e = rename_noreplace(&staging, "0.part", &d, "a.txt").unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        }
+        let mut noted = Vec::new();
+        let name = place_unique(&staging, "0.part", &d, "a.txt", &mut true, |c, s| {
+            noted.push((c.to_owned(), s));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(name, "a (1).txt");
+        let want = if RENAME_NOREPLACE {
+            vec![("a (1).txt".to_owned(), Step::Rename)]
+        } else {
+            vec![
+                ("a (1).txt".to_owned(), Step::Reserve),
+                ("a (1).txt".to_owned(), Step::Reserved),
+            ]
+        };
+        assert_eq!(noted, want);
+        assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"keep");
+        assert_eq!(std::fs::read(dir.path().join("a (1).txt")).unwrap(), b"new");
+
+        // A failing note stops the move: nothing renamed, no placeholder left.
+        std::fs::write(dir.path().join(".staging").join("1.part"), b"x").unwrap();
+        let r = place_unique(&staging, "1.part", &d, "b.txt", &mut true, |_, _| {
+            Err(Error::Io(io::Error::other("no record")))
+        });
+        assert!(r.is_err());
+        assert!(!dir.path().join("b.txt").exists());
+        assert!(dir.path().join(".staging").join("1.part").exists());
+    }
+
+    /// A name taken between the check and the attempt (another process) is refused by
+    /// the kernel or the exclusive create, and the next name is noted before the next
+    /// attempt, on both paths.
+    #[test]
+    fn place_unique_retries_a_name_taken_after_it_was_noted() {
+        for try_noreplace in [true, false] {
+            let (dir, d, staging) = place_fixture();
+            let root = dir.path().to_path_buf();
+            let mut noted = Vec::new();
+            let mut noreplace = try_noreplace;
+            let name = place_unique(&staging, "0.part", &d, "b.txt", &mut noreplace, |c, s| {
+                if c == "b.txt" && s != Step::Reserved {
+                    std::fs::write(root.join("b.txt"), b"theirs").unwrap();
+                }
+                noted.push((c.to_owned(), s));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(name, "b (1).txt", "{try_noreplace}");
+            let first = if try_noreplace && RENAME_NOREPLACE {
+                Step::Rename
+            } else {
+                Step::Reserve
+            };
+            assert_eq!(noted[0], ("b.txt".to_owned(), first));
+            assert_eq!(noted[1], ("b (1).txt".to_owned(), first));
+            assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), b"theirs");
+            assert_eq!(std::fs::read(root.join("b (1).txt")).unwrap(), b"new");
+        }
+    }
+
+    /// `syncfs` only for local block filesystems; sdcardfs, FUSE, NFS and anything
+    /// unknown flush file by file.
+    #[test]
+    fn syncfs_only_on_known_local_filesystems() {
+        for magic in [0xEF53, 0xF2F5_2010, 0x5846_5342, 0x9123_683E] {
+            assert_eq!(Flush::for_fs_type(magic), Flush::Syncfs, "{magic:#x}");
+        }
+        for magic in [
+            0x5DCA_2DF5,
+            0x6573_5546,
+            0x6969,
+            0x0102_1994,
+            0,
+            0x1234_5678,
+        ] {
+            assert_eq!(Flush::for_fs_type(magic), Flush::PerFile, "{magic:#x}");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        assert_eq!(Flush::for_dir(Path::new(".")), Flush::PerFile);
+        // A folder that cannot be looked at is not trusted either.
+        assert_eq!(
+            Flush::for_dir(Path::new("/no/such/playdrop/folder")),
+            Flush::PerFile
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_noreplace_refuses_a_symlink_at_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("bashrc");
+        std::fs::write(&target, b"original").unwrap();
+        let d = open_root(dir.path()).unwrap();
+        let staging = safe_dir(&d, &[".staging".into()], true).unwrap();
+        std::fs::write(dir.path().join(".staging").join("0.part"), b"evil").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("x")).unwrap();
+        let e = rename_noreplace(&staging, "0.part", &d, "x").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        assert!(std::fs::symlink_metadata(dir.path().join("x"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[cfg(unix)]

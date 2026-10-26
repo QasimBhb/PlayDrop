@@ -313,3 +313,47 @@ Additive type change and two behaviour changes.
   1,024 in all).
 - `ReceiveSink::deliver` is called for a bundle member before the bundle root arrives
   (section 2, protocol.md 11.1). The trait is unchanged.
+
+## 12. Phase 9 note (`playdrop-ffi` 0.4.0, behaviour change and one additive field)
+
+`HostConfig` gains `reconnect_for: Duration`, set by `new` and `with_sink` to the old fixed
+10 minutes: how long a send (and an outbox pull) keeps trying to reach the other device
+after a drop before it is reported failed. Hosts built through `new` or `with_sink` need no
+change; tests shorten it. `TransferSnapshot` gains `resumable: bool` (`#[serde(default)]`,
+so an older host reads as false): true on a `failed` send whose record is kept for resume,
+false once it is cancelled, resumed or complete. This lifts the section 8 exclusion of
+sender-side resume.
+
+Every send keeps a record under `<data_dir>/outgoing/` (`<id>.json`, `<id>.state` and an
+append-only `<id>.hashes`, all 0600; protocol.md 7.6 "sender persistence" and 11.1), deleted when the send completes, is cancelled or declined,
+fails for good, or its source changes size, and after 24 h. A send that gives up because
+the receiver is unreachable, or keeps dropping the upload, still ends `failed` with
+`TransferFailed`, but keeps its record, sets `resumable`, and its `note` (and the event's
+`reason`) says how it resumes: "receiver unreachable; resumes when <label> is back or when
+these files are sent to it again" when the host restarts it by itself (path sources, an
+unreachable receiver, at most three automatic resumes per record), otherwise "...; resumes
+when these files are sent to <label> again". It resumes under the same transfer ID: by
+itself as just said, by itself at the next host start when the host stopped mid-send
+(path sources), and on every platform when `send_sources` is called with the same items
+for the same peer within 24 h (the returned `TransferHandle::id()` is the earlier ID;
+stream openers are attached afresh, which is how a phone resumes a share). If the receiver
+had meanwhile ended that transfer (cancelled, declined, expired, failed), such a send
+continues as a new transfer under a new transfer ID on the wire, but this device keeps
+knowing it by the earlier ID: the handle, the events, `transfers()`, `TransferSummary.id`
+and `cancel_transfer` all use it, also after a restart; a send the host restarted by
+itself just ends then. A
+resumed send is listed once in `transfers()` and goes `offered`, `active`, `complete`
+again. A waiting send stays in `transfers()` (`failed`, `resumable`) for as long as its
+record exists, also after a restart of this host;
+`TransferHandle::bytes_sent` and the progress readings now start each connected round at
+what the receiver holds and keeps, so they never pass the total and count no byte twice.
+`cancel_transfer` on a waiting ID deletes its record, shows it `cancelled`, returns
+`Ok(())`, and tells the receiver in the background: at once when it is online, else at its
+next session (the cancel is kept on disk for up to 24 h); unpairing deletes a peer's
+records and such pending cancels. A receiving host now answers for a transfer that ended (any end) for
+24 h, also after a restart, so a sender that missed the end completes instead of sending
+the files again. No event or status was added.
+
+The `playdrop-ffi` mirror of `TransferSnapshot` carries `resumable` (bool) too, and the ffi
+version is 0.4.0 (an additive type change, like `files_done` in section 11). Hosts that
+build a `TransferSnapshot` by hand (test fixtures) must pass `resumable = false`.

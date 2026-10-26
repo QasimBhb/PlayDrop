@@ -91,6 +91,8 @@ export struct TransferRow {
     detail: string,
     can-respond: bool,
     can-cancel: bool,
+    // A failed send the daemon keeps to resume: offers "Forget" instead of "Cancel".
+    can-forget: bool,
     can-open: bool,
     can-show: bool,
 }

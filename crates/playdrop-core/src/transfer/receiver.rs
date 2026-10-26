@@ -15,16 +15,18 @@
 //!     bundle.delivered     delivery log of the bundle's members (see `DeliveryLog`)
 //! ```
 //!
-//! A streamed file leaves staging only after its root verifies, through an exclusive create
-//! of the final name (with " (n)" on collision) and a rename onto that placeholder (SR-18).
-//! A bundle member leaves the same way as soon as its own bytes are chunk-verified and
-//! durable, before the bundle root arrives (see `BundleInner`).
+//! A streamed file leaves staging only after its root verifies, through a rename that never
+//! replaces anything (" (n)" on collision, SR-18), recorded before it is made
+//! (`fsx::place_unique`; where that rename does not exist, onto an empty placeholder
+//! created exclusively first). A bundle member leaves the same way as soon as its own
+//! bytes are chunk-verified and durable, before the bundle root arrives (see
+//! `BundleInner`).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex as StdMutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -312,6 +314,12 @@ struct LedgerRecord {
     /// resumed after a restart can still report every destination.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     saved: Vec<SavedFile>,
+    /// True when the name in `saved` was recorded before a rename that never replaces
+    /// (Phase 9): no placeholder holds it. False when it names an empty placeholder: one
+    /// reserved before the record (0.3.0), or about to be reserved after it (this build
+    /// where no such rename exists: Windows, or a filesystem refusing the flag).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    named_before_rename: bool,
 }
 
 /// One placed file: its manifest fid and its final path relative to the receive root
@@ -323,6 +331,12 @@ struct SavedFile {
     path: PathBuf,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     location: Option<String>,
+    /// Delivery log only: `path` names an empty placeholder this host is about to create
+    /// and rename onto, because no rename that never replaces was available
+    /// ([`fsx::Step::Reserve`]). Recovery then renames onto an empty file at that name
+    /// instead of placing again. Never set on a member already placed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    reserved: bool,
 }
 
 impl SavedFile {
@@ -331,6 +345,15 @@ impl SavedFile {
             fid,
             path,
             location: None,
+            reserved: false,
+        }
+    }
+
+    /// A log line for a name about to be reserved with a placeholder.
+    fn reserving(fid: u32, path: PathBuf) -> Self {
+        Self {
+            reserved: true,
+            ..Self::placed(fid, path)
         }
     }
 
@@ -339,6 +362,7 @@ impl SavedFile {
             fid,
             path: PathBuf::new(),
             location: Some(location),
+            reserved: false,
         }
     }
 }
@@ -423,12 +447,21 @@ const DELIVERY_LOG: &str = "bundle.delivered";
 /// staging files of a batch are deleted only after its flush.
 const DELIVERY_BATCH: usize = 256;
 
+/// Version of the delivery logs this build writes (see [`DeliveryLog`]): a `Directory`
+/// line is written before anything happens to the name it records.
+///
+/// A downgrade to 0.3.0 in the middle of a transfer reads a version 3 log as "no log": it
+/// may then place members already placed again, under " (n)" names (accepted; noted in
+/// the changelog).
+const LOG_VERSION: u32 = 3;
+
 /// First line of the delivery log.
 ///
-/// Version 2 (this build) carries no root: the log starts with the bundle upload, before
-/// any member is placed, and the verified root is kept in the bundle's ledger record.
-/// Version 1 (Phase 7 builds) carried the root, because it was written only once the root
-/// had verified and just before the members were handed over.
+/// Versions 2 and 3 carry no root: the log starts with the bundle upload, before any
+/// member is placed, and the verified root is kept in the bundle's ledger record. Version
+/// 1 (Phase 7 builds) carried the root, because it was written only once the root had
+/// verified and just before the members were handed over; a log rewritten from version 1
+/// keeps that root in its header.
 #[derive(Debug, Serialize, Deserialize)]
 struct DeliveryHeader {
     v: u32,
@@ -439,10 +472,12 @@ struct DeliveryHeader {
 /// What a delivery log holds after a restart.
 #[derive(Debug)]
 struct DeliveryRecord {
-    /// The verified bundle root, from a version 1 log only.
+    /// Header version: tells what a `Directory` line promises (see [`DeliveryLog`]).
+    version: u32,
+    /// The verified bundle root, from a version 1 log (or one rewritten from it) only.
     root: Option<ChunkHash>,
-    /// Members recorded as delivered (or, in `Directory` mode, about to be renamed onto
-    /// the recorded placeholder), by fid; a later line for the same fid wins.
+    /// Members recorded as delivered or, in `Directory` mode, about to be renamed to the
+    /// recorded name, by fid; a later line for the same fid wins.
     done: HashMap<u32, SavedFile>,
     /// Length of the complete lines; a torn last line is cut off before appending.
     valid_len: u64,
@@ -451,17 +486,36 @@ struct DeliveryRecord {
 /// Append-only record of a bundle's member delivery, so a kill while members are handed
 /// over neither loses a member nor delivers one twice.
 ///
-/// `bundle.delivered` holds newline-terminated JSON lines. Line 1 is `{"v":2}`, written
-/// atomically when the bundle upload starts. Each following line is one [`SavedFile`]:
-/// `{"fid":3,"path":"T/f3 (1).dat"}` in `Directory` mode, written after the placeholder
-/// is reserved and before the rename onto it; `{"fid":3,"path":"","location":"..."}` in
-/// `Staged` mode, written after the sink returned. Members are handed over as soon as
-/// their bytes are chunk-verified and durable, long before the bundle root arrives (see
-/// [`BundleInner`]). The log is flushed every [`DELIVERY_BATCH`] members and whenever the
-/// delivery worker stops cleanly; the ledger's terminal record then lists every
-/// destination, and the log is cleared with the rest of the staging folder.
+/// `bundle.delivered` holds newline-terminated JSON lines. Line 1 is `{"v":3}` (see
+/// [`LOG_VERSION`]), written atomically when the bundle upload starts. Each following line
+/// is one [`SavedFile`]: `{"fid":3,"path":"","location":"..."}` in `Staged` mode, written
+/// after the sink returned; `{"fid":3,"path":"T/f3 (1).dat"}` in `Directory` mode, whose
+/// meaning depends on the version:
 ///
-/// A version 1 log left by a Phase 7 build is read the same way: its lines are members
+/// - Version 3: written before anything happens to the name ([`fsx::place_unique`]), and
+///   only for a name that was free a moment before. Usually the member is then renamed to
+///   it without replacing anything; if the name was taken in between, the rename fails and
+///   a new line names the next " (n)" name. Where no such rename exists (Windows, or a
+///   filesystem refusing the flag) the line carries `"reserved":true` and the name is then
+///   reserved with an empty placeholder and renamed onto. After a kill, the latest line
+///   for a member is read with its staging file: gone means the member is at that name;
+///   still there means the rename did not happen, so it is renamed onto an empty regular
+///   file at a `reserved` name, and otherwise placed again by the same rules, with new
+///   lines. The stream never writes a placed member's staging file again
+///   (`BundleInner::placed_before`), so a staging file cannot mean anything else.
+/// - Version 2 (Phase 8 builds): written after an empty placeholder was
+///   created exclusively at the name and before the rename onto it. Recovery renames onto
+///   a placeholder that is still empty, keeps the first place when it already holds data,
+///   and places afresh when it is gone. Once recovered, a version 2 log is rewritten in
+///   this build's version, so its lines never mix with lines of the other kind.
+///
+/// Members are handed over as soon as their bytes are chunk-verified and durable, long
+/// before the bundle root arrives (see [`BundleInner`]). The log is flushed every
+/// [`DELIVERY_BATCH`] members and whenever the delivery worker stops cleanly; the ledger's
+/// terminal record then lists every destination, and the log is cleared with the rest of
+/// the staging folder.
+///
+/// A version 1 log left by a Phase 7 build is read like version 2: its lines are members
 /// already delivered, and its header root (written only after that root verified) stands
 /// in for the root this build keeps in the ledger record.
 #[derive(Debug)]
@@ -476,11 +530,31 @@ impl DeliveryLog {
 
     /// Starts the log for a bundle whose upload is starting.
     fn create(staging: &Path) -> Result<Self> {
-        let mut header = serde_json::to_vec(&DeliveryHeader { v: 2, root: None })?;
-        header.push(b'\n');
+        Self::write(staging, None, &HashMap::new())
+    }
+
+    /// Replaces the log, atomically, with a header in this build's version and one line
+    /// per member in `done` (fid order), then opens it for appending. Used to start a log
+    /// and to bring a recovered log of another version up to this one.
+    fn write(
+        staging: &Path,
+        root: Option<ChunkHash>,
+        done: &HashMap<u32, SavedFile>,
+    ) -> Result<Self> {
+        let mut bytes = serde_json::to_vec(&DeliveryHeader {
+            v: LOG_VERSION,
+            root: root.as_ref().map(hash_to_hex),
+        })?;
+        bytes.push(b'\n');
+        let mut fids: Vec<&u32> = done.keys().collect();
+        fids.sort_unstable();
+        for fid in fids {
+            serde_json::to_writer(&mut bytes, &done[fid])?;
+            bytes.push(b'\n');
+        }
         let path = Self::path(staging);
-        fsx::write_atomic(&path, &header)?;
-        Self::open(&path, header.len() as u64)
+        fsx::write_atomic(&path, &bytes)?;
+        Self::open(&path, bytes.len() as u64)
     }
 
     /// Reopens the log for appending after its last complete line.
@@ -507,11 +581,11 @@ impl DeliveryLog {
             return Ok(None);
         };
         let root = match (header.v, header.root.as_deref()) {
-            (1, Some(hex)) => match super::hash_from_hex(hex) {
+            (1..=3, Some(hex)) => match super::hash_from_hex(hex) {
                 Ok(root) => Some(root),
                 Err(_) => return Ok(None),
             },
-            (2, _) => None,
+            (2 | 3, _) => None,
             _ => return Ok(None),
         };
         let mut valid_len = first.len() as u64;
@@ -530,6 +604,7 @@ impl DeliveryLog {
             valid_len += line.len() as u64;
         }
         Ok(Some(DeliveryRecord {
+            version: header.v,
             root,
             done,
             valid_len,
@@ -547,6 +622,34 @@ impl DeliveryLog {
     fn sync(&self) -> Result<()> {
         self.file.sync_data().map_err(fsx::map_io)
     }
+}
+
+/// Writes the delivery log line for one [`fsx::place_unique`] step of member `fid`: the
+/// name before its rename, or the name about to be reserved (marked `reserved`). The step
+/// after a reservation records nothing.
+///
+/// A line for a " (n)" name (anything but the manifest name `name`) is flushed before the
+/// rename it announces, so a power loss never keeps such a rename without its line; see
+/// the fallback in `DeliveryWorker::place` for why that matters. Collisions are rare, so
+/// the flush costs nothing in the common case.
+fn log_step(
+    log: &mut DeliveryLog,
+    fid: u32,
+    parents: &[String],
+    name: &str,
+    candidate: &str,
+    step: fsx::Step,
+) -> Result<()> {
+    let path = relative_path(parents, candidate);
+    match step {
+        fsx::Step::Rename => log.append(&SavedFile::placed(fid, path))?,
+        fsx::Step::Reserve => log.append(&SavedFile::reserving(fid, path))?,
+        fsx::Step::Reserved => return Ok(()),
+    }
+    if candidate != name {
+        log.sync()?;
+    }
+    Ok(())
 }
 
 /// Test-only kill points inside member delivery. The count is of members handed over by
@@ -573,12 +676,54 @@ fn simulated_kill() -> Error {
     Error::Io(io::Error::other("simulated kill"))
 }
 
+/// Time a bundle spends on its members, by thread. Read through
+/// [`TransferReceiver::member_timings`] by the loopback benchmark in
+/// `tests/phase9_receiver.rs`; nothing else uses it. Two clock reads per chunk and per
+/// member cost far less than the file work they time.
+#[derive(Debug, Default)]
+struct Timings {
+    /// Members whose staging file the stream thread started.
+    stream_members: AtomicU64,
+    /// Stream thread: member staging files (create, write, close), outside checkpoints.
+    stream_ns: AtomicU64,
+    /// Stream thread: checkpoints (member data sync, ledger record, feeding the worker).
+    checkpoint_ns: AtomicU64,
+    /// Members the delivery worker placed or handed to the sink.
+    delivered: AtomicU64,
+    /// Delivery thread: time in placing or handing over those members.
+    deliver_ns: AtomicU64,
+}
+
+impl Timings {
+    fn add(counter: &AtomicU64, since: Instant) {
+        let ns = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        counter.fetch_add(ns, Ordering::Relaxed);
+    }
+}
+
+/// A reading of a bundle's per-member timings (see [`TransferReceiver::member_timings`]).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemberTimings {
+    /// Members whose staging file the stream thread started.
+    pub stream_members: u64,
+    /// Stream thread: member staging files (create, write, close), outside checkpoints.
+    pub stream: Duration,
+    /// Stream thread: checkpoints (member data sync, ledger record, feeding the worker).
+    pub checkpoint: Duration,
+    /// Members the delivery worker placed or handed to the sink.
+    pub delivered: u64,
+    /// Delivery thread: time spent placing or handing over those members.
+    pub delivery: Duration,
+}
+
 /// What a bundle and its delivery worker share with the rest of the transfer.
 #[derive(Debug, Clone)]
 struct DeliveryShared {
-    /// Members placed or handed to the sink so far, for
-    /// [`TransferReceiver::files_done`].
-    done_count: Arc<AtomicUsize>,
+    /// Members placed or handed to the sink so far, with where they went, for
+    /// [`TransferReceiver::files_done`] and [`TransferReceiver::delivered`] while the
+    /// bundle still streams. A copy of the worker's `done` map, updated as it places.
+    placed: Arc<StdMutex<HashMap<u32, SavedFile>>>,
     /// Set by a cancel: once it is true no member is placed. The worker holds it while it
     /// places one member, so a cancel waits for the member in flight before it clears the
     /// staging folder, and never leaves a reserved name without its file.
@@ -588,14 +733,17 @@ struct DeliveryShared {
     /// out for thousands of members. The worker checks this flag before it takes the lock,
     /// so the cancel gets in right after the member in flight.
     cancel_requested: Arc<AtomicBool>,
+    /// Per-member time on the stream and delivery threads, for the benchmark.
+    timings: Arc<Timings>,
 }
 
 impl DeliveryShared {
     fn new() -> Self {
         Self {
-            done_count: Arc::new(AtomicUsize::new(0)),
+            placed: Arc::new(StdMutex::new(HashMap::new())),
             cancelled: Arc::new(StdMutex::new(false)),
             cancel_requested: Arc::new(AtomicBool::new(false)),
+            timings: Arc::new(Timings::default()),
         }
     }
 
@@ -626,6 +774,10 @@ struct Placer {
     root: cap_std::fs::Dir,
     dirs: HashMap<Vec<String>, cap_std::fs::Dir>,
     touched: HashSet<Vec<String>>,
+    /// Whether the rename that never replaces is still worth trying; cleared by
+    /// [`fsx::place_unique`] once it proves unavailable here, so later members go
+    /// straight to placeholders.
+    noreplace: bool,
 }
 
 impl Placer {
@@ -635,6 +787,7 @@ impl Placer {
             root: fsx::open_root(dest_root)?,
             dirs: HashMap::new(),
             touched: HashSet::new(),
+            noreplace: true,
         })
     }
 
@@ -679,6 +832,12 @@ struct DeliveryWorker {
     /// Test hook: an I/O error (not a kill) before fresh member n.
     #[cfg(test)]
     transient: Option<usize>,
+    /// Test hook: place with placeholders, as where no rename that never replaces exists.
+    #[cfg(test)]
+    placeholders: bool,
+    /// Test hook: another process takes this member's own name just after its first line.
+    #[cfg(test)]
+    squat: Option<u32>,
 }
 
 /// What a delivery worker leaves behind when it stops.
@@ -717,7 +876,15 @@ impl DeliveryWorker {
     fn serve(&mut self, jobs: &mpsc::Receiver<u32>) -> Result<()> {
         let dest = self.dest.clone();
         let mut placer = match &dest {
-            Dest::Directory(root) => Some(Placer::open(&self.staging, root)?),
+            Dest::Directory(root) => {
+                #[cfg_attr(not(test), allow(unused_mut))]
+                let mut placer = Placer::open(&self.staging, root)?;
+                #[cfg(test)]
+                if self.placeholders {
+                    placer.noreplace = false;
+                }
+                Some(placer)
+            }
             Dest::Sink { .. } => None,
         };
         let mut handed: Vec<PathBuf> = Vec::new();
@@ -731,6 +898,8 @@ impl DeliveryWorker {
             if *gate {
                 break;
             }
+            let t0 = Instant::now();
+            let before = fresh;
             match (&dest, placer.as_mut()) {
                 (Dest::Directory(_), Some(placer)) => self.place(fid, placer, &mut fresh)?,
                 (
@@ -742,12 +911,19 @@ impl DeliveryWorker {
                 ) => self.hand(fid, binding, transfer_id, &mut handed, &mut fresh)?,
                 (Dest::Directory(_), None) => unreachable!("Directory mode opens a placer"),
             }
+            if fresh > before {
+                let t = &self.shared.timings;
+                Timings::add(&t.deliver_ns, t0);
+                t.delivered.fetch_add(1, Ordering::Relaxed);
+            }
             drop(gate);
         }
+        // The log first: each line was written before its rename, and a power loss must not
+        // keep a rename whose line it lost.
+        self.log.sync()?;
         if let Some(placer) = placer.as_mut() {
             placer.sync()?;
         }
-        self.log.sync()?;
         for p in handed {
             fsx::remove_if_exists(&p)?;
         }
@@ -755,8 +931,8 @@ impl DeliveryWorker {
     }
 
     fn record(&mut self, saved: SavedFile) {
+        lock(&self.shared.placed).insert(saved.fid, saved.clone());
         self.done.insert(saved.fid, saved);
-        self.shared.done_count.fetch_add(1, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -773,20 +949,23 @@ impl DeliveryWorker {
         Ok(())
     }
 
-    /// `Directory` mode, one member (SR-18): the final name is reserved exclusively
-    /// (" (n)" on collision), a log line names it, then the staged file is renamed onto
-    /// it. A member delivered before a restart of the stream keeps its first place; the
-    /// bytes that came again are dropped.
+    /// `Directory` mode, one member (SR-18), all under version 3 of the [`DeliveryLog`]
+    /// ([`fsx::place_unique`]): a log line names a free name first, then the staged file
+    /// is renamed to it without replacing anything; a name taken in between gets a new
+    /// line and the next " (n)" name. Where that rename does not exist, the line is
+    /// written first and marked `reserved`, then the name is reserved with an empty
+    /// placeholder, then the file is renamed onto it. A member delivered before a restart
+    /// of the stream keeps its first place.
     fn place(&mut self, fid: u32, placer: &mut Placer, fresh: &mut usize) -> Result<()> {
         let staged_name = member_name(fid);
         let staged = self.staging.join(&staged_name);
-        let staged_exists = exists(&staged)?;
         if self.done.contains_key(&fid) {
-            if staged_exists {
-                fsx::remove_if_exists(&staged)?;
-            }
+            // Its bytes are not written again after a restart (`placed_before`); a staging
+            // file left by an older build is dropped.
+            fsx::remove_if_exists(&staged)?;
             return Ok(());
         }
+        let staged_exists = exists(&staged)?;
         let files = Arc::clone(&self.files);
         let entry = files
             .get(fid as usize)
@@ -795,12 +974,21 @@ impl DeliveryWorker {
         placer.ensure_dir(parents)?;
         let dir = &placer.dirs[parents];
         if !staged_exists {
-            // Durable bytes without a staging file and without a log line: only after a
-            // power loss that kept the rename but lost its log line (not possible on a
-            // filesystem that orders a file's appended data before a later rename, like
-            // ext4). Believed only when a regular file of the member's size sits at its
-            // manifest name; its " (n)" name cannot be known, so that name is reported.
-            // Anything else is an inconsistency, found again by `reconcile` on load.
+            // Durable bytes without a staging file and without a log line: after a power
+            // loss that kept the rename but lost its log line. Each line is written before
+            // its rename; a line for a " (n)" name is flushed before that rename
+            // (`log_step`), but a line for the manifest name reaches the disk only at a log
+            // flush (every `DELIVERY_BATCH` members and when the worker stops, before the
+            // folders are synced), while the journal may commit the rename sooner: with
+            // ext4 delayed allocation the appended line can follow up to 30 s later
+            // (`auto_da_alloc` covers only rename-over-existing and truncate). So this stays
+            // possible for manifest-name renames since the last flush, and only for those:
+            // the member is then believed placed when a regular file of its size sits at
+            // its manifest name, which is exactly where such a rename put it. Were a
+            // " (n)" rename to lose its line, this check could match a different file of
+            // the same size at the manifest name and report the member there; the flush
+            // per " (n)" line rules that out. Anything else is an inconsistency, found
+            // again by `reconcile` on load.
             if !has_file_of_size(dir, name, entry.size)? {
                 return Err(Error::Io(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -814,25 +1002,38 @@ impl DeliveryWorker {
         self.crash_at(Crash::Before(*fresh))?;
         // File names are allowed at DEBUG and below only (SR-32).
         tracing::debug!(fid, path = %entry.path.join("/"), "verified file placed");
-        // A kill between this exclusive create and the log line leaves one empty file
-        // behind; closing that window needs `renameat2(RENAME_NOREPLACE)` (rename without a
-        // placeholder), which `cap-std` does not offer on every platform.
-        let (final_name, placeholder) = fsx::create_unique(dir, name)?;
-        drop(placeholder);
-        let saved = SavedFile::placed(fid, relative_path(parents, &final_name));
-        if let Err(e) = self.log.append(&saved) {
-            // Without its log line the placeholder would stay empty forever and every
-            // retry would add another " (n)": remove it (best effort).
-            let _ = dir.remove_file(&final_name);
-            return Err(e);
-        }
+        let log = &mut self.log;
         #[cfg(test)]
-        self.crash_at(Crash::Inside(*fresh))?;
-        placer
-            .staging
-            .rename(&staged_name, dir, &final_name)
-            .map_err(fsx::map_io)?;
-        self.record(saved);
+        let kill = self
+            .crash
+            .filter(|c| *c == Crash::Inside(*fresh))
+            .map(|_| Arc::clone(&self.killed));
+        #[cfg(test)]
+        let squat = self.squat == Some(fid);
+        let final_name = fsx::place_unique(
+            &placer.staging,
+            &staged_name,
+            dir,
+            name,
+            &mut placer.noreplace,
+            |candidate, step| {
+                log_step(log, fid, parents, name, candidate, step)?;
+                #[cfg(test)]
+                {
+                    // Another process takes the member's own name just after its line.
+                    if squat && candidate == name && step == fsx::Step::Rename {
+                        dir.write(name, b"theirs").map_err(Error::Io)?;
+                        return Ok(());
+                    }
+                    if let (Some(killed), fsx::Step::Rename | fsx::Step::Reserved) = (&kill, step) {
+                        killed.store(true, Ordering::Release);
+                        return Err(simulated_kill());
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        self.record(SavedFile::placed(fid, relative_path(parents, &final_name)));
         *fresh += 1;
         if fresh.is_multiple_of(DELIVERY_BATCH) {
             // The destination folders are synced once, when the worker stops: a rename a
@@ -916,6 +1117,8 @@ struct Ledger {
     progress: SharedProgress,
     /// Final destinations of the files this stream placed, written with every record.
     saved: Vec<SavedFile>,
+    /// See [`LedgerRecord::named_before_rename`].
+    named_before_rename: bool,
 }
 
 impl Ledger {
@@ -941,6 +1144,7 @@ impl Ledger {
             durable: 0,
             progress: Arc::new(StdMutex::new(Progress::fresh())),
             saved: Vec::new(),
+            named_before_rename: false,
         }
     }
 
@@ -963,6 +1167,7 @@ impl Ledger {
             return Ok(l);
         };
         l.saved = rec.saved;
+        l.named_before_rename = rec.named_before_rename;
         let mut p = Progress::fresh();
         p.state = rec.state;
         p.root = rec
@@ -1078,6 +1283,7 @@ impl Ledger {
             state,
             root: root.as_ref().map(hash_to_hex),
             saved: self.saved.clone(),
+            named_before_rename: self.named_before_rename,
         };
         fsx::write_atomic(&self.json, &serde_json::to_vec(&rec)?)
     }
@@ -1092,6 +1298,7 @@ impl Ledger {
         self.unsynced = 0;
         self.durable = 0;
         self.saved.clear();
+        self.named_before_rename = false;
         self.write_record(FileState::Waiting, 0, 0, None)
     }
 
@@ -1141,6 +1348,9 @@ struct PartInner {
     preallocated: bool,
     #[cfg(test)]
     crash: Option<Crash>,
+    /// Test hook: place with a placeholder, as where no rename that never replaces exists.
+    #[cfg(test)]
+    placeholders: bool,
 }
 
 impl PartInner {
@@ -1249,14 +1459,17 @@ impl PartInner {
     /// Moves a verified file to its final place, then records it as verified. The root
     /// is already checked and kept in memory.
     ///
-    /// `Directory` mode closes the window between the rename and the terminal record: the
-    /// final name is reserved first (exclusive create, " (n)" on collision, SR-18), a
-    /// ledger record still saying `receiving` names it together with the root, then the
-    /// `.part` is renamed onto that placeholder, then the record says `verified`. After a
-    /// kill, [`PartFile::open_blocking`] and this method read the record: a missing `.part`
-    /// means the rename happened; a `.part` still there is renamed onto the placeholder
-    /// when it is still an empty regular file, and placed afresh otherwise. No file is
-    /// downloaded or placed twice.
+    /// `Directory` mode closes the window between the rename and the terminal record: a
+    /// ledger record still saying `receiving` names the final name together with the root,
+    /// then the `.part` is renamed to that name without replacing anything (a taken name
+    /// gets a new record and the next " (n)" name, SR-18, [`fsx::place_unique`]), then the
+    /// record says `verified`. After a kill, [`PartFile::open_blocking`] and this method
+    /// read the record: a missing `.part` means the rename happened; a `.part` still there
+    /// means it did not, and the file is placed again by the same rules. A record from a
+    /// placeholder build (0.3.0, or Windows, where the name is reserved by an exclusive
+    /// create before the record) is renamed onto its placeholder while that is still an
+    /// empty regular file, and placed afresh otherwise. No file is downloaded or placed
+    /// twice.
     ///
     /// `Staged` mode hands the file to the sink, then records it as verified with the
     /// sink's location, then deletes the staging file. A kill between the sink call and
@@ -1268,68 +1481,7 @@ impl PartInner {
             .ok_or_else(|| Error::BadRequest("file root not verified".into()))?;
         let staged_exists = exists(&self.path)?;
         match dest {
-            Dest::Directory(dest_root) => {
-                let reserved = self
-                    .ledger
-                    .saved
-                    .first()
-                    .filter(|s| s.fid == self.fid && s.location.is_none())
-                    .cloned();
-                if !staged_exists {
-                    if reserved.is_some() {
-                        // Renamed before a kill; only the terminal record was missing.
-                        return self.ledger.finish(FileState::Verified, Some(root));
-                    }
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::NotFound,
-                        "a verified file is missing from staging",
-                    )));
-                }
-                let (staging, staged_name) = staged_parts(&self.path)?;
-                let staging = fsx::open_own_dir(staging)?;
-                let staged_name = staged_name.to_owned();
-                let root_dir = fsx::open_root(dest_root)?;
-                let (name, parents) = split_path(&entry.path)?;
-                let dir = fsx::safe_dir(&root_dir, parents, false)?;
-                let reused = match &reserved {
-                    Some(prev) => reserved_placeholder(&dir, parents, &prev.path)?,
-                    None => None,
-                };
-                let final_name = if let Some(name) = reused {
-                    name
-                } else {
-                    #[cfg(test)]
-                    self.crash_at(Crash::Before(0))?;
-                    // File names are allowed at DEBUG and below only (SR-32).
-                    tracing::debug!(fid = self.fid, path = %entry.path.join("/"), "verified file placed");
-                    // A kill between this exclusive create and the record below leaves one
-                    // empty file behind; closing that window needs
-                    // `renameat2(RENAME_NOREPLACE)` (rename without a placeholder).
-                    let (final_name, placeholder) = fsx::create_unique(&dir, name)?;
-                    drop(placeholder);
-                    self.ledger.saved = vec![SavedFile::placed(
-                        self.fid,
-                        relative_path(parents, &final_name),
-                    )];
-                    if let Err(e) = self.ledger.persist() {
-                        // Without the record the placeholder would stay empty forever and
-                        // every retry would add another " (n)": remove it (best effort).
-                        self.ledger.saved.clear();
-                        let _ = dir.remove_file(&final_name);
-                        return Err(e);
-                    }
-                    final_name
-                };
-                #[cfg(test)]
-                self.crash_at(Crash::Inside(0))?;
-                staging
-                    .rename(&staged_name, &dir, &final_name)
-                    .map_err(fsx::map_io)?;
-                fsx::sync_dir_handle(&dir)?;
-                #[cfg(test)]
-                self.crash_at(Crash::After(0))?;
-                self.ledger.finish(FileState::Verified, Some(root))
-            }
+            Dest::Directory(dest_root) => self.place_in_dir(dest_root, entry, root, staged_exists),
             Dest::Sink {
                 binding,
                 transfer_id,
@@ -1361,6 +1513,94 @@ impl PartInner {
         }
     }
 
+    /// `Directory` mode of [`place`](Self::place): see its doc for the order and recovery.
+    fn place_in_dir(
+        &mut self,
+        dest_root: &Path,
+        entry: &FileEntry,
+        root: ChunkHash,
+        staged_exists: bool,
+    ) -> Result<()> {
+        let reserved = self
+            .ledger
+            .saved
+            .first()
+            .filter(|s| s.fid == self.fid && s.location.is_none())
+            .cloned();
+        if !staged_exists {
+            if reserved.is_some() {
+                // Renamed before a kill; only the terminal record was missing.
+                return self.ledger.finish(FileState::Verified, Some(root));
+            }
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "a verified file is missing from staging",
+            )));
+        }
+        let (staging, staged_name) = staged_parts(&self.path)?;
+        let staging = fsx::open_own_dir(staging)?;
+        let staged_name = staged_name.to_owned();
+        let root_dir = fsx::open_root(dest_root)?;
+        let (name, parents) = split_path(&entry.path)?;
+        let dir = fsx::safe_dir(&root_dir, parents, false)?;
+        let reused = match &reserved {
+            // A record that names a placeholder (a 0.3.0 staging folder, or a
+            // Windows build): rename onto it while it is still empty.
+            Some(prev) if !self.ledger.named_before_rename => {
+                reserved_placeholder(&dir, parents, &prev.path)?
+            }
+            // A record written before a rename that never replaces: the `.part` is
+            // still here, so that rename did not happen. Placed again below.
+            _ => None,
+        };
+        if let Some(final_name) = reused {
+            #[cfg(test)]
+            self.crash_at(Crash::Inside(0))?;
+            staging
+                .rename(&staged_name, &dir, &final_name)
+                .map_err(fsx::map_io)?;
+        } else {
+            #[cfg(test)]
+            self.crash_at(Crash::Before(0))?;
+            // File names are allowed at DEBUG and below only (SR-32).
+            tracing::debug!(fid = self.fid, path = %entry.path.join("/"), "verified file placed");
+            let fid = self.fid;
+            // Remembered for this placement only: a single file tries each name once.
+            #[cfg(test)]
+            let mut noreplace = !self.placeholders;
+            #[cfg(not(test))]
+            let mut noreplace = true;
+            fsx::place_unique(
+                &staging,
+                &staged_name,
+                &dir,
+                name,
+                &mut noreplace,
+                |c, step| {
+                    if step != fsx::Step::Reserved {
+                        // A name reserved with a placeholder is recorded as such, so
+                        // recovery renames onto it instead of placing again.
+                        self.ledger.saved = vec![SavedFile::placed(fid, relative_path(parents, c))];
+                        self.ledger.named_before_rename = step == fsx::Step::Rename;
+                        if let Err(e) = self.ledger.persist() {
+                            self.ledger.saved.clear();
+                            return Err(e);
+                        }
+                    }
+                    #[cfg(test)]
+                    if step != fsx::Step::Reserve {
+                        self.crash_at(Crash::Inside(0))?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+        fsx::sync_dir_handle(&dir)?;
+        #[cfg(test)]
+        self.crash_at(Crash::After(0))?;
+        self.ledger.finish(FileState::Verified, Some(root))
+    }
+
     /// Places a file left waiting by a kill or an I/O error, without asking the sender for
     /// anything. Returns where it went.
     fn retry_placement(&mut self, dest: &Dest, entry: &FileEntry) -> Result<Vec<SavedFile>> {
@@ -1375,8 +1615,8 @@ impl PartInner {
 
 /// Moves a staged file to its final name beneath `dest_root` without overwriting anything
 /// and without following symlinks (SR-18): the folders are walked through directory
-/// handles, the final name is created exclusively (with " (n)" on collision) and the staged
-/// file is renamed onto that placeholder. Returns the final path relative to `dest_root`.
+/// handles and the staged file is renamed to the final name, or its first free " (n)" form,
+/// by [`fsx::place_into`]. Returns the final path relative to `dest_root`.
 fn place(staged: &Path, dest_root: &Path, path: &[String]) -> Result<PathBuf> {
     let (staging, staged_name) = staged_parts(staged)?;
     let staging = fsx::open_own_dir(staging)?;
@@ -1447,6 +1687,8 @@ impl PartFile {
                 preallocated: false,
                 #[cfg(test)]
                 crash: None,
+                #[cfg(test)]
+                placeholders: false,
             })),
             progress,
         }
@@ -1635,6 +1877,15 @@ impl PartFile {
 // Bundle sink
 // ---------------------------------------------------------------------------------------
 
+/// The staging file of the bundle member being written, with the offset of its next byte
+/// (`u64::MAX` when unknown), so in-order writes need no seek.
+#[derive(Debug)]
+struct OpenMember {
+    fid: u32,
+    file: File,
+    pos: u64,
+}
+
 /// Receive state of the bundle stream (protocol.md 7.7, SR-19) and the delivery of its
 /// members.
 ///
@@ -1664,9 +1915,9 @@ impl PartFile {
 /// - Cancel: the worker stops after the member in flight and places nothing more; placed
 ///   members stay, staging is deleted as before.
 /// - Kill and load: members in the log are done (a `Directory` member logged but not yet
-///   renamed is renamed onto its reserved placeholder first); members durable but not in
-///   the log are handed over when streaming resumes, or at once when the whole bundle had
-///   arrived and its root verified.
+///   renamed is placed first, see [`DeliveryLog`] for how each log version tells);
+///   members durable but not in the log are handed over when streaming resumes, or at
+///   once when the whole bundle had arrived and its root verified.
 /// - A delivery error that is not the sink's (a transient I/O error) stops the worker
 ///   but keeps the verified data, the log and the root. The bundle reports `receiving`
 ///   at its full offset and delivery is tried again at the next `begin_bundle`, `finish`
@@ -1680,8 +1931,15 @@ struct BundleInner {
     staging: PathBuf,
     skipped: Vec<bool>,
     reader: Option<BundleReader>,
-    current: Option<(u32, File)>,
+    /// The member whose bytes the stream is writing.
+    current: Option<OpenMember>,
+    /// Members closed since the last checkpoint, flushed by it.
     dirty: Vec<u32>,
+    /// Members already placed when the stream last went back to 0 or the bundle was
+    /// loaded: their bytes are not written to staging again.
+    placed_before: HashSet<u32>,
+    /// How checkpoints flush member files ([`fsx::Flush`]), decided at the first one.
+    flush: Option<fsx::Flush>,
     /// Where members go.
     dest: Dest,
     /// The manifest's files, by fid.
@@ -1705,6 +1963,13 @@ struct BundleInner {
     /// Test hook for the next worker only: an I/O error before its fresh member n.
     #[cfg(test)]
     transient: Option<usize>,
+    /// Test hook: place members with placeholders, as where no rename that never replaces
+    /// exists (Windows, or a filesystem refusing the flag).
+    #[cfg(test)]
+    placeholders: bool,
+    /// Test hook: see `DeliveryWorker::squat`.
+    #[cfg(test)]
+    squat: Option<u32>,
 }
 
 impl Drop for BundleInner {
@@ -1751,6 +2016,8 @@ impl BundleInner {
             reader: None,
             current: None,
             dirty: Vec::new(),
+            placed_before: HashSet::new(),
+            flush: None,
             dest,
             files,
             delivery,
@@ -1764,6 +2031,10 @@ impl BundleInner {
             killed: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             transient: None,
+            #[cfg(test)]
+            placeholders: false,
+            #[cfg(test)]
+            squat: None,
         }
     }
 
@@ -1878,17 +2149,39 @@ impl BundleInner {
             // Any other error: the log on disk is read again just below.
         }
         // Finishes a member a stopped worker left half placed before its staging file is
-        // deleted, and keeps the record of every member already delivered.
+        // deleted, and keeps the record of every member already delivered. Their bytes
+        // come again from offset 0 and are dropped without touching staging, so a staging
+        // file of a logged member keeps meaning "not renamed yet" (see `DeliveryLog`).
         self.ensure_parked()?;
+        if let Some((_, done)) = &self.parked {
+            self.placed_before = done.keys().copied().collect();
+        }
         self.remove_members()?;
         self.ledger.reset()
     }
 
     fn close_current(&mut self) {
-        if let Some((fid, f)) = self.current.take() {
-            drop(f);
-            self.dirty.push(fid);
+        if let Some(m) = self.current.take() {
+            drop(m.file);
+            self.dirty.push(m.fid);
         }
+    }
+
+    /// How checkpoints flush member files in this staging folder: looked up once per
+    /// transfer (`fstatfs`), not at every checkpoint.
+    fn flush(&mut self) -> fsx::Flush {
+        let staging = &self.staging;
+        *self
+            .flush
+            .get_or_insert_with(|| fsx::Flush::for_dir(staging))
+    }
+
+    /// True when the stream writes member `fid` to staging: not skipped, and not placed
+    /// before the stream went back to 0 (its bytes come again and are dropped unwritten,
+    /// so a staging file of a logged member always means its rename has not happened).
+    fn writes_member(&self, fid: u32) -> bool {
+        !self.is_skipped(fid)
+            && (self.placed_before.is_empty() || !self.placed_before.contains(&fid))
     }
 
     fn write_chunk(&mut self, chunk: &VerifiedChunk) -> Result<()> {
@@ -1900,37 +2193,79 @@ impl BundleInner {
             .reader
             .as_mut()
             .ok_or_else(|| Error::BadRequest("bundle upload not started".into()))?;
+        let t0 = Instant::now();
         for ev in reader.feed(chunk.data.clone())? {
             match ev {
                 BundleEvent::MemberStart { fid } => {
                     self.close_current();
-                    if !self.is_skipped(fid) {
-                        let f = fsx::open_or_create(&self.member_path(fid))?;
-                        f.set_len(0)?;
-                        self.current = Some((fid, f));
+                    if self.writes_member(fid) {
+                        self.delivery
+                            .timings
+                            .stream_members
+                            .fetch_add(1, Ordering::Relaxed);
+                        // The truncate is kept on purpose even for a new file. On ext4 a
+                        // truncate to zero arms `auto_da_alloc`, so closing the member starts
+                        // writing its data back at once and the next checkpoint's `syncfs`
+                        // has less left to flush. Phase 9 benchmark (`phase9_receiver`):
+                        // one create-only open per member made checkpoints about 30% longer
+                        // and the 5,000-member bundle about 10% slower on ext4, with no
+                        // measurable gain on the test phone's f2fs.
+                        let file = fsx::open_or_create(&self.member_path(fid))?;
+                        file.set_len(0)?;
+                        self.current = Some(OpenMember { fid, file, pos: 0 });
                     }
                 }
                 BundleEvent::Data { fid, offset, bytes } => {
-                    if self.is_skipped(fid) {
+                    if !self.writes_member(fid) {
                         continue;
                     }
-                    if self.current.as_ref().map(|c| c.0) != Some(fid) {
+                    if self.current.as_ref().map(|c| c.fid) != Some(fid) {
+                        // Resuming inside this member: append after its durable bytes.
                         self.close_current();
-                        let f = fsx::open_existing_regular(&self.member_path(fid))?;
-                        self.current = Some((fid, f));
+                        let file = fsx::open_existing_regular(&self.member_path(fid))?;
+                        self.current = Some(OpenMember {
+                            fid,
+                            file,
+                            pos: u64::MAX,
+                        });
                     }
-                    let f = &mut self.current.as_mut().expect("set above").1;
-                    f.seek(SeekFrom::Start(offset))?;
-                    f.write_all(&bytes).map_err(fsx::map_io)?;
+                    let m = self.current.as_mut().expect("set above");
+                    if m.pos != offset {
+                        m.file.seek(SeekFrom::Start(offset))?;
+                    }
+                    m.file.write_all(&bytes).map_err(fsx::map_io)?;
+                    m.pos = offset + bytes.len() as u64;
                 }
                 BundleEvent::MemberEnd { .. } => self.close_current(),
             }
         }
+        Timings::add(&self.delivery.timings.stream_ns, t0);
         self.ledger.push(chunk.hash, chunk.data.len() as u64);
         if self.ledger.due() {
             self.checkpoint()?;
         }
         Ok(())
+    }
+
+    /// Removes the empty placeholder a `reserved` log line of member `fid` names, if it is
+    /// still an empty regular file (best effort: the transfer is failing anyway).
+    fn drop_placeholder(&self, fid: u32, recorded: &Path) {
+        let Dest::Directory(dest_root) = &self.dest else {
+            return;
+        };
+        let Some(entry) = self.files.get(fid as usize) else {
+            return;
+        };
+        let Ok((_, parents)) = split_path(&entry.path) else {
+            return;
+        };
+        let Ok(dir) = fsx::open_root(dest_root).and_then(|r| fsx::safe_dir(&r, parents, false))
+        else {
+            return;
+        };
+        if let Ok(Some(name)) = reserved_placeholder(&dir, parents, recorded) {
+            let _ = dir.remove_file(name);
+        }
     }
 
     /// Makes the verified offset durable, then hands every member it completed to the
@@ -1939,15 +2274,23 @@ impl BundleInner {
         if self.ledger.unsynced == 0 {
             return Ok(());
         }
-        if let Some((_, f)) = &self.current {
-            f.sync_data().map_err(fsx::map_io)?;
+        let t0 = Instant::now();
+        let out = self.checkpoint_now();
+        Timings::add(&self.delivery.timings.checkpoint_ns, t0);
+        out
+    }
+
+    fn checkpoint_now(&mut self) -> Result<()> {
+        if let Some(m) = &self.current {
+            m.file.sync_data().map_err(fsx::map_io)?;
         }
         // Closed members written since the last checkpoint, flushed together.
         let dirty: Vec<PathBuf> = std::mem::take(&mut self.dirty)
             .into_iter()
             .map(|fid| self.member_path(fid))
             .collect();
-        fsx::sync_files(&self.staging, &dirty)?;
+        let flush = self.flush();
+        fsx::sync_files(&self.staging, &dirty, flush)?;
         self.ledger.persist()?;
         self.feed()
     }
@@ -1959,11 +2302,39 @@ impl BundleInner {
         let _ = self.stop_worker(false);
         let done = match self.parked.take() {
             Some((_, done)) => done,
+            // Read from disk without recovery: a `Directory` member whose staging file is
+            // still there was not renamed (its line names where it was going), so it is
+            // not listed. A sink line is written after the sink took the member, while its
+            // staging file waits for the batch flush; it is listed.
             None => DeliveryLog::read(&self.staging)
                 .ok()
                 .flatten()
                 .map(|r| r.done)
-                .unwrap_or_default(),
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(fid, s)| {
+                    if s.location.is_some() {
+                        return true;
+                    }
+                    if !matches!(exists(&self.member_path(*fid)), Ok(true)) {
+                        return true;
+                    }
+                    if s.reserved {
+                        // Its empty placeholder would stay behind for good.
+                        self.drop_placeholder(*fid, &s.path);
+                    }
+                    false
+                })
+                .map(|(fid, s)| {
+                    (
+                        fid,
+                        SavedFile {
+                            reserved: false,
+                            ..s
+                        },
+                    )
+                })
+                .collect(),
         };
         self.ledger.saved = self
             .layout
@@ -1990,7 +2361,8 @@ impl BundleInner {
             .into_iter()
             .map(|fid| self.member_path(fid))
             .collect();
-        fsx::sync_files(&self.staging, &dirty)?;
+        let flush = self.flush();
+        fsx::sync_files(&self.staging, &dirty, flush)?;
         self.checkpoint()?;
         if lock(&self.ledger.progress).root != Some(*claimed) {
             // The root is durable before the last members are handed over, so a kill or an
@@ -2015,7 +2387,8 @@ impl BundleInner {
     fn restore(&mut self, resumable: bool) -> Result<Option<String>> {
         let rec = DeliveryLog::read(&self.staging)?;
         if let Some(v1_root) = rec.as_ref().and_then(|r| r.root) {
-            // A Phase 7 log was written only after the root verified (see `DeliveryLog`).
+            // A Phase 7 log (or one rewritten from it) was written only after the root
+            // verified (see `DeliveryLog`).
             let mut p = lock(&self.ledger.progress);
             if p.root.is_none() {
                 p.root = Some(v1_root);
@@ -2026,10 +2399,10 @@ impl BundleInner {
                 Some(rec) => {
                     let parked = self.recover(rec)?;
                     let done: HashSet<u32> = parked.1.keys().copied().collect();
+                    // A stream that resumes below them must not stage them again.
+                    self.placed_before.clone_from(&done);
                     // Progress counts members placed before the restart too.
-                    self.delivery
-                        .done_count
-                        .store(done.len(), Ordering::Release);
+                    lock(&self.delivery.placed).clone_from(&parked.1);
                     self.parked = Some(parked);
                     done
                 }
@@ -2065,13 +2438,17 @@ impl BundleInner {
         Ok(None)
     }
 
-    /// Finishes what a stopped worker left half done, from the log on disk.
+    /// Finishes what a stopped worker left half done, from the log on disk, and brings a
+    /// log of another version up to this build's (see [`DeliveryLog`]).
     ///
-    /// `Directory` mode: a logged member whose staging file is still there was about to
-    /// be renamed onto its recorded placeholder; the rename is done now, or the member is
-    /// placed afresh when a power loss lost the placeholder. `Staged` mode: the sink
-    /// already has every logged member, so leftover staging files are deleted once the
-    /// log is durable.
+    /// `Directory` mode, a logged member whose staging file is still there:
+    /// - version 3: its rename did not happen; it is placed now, same rules, new lines;
+    /// - versions 1 and 2: it was about to be renamed onto its recorded placeholder; the
+    ///   rename is done now, or the staged copy is dropped when the placeholder already
+    ///   holds the data, or the member is placed afresh when the placeholder is gone.
+    ///
+    /// `Staged` mode: the sink already has every logged member, so leftover staging files
+    /// are deleted once the log is durable.
     fn recover(&self, rec: DeliveryRecord) -> Result<(DeliveryLog, HashMap<u32, SavedFile>)> {
         let mut log = DeliveryLog::open(&DeliveryLog::path(&self.staging), rec.valid_len)?;
         let mut done = rec.done;
@@ -2096,14 +2473,47 @@ impl BundleInner {
                     let (name, parents) = split_path(&entry.path)?;
                     placer.ensure_dir(parents)?;
                     let dir = &placer.dirs[parents];
+                    let staged_name = member_name(fid);
+                    if rec.version >= 3 {
+                        let line = &done[&fid];
+                        // A `reserved` line whose placeholder is still an empty regular
+                        // file: the kill came between the reservation and the rename.
+                        let onto = if line.reserved {
+                            reserved_placeholder(dir, parents, &line.path)?
+                        } else {
+                            None
+                        };
+                        let final_name = if let Some(onto) = onto {
+                            placer
+                                .staging
+                                .rename(&staged_name, dir, &onto)
+                                .map_err(fsx::map_io)?;
+                            onto
+                        } else {
+                            fsx::place_unique(
+                                &placer.staging,
+                                &staged_name,
+                                dir,
+                                name,
+                                &mut placer.noreplace,
+                                |c, step| log_step(&mut log, fid, parents, name, c, step),
+                            )?
+                        };
+                        done.insert(
+                            fid,
+                            SavedFile::placed(fid, relative_path(parents, &final_name)),
+                        );
+                        continue;
+                    }
                     let recorded = &done[&fid].path;
-                    // Between this check and the rename below another local process could
-                    // write into the empty placeholder; the rename would then replace that
-                    // write. Only a process of the same user can do that, inside a folder
-                    // this host just reserved a name in; `renameat2(RENAME_NOREPLACE)`
-                    // would close it. A placeholder that already holds data means the
-                    // rename happened (`holds_data`); in the rare case that someone else
-                    // filled our empty placeholder, the staged copy is dropped instead.
+                    // A placeholder log (a 0.3.0 staging folder). Between this
+                    // check and the rename below another local process could write into the
+                    // empty placeholder; the rename would then replace that write. Only a
+                    // process of the same user can do that, inside a folder this host just
+                    // reserved a name in; version 3 logs need no placeholder and have no
+                    // such window. A placeholder that already holds data means the rename
+                    // happened (`holds_data`); in the rare case that someone else filled
+                    // our empty placeholder, the staged copy is dropped instead.
                     let reserved = reserved_placeholder(dir, parents, recorded)?;
                     let target = if let Some(reserved) = reserved {
                         reserved
@@ -2128,13 +2538,14 @@ impl BundleInner {
                     };
                     placer
                         .staging
-                        .rename(member_name(fid), dir, &target)
+                        .rename(&staged_name, dir, &target)
                         .map_err(fsx::map_io)?;
                 }
+                // The log first, as when a worker stops (lines precede renames).
+                log.sync()?;
                 if let Some(placer) = placer.as_mut() {
                     placer.sync()?;
                 }
-                log.sync()?;
             }
             Dest::Sink { .. } => {
                 log.sync()?;
@@ -2142,6 +2553,16 @@ impl BundleInner {
                     fsx::remove_if_exists(&self.member_path(fid))?;
                 }
             }
+        }
+        // Every member in `done` is now in place: the `reserved` mark no longer applies.
+        for s in done.values_mut() {
+            s.reserved = false;
+        }
+        if rec.version != LOG_VERSION {
+            // Every line now names a member in place (or with the sink), which both
+            // versions read the same way; from here on lines follow this build's order.
+            drop(log);
+            log = DeliveryLog::write(&self.staging, rec.root, &done)?;
         }
         Ok((log, done))
     }
@@ -2171,9 +2592,7 @@ impl BundleInner {
         }
         self.ensure_parked()?;
         let (log, done) = self.parked.take().expect("ensured above");
-        self.delivery
-            .done_count
-            .store(done.len(), Ordering::Release);
+        lock(&self.delivery.placed).clone_from(&done);
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
         let worker = DeliveryWorker {
@@ -2191,6 +2610,10 @@ impl BundleInner {
             killed: Arc::clone(&self.killed),
             #[cfg(test)]
             transient: self.transient.take(),
+            #[cfg(test)]
+            placeholders: self.placeholders,
+            #[cfg(test)]
+            squat: self.squat,
         };
         let (jobs, inbox) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -2799,7 +3222,9 @@ impl TransferReceiver {
 
     /// Final paths of the files placed so far, in manifest order, after any " (n)"
     /// collision rename (SR-18). Skipped files and files not yet verified are absent, so
-    /// once the transfer is `complete` this lists every received file.
+    /// once the transfer is `complete` this lists every received file. Bundle members
+    /// appear here once the bundle completes; [`delivered`](Self::delivered) lists them
+    /// as they are placed.
     pub fn saved_paths(&self) -> Vec<PathBuf> {
         lock(&self.shared.saved)
             .iter()
@@ -2809,13 +3234,32 @@ impl TransferReceiver {
             .collect()
     }
 
+    /// Every file placed so far, in manifest order: what the streams recorded, plus the
+    /// bundle members the delivery worker placed before the bundle completed.
+    fn placed_so_far(&self) -> Vec<SavedFile> {
+        let s = &self.shared;
+        let saved = lock(&s.saved);
+        let placed = lock(&s.delivery.placed);
+        saved
+            .iter()
+            .enumerate()
+            .filter_map(|(fid, f)| {
+                f.clone().or_else(|| {
+                    u32::try_from(fid)
+                        .ok()
+                        .and_then(|fid| placed.get(&fid).cloned())
+                })
+            })
+            .collect()
+    }
+
     /// Where each file placed so far went, in manifest order (`docs/core-api.md` section
-    /// 2): the final path in `Directory` mode, the sink's string in `Staged` mode.
+    /// 2): the final path in `Directory` mode, the sink's string in `Staged` mode. Bundle
+    /// members are listed as soon as they are placed, while the bundle still streams.
     pub fn delivered(&self) -> Vec<DeliveredFile> {
         let s = &self.shared;
-        lock(&s.saved)
+        self.placed_so_far()
             .iter()
-            .flatten()
             .map(|f| DeliveredFile {
                 path: s
                     .manifest
@@ -2829,6 +3273,21 @@ impl TransferReceiver {
                     .unwrap_or_else(|| s.root.join(&f.path).display().to_string()),
             })
             .collect()
+    }
+
+    /// Time this transfer's bundle spent per member so far, by thread. For the loopback
+    /// benchmark in `tests/phase9_receiver.rs`; not a stable API.
+    #[doc(hidden)]
+    pub fn member_timings(&self) -> MemberTimings {
+        let t = &self.shared.delivery.timings;
+        let d = |c: &AtomicU64| Duration::from_nanos(c.load(Ordering::Relaxed));
+        MemberTimings {
+            stream_members: t.stream_members.load(Ordering::Relaxed),
+            stream: d(&t.stream_ns),
+            checkpoint: d(&t.checkpoint_ns),
+            delivered: t.delivered.load(Ordering::Relaxed),
+            delivery: d(&t.deliver_ns),
+        }
     }
 
     /// True in `Staged` mode (files go to a sink).
@@ -2860,7 +3319,7 @@ impl TransferReceiver {
             n += usize::from(done);
         }
         if !bundle_verified {
-            n += s.delivery.done_count.load(Ordering::Acquire);
+            n += lock(&s.delivery.placed).len();
         }
         n
     }
@@ -4524,6 +4983,16 @@ pub(crate) mod tests {
         inner.crash = Some(crash);
     }
 
+    /// Makes the bundle's next delivery workers place with placeholders.
+    fn set_placeholders(rx: &TransferReceiver) {
+        let slot = rx.shared.bundle.as_ref().expect("manifest has a bundle");
+        let mut io = slot.io.try_lock().expect("no upload running");
+        let SlotIo::Bundle(inner) = &mut *io else {
+            panic!("bundle slot holds the bundle");
+        };
+        inner.placeholders = true;
+    }
+
     /// Receives the whole bundle of `m` under `root`, "kills" the process at `crash` while
     /// the verified members are handed over, then reopens the transfer from disk the way a
     /// restarted host does. Nothing is sent again after the reopen.
@@ -4533,6 +5002,20 @@ pub(crate) mod tests {
         contents: &[Vec<u8>],
         sink: Option<SinkBinding>,
         crash: Crash,
+    ) -> TransferReceiver {
+        receive_kill_reload_with(root, m, contents, sink, crash, false, None).await
+    }
+
+    /// [`receive_kill_reload`], optionally placing with placeholders before the kill (as
+    /// where no rename that never replaces exists). The reload places normally.
+    async fn receive_kill_reload_with(
+        root: &Path,
+        m: &Manifest,
+        contents: &[Vec<u8>],
+        sink: Option<SinkBinding>,
+        crash: Crash,
+        placeholders: bool,
+        squat: Option<u32>,
     ) -> TransferReceiver {
         let opts = AcceptOptions {
             sink: sink.clone(),
@@ -4545,6 +5028,17 @@ pub(crate) mod tests {
         let bundle = bundle_of(m, contents).await;
         let bsize = bundle.len() as u64;
         set_crash(&rx, crash);
+        if placeholders {
+            set_placeholders(&rx);
+        }
+        {
+            let slot = rx.shared.bundle.as_ref().expect("manifest has a bundle");
+            let mut io = slot.io.try_lock().expect("no upload running");
+            let SlotIo::Bundle(inner) = &mut *io else {
+                panic!("bundle slot holds the bundle");
+            };
+            inner.squat = squat;
+        }
         let mut up = rx.begin_bundle(&btok, 0, bsize - 1).await.unwrap();
         up.receive(&body(&bundle, 0, bsize).await[..])
             .await
@@ -4867,9 +5361,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// `Directory` mode: a member placed early, whose staging file came back because the
-    /// stream restarted at 0 just before a kill, is not placed a second time on reopen:
-    /// the copy is dropped and the first place stands.
+    /// Rewrites the delivery log's header as version 2, the placeholder layout of 0.3.0.
+    fn as_version_2_log(staging: &Path) {
+        let path = DeliveryLog::path(staging);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (header, lines) = text.split_once('\n').unwrap();
+        assert_eq!(header, format!("{{\"v\":{LOG_VERSION}}}"));
+        std::fs::write(&path, format!("{{\"v\":2}}\n{lines}")).unwrap();
+    }
+
+    /// `Directory` mode, a 0.3.0 staging folder (version 2 log): a member placed early,
+    /// whose staging file came back because that build's stream restarted at 0 just
+    /// before a kill, is not placed a second time on reopen: the copy is dropped and the
+    /// first place stands. (This build never stages a placed member again, see
+    /// `a_restart_at_zero_does_not_stage_placed_members_again`.)
     #[tokio::test]
     async fn recovery_drops_a_restreamed_copy_of_a_placed_member() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4896,7 +5401,8 @@ pub(crate) mod tests {
         }
         let staging = rx.staging_dir().to_path_buf();
         drop(rx);
-        // As if a restart at 0 had rewritten member 0 before the kill.
+        // As if a 0.3.0 restart at 0 had rewritten member 0 before the kill.
+        as_version_2_log(&staging);
         std::fs::write(staging.join(member_name(0)), &contents[0]).unwrap();
 
         let rx = TransferReceiver::load(&root, &m.id, FakeSpace::plenty(), every_chunk())
@@ -4923,6 +5429,259 @@ pub(crate) mod tests {
         want.sort();
         assert_eq!(names, want, "no duplicate");
         assert_eq!(std::fs::read(t.join("f0.dat")).unwrap(), contents[0]);
+    }
+
+    /// Lists the names in `dir`, sorted.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A staging folder left by 0.3.0 (version 2 delivery log, placeholders) is finished
+    /// correctly after an upgrade: a member logged with its empty placeholder still there
+    /// is renamed onto it, one whose placeholder already holds the data keeps that first
+    /// place, one whose placeholder is gone is placed afresh at its name, and one already
+    /// placed stays. The log is then rewritten in this build's version.
+    #[tokio::test]
+    async fn a_phase8_staging_folder_is_finished_after_an_upgrade() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Downloads");
+        let (m, contents) = spread_members();
+        let opts = AcceptOptions {
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let btok = rx.state().bundle.unwrap().token.unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let bsize = bundle.len() as u64;
+        let part = 3 * u64::from(CS);
+        let mut up = rx.begin_bundle(&btok, 0, part - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, part).await[..]).await.unwrap();
+        up.finish(None).await.unwrap();
+        let t0 = Instant::now();
+        while rx.files_done() < 4 {
+            assert!(t0.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let staging = rx.staging_dir().to_path_buf();
+        drop(rx);
+        let t = root.join("T");
+        // What 0.3.0 left after a kill, member by member (each has its log line):
+        // 0 placed; 1 logged, placeholder empty, not renamed; 2 placeholder holds the
+        // data and the staging file came back (a restart at 0); 3 logged, placeholder
+        // lost by a power cut, not renamed.
+        as_version_2_log(&staging);
+        std::fs::rename(t.join("f1.dat"), staging.join(member_name(1))).unwrap();
+        std::fs::write(t.join("f1.dat"), b"").unwrap();
+        std::fs::write(staging.join(member_name(2)), &contents[2]).unwrap();
+        std::fs::rename(t.join("f3.dat"), staging.join(member_name(3))).unwrap();
+
+        let rx = TransferReceiver::load(&root, &m.id, FakeSpace::plenty(), every_chunk())
+            .await
+            .unwrap();
+        for fid in 1..=3 {
+            assert!(
+                !staging.join(member_name(fid)).exists(),
+                "member {fid} left staging"
+            );
+        }
+        // The zero-length file outside the bundle comes at completion.
+        let want: Vec<String> = ["f0.dat", "f1.dat", "f2.dat", "f3.dat"]
+            .map(String::from)
+            .to_vec();
+        assert_eq!(names_in(&t), want, "each member once, at its own name");
+        for (fid, c) in contents.iter().enumerate().take(4) {
+            assert_eq!(&std::fs::read(t.join(format!("f{fid}.dat"))).unwrap(), c);
+        }
+        let log = std::fs::read_to_string(DeliveryLog::path(&staging)).unwrap();
+        assert!(
+            log.starts_with(&format!("{{\"v\":{LOG_VERSION}}}\n")),
+            "rewritten in this build's version: {log}"
+        );
+        assert_eq!(rx.files_done(), 4);
+
+        let mut up = rx.begin_bundle(&btok, part, bsize - 1).await.unwrap();
+        up.receive(&body(&bundle, part, bsize).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        let mut want: Vec<String> = (0..contents.len()).map(|i| format!("f{i}.dat")).collect();
+        want.push("empty".to_owned());
+        want.sort();
+        assert_eq!(names_in(&t), want, "no duplicate");
+        for (i, c) in contents.iter().enumerate() {
+            assert_eq!(&std::fs::read(t.join(format!("f{i}.dat"))).unwrap(), c);
+        }
+    }
+
+    /// After a restart at 0, the bytes of members already placed come again and are
+    /// dropped without a staging file: a staging file of a logged member then always means
+    /// its rename has not happened (version 3 delivery log).
+    #[tokio::test]
+    async fn a_restart_at_zero_does_not_stage_placed_members_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Downloads");
+        let (m, contents) = spread_members();
+        let opts = AcceptOptions {
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let btok = rx.state().bundle.unwrap().token.unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let bsize = bundle.len() as u64;
+        // Three chunks start members 0 to 4 and complete 0 to 3.
+        let part = 3 * u64::from(CS);
+        let mut up = rx.begin_bundle(&btok, 0, part - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, part).await[..]).await.unwrap();
+        up.finish(None).await.unwrap();
+        let t0 = Instant::now();
+        while rx.files_done() < 4 {
+            assert!(t0.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let first = rx.member_timings().stream_members;
+        assert_eq!(first, 5);
+        // Placed members are listed while the bundle still streams.
+        let listed: Vec<String> = rx.delivered().into_iter().map(|d| d.path).collect();
+        assert_eq!(listed, ["T/f0.dat", "T/f1.dat", "T/f2.dat", "T/f3.dat"]);
+
+        let mut up = rx.begin_bundle(&btok, 0, bsize - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, bsize).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        assert_eq!(
+            rx.member_timings().stream_members - first,
+            contents.len() as u64 - 4,
+            "only members not yet placed were staged again"
+        );
+        let mut want: Vec<String> = (0..contents.len()).map(|i| format!("f{i}.dat")).collect();
+        want.push("empty".to_owned());
+        want.sort();
+        assert_eq!(names_in(&root.join("T")), want, "each member once");
+    }
+
+    /// The skip set survives a kill: after a load, a restart at 0 still drops the bytes of
+    /// members placed before the kill without staging them, and places nothing twice.
+    #[tokio::test]
+    async fn placed_members_are_not_staged_again_after_a_load_and_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Downloads");
+        let (m, contents) = spread_members();
+        let opts = AcceptOptions {
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let btok = rx.state().bundle.unwrap().token.unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let bsize = bundle.len() as u64;
+        let part = 3 * u64::from(CS);
+        let mut up = rx.begin_bundle(&btok, 0, part - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, part).await[..]).await.unwrap();
+        up.finish(None).await.unwrap();
+        let t0 = Instant::now();
+        while rx.files_done() < 4 {
+            assert!(t0.elapsed() < Duration::from_secs(10));
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        drop(rx);
+
+        let rx = TransferReceiver::load(&root, &m.id, FakeSpace::plenty(), every_chunk())
+            .await
+            .unwrap();
+        assert_eq!(rx.files_done(), 4);
+        let mut up = rx.begin_bundle(&btok, 0, bsize - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, bsize).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        assert_eq!(
+            rx.member_timings().stream_members,
+            contents.len() as u64 - 4,
+            "members placed before the kill were not staged again"
+        );
+        let mut want: Vec<String> = (0..contents.len()).map(|i| format!("f{i}.dat")).collect();
+        want.push("empty".to_owned());
+        want.sort();
+        assert_eq!(names_in(&root.join("T")), want, "each member once");
+        for (i, c) in contents.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(root.join("T").join(format!("f{i}.dat"))).unwrap(),
+                c
+            );
+        }
+    }
+
+    /// Another process takes member 0's own name right after its log line (so the rename
+    /// that never replaces fails and the member goes on to " (1)"), and the process is
+    /// killed at the " (1)" line, before that rename. The reload leaves one copy at the
+    /// " (1)" name and the other file untouched.
+    #[tokio::test]
+    async fn a_kill_during_a_collision_retry_leaves_one_copy() {
+        let (_, sample) = bundle_members();
+        let n = sample.len();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Downloads");
+        let (m, contents) = bundle_members();
+        let rx =
+            receive_kill_reload_with(&root, &m, &contents, None, Crash::Inside(0), false, Some(0))
+                .await;
+        let t = root.join("T");
+        assert_eq!(std::fs::read(t.join("f0.dat")).unwrap(), b"theirs");
+        assert_eq!(std::fs::read(t.join("f0 (1).dat")).unwrap(), contents[0]);
+        let mut want: Vec<String> = (0..n).map(|i| format!("f{i}.dat")).collect();
+        want.push("f0 (1).dat".to_owned());
+        want.push("empty".to_owned());
+        want.sort();
+        assert_eq!(names_in(&t), want, "one copy, at the retried name");
+        assert_eq!(rx.saved_paths()[0], t.join("f0 (1).dat"));
+    }
+
+    /// Where the rename that never replaces is missing, names are reserved with
+    /// placeholders under `reserved` log lines. A kill between a reservation and its rename
+    /// is finished on reload by renaming onto that placeholder: one copy at the member's
+    /// name, no empty file left, no " (1)".
+    #[tokio::test]
+    async fn a_kill_between_reserve_and_rename_leaves_no_empty_file() {
+        let (_, sample) = bundle_members();
+        let n = sample.len();
+        for k in [0, 1, n - 1] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("Downloads");
+            let (m, contents) = bundle_members();
+            let rx =
+                receive_kill_reload_with(&root, &m, &contents, None, Crash::Inside(k), true, None)
+                    .await;
+            let t = root.join("T");
+            let mut want: Vec<String> = (0..n).map(|i| format!("f{i}.dat")).collect();
+            want.push("empty".to_owned());
+            want.sort();
+            assert_eq!(names_in(&t), want, "kill at {k}: each member once");
+            for (i, c) in contents.iter().enumerate() {
+                assert_eq!(
+                    &std::fs::read(t.join(format!("f{i}.dat"))).unwrap(),
+                    c,
+                    "{k}"
+                );
+            }
+            assert_eq!(rx.delivered().len(), n);
+        }
     }
 
     /// A sink that takes 20 ms per file and counts deliveries per path.
@@ -5065,6 +5824,7 @@ pub(crate) mod tests {
         root: &Path,
         sink: Option<SinkBinding>,
         crash: Crash,
+        placeholders: bool,
     ) -> (TransferReceiver, Vec<u8>) {
         let (m, contents) = manifest(&[(2 * CS as usize + 7, false)]);
         let opts = AcceptOptions {
@@ -5079,7 +5839,9 @@ pub(crate) mod tests {
             let SlotIo::File(part) = &mut *io else {
                 panic!("streamed file");
             };
-            part.inner.as_mut().unwrap().crash = Some(crash);
+            let inner = part.inner.as_mut().unwrap();
+            inner.crash = Some(crash);
+            inner.placeholders = placeholders;
         }
         let tok = rx.state().files[0].token.clone().unwrap();
         let size = contents[0].len() as u64;
@@ -5113,25 +5875,34 @@ pub(crate) mod tests {
         (rx, contents.into_iter().next().unwrap())
     }
 
-    /// `Directory` mode: a kill before the name is reserved, between the reservation and
-    /// the rename, or after the rename finishes the placement on reopen, once, at the
-    /// reserved name: no re-download and no "name (2)".
+    /// `Directory` mode: a kill before the name is recorded, between the record and the
+    /// rename, or after the rename finishes the placement on reopen, once, at the
+    /// recorded name: no re-download and no "name (2)". Both with the rename that never
+    /// replaces and with placeholders (where that rename is missing, the kill between
+    /// record and rename comes after the placeholder exists).
     #[tokio::test]
     async fn file_placement_survives_a_kill_in_directory_mode() {
-        for crash in [Crash::Before(0), Crash::Inside(0), Crash::After(0)] {
+        for (crash, placeholders) in [Crash::Before(0), Crash::Inside(0), Crash::After(0)]
+            .into_iter()
+            .flat_map(|c| [(c, false), (c, true)])
+        {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().join("Downloads");
             // A file already at the destination name: the incoming one gets " (1)".
             std::fs::create_dir_all(root.join("T")).unwrap();
             std::fs::write(root.join("T").join("f0.dat"), b"keep me").unwrap();
-            let (rx, data) = file_kill_reload(&root, None, crash).await;
+            let (rx, data) = file_kill_reload(&root, None, crash, placeholders).await;
             let t = root.join("T");
             let mut names: Vec<String> = std::fs::read_dir(&t)
                 .unwrap()
                 .map(|e| e.unwrap().file_name().into_string().unwrap())
                 .collect();
             names.sort();
-            assert_eq!(names, ["empty", "f0 (1).dat", "f0.dat"], "{crash:?}");
+            assert_eq!(
+                names,
+                ["empty", "f0 (1).dat", "f0.dat"],
+                "{crash:?} {placeholders}"
+            );
             assert_eq!(std::fs::read(t.join("f0 (1).dat")).unwrap(), data);
             assert_eq!(std::fs::read(t.join("f0.dat")).unwrap(), b"keep me");
             assert_eq!(rx.saved_paths(), [t.join("f0 (1).dat")], "{crash:?}");
@@ -5150,12 +5921,66 @@ pub(crate) mod tests {
                 sink: sink.clone(),
                 peer: "ef".repeat(32),
             };
-            let (rx, data) = file_kill_reload(tmp.path(), Some(binding), crash).await;
+            let (rx, data) = file_kill_reload(tmp.path(), Some(binding), crash, false).await;
             let got = lock(&sink.got);
             assert_eq!(got.len(), times, "{crash:?}");
             assert!(got.iter().all(|(_, b)| *b == data));
             assert_eq!(rx.delivered().len(), 1);
             assert_eq!(rx.delivered()[0].location, "content://test/T/f0.dat");
         }
+    }
+
+    /// A single file left by 0.3.0 mid-placement: its ledger record names an empty
+    /// placeholder reserved before the record (no `namedBeforeRename`), and its `.part` is
+    /// still there. The reload renames onto that placeholder: one copy, at that name.
+    #[tokio::test]
+    async fn a_phase8_single_file_record_is_placed_onto_its_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Downloads");
+        let (m, contents) = manifest(&[(2 * CS as usize + 7, false)]);
+        let rx = TransferReceiver::accept(
+            &root,
+            m.clone(),
+            FakeSpace::plenty(),
+            AcceptOptions::default(),
+        )
+        .await
+        .unwrap();
+        {
+            let mut io = rx.shared.files[0].io.try_lock().unwrap();
+            let SlotIo::File(part) = &mut *io else {
+                panic!("streamed file");
+            };
+            // Stops after the root is durable, before any name is recorded.
+            part.inner.as_mut().unwrap().crash = Some(Crash::Before(0));
+        }
+        let tok = rx.state().files[0].token.clone().unwrap();
+        let size = contents[0].len() as u64;
+        let mut up = rx.begin_file(0, &tok, 0, size - 1).await.unwrap();
+        up.receive(&body(&contents[0], 0, size).await[..])
+            .await
+            .unwrap();
+        assert!(up.finish(Some(root_of(&contents[0]))).await.is_err());
+        let staging = rx.staging_dir().to_path_buf();
+        drop(rx);
+
+        // What 0.3.0 left: the placeholder created, the record naming it, no rename.
+        let t = root.join("T");
+        std::fs::write(t.join("f0.dat"), b"").unwrap();
+        let ledger = staging.join("0.json");
+        let mut rec: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ledger).unwrap()).unwrap();
+        assert!(rec.get("namedBeforeRename").is_none());
+        rec["saved"] = serde_json::json!([{ "fid": 0, "path": "T/f0.dat" }]);
+        std::fs::write(&ledger, serde_json::to_vec(&rec).unwrap()).unwrap();
+        assert!(staging.join("0.part").exists());
+
+        let rx = TransferReceiver::load(&root, &m.id, FakeSpace::plenty(), SyncPolicy::default())
+            .await
+            .unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        assert_eq!(names_in(&t), ["empty", "f0.dat"], "one copy, no \" (1)\"");
+        assert_eq!(std::fs::read(t.join("f0.dat")).unwrap(), contents[0]);
+        assert_eq!(rx.saved_paths(), [t.join("f0.dat")]);
     }
 }

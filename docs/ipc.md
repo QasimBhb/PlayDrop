@@ -118,6 +118,15 @@ A send stays `offered` and sends no `transfer_progress` until bytes stream, so p
 with `bytes: 0` means the receiver has not decided yet only on an older daemon. A client
 that must work with both treats `bytes == 0` as still waiting and does not rely on it.
 
+### 1.5 Resumable sends added in 0.4.0
+
+`IPC_VERSION` stays 1 (additions only).
+
+| Field or request | Meaning |
+|---|---|
+| `resumable` on a transfer snapshot | True on a `failed` send whose record the daemon keeps, so it resumes when the other device is back or when the same files are sent to it again. False once the send is cancelled, resumed or complete. Missing from an older daemon reads as false |
+| `cancel_transfer` on a resumable failed id | Forgets the record and tells the receiver, so the send no longer resumes. The snapshot then reads `cancelled` with `resumable: false`. An id the daemon does not know is `not_found` |
+
 Requests are independent and may be issued concurrently. Events are broadcast to every
 connected client from the moment it connects; there is no replay. A UI that starts late
 rebuilds its view from `Status`, `Peers` and `Transfers` and then applies events.

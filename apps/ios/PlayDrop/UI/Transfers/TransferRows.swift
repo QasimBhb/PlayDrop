@@ -33,6 +33,8 @@ struct TransferRow: Identifiable, Equatable, Sendable {
     let note: String?
     /// Cancel is offered.
     let canCancel: Bool
+    /// Forget is offered: a failed send the core keeps for resume. It calls the same cancel.
+    let canForget: Bool
     /// Paths of the delivered files on this iPhone (receive side, once complete).
     let deliveredPaths: [String]
 
@@ -90,6 +92,7 @@ enum TransferRows {
             fileCount: s.fileCount,
             note: s.note,
             canCancel: !finished && !(receive && s.state == .offered),
+            canForget: !receive && s.state == .failed && s.resumable,
             deliveredPaths: receive && s.state == .complete ? s.delivered.map(\.location) : []
         )
     }

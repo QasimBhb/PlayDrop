@@ -20,7 +20,8 @@ const T: Duration = Duration::from_secs(30);
 /// first open is the offer's metadata read and the second the resume check before
 /// streaming; the third is the bundle reading the member, so the bundle stalls while the
 /// streamed files finish. The count is tied to `transfer/sender.rs` (`check_source` in
-/// `plan_resume`, then `FsOpener::open` for the member): an extra open there, or a
+/// `plan_resume`, then `FsOpener::open` for the member, which opens it once through
+/// `bundle::open_source_member` on a blocking thread): an extra open there, or a
 /// reconnect round, parks the sender at the gate and this test times out.
 #[derive(Debug)]
 struct GatedOpener {

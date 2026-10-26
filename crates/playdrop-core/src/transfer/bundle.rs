@@ -17,6 +17,7 @@ use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncReadExt, ReadBuf, Take};
 
 use super::manifest::{Manifest, MAX_BUNDLE_MEMBER};
+use super::source::SourceRef;
 use crate::{Error, Result};
 
 /// Size of one tar block.
@@ -447,6 +448,57 @@ pub trait MemberOpener: Send + Sync {
     fn open(&self, fid: u32, offset: u64) -> OpenFuture;
 }
 
+/// Largest rest of a member that [`open_source_member`] reads whole in one blocking call.
+/// Bundle members are at most a few hundred KiB in practice (the manifest's bundle
+/// threshold), so this covers nearly all of them while bounding the memory held per
+/// member to one small buffer.
+pub const READ_WHOLE_MAX: u64 = 256 * 1024;
+
+/// Opens bundle member bytes from `source` at `offset`, for a member of `size` bytes (its
+/// manifest size): the sender's [`MemberOpener`] over recorded sources.
+///
+/// When at most [`READ_WHOLE_MAX`] bytes are left, the source is opened, read and closed
+/// in one call on the blocking pool and the bytes are served from memory. Through
+/// `tokio::fs` the same member costs a pool hop for the open, the seek, each read and the
+/// close, which for thousands of 4 to 64 KiB members is most of the sender's per-member
+/// time. Larger rests are opened at `offset` through [`SourceRef::open_at`] and streamed.
+///
+/// At most the rest up to `size` is read. A source that grew is cut at the manifest size,
+/// as [`BundleWriter`] does; one that shrank yields fewer bytes and the writer fails with
+/// `UnexpectedEof` (resume re-checks sources, SR-21).
+///
+/// [`SourceRef::open_at`]: super::source::SourceRef::open_at
+pub fn open_source_member(source: SourceRef, size: u64, offset: u64) -> OpenFuture {
+    let left = size.saturating_sub(offset);
+    Box::pin(async move {
+        if left > READ_WHOLE_MAX {
+            let f = source.open_at(offset).await?;
+            return Ok(Box::new(f) as MemberReader);
+        }
+        let bytes = tokio::task::spawn_blocking(move || read_rest(&source, offset, left))
+            .await
+            .map_err(io::Error::other)??;
+        Ok(Box::new(io::Cursor::new(bytes)) as MemberReader)
+    })
+}
+
+/// Opens `source`, seeks to `offset` and reads at most `left` bytes. Blocking; an opener
+/// may call foreign code, which is why this runs on the blocking pool.
+fn read_rest(source: &SourceRef, offset: u64, left: u64) -> io::Result<Vec<u8>> {
+    use std::io::{Read as _, Seek as _};
+    let mut f = match source {
+        SourceRef::Path(p) => std::fs::File::open(p)?,
+        SourceRef::Opener(o) => o.open()?,
+    };
+    if offset > 0 {
+        f.seek(io::SeekFrom::Start(offset))?;
+    }
+    // `left` is at most READ_WHOLE_MAX, so it fits in usize.
+    let mut buf = Vec::with_capacity(usize::try_from(left).unwrap_or(0));
+    f.take(left).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
 enum Phase {
     Header {
         idx: usize,
@@ -479,6 +531,10 @@ pub struct BundleWriter {
     opener: Arc<dyn MemberOpener>,
     phase: Phase,
     header: [u8; 512],
+    /// An error met after this read already put bytes in the buffer: those bytes are
+    /// returned first and the error at the next read (`AsyncRead` returns no bytes along
+    /// with an error).
+    pending: Option<io::Error>,
 }
 
 impl std::fmt::Debug for BundleWriter {
@@ -504,6 +560,7 @@ impl BundleWriter {
             opener,
             phase: Phase::Done,
             header: [0; 512],
+            pending: None,
         };
         w.phase = w.phase_at(start);
         Ok(w)
@@ -574,7 +631,19 @@ impl AsyncRead for BundleWriter {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        if let Some(e) = this.pending.take() {
+            return Poll::Ready(Err(e));
+        }
         let start_len = buf.filled().len();
+        // Bytes already written by this call go out first; the error waits a call.
+        let fail = |this: &mut Self, buf: &ReadBuf<'_>, e: io::Error| {
+            if buf.filled().len() > start_len {
+                this.pending = Some(e);
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Ready(Err(e))
+            }
+        };
         loop {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
@@ -604,7 +673,7 @@ impl AsyncRead for BundleWriter {
                             Poll::Pending
                         };
                     }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Err(e)) => return fail(this, buf, e),
                     Poll::Ready(Ok(reader)) => {
                         let m = this.layout.members[*idx];
                         let left = m.size - *within;
@@ -624,7 +693,7 @@ impl AsyncRead for BundleWriter {
                                 Poll::Pending
                             };
                         }
-                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Ready(Err(e)) => return fail(this, buf, e),
                         Poll::Ready(Ok(())) => {}
                     }
                     let n = buf.filled().len() - before;
@@ -632,10 +701,11 @@ impl AsyncRead for BundleWriter {
                         let idx = *idx;
                         this.phase = this.after_data(idx);
                     } else if n == 0 {
-                        return Poll::Ready(Err(io::Error::new(
+                        let e = io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "bundle member shorter than the manifest size",
-                        )));
+                        );
+                        return fail(this, buf, e);
                     }
                 }
                 Phase::Pad {
@@ -681,6 +751,115 @@ mod tests {
         fn open(&self, fid: u32, offset: u64) -> OpenFuture {
             let data = self.0[fid as usize][usize::try_from(offset).unwrap()..].to_vec();
             Box::pin(async move { Ok(Box::new(std::io::Cursor::new(data)) as MemberReader) })
+        }
+    }
+
+    /// Reopens a file by path, as a host's opener would hand over a `content://` item.
+    #[derive(Debug)]
+    struct PathOpener(std::path::PathBuf);
+
+    impl crate::transfer::source::SourceOpener for PathOpener {
+        fn open(&self) -> io::Result<std::fs::File> {
+            std::fs::File::open(&self.0)
+        }
+    }
+
+    fn sources_for(path: &std::path::Path) -> [SourceRef; 2] {
+        [
+            SourceRef::Path(path.to_path_buf()),
+            SourceRef::Opener(Arc::new(PathOpener(path.to_path_buf()))),
+        ]
+    }
+
+    async fn read_member(source: SourceRef, size: u64, offset: u64) -> io::Result<Vec<u8>> {
+        let mut r = open_source_member(source, size, offset).await?;
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).await?;
+        Ok(out)
+    }
+
+    /// From an offset, on both sides of `READ_WHOLE_MAX`, for path and opener sources: the
+    /// rest of the member, and never more than the manifest size.
+    #[tokio::test]
+    async fn open_source_member_reads_the_rest_from_any_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rng = TestRng(9);
+        let big = usize::try_from(READ_WHOLE_MAX).unwrap() + 4096;
+        for len in [10_000usize, big] {
+            let data = rng.bytes(len);
+            let path = dir.path().join(format!("m{len}"));
+            std::fs::write(&path, &data).unwrap();
+            let size = len as u64;
+            // Rests above and below the limit (only below for the small member).
+            for offset in [0, 3_000, size - 100] {
+                for source in sources_for(&path) {
+                    let got = read_member(source, size, offset).await.unwrap();
+                    assert_eq!(
+                        got,
+                        data[usize::try_from(offset).unwrap()..],
+                        "{len} {offset}"
+                    );
+                }
+            }
+            // A grown source is cut at the manifest size by the small path; the writer
+            // cuts the streamed path (checked through `BundleWriter` below).
+            let mut grown = data.clone();
+            grown.extend_from_slice(b"appended later");
+            std::fs::write(&path, &grown).unwrap();
+            let got = read_member(SourceRef::Path(path.clone()), size, size - 100)
+                .await
+                .unwrap();
+            assert_eq!(got, data[len - 100..]);
+        }
+    }
+
+    /// Through `BundleWriter` with `open_source_member`: a source that grew since the offer
+    /// is cut at the manifest size, and one that shrank fails with `UnexpectedEof`.
+    #[tokio::test]
+    async fn bundle_from_sources_cuts_grown_and_refuses_shrunk_members() {
+        struct Sources(Vec<(SourceRef, u64)>);
+        impl MemberOpener for Sources {
+            fn open(&self, fid: u32, offset: u64) -> OpenFuture {
+                let (source, size) = self.0[fid as usize].clone();
+                open_source_member(source, size, offset)
+            }
+        }
+        let big = usize::try_from(READ_WHOLE_MAX).unwrap() + 4096;
+        let (m, contents) = sample(&[1000, 10, big, 700]);
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..contents.len())
+            .map(|i| dir.path().join(format!("f{i}")))
+            .collect();
+        for (p, c) in paths.iter().zip(&contents) {
+            let mut grown = c.clone();
+            grown.extend_from_slice(b"grew");
+            std::fs::write(p, &grown).unwrap();
+        }
+        let layout = Arc::new(BundleLayout::new(&m).unwrap());
+        let sources = |which: usize| {
+            Arc::new(Sources(
+                paths
+                    .iter()
+                    .zip(&contents)
+                    .enumerate()
+                    .map(|(i, (p, c))| (sources_for(p)[(i + which) % 2].clone(), c.len() as u64))
+                    .collect(),
+            ))
+        };
+        let want = write_from(&m, &contents, 0).await;
+        for which in [0, 1] {
+            let mut w = BundleWriter::new(layout.clone(), sources(which), 0).unwrap();
+            let mut got = Vec::new();
+            w.read_to_end(&mut got).await.unwrap();
+            assert!(got == want, "grown sources are cut at the manifest size");
+        }
+        for shrunk in [0usize, 2] {
+            std::fs::write(&paths[shrunk], &contents[shrunk][..500]).unwrap();
+            let mut w = BundleWriter::new(layout.clone(), sources(0), 0).unwrap();
+            let mut got = Vec::new();
+            let e = w.read_to_end(&mut got).await.unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::UnexpectedEof, "member {shrunk}");
+            std::fs::write(&paths[shrunk], &contents[shrunk]).unwrap();
         }
     }
 

@@ -164,6 +164,8 @@ impl Controller {
                     other => c.report("Could not read the daemon status", other),
                 });
             });
+        }
+        if what != Refetch::Peers {
             self.ipc.request(Request::Transfers, |r| {
                 with(|c| match r {
                     Result::Ok(Ok::Transfers(t)) => {
@@ -173,6 +175,9 @@ impl Controller {
                     other => c.report("Could not list transfers", other),
                 });
             });
+        }
+        if what == Refetch::Transfers {
+            return;
         }
         self.ipc.request(Request::Peers, |r| {
             with(|c| match r {

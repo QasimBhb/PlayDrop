@@ -34,6 +34,8 @@ mod receive;
 mod registry;
 mod router;
 mod send;
+mod send_resume;
+mod send_store;
 mod session;
 mod status;
 mod transfers;
@@ -164,6 +166,11 @@ pub struct HostConfig {
     /// daemon with `SendInput` or the `RemoteDesktop` portal). Off by default; phones never
     /// accept input. Any host may send input (`caps.out`) regardless.
     pub accepts_input: bool,
+    /// How long a send (and an outbox pull) keeps trying to reach the other device after
+    /// a drop before it is reported failed (protocol.md 7.6). Default 10 minutes. A send
+    /// that gives up keeps its record and resumes when the device is back
+    /// (`docs/core-api.md` section 12); tests shorten the window.
+    pub reconnect_for: Duration,
 }
 
 impl HostConfig {
@@ -188,6 +195,7 @@ impl HostConfig {
             free_space: Arc::new(platform::VolumeSpace),
             secret_store: None,
             accepts_input: false,
+            reconnect_for: send::RECONNECT_FOR,
         }
     }
 
@@ -320,7 +328,12 @@ pub(crate) struct Inner {
     pub(crate) qr_offer: Mutex<Option<QrOffer>>,
     pub(crate) pairing: Mutex<Option<pairing::ActivePairing>>,
     pub(crate) incoming: Mutex<HashMap<String, receive::Incoming>>,
-    pub(crate) outgoing: Mutex<HashMap<String, send::Outgoing>>,
+    /// Incoming transfers that ended, answered for 24 h (protocol.md 7.6).
+    pub(crate) ended: Mutex<HashMap<String, receive::EndedEntry>>,
+    /// Writes and deletes of incoming records, in order (protocol.md 7.6).
+    pub(crate) owner_io: receive::OwnerIo,
+    /// Running sends and the index of recorded ones (protocol.md 7.6).
+    pub(crate) sends: Mutex<send_resume::Sends>,
     pub(crate) transfers: Mutex<transfers::TransferBook>,
     pub(crate) discovery: Mutex<Option<Discovery>>,
     pub(crate) dial_limiter: Mutex<DialLimiter>,
@@ -346,6 +359,8 @@ pub(crate) struct Inner {
     pub(crate) outbox: Mutex<HashMap<String, Arc<outbox::Held>>>,
     /// Outbox items being pulled from peers right now.
     pub(crate) pulling: Mutex<HashSet<String>>,
+    /// [`HostConfig::reconnect_for`].
+    pub(crate) reconnect_for: Duration,
     /// "Add device" adverts already reported in this window, by address (name, type).
     pub(crate) add_device_seen: Mutex<HashMap<SocketAddr, (String, String)>>,
     pub(crate) interfaces: Arc<dyn InterfaceSource>,
@@ -370,6 +385,9 @@ pub(crate) enum TransferEnd {
     },
     /// Failed, with the reason shown to the user (SR-22 wording).
     Failed(String),
+    /// A send that failed but keeps its record and resumes later (protocol.md 7.6); the
+    /// reason says how. Listed with `resumable` set.
+    FailedResumable(String),
     /// Cancelled or declined by either side, with the reason.
     Cancelled(String),
 }
@@ -544,7 +562,7 @@ impl Inner {
                 folder.clone(),
                 delivered.clone(),
             ),
-            TransferEnd::Failed(r) => (
+            TransferEnd::Failed(r) | TransferEnd::FailedResumable(r) => (
                 TransferStatus::Failed,
                 Some(r.clone()),
                 Vec::new(),
@@ -559,8 +577,13 @@ impl Inner {
                 Vec::new(),
             ),
         };
-        lock(&self.transfers)
-            .finish_with_files(id, direction, status, note, saved, folder, delivered);
+        {
+            let mut book = lock(&self.transfers);
+            book.finish_with_files(id, direction, status, note, saved, folder, delivered);
+            if matches!(end, TransferEnd::FailedResumable(_)) {
+                book.set_resumable(id, direction, true);
+            }
+        }
         let ev = match end {
             TransferEnd::Complete {
                 bytes,
@@ -582,14 +605,14 @@ impl Inner {
                 folder,
                 delivered,
             },
-            TransferEnd::Failed(reason) | TransferEnd::Cancelled(reason) => {
-                HostEvent::TransferFailed {
-                    id: id.to_owned(),
-                    peer: peer.to_hex(),
-                    direction,
-                    reason,
-                }
-            }
+            TransferEnd::Failed(reason)
+            | TransferEnd::FailedResumable(reason)
+            | TransferEnd::Cancelled(reason) => HostEvent::TransferFailed {
+                id: id.to_owned(),
+                peer: peer.to_hex(),
+                direction,
+                reason,
+            },
         };
         self.emit(ev);
     }
@@ -690,8 +713,9 @@ impl std::fmt::Debug for Host {
 impl Host {
     /// Starts a host: loads or creates the identity and pin store (SR-28), binds the port
     /// exclusively (SR-31, [`Error::PortHeld`] if taken), starts the server, reloads
-    /// unfinished incoming transfers (protocol.md 7.6), starts discovery and the last-known
-    /// dial loop. Returns the host and its event stream.
+    /// unfinished incoming transfers and restarts unfinished sends (protocol.md 7.6),
+    /// starts discovery and the last-known dial loop. Returns the host and its event
+    /// stream.
     #[allow(clippy::too_many_lines, reason = "start-up is one linear sequence")]
     pub async fn start(config: HostConfig) -> Result<(Self, mpsc::Receiver<HostEvent>)> {
         let data_dir = config.data_dir.clone();
@@ -740,7 +764,9 @@ impl Host {
             qr_offer: Mutex::new(None),
             pairing: Mutex::new(None),
             incoming: Mutex::new(HashMap::new()),
-            outgoing: Mutex::new(HashMap::new()),
+            ended: Mutex::new(HashMap::new()),
+            owner_io: receive::OwnerIo::start(),
+            sends: Mutex::new(send_resume::Sends::default()),
             transfers: Mutex::new(transfers::TransferBook::default()),
             discovery: Mutex::new(None),
             dial_limiter: Mutex::new(DialLimiter::new()),
@@ -756,6 +782,7 @@ impl Host {
             input: Mutex::new(input::InputState::default()),
             outbox: Mutex::new(HashMap::new()),
             pulling: Mutex::new(HashSet::new()),
+            reconnect_for: config.reconnect_for,
             add_device_seen: Mutex::new(HashMap::new()),
             interfaces: Arc::clone(&interfaces),
             lock_state: config.lock_state,
@@ -782,6 +809,10 @@ impl Host {
         // transfer by ID, and a `404` for one still being reloaded would end its send.
         receive::load_persisted(&inner).await;
         outbox::load_persisted(&inner).await;
+        // Sends that were running when this host stopped start again from their records,
+        // and the rest are indexed so a peer that connects at once finds its waiting
+        // sends (protocol.md 7.6).
+        send_resume::load_persisted(&inner).await;
 
         let server_task = tokio::spawn(server.run(acceptor, router, inner.shutdown_rx()));
         *lock(&inner.server_task) = Some(server_task);
@@ -813,6 +844,7 @@ impl Host {
         inner.spawn(connect::diagnostics(Arc::clone(&inner)));
         inner.spawn(receive::maintenance(Arc::clone(&inner)));
         inner.spawn(outbox::maintenance(Arc::clone(&inner)));
+        inner.spawn(send_resume::maintenance(Arc::clone(&inner)));
         inner.spawn(input::maintenance(Arc::clone(&inner)));
 
         inner.emit(HostEvent::Listening {
@@ -874,6 +906,9 @@ impl Host {
         for c in inner.registry.all_connections() {
             let _ = tokio::time::timeout(Duration::from_millis(500), c.closed()).await;
         }
+        // Every task is gone: what they queued for the incoming records lands now, before
+        // a host restarted on the same folders reads them.
+        inner.owner_io.close().await;
         tracing::info!(device = %short(&inner.local_id), "host stopped");
     }
 
@@ -1070,10 +1105,13 @@ impl Host {
     /// - Incoming: deletes every `.part`, answers later `PUT`s with `410 cancelled`, and
     ///   pushes a `transfer` frame with state `cancelled`, reason `user` (5.13), so the
     ///   sender stops. A pending offer is withdrawn the same way.
+    /// - A failed send that waits to resume (`docs/core-api.md` section 12): its record is
+    ///   deleted, so it never resumes, and when the peer is online the receiver gets the
+    ///   `DELETE` and frees its slot (best effort).
     ///
-    /// [`Error::NotFound`] if no live transfer has this ID.
+    /// [`Error::NotFound`] if no live or resumable transfer has this ID.
     pub async fn cancel_transfer(&self, id: &str) -> Result<()> {
-        if send::cancel(&self.inner, id) {
+        if send_resume::cancel(&self.inner, id).await {
             return Ok(());
         }
         receive::cancel_local(&self.inner, id).await

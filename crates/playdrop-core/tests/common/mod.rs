@@ -112,6 +112,9 @@ impl TestHost {
     pub async fn restart(self, root: &Path) -> TestHost {
         let (name, port) = (self.name.clone(), self.port);
         self.host.shutdown().await;
+        // A killed process leaves nothing behind: the old host, with its open part files
+        // and in-memory transfer map, is gone before the new one reloads the same folders.
+        drop(self);
         start_host(root, &name, port).await
     }
 }
@@ -221,18 +224,22 @@ pub fn mib_per_s(bytes: u64, elapsed: Duration) -> f64 {
     b / (1024.0 * 1024.0) / elapsed.as_secs_f64()
 }
 
-/// Turns on debug logs when `PD_LOG` is set.
+/// Captures the core's warnings into the test output, so a failing test shows what the
+/// host complained about (the output is only printed for failures); `PD_LOG` raises the
+/// level to debug.
 pub fn init_logs() {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
-    if std::env::var_os("PD_LOG").is_some() {
-        let filter = tracing_subscriber::filter::Targets::new()
-            .with_target("playdrop_core", tracing::Level::DEBUG);
-        let _ = tracing_subscriber::registry()
-            .with(tracing_subscriber::fmt::layer().with_test_writer())
-            .with(filter)
-            .try_init();
-    }
+    let level = if std::env::var_os("PD_LOG").is_some() {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    };
+    let filter = tracing_subscriber::filter::Targets::new().with_target("playdrop_core", level);
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_test_writer())
+        .with(filter)
+        .try_init();
 }
 
 /// Bytes as MiB, for printing.

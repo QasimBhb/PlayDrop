@@ -75,6 +75,12 @@ component TransferCard inherits Card {
                     TransfersState.show-in-folder(root.transfer.id);
                 }
             }
+            if root.transfer.can-forget: Button {
+                text: "Forget";
+                clicked => {
+                    TransfersState.forget(root.transfer.id);
+                }
+            }
             if root.transfer.can-cancel: Button {
                 text: "Cancel";
                 clicked => {

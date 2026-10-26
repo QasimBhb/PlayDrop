@@ -2,11 +2,12 @@
 
 use std::io::Read as _;
 
+use playdrop_core::host::TransferSnapshot;
 use playdrop_ipc::{ClipSkip, Ok as Answer, Request};
 
 use super::{
-    absolute_paths, ask, connect, output, peers as list_peers, pick_peer, unexpected, ClipArgs,
-    Exit, Failure, JsonArgs, OutboxAction, OutboxAddArgs, OutboxArgs, PingArgs,
+    absolute_paths, ask, connect, output, peers as list_peers, pick_peer, unexpected, CancelArgs,
+    ClipArgs, Exit, Failure, JsonArgs, OutboxAction, OutboxAddArgs, OutboxArgs, PingArgs,
 };
 
 /// Most clipboard text the daemon takes (`docs/ipc.md` section 1.1).
@@ -56,6 +57,55 @@ pub async fn transfers(args: JsonArgs) -> Result<(), Failure> {
         print!("{}", output::transfers(list, &peers, output::unix_now()));
     }
     Ok(())
+}
+
+/// `playdrop cancel`. The ID is matched here, against the daemon's own list, so a short
+/// start of it works like a short device ID does and a wrong one exits 2 with the list.
+pub async fn cancel(args: CancelArgs) -> Result<(), Failure> {
+    let client = connect().await?;
+    let answer = ask(&client, Request::Transfers).await?;
+    let Answer::Transfers(list) = &answer else {
+        return Err(unexpected("transfers", &answer));
+    };
+    let id = resolve_transfer(list, &args.id)?.id.clone();
+    ask(&client, Request::CancelTransfer { id: id.clone() }).await?;
+    println!("cancelled {id}");
+    Ok(())
+}
+
+/// The one transfer whose ID is `want` or starts with it. An exact match wins over a longer
+/// ID that merely starts with the same text.
+fn resolve_transfer<'a>(
+    list: &'a [TransferSnapshot],
+    want: &str,
+) -> Result<&'a TransferSnapshot, Failure> {
+    let want = want.trim();
+    if let Some(t) = list.iter().find(|t| t.id == want) {
+        return Ok(t);
+    }
+    let hits: Vec<&TransferSnapshot> = if want.is_empty() {
+        Vec::new()
+    } else {
+        list.iter().filter(|t| t.id.starts_with(want)).collect()
+    };
+    match hits.as_slice() {
+        [one] => Ok(one),
+        [] => Err(Failure::new(
+            Exit::Usage,
+            format!("no transfer matches \"{want}\"; `playdrop transfers` lists them"),
+        )),
+        many => Err(Failure::new(
+            Exit::Usage,
+            format!(
+                "\"{want}\" matches {} transfers; give more of the ID:\n{}",
+                many.len(),
+                many.iter()
+                    .map(|t| format!("  {}", t.id))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )),
+    }
 }
 
 /// `playdrop diagnose`.
@@ -217,6 +267,34 @@ async fn outbox_add(args: OutboxAddArgs) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn transfer(id: &str) -> TransferSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "peer": "00", "short_id": "aaaa-bbbb", "direction": "send",
+            "state": "failed", "bytes": 0, "total": 0, "bytes_per_sec": 0,
+            "started_at": 0, "file_count": 1, "resumable": true
+        }))
+        .expect("snapshot")
+    }
+
+    #[test]
+    fn a_transfer_id_matches_exactly_or_by_a_unique_start() {
+        let list = [transfer("7f3a91"), transfer("7f3b02"), transfer("7f3a")];
+        assert_eq!(resolve_transfer(&list, "7f3a").expect("exact").id, "7f3a");
+        assert_eq!(
+            resolve_transfer(&list, "7f3b").expect("prefix").id,
+            "7f3b02"
+        );
+        let many = resolve_transfer(&list, "7f3").expect_err("ambiguous");
+        assert_eq!(many.exit, Exit::Usage);
+        assert!(many.message.contains("matches 3 transfers"));
+        let none = resolve_transfer(&list, "zz").expect_err("unknown");
+        assert_eq!(none.exit, Exit::Usage);
+        assert_eq!(
+            resolve_transfer(&list, "").expect_err("empty").exit,
+            Exit::Usage
+        );
+    }
 
     #[test]
     fn a_missing_reason_from_an_older_daemon_reads_as_echo() {

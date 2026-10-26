@@ -60,6 +60,16 @@ enum Command {
     Status(daemon::JsonArgs),
     /// List running transfers and those that finished in the last 10 minutes.
     Transfers(daemon::JsonArgs),
+    /// Cancel a transfer, or forget a failed send that is waiting to resume.
+    ///
+    /// ID is the first column of `playdrop transfers`; a unique start of it is enough.
+    /// A send shown as `failed (resumes)` stops resuming and the receiver is told.
+    /// Exits 0 when cancelled or forgotten, 1 when the daemon could not, 2 for an unknown
+    /// or ambiguous ID, 3 when the daemon is not running.
+    ///
+    ///   playdrop cancel 7f3a
+    #[command(verbatim_doc_comment)]
+    Cancel(daemon::CancelArgs),
     /// Send text to a device's clipboard
     ///
     ///   playdrop clip "see you at 6"
@@ -165,6 +175,7 @@ async fn main() -> ExitCode {
         Command::Peers(a) => daemon::DaemonCommand::Peers(a),
         Command::Status(a) => daemon::DaemonCommand::Status(a),
         Command::Transfers(a) => daemon::DaemonCommand::Transfers(a),
+        Command::Cancel(a) => daemon::DaemonCommand::Cancel(a),
         Command::Clip(a) => daemon::DaemonCommand::Clip(a),
         Command::Ping(a) => daemon::DaemonCommand::Ping(a),
         Command::Outbox(a) => daemon::DaemonCommand::Outbox(a),

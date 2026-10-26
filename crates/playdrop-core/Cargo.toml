@@ -40,6 +40,11 @@ unicode-normalization = "0.1.25"
 x509-parser = "0.18.1"
 zeroize = "1.9.1"
 
+[target.'cfg(windows)'.dependencies]
+# MoveFileExW without MOVEFILE_REPLACE_EXISTING: a rename that never overwrites (SR-18),
+# which std and cap-std do not offer on Windows. The same version the daemon's crates lock.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 proptest = "1.11.0"
 tempfile = "3.27.0"

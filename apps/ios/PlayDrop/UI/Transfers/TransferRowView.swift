@@ -3,14 +3,14 @@ import SwiftUI
 
 // One transfer in the Transfers tab: direction, peer, state, file count and size, a progress
 // bar with bytes, rate and time left while active, the note or failure reason, Cancel for
-// running transfers, and Open plus the Files location for received ones. Port of Android
-// `TransferCard`.
+// running transfers, Forget for a failed send waiting to resume, and Open plus the Files
+// location for received ones. Port of Android `TransferCard`.
 
 /// One live or recent transfer.
 struct TransferRowView: View {
     /// The row data.
     let row: TransferRow
-    /// Cancels the transfer.
+    /// Cancels the transfer, or forgets a failed send that waits to resume.
     let onCancel: () -> Void
     /// Opens the first received file.
     let onOpen: (URL) -> Void
@@ -49,11 +49,16 @@ struct TransferRowView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            if row.canCancel || openURL != nil {
+            if row.canCancel || row.canForget || openURL != nil {
                 HStack(spacing: 8) {
                     if let url = openURL {
                         Button(L10n.Transfers.open) { onOpen(url) }
                             .buttonStyle(.bordered)
+                    }
+                    if row.canForget {
+                        // Same call as Cancel: the core forgets the waiting send and tells the receiver.
+                        Button(L10n.Transfers.forget, role: .destructive, action: onCancel)
+                            .buttonStyle(.borderless)
                     }
                     if row.canCancel {
                         Button(L10n.cancel, role: .destructive, action: onCancel)

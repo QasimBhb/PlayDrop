@@ -102,6 +102,11 @@ pub struct TransferSnapshot {
     /// `HostEvent::TransferComplete` (`docs/core-api.md` section 2).
     #[serde(default)]
     pub delivered: Vec<DeliveredFile>,
+    /// Send side: true on a `failed` send whose record is kept, so it resumes when the
+    /// receiver is back or when the same files are sent again (`docs/core-api.md` section
+    /// 12; `note` says which). False once it is cancelled, resumed or complete.
+    #[serde(default)]
+    pub resumable: bool,
 }
 
 impl TransferSnapshot {
@@ -131,6 +136,7 @@ impl TransferSnapshot {
             saved: Vec::new(),
             folder: None,
             delivered: Vec::new(),
+            resumable: false,
         }
     }
 }
@@ -162,6 +168,10 @@ pub(crate) struct ProgressReading {
 pub(crate) struct TransferBook {
     live: HashMap<Key, TransferSnapshot>,
     finished: VecDeque<(Instant, TransferSnapshot)>,
+    /// Failed sends that wait to resume (`resumable`): listed for as long as their record
+    /// exists, not pruned with the other finished snapshots, so a UI or `playdrop cancel`
+    /// can still find them hours later.
+    waiting: HashMap<Key, TransferSnapshot>,
 }
 
 impl TransferBook {
@@ -232,6 +242,71 @@ impl TransferBook {
         self.prune(Instant::now());
     }
 
+    /// Drops the finished snapshots with this ID and direction. A send that resumes under
+    /// its earlier ID (protocol.md 7.6) calls it before [`begin`](Self::begin), so the list
+    /// never shows the same transfer twice.
+    pub(crate) fn forget_finished(&mut self, id: &str, dir: TransferDirection) {
+        self.finished
+            .retain(|(_, s)| !(s.id == id && s.direction == dir));
+        self.waiting.remove(&(id.to_owned(), dir));
+    }
+
+    /// Lists a send that waits to resume, as after a restart of this host (its record
+    /// survived, its snapshot did not).
+    pub(crate) fn add_waiting(&mut self, mut snap: TransferSnapshot) {
+        snap.resumable = true;
+        self.waiting.insert((snap.id.clone(), snap.direction), snap);
+    }
+
+    /// Changes how a finished transfer is shown, for a failed send that waited to resume
+    /// and was then cancelled. Unknown IDs are ignored.
+    pub(crate) fn amend_finished(
+        &mut self,
+        id: &str,
+        dir: TransferDirection,
+        state: TransferStatus,
+        note: String,
+    ) {
+        if let Some(mut s) = self.waiting.remove(&(id.to_owned(), dir)) {
+            s.state = state;
+            s.note = Some(note);
+            s.resumable = false;
+            self.finished.push_back((Instant::now(), s));
+            self.prune(Instant::now());
+            return;
+        }
+        if let Some((_, s)) = self
+            .finished
+            .iter_mut()
+            .rev()
+            .find(|(_, s)| s.id == id && s.direction == dir)
+        {
+            s.state = state;
+            s.note = Some(note);
+            s.resumable = false;
+        }
+    }
+
+    /// Marks a finished transfer as waiting to resume (or not).
+    pub(crate) fn set_resumable(&mut self, id: &str, dir: TransferDirection, resumable: bool) {
+        let key = (id.to_owned(), dir);
+        if resumable {
+            if let Some(i) = self
+                .finished
+                .iter()
+                .rposition(|(_, s)| s.id == id && s.direction == dir)
+            {
+                if let Some((_, mut s)) = self.finished.remove(i) {
+                    s.resumable = true;
+                    self.waiting.insert(key, s);
+                }
+            }
+        } else if let Some(mut s) = self.waiting.remove(&key) {
+            s.resumable = false;
+            self.finished.push_back((Instant::now(), s));
+        }
+    }
+
     /// Whether a live transfer with this ID exists in that direction.
     #[cfg(test)]
     pub(crate) fn is_live(&self, id: &str, dir: TransferDirection) -> bool {
@@ -276,6 +351,7 @@ impl TransferBook {
             .iter()
             .map(|(_, s)| s.clone())
             .chain(self.live.values().cloned())
+            .chain(self.waiting.values().cloned())
             .collect();
         out.sort_by(|a, b| a.started_at.cmp(&b.started_at).then(a.id.cmp(&b.id)));
         out
@@ -297,6 +373,62 @@ mod tests {
             2,
             Some("hi".into()),
         )
+    }
+
+    /// A send that resumes under its ID replaces its finished snapshot instead of
+    /// listing the ID twice; a cancelled waiting send shows as cancelled.
+    #[test]
+    fn resumed_id_is_listed_once() {
+        let mut b = TransferBook::default();
+        b.begin(snap(0));
+        b.finish(
+            "t0",
+            TransferDirection::Receive,
+            TransferStatus::Failed,
+            Some("receiver unreachable; resumes".into()),
+        );
+        b.set_resumable("t0", TransferDirection::Receive, true);
+        assert!(b.list()[0].resumable);
+        b.amend_finished(
+            "t0",
+            TransferDirection::Receive,
+            TransferStatus::Cancelled,
+            "cancelled by you".into(),
+        );
+        assert_eq!(b.list()[0].state, TransferStatus::Cancelled);
+        assert!(!b.list()[0].resumable, "a cancelled send no longer resumes");
+        assert_eq!(b.list()[0].note.as_deref(), Some("cancelled by you"));
+        b.forget_finished("t0", TransferDirection::Send);
+        assert_eq!(b.list().len(), 1, "another direction is another transfer");
+        b.forget_finished("t0", TransferDirection::Receive);
+        b.begin(snap(0));
+        let l = b.list();
+        assert_eq!(l.len(), 1);
+        assert_eq!(l[0].state, TransferStatus::Offered);
+    }
+
+    /// A send that waits to resume stays listed past the age and count bounds of the
+    /// other finished snapshots, until it is cancelled or resumed.
+    #[test]
+    fn waiting_sends_outlive_pruning() {
+        let mut b = TransferBook::default();
+        b.add_waiting(snap(7));
+        let later = Instant::now() + KEEP_FOR * 3;
+        let l = b.list_at(later);
+        assert_eq!(l.len(), 1);
+        assert!(l[0].resumable);
+        b.forget_finished("t7", TransferDirection::Receive);
+        assert!(b.list_at(later).is_empty(), "a resumed send drops it");
+        b.add_waiting(snap(7));
+        b.amend_finished(
+            "t7",
+            TransferDirection::Receive,
+            TransferStatus::Cancelled,
+            "cancelled by you".into(),
+        );
+        let l = b.list();
+        assert_eq!(l[0].state, TransferStatus::Cancelled);
+        assert!(!l[0].resumable);
     }
 
     #[test]

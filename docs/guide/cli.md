@@ -9,6 +9,7 @@ playdrop send <PATH>... [--to <peer>] [--no-wait] [--json]
 playdrop peers [--json]
 playdrop status [--json]
 playdrop transfers [--json]
+playdrop cancel <ID>
 playdrop clip (<TEXT> | --stdin) [--to <peer>]
 playdrop ping [--to <peer>] [MESSAGE]
 playdrop outbox [--json]
@@ -42,7 +43,15 @@ starts the transfer and returns at once. Check on it with `playdrop transfers`.
 **`status`** shows the daemon's state, the same as the window's status.
 
 **`transfers`** lists current and recent transfers with their progress. For a transfer of many
-files that is moving, the FILES column shows how many are done, like `1204/5000`.
+files that is moving, the FILES column shows how many are done, like `1204/5000`. A failed send
+that PlayDrop keeps so it can resume shows `failed (resumes)` in the STATE column; `--json`
+gives it as `"resumable": true`.
+
+**`cancel`** cancels a transfer, or forgets a failed send that is waiting to resume. `ID` is the
+first column of `playdrop transfers`; the start of it is enough when it is unique. A send that
+could not reach the other device shows as `failed (resumes)`: it continues by itself when the
+device is back or when you send the same files again, and `playdrop cancel <ID>` stops that and
+tells the other device.
 
 **`clip`** sends text to a device's clipboard. `playdrop clip "hello"` sends that text.
 `playdrop clip --stdin` reads the text from standard input, for example
@@ -77,8 +86,8 @@ playdrop peers --json
 | Code | Meaning |
 |---|---|
 | 0 | It worked |
-| 1 | It failed (a transfer failed or was refused, the device went away) |
-| 2 | Wrong usage, or an unknown or ambiguous device |
+| 1 | It failed (a transfer failed or was refused, the device went away, the daemon could not cancel) |
+| 2 | Wrong usage, or an unknown or ambiguous device or transfer ID |
 | 3 | The daemon is not running |
 
 A script can tell "start the daemon" from "fix the command":

@@ -58,7 +58,7 @@ full size instead of killing the send, a send is `offered` until bytes move and 
 workflows. 466 Rust tests, 168 Android JUnit, 106 Swift. Phone bench on 2026-10-16: 5,000
 small files to the A54 at 22 MiB/s in 7.3 s (was 7 to 9.5 MiB/s, 17 to 23 s), all sums
 verified; the Wi-Fi drop gate is still owed (the mesh isolates the phone after a toggle).
-v0.3.0 tagged on 2026-10-17 (GitHub Releases, the release workflow builds the five files). Next: Phase 9 from `docs/phases/phase-8-fast-bulk.md` section 7.
+v0.3.0 tagged on 2026-10-17, but its release run failed (stale Flatpak crate list, a Windows resume race in `Host::start`); the fix is its own commit and `packaging/flatpak/check-sources.py` now guards the crate list. Phase 9 (resume everywhere and the small-file floor, v0.4.0) written 2026-10-17 to 2026-10-22: the sender keeps a record per send under `outgoing/` and resumes it when the receiver is back, after its own restart, or when the same files are sent again (the phone case); the receiver keeps ended transfers 24 h; `TransferSnapshot.resumable`, `playdrop cancel`, Forget buttons (`playdrop-ffi` 0.4.0); Android now flushes bundle members with one `syncfs` on safe filesystems (phone bundle receive 7.0 to 5.3 s) and members land with a no-replace rename (delivery log v3). 509 Rust tests, 182 Android JUnit, 106 Swift. Next: Phase 10 from `docs/phases/phase-9-resume-everywhere.md` section 7.
 
 ## Read first
 

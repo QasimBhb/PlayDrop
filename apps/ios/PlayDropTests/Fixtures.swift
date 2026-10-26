@@ -26,12 +26,12 @@ enum Fixtures {
         _ id: String, peer: String = "p", direction: TransferDirection = .receive,
         state: TransferStatus = .active, bytes: UInt64 = 0, total: UInt64 = 100,
         bytesPerSec: UInt64 = 0, startedAt: UInt64 = 0, note: String? = nil,
-        delivered: [DeliveredFile] = []
+        delivered: [DeliveredFile] = [], resumable: Bool = false
     ) -> TransferSnapshot {
         TransferSnapshot(
             id: id, peer: peer, shortId: "S-\(peer)", direction: direction, state: state,
             bytes: bytes, total: total, bytesPerSec: bytesPerSec, filesDone: 0, startedAt: startedAt,
-            fileCount: 1, note: note, delivered: delivered
+            fileCount: 1, note: note, delivered: delivered, resumable: resumable
         )
     }
 

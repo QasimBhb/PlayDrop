@@ -126,6 +126,18 @@ internal class MoveJournal(private val file: File) {
         file.delete()
     }
 
+    /**
+     * Settles the entry [e] a stopped pass left: when [recovery] says the target is an
+     * unfinished copy, [removeTarget] removes it (and logs why when it cannot). Returns false,
+     * keeping the entry, when the copy could not be removed; the pass must then wait, since its
+     * next copy would overwrite the entry. Otherwise the entry is forgotten.
+     */
+    fun settle(e: Entry, landingExists: Boolean, targetExists: Boolean, removeTarget: () -> Boolean): Boolean {
+        if (recovery(landingExists, targetExists) == Recovery.DELETE_TARGET && !removeTarget()) return false
+        clear()
+        return true
+    }
+
     companion object {
         /**
          * The rule behind the cleanup before each pass. For a MediaStore row the caller passes

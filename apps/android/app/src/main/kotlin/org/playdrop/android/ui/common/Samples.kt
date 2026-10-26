@@ -198,6 +198,7 @@ object Samples {
         peer: String = laptop.deviceId,
         note: String? = null,
         delivered: List<DeliveredFile> = emptyList(),
+        resumable: Boolean = false,
     ) = TransferSnapshot(
         id = id,
         peer = peer,
@@ -212,5 +213,6 @@ object Samples {
         fileCount = files.toULong(),
         note = note,
         delivered = delivered,
+        resumable = resumable,
     )
 }

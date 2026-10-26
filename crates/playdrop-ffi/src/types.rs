@@ -390,6 +390,9 @@ pub struct TransferSnapshot {
     pub note: Option<String>,
     /// Delivered files (receive side, once complete).
     pub delivered: Vec<DeliveredFile>,
+    /// A failed send whose record is kept: it resumes by itself or when the same files
+    /// are sent again, and `Host::cancel_transfer` forgets it. False otherwise.
+    pub resumable: bool,
 }
 
 impl From<host::TransferSnapshot> for TransferSnapshot {
@@ -408,6 +411,7 @@ impl From<host::TransferSnapshot> for TransferSnapshot {
             file_count: t.file_count as u64,
             note: t.note,
             delivered: t.delivered.into_iter().map(Into::into).collect(),
+            resumable: t.resumable,
         }
     }
 }

@@ -1,5 +1,5 @@
-//! The daemon client commands: `send`, `peers`, `status`, `transfers`, `clip`, `ping`,
-//! `outbox` and `diagnose`.
+//! The daemon client commands: `send`, `peers`, `status`, `transfers`, `cancel`, `clip`,
+//! `ping`, `outbox` and `diagnose`.
 //!
 //! Each one connects to the running `playdropd` through `playdrop-ipc` (D-Bus on Linux,
 //! the per-user named pipe on Windows), asks one or two questions and prints the answer.
@@ -149,6 +149,14 @@ pub struct PingArgs {
     pub message: Option<String>,
 }
 
+/// Options of `playdrop cancel`.
+#[derive(Debug, clap::Args)]
+pub struct CancelArgs {
+    /// Transfer ID as shown by `playdrop transfers`, or a unique start of it.
+    #[arg(value_name = "ID")]
+    pub id: String,
+}
+
 /// Options of `playdrop outbox`.
 #[derive(Debug, clap::Args)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -194,6 +202,8 @@ pub enum DaemonCommand {
     Status(JsonArgs),
     /// `playdrop transfers`.
     Transfers(JsonArgs),
+    /// `playdrop cancel`.
+    Cancel(CancelArgs),
     /// `playdrop clip`.
     Clip(ClipArgs),
     /// `playdrop ping`.
@@ -211,6 +221,7 @@ pub async fn run(cmd: DaemonCommand) -> ExitCode {
         DaemonCommand::Peers(a) => commands::peers(a).await,
         DaemonCommand::Status(a) => commands::status(a).await,
         DaemonCommand::Transfers(a) => commands::transfers(a).await,
+        DaemonCommand::Cancel(a) => commands::cancel(a).await,
         DaemonCommand::Clip(a) => commands::clip(a).await,
         DaemonCommand::Ping(a) => commands::ping(a).await,
         DaemonCommand::Outbox(a) => commands::outbox(a).await,

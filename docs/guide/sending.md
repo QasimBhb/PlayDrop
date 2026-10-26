@@ -26,11 +26,21 @@ through the internet or a server.
 ## Resume
 
 If the connection drops, for example when Wi-Fi blinks, the transfer carries on from where it
-stopped and checks the data as it goes. If the sending app or daemon itself is restarted, start
-the send again: resuming across a restart of the sender is not part of version 0.1 or 0.2.
+stopped and checks the data as it goes. Since 0.4.0 the sender remembers every transfer too:
 
-Resume is tested between two computers. Killing a transfer to a phone over Wi-Fi and checking
-the result has not been done yet.
+- A send that gave up because the other device was unreachable for ten minutes shows as failed
+  with "resumes when <device> is back". When that device reconnects, a computer continues the
+  send by itself from where it stopped, with the same transfer. So does a computer whose
+  daemon was restarted mid-send.
+- A phone cannot reopen shared files once the app was stopped. Share the same files to the same
+  device again within 24 hours and the send continues from where it stopped instead of starting
+  over.
+- Sending the same files to the same device again within 24 hours always continues the earlier
+  transfer, on every platform.
+- Cancelling the failed entry forgets it; the receiving side frees its partial data.
+
+Resume is tested between two computers, including a restart of the sending side. Killing a
+transfer to a phone over Wi-Fi and checking the result has not been done yet.
 
 ## Auto-accept
 

@@ -331,7 +331,8 @@ fn check_collisions(m: &Manifest) -> Result<()> {
 }
 
 /// Identity of a source file beyond its path, used to notice a replaced file (SR-21).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Serialisable because the sender's on-disk record of a send keeps it (protocol.md 7.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileId {
     /// Device number.
     pub dev: u64,

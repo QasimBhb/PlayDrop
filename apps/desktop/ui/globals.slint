@@ -86,6 +86,7 @@ export global TransfersState {
     in property <int> pending-offers;
     callback respond(string, bool);
     callback cancel(string);
+    callback forget(string);
     callback open(string);
     callback show-in-folder(string);
     callback clear-finished();

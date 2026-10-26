@@ -15,7 +15,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::events::{HostEvent, Secret};
 use super::registry::Placement;
-use super::{blobs, input, lock, outbox, pairing, receive, send, status, Inner};
+use super::{blobs, input, lock, outbox, pairing, receive, send, send_resume, status, Inner};
 use crate::identity::DeviceId;
 use crate::net::connection::short;
 use crate::net::server::SESSION_PATH;
@@ -704,6 +704,8 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
     // Session start: remembered battery and presence (5.8, 5.10), waiting outbox (5.11).
     status::on_activate(inner, sess);
     outbox::notify(inner, peer);
+    // Sends that gave up while the peer was away resume now (protocol.md 7.6).
+    send_resume::resume_for_peer(inner, peer);
 }
 
 async fn store_announce_key(inner: &Arc<Inner>, peer: DeviceId, k: &AnnounceKey) {
@@ -745,7 +747,7 @@ pub(crate) async fn unpair(inner: &Arc<Inner>, peer: DeviceId, notify: bool) -> 
         }
     });
     receive::drop_peer(inner, &peer).await;
-    send::drop_peer(inner, &peer);
+    send_resume::drop_peer(inner, &peer).await;
     outbox::drop_peer(inner, &peer).await;
     lock(&inner.status).forget(&peer);
     for s in inner.registry.sessions() {

@@ -170,6 +170,7 @@
     <string name="ui_transfers_accept">Accept</string>
     <string name="ui_transfers_decline">Decline</string>
     <string name="ui_transfers_open">Open</string>
+    <string name="ui_transfers_forget">Forget</string>
     <string name="ui_transfers_open_folder">Open folder</string>
     <string name="ui_transfers_no_viewer">No app on this phone can open that.</string>
     <string name="ui_transfers_risky">This file type could install or run code, so it opens in Downloads instead.</string>

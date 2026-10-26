@@ -122,6 +122,9 @@ pub struct TransferView {
     pub saved: Vec<PathBuf>,
     /// Wall time once complete.
     pub elapsed_ms: Option<u64>,
+    /// A failed send the daemon keeps so it resumes. Only a snapshot carries this, so an
+    /// event that ends or restarts a send resets it and a refetch fills it in.
+    pub resumable: bool,
 }
 
 impl TransferView {
@@ -141,6 +144,7 @@ impl TransferView {
             note: s.note,
             saved: s.saved,
             elapsed_ms: None,
+            resumable: s.resumable,
         }
     }
 
@@ -160,6 +164,7 @@ impl TransferView {
             note: None,
             saved: Vec::new(),
             elapsed_ms: None,
+            resumable: false,
         }
     }
 }
@@ -180,6 +185,9 @@ pub struct PromptView {
 pub enum Refetch {
     /// Peers only (pairing changed).
     Peers,
+    /// Transfers only (the daemon knows something an event does not carry, such as
+    /// whether a failed send is kept for resume).
+    Transfers,
     /// Status, peers and transfers (host restarted).
     All,
 }
@@ -644,6 +652,7 @@ impl Store {
                 ..
             } => self.upsert_transfer(&id, &peer, direction, |t| {
                 t.state = TransferStatus::Active;
+                t.resumable = false;
                 t.bytes = bytes;
                 t.total = total;
                 t.bytes_per_sec = bytes_per_sec;
@@ -660,6 +669,7 @@ impl Store {
                 ..
             } => self.upsert_transfer(&id, &peer, direction, |t| {
                 t.state = TransferStatus::Complete;
+                t.resumable = false;
                 t.bytes = bytes;
                 t.total = bytes;
                 t.bytes_per_sec = 0;
@@ -674,11 +684,19 @@ impl Store {
                 peer,
                 direction,
                 reason,
-            } => self.upsert_transfer(&id, &peer, direction, |t| {
-                t.state = TransferStatus::Failed;
-                t.bytes_per_sec = 0;
-                t.note = Some(reason);
-            }),
+            } => {
+                let mut changes = self.upsert_transfer(&id, &peer, direction, |t| {
+                    t.state = TransferStatus::Failed;
+                    t.resumable = false;
+                    t.bytes_per_sec = 0;
+                    t.note = Some(reason);
+                });
+                // The event does not say whether the daemon kept the send for resume.
+                if direction == TransferDirection::Send {
+                    changes.push(Change::Refetch(Refetch::Transfers));
+                }
+                changes
+            }
             HostEvent::Clipboard { peer, .. } => vec![Change::Notice(
                 format!("Clipboard received from {}", self.peer_name(&peer)),
                 false,
@@ -1272,6 +1290,7 @@ pub fn transfer_row(t: &TransferView, peer_name: &str) -> TransferRow {
         detail: detail.into(),
         can_respond: receive && t.state == TransferStatus::Offered,
         can_cancel: !(finished || receive && t.state == TransferStatus::Offered),
+        can_forget: !receive && t.state == TransferStatus::Failed && t.resumable,
         can_open: receive && t.state == TransferStatus::Complete && t.saved.len() == 1,
         can_show: receive && t.state == TransferStatus::Complete && !t.saved.is_empty(),
     }
@@ -2221,7 +2240,11 @@ mod tests {
             }),
             0,
         );
-        assert_eq!(ch, vec![Change::Transfers]);
+        // A failed send also asks for a fresh list: only a snapshot says if it resumes.
+        assert_eq!(
+            ch,
+            vec![Change::Transfers, Change::Refetch(Refetch::Transfers)]
+        );
         let row = transfer_row(&s.transfers[1], "Phone");
         assert_eq!(row.title, "To Phone");
         assert_eq!(row.detail, "peer went away");
@@ -2229,6 +2252,55 @@ mod tests {
 
         s.clear_finished();
         assert!(s.transfers.is_empty());
+    }
+
+    #[test]
+    fn a_failed_send_kept_for_resume_offers_forget() {
+        let snap = |direction: &str, state: &str, resumable: bool| -> TransferSnapshot {
+            serde_json::from_value(serde_json::json!({
+                "id": "t5", "peer": "aa", "short_id": "K3QD", "direction": direction,
+                "state": state, "bytes": 10, "total": 20, "bytes_per_sec": 0,
+                "started_at": 1, "file_count": 1,
+                "note": "receiver unreachable; resumes when Phone is back",
+                "resumable": resumable
+            }))
+            .unwrap()
+        };
+        let mut s = Store::default();
+        s.set_transfers(vec![snap("send", "failed", true)]);
+        let row = transfer_row(&s.transfers[0], "Phone");
+        assert!(row.can_forget && !row.can_cancel && !row.can_respond);
+        assert_eq!(row.state, "failed");
+        assert!(row.detail.contains("resumes when Phone is back"));
+        // Not resumable, still running, or a receive: no Forget.
+        for (dir, state, resumable) in [
+            ("send", "failed", false),
+            ("send", "active", false),
+            ("receive", "failed", true),
+        ] {
+            s.set_transfers(vec![snap(dir, state, resumable)]);
+            assert!(!transfer_row(&s.transfers[0], "Phone").can_forget);
+        }
+        // An older daemon sends no flag at all, which reads as false.
+        let mut old = serde_json::to_value(snap("send", "failed", true)).unwrap();
+        old.as_object_mut().unwrap().remove("resumable");
+        s.set_transfers(vec![serde_json::from_value(old).unwrap()]);
+        assert!(!s.transfers[0].resumable);
+        // Resuming (progress) clears the flag until the next snapshot says otherwise.
+        s.set_transfers(vec![snap("send", "failed", true)]);
+        s.apply(
+            Event::Host(HostEvent::TransferProgress {
+                id: "t5".into(),
+                peer: "aa".into(),
+                direction: TransferDirection::Send,
+                bytes: 12,
+                total: 20,
+                bytes_per_sec: 1,
+                files_done: 0,
+            }),
+            0,
+        );
+        assert!(!s.transfers[0].resumable);
     }
 
     #[test]

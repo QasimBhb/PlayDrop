@@ -9,7 +9,7 @@
 
 pub mod bundle;
 pub mod chunk;
-mod fsx;
+pub(crate) mod fsx;
 pub mod manifest;
 pub mod receiver;
 pub mod sender;
@@ -30,7 +30,9 @@ pub use receiver::{
     AcceptOptions, FileState, FreeSpace, PartFile, PutError, PutResponse, SinkBinding, SpaceInfo,
     SyncPolicy, TransferReceiver, TransferState, TransferStateView,
 };
-pub use sender::{ResumeAction, ResumePlan, TransferSender};
+pub use sender::{
+    HashRebuilder, LostHashes, ResumeAction, ResumePlan, StreamRef, TransferSender, UnsavedHashes,
+};
 pub use sink::{DeliverItem, DeliveredFile, ReceiveSink, SinkError};
 pub use source::{SourceOpener, SourceRef, StreamSource};
 

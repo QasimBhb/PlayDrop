@@ -8,6 +8,43 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.4.0] - Unreleased
+
+### Added
+
+- A send that gives up because the other device could not be reached is no longer lost. It
+  shows as failed with "resumes when <device> is back", and a computer continues it by itself,
+  from where it stopped, when that device reconnects or when its own daemon restarts.
+- Sending the same files to the same device again within 24 hours continues the earlier
+  transfer instead of starting over, on every platform. This is how a phone resumes: share the
+  same items again.
+- `playdrop cancel <id>` cancels a transfer, or forgets a failed send that was waiting to
+  resume. `playdrop transfers` shows such a send as `failed (resumes)`, and the window, the
+  Android app and the iOS app show a Forget button on its row.
+
+### Changed
+
+- Many small files reach an Android phone faster: received files were flushed to storage one
+  by one on Android, and are now flushed in one go where the storage allows it safely.
+- Received files are moved into place in one step that never overwrites anything, instead of
+  first creating an empty file at the name. Faster for folders of small files, and a crash can
+  no longer leave an empty file behind (Linux, Android and Apple; Windows keeps the old way).
+- A sender that was stopped in the middle of a large file no longer re-reads that file's
+  whole beginning over the network after a restart: it checks it against what the receiver
+  already holds on its own disk first.
+
+### Fixed
+
+- A receiver restarted after a transfer had finished could get the same files again from a
+  sender that missed the end; it now remembers finished transfers for 24 hours.
+- A shrinking source file in the middle of sending many small files could trip an internal
+  error in the sender instead of a clear failure.
+
+### Notes
+
+- Downgrading to 0.3.0 while a transfer to that device is half done can place some files a
+  second time with " (1)" names. Let transfers finish before downgrading.
+
 ## [0.3.0] - 2026-10-17
 
 ### Added
@@ -38,6 +75,10 @@ Before tagging, give the version's heading its release date in place of "Unrelea
 
 ### Fixed
 
+- The release build itself, found by the first v0.3.0 run: the Flatpak job stopped on a crate
+  missing from its offline crate list (the list is regenerated and now checked on every push),
+  and a receiver restarted mid-transfer could answer a reconnecting sender before it had
+  reloaded the transfer, which the Windows test run caught; it now reloads first.
 - A file being saved at the moment the app is killed no longer comes back as "name (1)" or
   gets downloaded again.
 - A temporary disk error while saving received files no longer makes the sender start over:

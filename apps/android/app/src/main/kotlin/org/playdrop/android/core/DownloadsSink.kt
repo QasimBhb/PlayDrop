@@ -282,8 +282,7 @@ internal class DownloadsSink(
             return true
         }
         val target = File(e.target)
-        val decision = MoveJournal.recovery(File(e.landing).exists(), e.targetIsUri || target.exists())
-        if (decision == MoveJournal.Recovery.DELETE_TARGET) {
+        return journal.settle(e, File(e.landing).exists(), e.targetIsUri || target.exists()) {
             val removed = if (e.targetIsUri) {
                 runCatching { app.contentResolver.delete(Uri.parse(e.target), null, null); true }
                     .onFailure { HostLog.w("landing", "could not remove an unfinished copy from Downloads", it) }
@@ -291,14 +290,13 @@ internal class DownloadsSink(
             } else {
                 target.delete() || !target.exists()
             }
-            if (!removed) {
+            if (removed) {
+                HostLog.i("landing", "removed an unfinished copy left by a stopped move; it is moved again")
+            } else {
                 HostLog.w("landing", "could not remove an unfinished copy in Downloads; moving waits")
-                return false
             }
-            HostLog.i("landing", "removed an unfinished copy left by a stopped move; it is moved again")
+            removed
         }
-        journal.clear()
-        return true
     }
 
     /**
@@ -324,19 +322,15 @@ internal class DownloadsSink(
      * Blocking. A file that fails stays landed, with its name still promised, for a retry;
      * [MoveOutcome.GONE] when it is no longer there. See [MoveResult] for the flags.
      */
-    fun moveLanded(transferId: String, file: File): MoveResult {
-        val root = landingRoot() ?: return MoveResult(MoveOutcome.FAILED)
-        val landed = LandingTree.relative(root, file)?.let(LandingPaths::parse)
-        if (landed == null || landed.transferId != transferId) {
-            HostLog.w("landing", "a file in the landing folder has a path PlayDrop would not write; left in place")
-            return MoveResult(MoveOutcome.FAILED)
-        }
-        val target = downloadsFile(landed)
-        if (!file.exists()) {
-            claims.release(target.path, file.path)
-            return MoveResult(MoveOutcome.GONE)
-        }
-        val key = moveKey(transferId)
+    fun moveLanded(transferId: String, file: File): MoveResult = landedMove.move(transferId, file)
+
+    /**
+     * The platform half of [moveLanded] ([LandedMove] holds the order of the steps and exists so
+     * that order runs in JVM tests without a ContentResolver): the direct copy, or MediaStore
+     * when direct writes are refused, both journaled.
+     */
+    private val placer = DownloadsPlacer { landed, file ->
+        val key = moveKey(landed.transferId)
         var input: ParcelFileDescriptor? = null
         val openInput: () -> FileDescriptor = {
             (input ?: ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).also { input = it }).fileDescriptor
@@ -359,42 +353,26 @@ internal class DownloadsSink(
             input = null
             // MediaStore may also rename on a clash; its URI is new either way, so count it.
             val renumbered = placed == null || placed.name != landed.name
-            // Before the landed file is deleted: a kill after the delete must not lose where the
-            // file went, and a file that got its promised name must drop any older entry (a
-            // redone move). If the table cannot be updated the file stays landed and the pass
-            // stops (the journal entry is kept, the next pass removes this copy and redoes it):
-            // deleting it would leave a stale location that could open someone else's file.
-            val promisedUri = receivedUri(target, landed.dirs)
+            val promisedUri = receivedUri(downloadsFile(landed), landed.dirs)
             val actual = placed?.let { receivedUri(it, landed.dirs) } ?: mediaStoreUri
-            if (renumbered || !relocations.isEmpty()) {
-                if (!relocations.noteMove(transferId, promisedUri, actual, renumbered)) {
-                    HostLog.w("landing", "could not update the relocation table; the move is redone later")
-                    return MoveResult(MoveOutcome.FAILED, stopPass = true)
-                }
-                relocationsDirty.set(true)
-            }
-            // Delete before forgetting the journal. If the delete fails the entry stays and
-            // the pass stops, so the next pass removes this copy and moves the file again
-            // instead of leaving it twice.
-            if (!file.delete() && file.exists()) {
-                HostLog.w("landing", "a copied file could not be removed from the landing folder; the move is redone later")
-                return MoveResult(MoveOutcome.FAILED, stopPass = true)
-            }
-            journal.clear()
-            claims.release(target.path, file.path)
-            if (renumbered) {
-                HostLog.i("landing", "transfer ${transferId.take(8)}: a landed file reached Downloads under another name than promised")
-            }
-            return MoveResult(MoveOutcome.COPIED, renumbered)
-        } catch (e: Exception) {
-            // A journal entry left by a failed copy points at a copy that was already removed
-            // (or a pending MediaStore row); settling it before the next pass is harmless.
-            HostLog.w("landing", "moving a landed file into Downloads failed; it stays in the landing folder", e)
-            return MoveResult(MoveOutcome.FAILED)
+            Placement(promisedUri, actual, renumbered)
         } finally {
             runCatching { input?.close() }
         }
     }
+
+    // Must stay declared after placer, relocations, journal and claims: it captures them at construction.
+    private val landedMove = LandedMove(
+        landingRoot = ::landingRoot,
+        downloadsFile = ::downloadsFile,
+        placer = placer,
+        relocations = relocations,
+        journal = journal,
+        claims = claims,
+        onRelocationsChanged = { relocationsDirty.set(true) },
+        info = { HostLog.i("landing", it) },
+        warn = { message, error -> HostLog.w("landing", message, error) },
+    )
 
     /** Called by the mover after a pass: flushes the scans and logs the cost of the pass. */
     fun moveEnded(transferId: String) {

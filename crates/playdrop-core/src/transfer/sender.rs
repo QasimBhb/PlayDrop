@@ -4,9 +4,9 @@
 use std::io::SeekFrom;
 use std::sync::Arc;
 
-use tokio::io::AsyncSeekExt;
+use tokio::io::{AsyncRead, AsyncSeekExt};
 
-use super::bundle::{BundleLayout, BundleWriter, MemberOpener, MemberReader, OpenFuture};
+use super::bundle::{BundleLayout, BundleWriter, MemberOpener, OpenFuture};
 use super::chunk::{chunk_count, prefix_hash, root_hash, ChunkEncoder, ChunkHash};
 use super::manifest::{Manifest, SourceInfo};
 use super::receiver::{FileState, TransferStateView};
@@ -38,6 +38,9 @@ pub struct ResumePlan {
     pub files: Vec<(u32, ResumeAction)>,
     /// Action for the bundle, when there is one.
     pub bundle: Option<ResumeAction>,
+    /// Streams planned as a restart only because this sender lost their hashes below the
+    /// receiver's offset; see [`TransferSender::plan_resume`].
+    pub rebuild: Vec<LostHashes>,
 }
 
 impl ResumePlan {
@@ -69,6 +72,25 @@ pub struct TransferSender {
     bundle_hashes: Vec<ChunkHash>,
     layout: Option<Arc<BundleLayout>>,
     chunk_size: u32,
+    /// Per fid, the lowest hash index that changed since [`take_unsaved`] last ran
+    /// (`usize::MAX`: none), so a record keeps its hashes by appending only what is new.
+    ///
+    /// [`take_unsaved`]: Self::take_unsaved
+    unsaved: Vec<usize>,
+    /// The same for the bundle.
+    bundle_unsaved: usize,
+}
+
+/// Hashes of one stream that changed since they were last saved: `hashes` replace
+/// everything from index `start` on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsavedHashes {
+    /// Which stream.
+    pub stream: StreamRef,
+    /// The first changed index.
+    pub start: usize,
+    /// The hashes from `start` to the end of the stream's list.
+    pub hashes: Vec<ChunkHash>,
 }
 
 impl TransferSender {
@@ -87,9 +109,11 @@ impl TransferSender {
         };
         Ok(Self {
             hashes: vec![Vec::new(); manifest.files.len()],
+            unsaved: vec![usize::MAX; manifest.files.len()],
             manifest,
             sources: Arc::new(sources),
             bundle_hashes: Vec::new(),
+            bundle_unsaved: usize::MAX,
             layout,
             chunk_size,
         })
@@ -98,6 +122,11 @@ impl TransferSender {
     /// The manifest being sent.
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
+    }
+
+    /// The binding chunk size from the receiver's answer.
+    pub fn chunk_size(&self) -> u32 {
+        self.chunk_size
     }
 
     /// Re-checks one source against its recorded size, mtime and file ID (SR-21).
@@ -212,9 +241,63 @@ impl TransferSender {
     /// Stores the hashes an encoder for `fid` produced (from [`ChunkEncoder::into_hashes`]).
     /// Call it even after a cut stream: hashes of chunks read are valid source facts.
     pub fn record_hashes(&mut self, fid: u32, hashes: Vec<ChunkHash>) {
-        if let Some(slot) = self.hashes.get_mut(fid as usize) {
-            *slot = hashes;
+        self.set_stream(StreamRef::File(fid), hashes);
+    }
+
+    /// Replaces a stream's hashes, noting from which index they differ.
+    fn set_stream(&mut self, stream: StreamRef, new: Vec<ChunkHash>) {
+        let (list, mark) = match stream {
+            StreamRef::File(fid) => match (
+                self.hashes.get_mut(fid as usize),
+                self.unsaved.get_mut(fid as usize),
+            ) {
+                (Some(l), Some(m)) => (l, m),
+                _ => return,
+            },
+            StreamRef::Bundle => (&mut self.bundle_hashes, &mut self.bundle_unsaved),
+        };
+        let same = list.iter().zip(&new).take_while(|(a, b)| a == b).count();
+        if same < new.len() {
+            *mark = (*mark).min(same);
         }
+        *list = new;
+    }
+
+    /// The hashes that changed since the last call, per stream, and marks them saved.
+    pub fn take_unsaved(&mut self) -> Vec<UnsavedHashes> {
+        let mut out = Vec::new();
+        for (fid, (list, mark)) in self.hashes.iter().zip(self.unsaved.iter_mut()).enumerate() {
+            if *mark < list.len() {
+                out.push(UnsavedHashes {
+                    stream: StreamRef::File(u32::try_from(fid).unwrap_or(u32::MAX)),
+                    start: *mark,
+                    hashes: list[*mark..].to_vec(),
+                });
+            }
+            *mark = usize::MAX;
+        }
+        if self.bundle_unsaved < self.bundle_hashes.len() {
+            out.push(UnsavedHashes {
+                stream: StreamRef::Bundle,
+                start: self.bundle_unsaved,
+                hashes: self.bundle_hashes[self.bundle_unsaved..].to_vec(),
+            });
+        }
+        self.bundle_unsaved = usize::MAX;
+        out
+    }
+
+    /// Marks every held hash unsaved, so the next [`take_unsaved`](Self::take_unsaved)
+    /// returns them all (a record rewritten from scratch).
+    pub fn mark_all_unsaved(&mut self) {
+        self.unsaved.fill(0);
+        self.bundle_unsaved = 0;
+    }
+
+    /// Marks every held hash saved (they were loaded from the record).
+    pub fn mark_all_saved(&mut self) {
+        self.unsaved.fill(usize::MAX);
+        self.bundle_unsaved = usize::MAX;
     }
 
     /// Root of file `fid` for the `pd-root` trailer, once every chunk hash is known.
@@ -252,7 +335,7 @@ impl TransferSender {
 
     /// Stores the hashes a bundle encoder produced.
     pub fn record_bundle_hashes(&mut self, hashes: Vec<ChunkHash>) {
-        self.bundle_hashes = hashes;
+        self.set_stream(StreamRef::Bundle, hashes);
     }
 
     /// Bundle root for the `pd-root` trailer, once every chunk hash is known.
@@ -266,6 +349,13 @@ impl TransferSender {
     /// cancel (protocol.md 7.6, SR-21): the remote `prefix` must equal the prefix of the
     /// locally recorded hashes, and the source must still match its recorded size, mtime
     /// and file ID.
+    ///
+    /// A stream whose hashes below the receiver's offset this sender does not hold (a send
+    /// killed mid-`PUT` records none for that stream) is planned as a restart and listed
+    /// in [`ResumePlan::rebuild`]: the caller may rebuild those hashes from the unchanged
+    /// source ([`HashRebuilder`]), install them and plan again, so a lost record costs
+    /// one local read instead of a re-send from 0. The rebuilt prefix still has to match
+    /// the receiver's before any byte is resumed (SR-21).
     pub async fn plan_resume(&self, remote: &TransferStateView) -> Result<ResumePlan> {
         if remote.id != self.manifest.id {
             return Err(Error::NotFound);
@@ -274,6 +364,7 @@ impl TransferSender {
             return Err(Error::BadRequest("chunk size changed".into()));
         }
         let mut files = Vec::new();
+        let mut rebuild = Vec::new();
         for f in self
             .manifest
             .files
@@ -294,12 +385,12 @@ impl TransferSender {
                             ResumeAction::Resume { from: 0 }
                         }
                         SourceStatus::Modified => ResumeAction::Restart,
-                        SourceStatus::Unchanged => decide(
+                        SourceStatus::Unchanged => self.decide_unchanged(
+                            StreamRef::File(f.fid),
                             r.verified_offset,
                             f.size,
                             r.prefix.as_deref(),
-                            &self.hashes[f.fid as usize],
-                            self.chunk_size,
+                            &mut rebuild,
                         ),
                     }
                 }
@@ -326,12 +417,12 @@ impl TransferSender {
                             ResumeAction::Resume { from: 0 }
                         }
                         SourceStatus::Modified => ResumeAction::Restart,
-                        SourceStatus::Unchanged => decide(
+                        SourceStatus::Unchanged => self.decide_unchanged(
+                            StreamRef::Bundle,
                             rb.verified_offset,
                             layout.total(),
                             rb.prefix.as_deref(),
-                            &self.bundle_hashes,
-                            self.chunk_size,
+                            &mut rebuild,
                         ),
                     }
                 }
@@ -341,8 +432,179 @@ impl TransferSender {
             }
             _ => None,
         };
-        Ok(ResumePlan { files, bundle })
+        Ok(ResumePlan {
+            files,
+            bundle,
+            rebuild,
+        })
     }
+
+    /// [`plan_resume`](Self::plan_resume), then rebuilds every lost prefix from the
+    /// source, installs it and plans again. A rebuild that fails leaves that stream as a
+    /// restart. For callers that may hold the sender while the source is read; the host
+    /// uses the steps separately so a long read does not lock the send.
+    pub async fn plan_resume_rebuilding(
+        &mut self,
+        remote: &TransferStateView,
+    ) -> Result<ResumePlan> {
+        let plan = self.plan_resume(remote).await?;
+        if plan.rebuild.is_empty() {
+            return Ok(plan);
+        }
+        let rebuilder = self.rebuilder();
+        for lost in &plan.rebuild {
+            match rebuilder.hashes(lost.stream, lost.offset).await {
+                Ok(h) => self.install_hashes(lost.stream, h),
+                Err(e) => {
+                    tracing::debug!(stream = ?lost.stream, error = %e, "lost chunk hashes could not be rebuilt");
+                }
+            }
+        }
+        let mut plan = self.plan_resume(remote).await?;
+        plan.rebuild.clear();
+        Ok(plan)
+    }
+
+    /// The prefix decision for a stream whose source is unchanged. When the receiver
+    /// reports a chunk-aligned prefix inside the stream and fewer hashes than that are held
+    /// here, the stream is also listed in `rebuild`, so the hashes can be rebuilt instead
+    /// of restarting.
+    fn decide_unchanged(
+        &self,
+        stream: StreamRef,
+        offset: u64,
+        size: u64,
+        prefix: Option<&str>,
+        rebuild: &mut Vec<LostHashes>,
+    ) -> ResumeAction {
+        let held = match stream {
+            StreamRef::File(fid) => self.hashes(fid),
+            StreamRef::Bundle => &self.bundle_hashes,
+        };
+        let cs = u64::from(self.chunk_size);
+        let lost = offset > 0
+            && offset < size
+            && offset.is_multiple_of(cs)
+            && prefix.is_some()
+            && usize::try_from(offset / cs).is_ok_and(|k| held.len() < k);
+        if lost {
+            rebuild.push(LostHashes { stream, offset });
+        }
+        decide(offset, size, prefix, held, self.chunk_size)
+    }
+
+    /// What rebuilding lost hashes needs, detached from the sender so the read runs
+    /// without holding it.
+    pub fn rebuilder(&self) -> HashRebuilder {
+        HashRebuilder {
+            sources: Arc::clone(&self.sources),
+            layout: self.layout.clone(),
+            chunk_size: self.chunk_size,
+        }
+    }
+
+    /// Installs hashes rebuilt by a [`HashRebuilder`] (or copied from a running encoder),
+    /// from chunk 0.
+    pub fn install_hashes(&mut self, stream: StreamRef, hashes: Vec<ChunkHash>) {
+        match stream {
+            StreamRef::File(fid) => self.record_hashes(fid, hashes),
+            StreamRef::Bundle => self.record_bundle_hashes(hashes),
+        }
+    }
+
+    /// Brings the held hashes of a stream up to those of a running encoder (`all`, from
+    /// chunk 0), copying only the new tail. Called during a long `PUT`, so the record
+    /// holds hashes before the `PUT` ends (protocol.md 7.6).
+    pub fn sync_hashes(&mut self, stream: StreamRef, all: &[ChunkHash]) {
+        let (list, mark) = match stream {
+            StreamRef::File(fid) => match (
+                self.hashes.get_mut(fid as usize),
+                self.unsaved.get_mut(fid as usize),
+            ) {
+                (Some(l), Some(m)) => (l, m),
+                _ => return,
+            },
+            StreamRef::Bundle => (&mut self.bundle_hashes, &mut self.bundle_unsaved),
+        };
+        if all.len() >= list.len() && all[..list.len()] == list[..] {
+            *mark = (*mark).min(list.len());
+            list.extend_from_slice(&all[list.len()..]);
+        } else {
+            *mark = 0;
+            list.clear();
+            list.extend_from_slice(all);
+        }
+    }
+}
+
+/// One stream of a transfer: a streamed file or the bundle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamRef {
+    /// A streamed (not bundled) file, by fid.
+    File(u32),
+    /// The tar bundle (protocol.md 7.7).
+    Bundle,
+}
+
+/// A stream whose hashes below the receiver's verified offset the sender lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LostHashes {
+    /// Which stream.
+    pub stream: StreamRef,
+    /// The receiver's verified offset: hashes from 0 to here are needed.
+    pub offset: u64,
+}
+
+/// Rebuilds lost chunk hashes from the sources (protocol.md 7.6): a file is read from 0
+/// to the offset on this device only; the bundle is deterministic, so it is regenerated
+/// from 0 the same way. Holds only shared handles, so it runs without the sender.
+#[derive(Debug, Clone)]
+pub struct HashRebuilder {
+    sources: Arc<Vec<SourceInfo>>,
+    layout: Option<Arc<BundleLayout>>,
+    chunk_size: u32,
+}
+
+impl HashRebuilder {
+    /// The chunk hashes of `stream` from 0 to `offset` (chunk-aligned).
+    pub async fn hashes(&self, stream: StreamRef, offset: u64) -> Result<Vec<ChunkHash>> {
+        let hashes = match stream {
+            StreamRef::File(fid) => {
+                let src = self.sources.get(fid as usize).ok_or(Error::NotFound)?;
+                let f = src.source.open().await?;
+                hash_prefix(f, offset, self.chunk_size).await?
+            }
+            StreamRef::Bundle => {
+                let layout = self.layout.clone().ok_or(Error::NotFound)?;
+                let opener = Arc::new(FsOpener {
+                    sources: Arc::clone(&self.sources),
+                });
+                let w = BundleWriter::new(layout, opener, 0)?;
+                hash_prefix(w, offset, self.chunk_size).await?
+            }
+        };
+        tracing::debug!(
+            ?stream,
+            bytes = offset,
+            "chunk hashes below the receiver's offset rebuilt from the source"
+        );
+        Ok(hashes)
+    }
+}
+
+/// Chunk hashes of the first `end` bytes of `reader` (`end` chunk-aligned), computed the
+/// same way a `PUT` computes them, so the result can stand in for hashes that were lost.
+async fn hash_prefix<R: AsyncRead + Unpin>(
+    reader: R,
+    end: u64,
+    chunk_size: u32,
+) -> Result<Vec<ChunkHash>> {
+    let mut enc = ChunkEncoder::new(reader, 0, end, chunk_size, Vec::new())?;
+    while std::future::poll_fn(|cx| enc.poll_next_record(cx))
+        .await?
+        .is_some()
+    {}
+    Ok(enc.into_hashes())
 }
 
 /// Prefix comparison of protocol.md 7.6 for one stream.
@@ -408,12 +670,11 @@ struct FsOpener {
 
 impl MemberOpener for FsOpener {
     fn open(&self, fid: u32, offset: u64) -> OpenFuture {
-        let source: Option<SourceRef> = self.sources.get(fid as usize).map(|s| s.source.clone());
-        Box::pin(async move {
-            let source = source.ok_or_else(|| std::io::Error::other("unknown fid"))?;
-            let f = source.open_at(offset).await?;
-            Ok(Box::new(f) as MemberReader)
-        })
+        // Small members are read whole in one blocking call (bundle.rs, Phase 9 item 2).
+        match self.sources.get(fid as usize) {
+            Some(s) => super::bundle::open_source_member(s.source.clone(), s.size, offset),
+            None => Box::pin(async { Err(std::io::Error::other("unknown fid")) }),
+        }
     }
 }
 
@@ -542,6 +803,152 @@ mod tests {
             .unwrap();
         assert_eq!(plan.files[0].1, ResumeAction::Cancel);
         assert!(plan.must_cancel());
+    }
+
+    /// Chunk hashes of `bytes` as a `PUT` computes them.
+    fn chunk_hashes(bytes: &[u8]) -> Vec<ChunkHash> {
+        bytes
+            .chunks(CS as usize)
+            .map(|c| *blake3::hash(c).as_bytes())
+            .collect()
+    }
+
+    /// A sender that lost the hashes below the receiver's offset (killed mid-`PUT`)
+    /// rebuilds them from the unchanged source and resumes when the receiver's prefix
+    /// matches; a receiver prefix that differs still restarts at 0 (SR-21).
+    #[tokio::test]
+    async fn lost_hashes_are_rebuilt_from_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, data) = setup(tmp.path()).await;
+        assert!(s.hashes(0).is_empty(), "nothing recorded yet");
+        let off = 2 * u64::from(CS);
+        let good = prefix_hash(off, CS, &chunk_hashes(&data)[..2]);
+        let good = crate::transfer::hash_to_hex(&good);
+        let plan = s
+            .plan_resume(&view(&s, off, Some(good.clone()), 0, None))
+            .await
+            .unwrap();
+        assert_eq!(
+            plan.files[0].1,
+            ResumeAction::Restart,
+            "lost, not yet rebuilt"
+        );
+        assert_eq!(
+            plan.rebuild,
+            vec![LostHashes {
+                stream: StreamRef::File(0),
+                offset: off
+            }]
+        );
+        let plan = s
+            .plan_resume_rebuilding(&view(&s, off, Some(good), 0, None))
+            .await
+            .unwrap();
+        assert_eq!(plan.files[0].1, ResumeAction::Resume { from: off });
+        assert_eq!(s.hashes(0), &chunk_hashes(&data)[..2]);
+        // The resumed encoder carries on from the rebuilt hashes to the right root.
+        let mut enc = s.file_encoder(0, off).await.unwrap();
+        let mut tail = Vec::new();
+        enc.read_to_end(&mut tail).await.unwrap();
+        let full = root_hash(data.len() as u64, CS, &chunk_hashes(&data));
+        assert_eq!(enc.root(data.len() as u64), Some(full));
+
+        let again = tmp.path().join("again");
+        std::fs::create_dir(&again).unwrap();
+        let (mut s, _) = setup(&again).await;
+        let bad = crate::transfer::hash_to_hex(&[5; 32]);
+        let plan = s
+            .plan_resume_rebuilding(&view(&s, off, Some(bad), 0, None))
+            .await
+            .unwrap();
+        assert_eq!(plan.files[0].1, ResumeAction::Restart);
+    }
+
+    /// A running encoder's hashes are copied into the sender a tail at a time, and a
+    /// restarted encoder's replace them.
+    #[tokio::test]
+    async fn sync_hashes_follows_the_encoder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut s, data) = setup(tmp.path()).await;
+        let all = chunk_hashes(&data);
+        s.sync_hashes(StreamRef::File(0), &all[..1]);
+        s.sync_hashes(StreamRef::File(0), &all[..3]);
+        assert_eq!(s.hashes(0), &all[..3]);
+        let unsaved = s.take_unsaved();
+        assert_eq!(unsaved.len(), 1);
+        assert_eq!((unsaved[0].start, unsaved[0].hashes.len()), (0, 3));
+        s.sync_hashes(StreamRef::File(0), &all[..4]);
+        let unsaved = s.take_unsaved();
+        assert_eq!((unsaved[0].start, &unsaved[0].hashes[..]), (3, &all[3..4]));
+        assert_eq!(s.take_unsaved(), Vec::new(), "nothing new");
+        s.sync_hashes(StreamRef::File(0), &[[1; 32]]);
+        assert_eq!(s.hashes(0), &[[1; 32]]);
+        assert_eq!(
+            s.take_unsaved()[0].start,
+            0,
+            "a replaced list is saved from 0"
+        );
+        // The same hashes again (a `PUT` end) change nothing.
+        s.record_hashes(0, vec![[1; 32]]);
+        assert_eq!(s.take_unsaved(), Vec::new());
+    }
+
+    /// The same for the bundle, which is regenerated from 0 (protocol.md 7.7).
+    #[tokio::test]
+    async fn lost_bundle_hashes_are_rebuilt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        for i in 0..3u64 {
+            let bytes = crate::transfer::chunk::tests::TestRng(20 + i).bytes(100_000);
+            std::fs::write(src.join(format!("m{i}")), bytes).unwrap();
+        }
+        let mut b = ManifestBuilder::new(CS);
+        b.add_path(&src).await.unwrap();
+        let (m, sources) = b.build().unwrap();
+        let total = m.bundle.unwrap().size;
+        assert!(total > 2 * u64::from(CS));
+        let mut first = TransferSender::new(m.clone(), sources.clone(), CS).unwrap();
+        let mut enc = first.bundle_encoder(0).unwrap();
+        let mut body = Vec::new();
+        enc.read_to_end(&mut body).await.unwrap();
+        let all = enc.into_hashes();
+
+        let mut s = TransferSender::new(m, sources, CS).unwrap();
+        let off = 2 * u64::from(CS);
+        let remote = TransferStateView {
+            id: s.manifest().id.clone(),
+            state: TransferState::Active,
+            chunk_size: CS,
+            total_bytes: s.manifest().total_bytes,
+            bytes_verified: 0,
+            files: (0..3)
+                .map(|fid| FileStateView {
+                    fid,
+                    state: FileState::Waiting,
+                    size: 100_000,
+                    verified_offset: 0,
+                    root: None,
+                    prefix: None,
+                    token: None,
+                })
+                .collect(),
+            bundle: Some(StreamStateView {
+                state: FileState::Receiving,
+                size: total,
+                verified_offset: off,
+                root: None,
+                prefix: Some(crate::transfer::hash_to_hex(&prefix_hash(
+                    off,
+                    CS,
+                    &all[..2],
+                ))),
+                token: None,
+            }),
+        };
+        let plan = s.plan_resume_rebuilding(&remote).await.unwrap();
+        assert_eq!(plan.bundle, Some(ResumeAction::Resume { from: off }));
+        assert_eq!(s.bundle_hashes(), &all[..2]);
     }
 
     #[tokio::test]

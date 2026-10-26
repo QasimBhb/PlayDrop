@@ -388,3 +388,45 @@ and the desktop reached another LAN device meanwhile. The receiver kept its veri
 0 (sender persistence is receiver-only, protocol.md 11.1), so that staging folder waits for
 the 24 h sweep. The gate is still owed; run it again after the phone rejoins the network
 from its own settings, with a shorter outage, and record the resume offset and the sha256.
+
+## 10. Phase 9: the small-file floor measured on both ends (2026-10-17 to 2026-10-22)
+
+Not an end-to-end phone run: the receiver's bundle path was timed in isolation with the
+ignored benchmark `cargo test --release -p playdrop-core --test phase9_receiver -- --ignored
+--nocapture` (5,000 members of 4 to 64 KiB, seeded, 170.9 MiB bundle, 1 MiB chunks), on the
+desktop (`/tmp`, ext4) and on the Galaxy A54 by running the same test binary from
+`/data/local/tmp` (f2fs) as the shell user. Before is the 0.3.0 receiver with the same timing
+hooks; runs were interleaved. Times per member in ms.
+
+### 10.1 Desktop, ext4 (medians of 18 runs)
+
+| Mode | Wall s | Stream | Checkpoint | Delivery |
+|---|---|---|---|---|
+| Directory, before | 0.50 | 0.024 | 0.055 | 0.026 |
+| Directory, after | 0.49 | 0.024 | 0.055 | 0.021 |
+| Staged, before | 0.44 | 0.021 | 0.050 | 0.020 |
+| Staged, after | 0.44 | 0.022 | 0.050 | 0.020 |
+
+### 10.2 Phone, f2fs (medians of 9; noisy, read as relative)
+
+| Mode | Wall s | MiB/s | Stream | Checkpoint | Delivery |
+|---|---|---|---|---|---|
+| Directory, before | 9.43 | 18.1 | 0.45 | 0.89 | 0.185 |
+| Directory, after | 4.62 | 37.0 | 0.33 | 0.26 | 0.068 |
+| Staged, before | 7.01 | 24.4 | 0.32 | 0.64 | 0.143 |
+| Staged, after | 5.31 | 32.2 | 0.37 | 0.37 | 0.100 |
+
+### 10.3 What made the difference
+
+- The checkpoint flush: 0.3.0 used one `syncfs` for many members only under
+  `cfg(target_os = "linux")`, which Android does not match, so the phone flushed every member
+  with its own `fdatasync`. 0.4.0 uses `syncfs` on Linux and Android when the staging folder is
+  on ext2/3/4, f2fs, xfs or btrfs, and per-file flushes elsewhere (sdcardfs on Android 8 to 10
+  reports success from `syncfs` without flushing).
+- Placement: a no-replace rename instead of an exclusive create followed by a rename onto it.
+- Sender: members under 256 KiB are read in one blocking call (0.18 to about 0.11 ms per
+  member on the phone, reading from page cache, no hashing).
+
+The `mixed-5000` against `medium-100` gate (0.8) still needs a real desktop-to-phone run with
+`bench/desktop-to-phone.sh` on a release APK; the phone-side receive of the bundle alone is now
+roughly twice as fast in Directory mode and a quarter faster in Staged mode, which the app uses.

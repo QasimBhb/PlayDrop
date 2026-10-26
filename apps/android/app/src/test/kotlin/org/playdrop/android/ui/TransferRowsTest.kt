@@ -38,6 +38,23 @@ class TransferRowsTest {
     }
 
     @Test
+    fun forgetIsOfferedOnlyForAFailedSendKeptForResume() {
+        fun row(direction: TransferDirection, state: TransferStatus, resumable: Boolean) = TransferRows.derive(
+            listOf(Samples.snapshot("x", direction, state, 10, 20, 0, 1, resumable = resumable)),
+            peers,
+            emptyMap(),
+        ).single()
+        val kept = row(TransferDirection.SEND, TransferStatus.FAILED, resumable = true)
+        assertTrue(kept.canForget)
+        assertFalse(kept.canCancel)
+        assertFalse(kept.canRespond)
+        assertFalse(row(TransferDirection.SEND, TransferStatus.FAILED, resumable = false).canForget)
+        assertFalse(row(TransferDirection.SEND, TransferStatus.CANCELLED, resumable = false).canForget)
+        assertFalse(row(TransferDirection.SEND, TransferStatus.ACTIVE, resumable = false).canForget)
+        assertFalse(row(TransferDirection.RECEIVE, TransferStatus.FAILED, resumable = true).canForget)
+    }
+
+    @Test
     fun labelsComeFromPeersOrFallBackToShortId() {
         val stranger = Samples.snapshot("x", TransferDirection.SEND, TransferStatus.ACTIVE, 1, 2, 0, 1, peer = "ff".repeat(32))
         val rows = TransferRows.derive(listOf(Samples.transfers[0], stranger), peers, emptyMap()).associateBy { it.id }

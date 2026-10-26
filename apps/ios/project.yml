@@ -32,7 +32,7 @@ configFiles:
 settings:
   base:
     # Version shown in the App Store and in Settings (Info.plist reads these two).
-    MARKETING_VERSION: 0.3.0
+    MARKETING_VERSION: 0.4.0
     CURRENT_PROJECT_VERSION: 1
     # Swift 6 toolchain, Swift 5 language mode for the app and the extension, with the
     # Swift 6 concurrency checks on as warnings. PlayDropShared opts into Swift 6 mode in its

@@ -482,6 +482,7 @@ mod tests {
             saved: Vec::new(),
             folder: None,
             delivered: Vec::new(),
+            resumable: false,
         }
     }
 

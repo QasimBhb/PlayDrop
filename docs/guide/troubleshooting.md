@@ -48,6 +48,20 @@ device that accepts your clipboard is offline right now, or you switched sending
 received" is not a problem: the other device already has that text. The three reasons are
 explained in [clipboard.md](clipboard.md).
 
+## A send failed with "resumes when ... is back"
+
+The other device could not be reached for ten minutes (Wi-Fi dropped, the phone went to sleep
+on a network that isolates it, the daemon there was down). Nothing is lost: the receiving side
+keeps what it verified for 24 hours, and the sender keeps its side of the transfer.
+
+- From a computer, do nothing: the send continues by itself when the device reconnects. If you
+  would rather drop it, forget the failed entry: `playdrop transfers` shows it as
+  `failed (resumes)` and `playdrop cancel <id>` forgets it (the window and the phone apps have a
+  Forget button on that row).
+- From a phone, share the same files to the same device again; the transfer continues from
+  where it stopped.
+- Sending the same files again from any device within 24 hours also continues it.
+
 ## Logs
 
 PlayDrop's logs never contain keys, pairing secrets or the contents of what you send. File names

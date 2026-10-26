@@ -28,7 +28,7 @@ use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use super::receive::{self, Target, CHUNK_SIZE_HEADER, ROOT_TRAILER};
-use super::send::{self, request_json, SendSource, Step, FILE_CONCURRENCY, RECONNECT_FOR};
+use super::send::{self, request_json, SendSource, Step, FILE_CONCURRENCY};
 use super::{connect, lock, Inner};
 use crate::identity::{secure_fs, DeviceId};
 use crate::net::connection::short;
@@ -804,7 +804,7 @@ async fn pull_item(inner: &Arc<Inner>, peer: DeviceId, id: &str) {
         let conn = match connect::outbound(inner, peer).await {
             Ok(c) => c,
             Err(e) => {
-                if last_ok.elapsed() > RECONNECT_FOR {
+                if last_ok.elapsed() > inner.reconnect_for {
                     fail(inner, id, &rx, format!("holder unreachable: {e}")).await;
                     return;
                 }

@@ -45,6 +45,8 @@ extension L10n {
         static var decline: String { String(localized: "ui_transfers_decline", defaultValue: "Decline") }
         /// "Open".
         static var open: String { String(localized: "ui_transfers_open", defaultValue: "Open") }
+        /// "Forget" (a failed send that waits to resume).
+        static var forget: String { String(localized: "ui_transfers_forget", defaultValue: "Forget") }
         /// Where received files are.
         static var savedIn: String {
             String(

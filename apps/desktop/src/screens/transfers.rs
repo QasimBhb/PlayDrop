@@ -1,4 +1,4 @@
-//! Transfers screen: offers, progress, results, cancel, open and show in folder.
+//! Transfers screen: offers, progress, results, cancel, forget, open and show in folder.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -8,7 +8,7 @@ use playdrop_ipc::Request;
 use slint::{ComponentHandle, Model, ModelRc};
 
 use super::{with, Controller};
-use crate::model;
+use crate::model::{self, Refetch};
 use crate::{App, TransfersState};
 
 pub(super) fn install(app: &App, c: &Rc<Controller>) {
@@ -19,6 +19,9 @@ pub(super) fn install(app: &App, c: &Rc<Controller>) {
     });
     t.on_cancel(|id| {
         with(|c| cancel(c, id.to_string()));
+    });
+    t.on_forget(|id| {
+        with(|c| forget(c, id.to_string()));
     });
     t.on_open(|id| {
         with(|c| open(c, id.as_str(), false));
@@ -84,6 +87,18 @@ fn respond(c: &Controller, id: String, accept: bool) {
 fn cancel(c: &Controller, id: String) {
     c.ipc().request(Request::CancelTransfer { id }, |r| {
         with(|c| c.done_or_report("", "Could not cancel", r));
+    });
+}
+
+/// "Forget" on a failed send that waits to resume. It is the same request as cancel (the
+/// daemon deletes the record and tells the receiver); the list is read again afterwards
+/// because that end may send no event.
+fn forget(c: &Controller, id: String) {
+    c.ipc().request(Request::CancelTransfer { id }, |r| {
+        with(|c| {
+            c.done_or_report("", "Could not forget the send", r);
+            c.load(Refetch::Transfers);
+        });
     });
 }
 

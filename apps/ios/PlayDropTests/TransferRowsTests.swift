@@ -47,6 +47,22 @@ final class TransferRowsTests: XCTestCase {
         XCTAssertFalse(rows[2].canCancel, "an incoming offer is answered, not cancelled")
     }
 
+    func testForgetIsOfferedOnlyForAFailedSendKeptForResume() {
+        func row(_ direction: TransferDirection, _ state: TransferStatus, resumable: Bool) -> TransferRow {
+            TransferRows.derive(
+                snapshots: [Fixtures.transfer("x", direction: direction, state: state, resumable: resumable)],
+                pendingOfferIds: [], label: { $0 }
+            )[0]
+        }
+        let kept = row(.send, .failed, resumable: true)
+        XCTAssertTrue(kept.canForget)
+        XCTAssertFalse(kept.canCancel)
+        XCTAssertFalse(row(.send, .failed, resumable: false).canForget)
+        XCTAssertFalse(row(.send, .cancelled, resumable: false).canForget)
+        XCTAssertFalse(row(.send, .active, resumable: false).canForget)
+        XCTAssertFalse(row(.receive, .failed, resumable: true).canForget)
+    }
+
     func testFileURLs() {
         let urls = TransferRows.fileURLs(["/tmp/a.txt", "file:///tmp/b.txt", "content://x/y", "relative"])
         XCTAssertEqual(urls.map(\.path), ["/tmp/a.txt", "/tmp/b.txt"])

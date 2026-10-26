@@ -76,7 +76,7 @@ fun TransfersRoute(vm: TransfersViewModel, showMessage: (String) -> Unit) {
     )
 }
 
-/** Live and recent transfers with Cancel, Accept and Decline, and Open for received files. */
+/** Live and recent transfers with Cancel (Forget for a send waiting to resume), Accept and Decline, and Open for received files. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun TransfersScreen(
@@ -175,6 +175,10 @@ private fun TransferCard(
                 if (row.canRespond) {
                     Button(onClick = { onRespond(row.id, true) }) { Text(stringResource(R.string.ui_transfers_accept)) }
                     OutlinedButton(onClick = { onRespond(row.id, false) }) { Text(stringResource(R.string.ui_transfers_decline)) }
+                }
+                if (row.canForget) {
+                    // The core's cancel on a waiting send forgets its record and tells the receiver.
+                    TextButton(onClick = { onCancel(row.id) }) { Text(stringResource(R.string.ui_transfers_forget)) }
                 }
                 if (row.canCancel) {
                     TextButton(onClick = { onCancel(row.id) }) { Text(stringResource(R.string.ui_cancel)) }

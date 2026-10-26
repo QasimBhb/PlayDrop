@@ -4571,7 +4571,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playdrop-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4592,7 +4592,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "blake3",
@@ -4624,13 +4624,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "windows-sys 0.61.2",
  "x509-parser",
  "zeroize",
 ]
 
 [[package]]
 name = "playdrop-desktop"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4651,7 +4652,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ffi"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "android_logger",
  "jni",
@@ -4669,7 +4670,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ipc"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "futures-util",
  "playdrop-core",
@@ -4689,7 +4690,7 @@ dependencies = [
 
 [[package]]
 name = "playdropd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -6662,7 +6663,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "uniffi",
 ]

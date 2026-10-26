@@ -52,6 +52,8 @@ data class TransferRow(
     val note: String?,
     /** Cancel is offered. */
     val canCancel: Boolean,
+    /** Forget is offered: a failed send the core keeps for resume (same call as cancel). */
+    val canForget: Boolean,
     /** Accept and Decline are offered. */
     val canRespond: Boolean,
     /** Content URI of the first delivered file, for "Open". */
@@ -128,6 +130,7 @@ object TransferRows {
             moreNames = (fileCount - names.size).coerceAtLeast(0).takeIf { names.isNotEmpty() } ?: 0,
             note = s.note ?: offer?.note,
             canCancel = !finished && !(receive && offered),
+            canForget = !receive && s.state == TransferStatus.FAILED && s.resumable,
             canRespond = receive && offered,
             openUri = delivered.firstOrNull()?.let { relocate(s.id, it.location) },
             openName = delivered.firstOrNull()?.path,

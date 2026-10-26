@@ -260,7 +260,7 @@ pub fn transfers(list: &[TransferSnapshot], peers: &[PeerSummary], now: u64) -> 
                 t.id.clone(),
                 direction_name(t.direction).to_owned(),
                 peer_name(peers, &t.peer, &t.short_id),
-                state_name(t.state).to_owned(),
+                state_column(t),
                 format!("{} of {}", size(t.bytes), size(t.total)),
                 files_column(t),
                 ago(now, Some(t.started_at)),
@@ -274,6 +274,16 @@ pub fn transfers(list: &[TransferSnapshot], peers: &[PeerSummary], now: u64) -> 
         ],
         &rows,
     )
+}
+
+/// The STATE column: a failed send that is kept for resume says so, since `failed` alone
+/// reads as lost. `playdrop cancel` forgets it.
+fn state_column(t: &TransferSnapshot) -> String {
+    if t.resumable && t.state == TransferStatus::Failed {
+        "failed (resumes)".to_owned()
+    } else {
+        state_name(t.state).to_owned()
+    }
 }
 
 /// The FILES column: "done/total" while a bundle is moving, the total otherwise. A daemon
@@ -634,6 +644,7 @@ mod tests {
             saved: Vec::new(),
             folder: None,
             delivered: Vec::new(),
+            resumable: false,
         }
     }
 
@@ -654,6 +665,26 @@ mod tests {
             assert!(row.contains(want), "{want} missing from {row}");
         }
         assert!(transfers(&[], &peers, 0).starts_with("no transfers"));
+    }
+
+    #[test]
+    fn a_failed_send_kept_for_resume_says_so() {
+        let mut t = snapshot(TransferStatus::Failed);
+        assert_eq!(state_column(&t), "failed");
+        t.resumable = true;
+        assert_eq!(state_column(&t), "failed (resumes)");
+        let out = transfers(&[t.clone()], &[], 1_000);
+        assert!(out
+            .lines()
+            .nth(1)
+            .expect("row")
+            .contains("failed (resumes)"));
+        // The flag only matters on a failed row; a stale flag never relabels another state.
+        t.state = TransferStatus::Cancelled;
+        assert_eq!(state_column(&t), "cancelled");
+        // JSON passes the flag through as the daemon sent it.
+        t.state = TransferStatus::Failed;
+        assert!(json(&t).contains("\"resumable\":true"));
     }
 
     #[test]

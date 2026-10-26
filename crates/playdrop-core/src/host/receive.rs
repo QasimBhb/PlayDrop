@@ -146,6 +146,117 @@ struct Pending202 {
 #[derive(Serialize, Deserialize)]
 struct OwnerRecord {
     owner: DeviceId,
+    /// Set once the transfer ended; the record then answers for it (see [`Ended`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ended: Option<Ended>,
+}
+
+/// How long an ended transfer is still answered for (protocol.md 7.6: the same 24 h a
+/// `.part` waits), so a sender that asks after a restart of this host learns the end
+/// instead of getting `404` and offering everything again.
+const ENDED_KEEP: Duration = Duration::from_hours(24);
+
+/// How an incoming transfer ended, kept on disk in `incoming/<id>.json` with its owner
+/// (protocol.md 7.6 "both sides persist ID, manifest and file states"). After a restart
+/// `GET` answers with this state, a `POST` of the same manifest gets it back as `200`,
+/// `PUT` is refused as for that state, and `DELETE` is a no-op `204`. Swept after
+/// [`ENDED_KEEP`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Ended {
+    state: TransferState,
+    at_ms: u64,
+    /// BLAKE3 of the manifest's JSON, to tell the same offer from another one (7.3).
+    manifest_hash: String,
+    chunk_size: u32,
+    total_bytes: u64,
+}
+
+/// An ended transfer and its owner, as the host keeps it in memory.
+#[derive(Debug, Clone)]
+pub(crate) struct EndedEntry {
+    owner: DeviceId,
+    ended: Ended,
+}
+
+fn manifest_hash(m: &Manifest) -> String {
+    let json = serde_json::to_vec(m).unwrap_or_default();
+    blake3::hash(&json).to_hex().to_string()
+}
+
+impl Ended {
+    fn of(manifest: &Manifest, state: TransferState) -> Self {
+        Self {
+            state,
+            at_ms: unix_ms(),
+            manifest_hash: manifest_hash(manifest),
+            chunk_size: manifest.chunk_size,
+            total_bytes: manifest.total_bytes,
+        }
+    }
+
+    /// The `GET` answer for an ended transfer: its state and totals, no per-file detail
+    /// (a sender only needs the state once a transfer ended).
+    fn view(&self, id: &str) -> TransferStateView {
+        TransferStateView {
+            id: id.to_owned(),
+            state: self.state,
+            chunk_size: self.chunk_size,
+            total_bytes: self.total_bytes,
+            bytes_verified: if self.state == TransferState::Complete {
+                self.total_bytes
+            } else {
+                0
+            },
+            files: Vec::new(),
+            bundle: None,
+        }
+    }
+
+    fn is_expired(&self, now_ms: u64) -> bool {
+        let keep = u64::try_from(ENDED_KEEP.as_millis()).unwrap_or(u64::MAX);
+        now_ms.saturating_sub(self.at_ms) > keep
+    }
+
+    /// The refusal a `PUT` gets for this state (7.1).
+    fn put_refusal(&self) -> HttpError {
+        match self.state {
+            TransferState::Declined => HttpError::from_code(ErrorCode::Declined, ""),
+            TransferState::Expired => HttpError::from_code(ErrorCode::Expired, ""),
+            TransferState::Cancelled => HttpError::from_code(ErrorCode::Cancelled, ""),
+            other => HttpError::from_code(
+                ErrorCode::BadRequest,
+                format!("transfer is {other:?}").to_lowercase(),
+            ),
+        }
+    }
+}
+
+/// The ended record of `id` if `peer` owns it (SR-13).
+fn ended_for(inner: &Inner, id: &str, peer: &DeviceId) -> Option<Ended> {
+    lock(&inner.ended)
+        .get(id)
+        .filter(|e| e.owner == *peer)
+        .map(|e| e.ended.clone())
+}
+
+/// Records how a transfer ended, on disk and in memory, replacing its owner record
+/// (protocol.md 7.6). Best effort: a failed write only means a later `GET` gets `404`.
+fn record_end(inner: &Inner, id: &str, owner: DeviceId, manifest: &Manifest, state: TransferState) {
+    let ended = Ended::of(manifest, state);
+    match serde_json::to_vec(&OwnerRecord {
+        owner,
+        ended: Some(ended.clone()),
+    }) {
+        Ok(json) => inner.owner_io.send(OwnerOp::Write {
+            dir: inner.data_dir.join("incoming"),
+            path: index_path(inner, id),
+            json,
+            done: None,
+        }),
+        Err(e) => tracing::debug!(error = %e, "end of transfer not recorded"),
+    }
+    lock(&inner.ended).insert(id.to_owned(), EndedEntry { owner, ended });
 }
 
 fn index_path(inner: &Inner, id: &str) -> std::path::PathBuf {
@@ -154,19 +265,130 @@ fn index_path(inner: &Inner, id: &str) -> std::path::PathBuf {
 
 /// Persists which device owns a transfer, so SR-13 binding survives a restart (7.6).
 async fn write_owner(inner: &Inner, id: &str, owner: DeviceId) -> Result<()> {
-    let dir = inner.data_dir.join("incoming");
-    let path = index_path(inner, id);
-    tokio::task::spawn_blocking(move || {
-        secure_fs::ensure_private_dir(&dir)?;
-        let json = serde_json::to_vec(&OwnerRecord { owner })?;
-        secure_fs::write_private_atomic(&path, &json)
-    })
-    .await
-    .map_err(|e| Error::Io(std::io::Error::other(e)))?
+    let json = serde_json::to_vec(&OwnerRecord { owner, ended: None })?;
+    let (done, written) = tokio::sync::oneshot::channel();
+    // Through the queue like every other change to the record, so a later removal can
+    // never land before it; the accept waits until it is durable.
+    inner.owner_io.send(OwnerOp::Write {
+        dir: inner.data_dir.join("incoming"),
+        path: index_path(inner, id),
+        json,
+        done: Some(done),
+    });
+    written
+        .await
+        .map_err(|e| Error::Io(std::io::Error::other(e)))?
 }
 
 fn remove_owner(inner: &Inner, id: &str) {
-    let _ = std::fs::remove_file(index_path(inner, id));
+    inner.owner_io.send(OwnerOp::Remove(index_path(inner, id)));
+}
+
+/// One change to an `incoming/<id>.json` record after the transfer was accepted.
+#[derive(Debug)]
+pub(crate) enum OwnerOp {
+    /// Write a record atomically, 0600; `done`, when given, gets the outcome.
+    Write {
+        dir: std::path::PathBuf,
+        path: std::path::PathBuf,
+        json: Vec<u8>,
+        done: Option<tokio::sync::oneshot::Sender<Result<()>>>,
+    },
+    /// Delete a record.
+    Remove(std::path::PathBuf),
+}
+
+/// Applies owner record changes one at a time, in the order they were made, on a thread
+/// of its own: an end recorded and a removal racing each other (a sweep, an unpair) land
+/// in order, and no request handler waits for the disk. The thread ends once the host is
+/// gone and every queued change is done.
+#[derive(Debug)]
+pub(crate) struct OwnerIo {
+    /// `None` once [`close`](Self::close) ran; later changes are applied in place.
+    tx: std::sync::Mutex<Option<std::sync::mpsc::Sender<OwnerOp>>>,
+    thread: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// How long [`OwnerIo::close`] waits for queued changes to land.
+const OWNER_IO_FLUSH: Duration = Duration::from_secs(5);
+
+impl OwnerIo {
+    pub(crate) fn start() -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<OwnerOp>();
+        let spawned = std::thread::Builder::new()
+            .name("playdrop-incoming-io".into())
+            .spawn(move || {
+                for op in rx {
+                    apply_owner_op(op);
+                }
+            });
+        let thread = match spawned {
+            Ok(t) => Some(t),
+            Err(e) => {
+                tracing::warn!(error = %e, "incoming record thread not started; records are written in place");
+                None
+            }
+        };
+        let tx = thread.is_some().then_some(tx);
+        Self {
+            tx: std::sync::Mutex::new(tx),
+            thread: std::sync::Mutex::new(thread),
+        }
+    }
+
+    fn send(&self, op: OwnerOp) {
+        let unsent = match lock(&self.tx).as_ref() {
+            Some(tx) => tx.send(op).err().map(|std::sync::mpsc::SendError(op)| op),
+            None => Some(op),
+        };
+        if let Some(op) = unsent {
+            apply_owner_op(op);
+        }
+    }
+
+    /// Closes the queue and waits (up to [`OWNER_IO_FLUSH`]) until every queued change has
+    /// landed, so a host started again on the same data directory never sees one arrive
+    /// late (`Host::shutdown`).
+    pub(crate) async fn close(&self) {
+        drop(lock(&self.tx).take());
+        let Some(thread) = lock(&self.thread).take() else {
+            return;
+        };
+        let joined = tokio::time::timeout(
+            OWNER_IO_FLUSH,
+            tokio::task::spawn_blocking(move || thread.join()),
+        )
+        .await;
+        if joined.is_err() {
+            tracing::warn!("incoming record changes still pending at shutdown");
+        }
+    }
+}
+
+fn apply_owner_op(op: OwnerOp) {
+    let done = match op {
+        OwnerOp::Write {
+            dir,
+            path,
+            json,
+            done,
+        } => {
+            let written = secure_fs::ensure_private_dir(&dir)
+                .and_then(|()| secure_fs::write_private_atomic(&path, &json));
+            if let Some(done) = done {
+                let _ = done.send(written);
+                return;
+            }
+            written
+        }
+        OwnerOp::Remove(path) => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        },
+    };
+    if let Err(e) = done {
+        tracing::debug!(error = %e, "incoming record not updated");
+    }
 }
 
 fn unix_ms() -> u64 {
@@ -312,7 +534,7 @@ pub(crate) fn receiver_state(
 /// Fails an incoming transfer from inside (an outbox pull that cannot go on): deletes its
 /// `.part` files and reports it once.
 pub(crate) async fn fail_local(inner: &Arc<Inner>, id: &str, why: String) {
-    let (owner, rx) = {
+    let (owner, rx, manifest) = {
         let mut map = lock(&inner.incoming);
         let Some(e) = map.get_mut(id) else { return };
         if e.reported {
@@ -325,12 +547,12 @@ pub(crate) async fn fail_local(inner: &Arc<Inner>, id: &str, why: String) {
             e.state = OfferState::Cancelled;
             None
         };
-        (e.owner, rx)
+        (e.owner, rx, Arc::clone(&e.manifest))
     };
     if let Some(rx) = rx {
         let _ = rx.cancel().await;
     }
-    remove_owner(inner, id);
+    record_end(inner, id, owner, &manifest, TransferState::Failed);
     inner.transfer_ended(
         id,
         &owner,
@@ -339,6 +561,35 @@ pub(crate) async fn fail_local(inner: &Arc<Inner>, id: &str, why: String) {
     );
 }
 
+/// The answer to an offer whose ID ended before this host restarted, if it did: the same
+/// manifest from its owner gets the end back as `200` (protocol.md 7.3), anything else
+/// `409 conflict`.
+fn ended_offer(
+    inner: &Inner,
+    id: &str,
+    peer: DeviceId,
+    manifest: &Manifest,
+) -> Option<std::result::Result<OfferReply, HttpError>> {
+    if lock(&inner.incoming).contains_key(id) {
+        return None;
+    }
+    let e = lock(&inner.ended).get(id).cloned()?;
+    Some(
+        if e.owner == peer && e.ended.manifest_hash == manifest_hash(manifest) {
+            Ok(OfferReply::Known(Box::new(e.ended.view(id))))
+        } else {
+            Err(HttpError::from_code(
+                ErrorCode::Conflict,
+                "transfer ID already used with another manifest",
+            ))
+        },
+    )
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one offer from parse to reply, read top to bottom"
+)]
 async fn offer_inner(
     inner: &Arc<Inner>,
     peer: DeviceId,
@@ -350,6 +601,9 @@ async fn offer_inner(
     let id = manifest.id.clone();
     let manifest = Arc::new(manifest);
     let grants = inner.pins.get(&peer).ok_or(Error::NotPaired)?.grants;
+    if let Some(reply) = ended_offer(inner, &id, peer, &manifest) {
+        return reply;
+    }
     {
         let mut map = lock(&inner.incoming);
         if let Some(ex) = map.get(&id) {
@@ -489,7 +743,7 @@ async fn accept_now(
     };
     if cancelled {
         let _ = rx.cancel().await;
-        remove_owner(inner, id);
+        record_end(inner, id, owner, manifest, TransferState::Cancelled);
         return Err(Error::Cancelled);
     }
     tracing::debug!(peer = %short(&owner), files = manifest.files.len(), "transfer accepted");
@@ -503,10 +757,12 @@ fn lookup(
     peer: &DeviceId,
 ) -> std::result::Result<TransferReceiver, HttpError> {
     let map = lock(&inner.incoming);
-    let e = map
-        .get(id)
-        .filter(|e| e.owner == *peer)
-        .ok_or_else(|| HttpError::from_code(ErrorCode::NotFound, ""))?;
+    let Some(e) = map.get(id).filter(|e| e.owner == *peer) else {
+        return Err(ended_for(inner, id, peer).map_or_else(
+            || HttpError::from_code(ErrorCode::NotFound, ""),
+            |e| e.put_refusal(),
+        ));
+    };
     match &e.state {
         OfferState::Accepted(rx) => Ok(rx.clone()),
         OfferState::Pending { .. } | OfferState::Accepting => Err(HttpError::from_code(
@@ -717,7 +973,7 @@ fn report_if_done(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver) {
         e.reported = true;
         (e.owner, e.started)
     };
-    remove_owner(inner, id);
+    record_end(inner, id, owner, rx.manifest(), state);
     let end = match state {
         TransferState::Complete => {
             let st = rx.state();
@@ -753,6 +1009,39 @@ fn report_if_done(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver) {
     inner.transfer_ended(id, &owner, TransferDirection::Receive, end);
 }
 
+/// Forgets transfers that ended more than [`ENDED_KEEP`] ago: their records on disk and,
+/// for those that ended while this host ran, their entries in memory. A `GET` for one then
+/// answers `404` (protocol.md 7.6).
+fn sweep_ended(inner: &Inner) {
+    let now = unix_ms();
+    let old: Vec<String> = {
+        let mut ended = lock(&inner.ended);
+        let ids: Vec<String> = ended
+            .iter()
+            .filter(|(_, e)| e.ended.is_expired(now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in &ids {
+            ended.remove(id);
+        }
+        ids
+    };
+    if old.is_empty() {
+        return;
+    }
+    {
+        let mut map = lock(&inner.incoming);
+        for id in &old {
+            if map.get(id).is_some_and(|e| !e.is_active()) {
+                map.remove(id);
+            }
+        }
+    }
+    for id in &old {
+        remove_owner(inner, id);
+    }
+}
+
 /// `GET /v1/transfers/{id}` (protocol.md 7.5).
 pub(crate) async fn get_state(
     inner: &Arc<Inner>,
@@ -764,7 +1053,8 @@ pub(crate) async fn get_state(
     let view = lock(&inner.incoming)
         .get(id)
         .filter(|e| e.owner == peer)
-        .map(view_of);
+        .map(view_of)
+        .or_else(|| ended_for(inner, id, &peer).map(|e| e.view(id)));
     match view {
         Some(v) => {
             let _ = respond_json(respond, StatusCode::OK, &v).await;
@@ -801,16 +1091,25 @@ pub(crate) async fn cancel(
     let found = {
         let mut map = lock(&inner.incoming);
         map.get_mut(&id).filter(|e| e.owner == peer).map(|e| {
-            if let OfferState::Accepted(rx) = &e.state {
+            let rx = if let OfferState::Accepted(rx) = &e.state {
                 Some(rx.clone())
             } else {
                 e.state = OfferState::Cancelled;
                 None
-            }
+            };
+            (rx, Arc::clone(&e.manifest))
         })
     };
-    let Some(rx) = found else {
-        let _ = respond_error(&mut respond, &HttpError::from_code(ErrorCode::NotFound, "")).await;
+    let Some((rx, manifest)) = found else {
+        // A transfer that ended before this host restarted has nothing left to delete.
+        let status = if ended_for(&inner, &id, &peer).is_some() {
+            let _ =
+                crate::net::respond(&mut respond, StatusCode::NO_CONTENT, None, Bytes::new()).await;
+            return;
+        } else {
+            HttpError::from_code(ErrorCode::NotFound, "")
+        };
+        let _ = respond_error(&mut respond, &status).await;
         return;
     };
     if let Some(rx) = &rx {
@@ -822,7 +1121,10 @@ pub(crate) async fn cancel(
     let reported = lock(&inner.incoming)
         .get_mut(&id)
         .is_some_and(|e| std::mem::replace(&mut e.reported, true));
-    remove_owner(&inner, &id);
+    // A transfer that already ended keeps the end it had.
+    if !reported {
+        record_end(&inner, &id, peer, &manifest, TransferState::Cancelled);
+    }
     if !reported {
         let safe_reason: String = reason
             .chars()
@@ -843,7 +1145,7 @@ pub(crate) async fn cancel(
 /// frame with state `cancelled`, reason `user`, so the sender stops (5.13). A pending
 /// offer is withdrawn the same way.
 pub(crate) async fn cancel_local(inner: &Arc<Inner>, id: &str) -> Result<()> {
-    let (owner, rx) = {
+    let (owner, rx, manifest) = {
         let mut map = lock(&inner.incoming);
         let e = map.get_mut(id).ok_or(Error::NotFound)?;
         if e.reported {
@@ -868,14 +1170,14 @@ pub(crate) async fn cancel_local(inner: &Arc<Inner>, id: &str) -> Result<()> {
             }
         };
         e.reported = true;
-        (e.owner, rx)
+        (e.owner, rx, Arc::clone(&e.manifest))
     };
     if let Some(rx) = &rx {
         if let Err(e) = rx.cancel().await {
             tracing::debug!(error = %e, "cancel cleanup failed");
         }
     }
-    remove_owner(inner, id);
+    record_end(inner, id, owner, &manifest, TransferState::Cancelled);
     send_decision(inner, owner, id, FrameState::Cancelled, Some("user"));
     inner.transfer_ended(
         id,
@@ -919,6 +1221,7 @@ pub(crate) async fn respond_offer(inner: &Arc<Inner>, id: &str, accept: bool) ->
                     en.state = OfferState::Cancelled;
                     en.reported = true;
                 }
+                record_end(inner, id, owner, &manifest, TransferState::Failed);
                 send_decision(inner, owner, id, FrameState::Failed, Some("error"));
                 inner.transfer_ended(
                     id,
@@ -933,6 +1236,7 @@ pub(crate) async fn respond_offer(inner: &Arc<Inner>, id: &str, accept: bool) ->
         if let Some(en) = lock(&inner.incoming).get_mut(id) {
             en.reported = true;
         }
+        record_end(inner, id, owner, &manifest, TransferState::Declined);
         inner.transfer_ended(
             id,
             &owner,
@@ -969,6 +1273,7 @@ pub(crate) async fn load_persisted(inner: &Arc<Inner>) {
         return;
     };
     let mut found: Vec<(String, DeviceId)> = Vec::new();
+    let now = unix_ms();
     for entry in rd.flatten() {
         let path = entry.path();
         let Some(id) = path.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
@@ -978,8 +1283,15 @@ pub(crate) async fn load_persisted(inner: &Arc<Inner>) {
             .ok()
             .and_then(|b| serde_json::from_slice::<OwnerRecord>(&b).ok());
         match rec {
-            Some(r) => found.push((id, r.owner)),
-            None => {
+            // An ended transfer is answered for without a receiver until it is 24 h old.
+            Some(OwnerRecord {
+                owner,
+                ended: Some(ended),
+            }) if !ended.is_expired(now) => {
+                lock(&inner.ended).insert(id, EndedEntry { owner, ended });
+            }
+            Some(OwnerRecord { owner, ended: None }) => found.push((id, owner)),
+            _ => {
                 let _ = std::fs::remove_file(&path);
             }
         }
@@ -1011,10 +1323,12 @@ pub(crate) async fn load_persisted(inner: &Arc<Inner>) {
             }
             Ok(rx) => {
                 tracing::debug!(state = ?rx.transfer_state(), "persisted transfer already finished");
-                remove_owner(inner, &id);
+                record_end(inner, &id, owner, rx.manifest(), rx.transfer_state());
             }
             Err(e) => {
-                tracing::info!(error = %e, "persisted transfer could not be reloaded; dropped");
+                // Logged at warn so a test or CI run that fails afterwards (a sender asking
+                // for the transfer and getting 404) shows why the reload failed.
+                tracing::warn!(id = %id, error = %e, "persisted transfer could not be reloaded; dropped");
                 remove_owner(inner, &id);
             }
         }
@@ -1050,10 +1364,25 @@ pub(crate) async fn drop_peer(inner: &Arc<Inner>, peer: &DeviceId) {
             })
             .collect()
     };
+    let ended: Vec<String> = {
+        let mut ended = lock(&inner.ended);
+        let ids: Vec<String> = ended
+            .iter()
+            .filter(|(_, e)| e.owner == *peer)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in &ids {
+            ended.remove(id);
+        }
+        ids
+    };
     for (id, rx) in gone {
         if let Some(rx) = rx {
             let _ = rx.cancel().await;
         }
+        remove_owner(inner, &id);
+    }
+    for id in ended {
         remove_owner(inner, &id);
     }
 }
@@ -1074,7 +1403,7 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                     OfferState::Pending { deadline, .. } if now >= *deadline => {
                         e.state = OfferState::Expired;
                         e.reported = true;
-                        expired.push((id.clone(), e.owner));
+                        expired.push((id.clone(), e.owner, Arc::clone(&e.manifest)));
                     }
                     OfferState::Accepted(rx) if !e.reported => {
                         let bytes = rx.state().bytes_verified;
@@ -1116,7 +1445,8 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                 },
             );
         }
-        for (id, owner) in expired {
+        for (id, owner, manifest) in expired {
+            record_end(&inner, &id, owner, &manifest, TransferState::Expired);
             inner.transfer_ended(
                 &id,
                 &owner,
@@ -1126,6 +1456,7 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
         }
         if last_cleanup.is_none_or(|t| now.duration_since(t) >= CLEANUP_EVERY) {
             last_cleanup = Some(now);
+            sweep_ended(&inner);
             match cleanup_idle(inner.receive_root(), IDLE_TIMEOUT).await {
                 Ok(ids) => {
                     let gone: Vec<(String, Incoming)> = {
