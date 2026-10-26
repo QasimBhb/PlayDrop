@@ -32,16 +32,29 @@ fi
 [ -f "$generator" ] || { echo "generator not found: $generator" >&2; exit 1; }
 
 # -I keeps Python from importing anything from the generator's own folder or the cwd.
+sdk="org.freedesktop.Sdk//25.08"
 if command -v uv >/dev/null; then
     uv run --quiet --no-project --with aiohttp --with tomlkit -- \
         python3 -I "$generator" "$repo/Cargo.lock" -o "$out"
-else
-    if ! python3 -c 'import aiohttp, tomlkit' 2>/dev/null; then
-        echo "python3 lacks aiohttp or tomlkit; install uv (https://docs.astral.sh/uv/)" >&2
-        echo "or run: python3 -m pip install --user aiohttp tomlkit" >&2
-        exit 1
-    fi
+elif python3 -c 'import aiohttp, tomlkit' 2>/dev/null; then
     python3 -I "$generator" "$repo/Cargo.lock" -o "$out"
+elif command -v flatpak >/dev/null && flatpak info --user "$sdk" >/dev/null 2>&1; then
+    # No uv and no modules on the host (Pop!_OS ships python3 without pip or venv): the
+    # Freedesktop SDK the Flatpak build itself needs has a Python with pip. The two
+    # packages go into a throwaway folder, nothing is installed on the host.
+    work="$(mktemp -d "${TMPDIR:-/tmp}/playdrop-cargo-sources.XXXXXX")"
+    trap 'rm -rf "$work"' EXIT
+    cp "$generator" "$work/generator.py"
+    cp "$repo/Cargo.lock" "$work/Cargo.lock"
+    flatpak run --share=network --filesystem="$work" --command=sh "$sdk" -c \
+        "python3 -m pip install --quiet --target '$work/lib' aiohttp tomlkit \
+         && cd '$work' && PYTHONPATH='$work/lib' python3 generator.py Cargo.lock -o cargo-sources.json"
+    cp "$work/cargo-sources.json" "$out"
+else
+    echo "python3 lacks aiohttp or tomlkit; install uv (https://docs.astral.sh/uv/)," >&2
+    echo "run: python3 -m pip install --user aiohttp tomlkit, or install the Flatpak SDK" >&2
+    echo "($sdk, see README.md) and run this script again" >&2
+    exit 1
 fi
 
 echo "wrote $out ($(grep -c '"type": "archive"' "$out") crates)"

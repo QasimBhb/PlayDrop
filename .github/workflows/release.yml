@@ -192,6 +192,11 @@ jobs:
             org.freedesktop.Sdk.Extension.rust-stable//25.08
           df -h / | tail -1
 
+      - name: Crate list is in step with Cargo.lock
+        # Fails in seconds, before the runtime download, when cargo-sources.json was not
+        # regenerated after a Cargo.lock change (the way v0.3.0's first run failed).
+        run: python3 -I packaging/flatpak/check-sources.py
+
       - name: Build the bundle
         # Builds offline from packaging/flatpak/cargo-sources.json and exports a single-file
         # bundle. State and build dirs live in the runner's temp dir, outside the checkout.

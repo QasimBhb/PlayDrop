@@ -30,9 +30,16 @@ packaging/flatpak/update-sources.sh
 The script clones flatpak-builder-tools into `~/.cache/playdrop/` (never into the repo) and
 runs its `cargo/flatpak-cargo-generator.py`. It needs `aiohttp` and `tomlkit`: with
 [uv](https://docs.astral.sh/uv/) installed it fetches them into uv's cache and installs
-nothing system-wide; without uv, `python3` must already have them. The generated file also
+nothing system-wide; without uv, `python3` must already have them; without either, the
+script runs the generator inside the Freedesktop SDK from the one-time setup above, whose
+Python has pip (Pop!_OS ships `python3` with neither pip nor venv). The generated file also
 writes a cargo config into `CARGO_HOME` that redirects crates.io to the vendored copies,
 which is why the manifest sets `CARGO_HOME`.
+
+`packaging/flatpak/check-sources.py` (standard library only) fails when the list and
+`Cargo.lock` disagree. The Linux workflow runs it on every push that touches `Cargo.lock`
+and the release workflow runs it before the Flatpak build, because the v0.3.0 release run
+on 2026-10-17 failed on one crate that had been added since the list was last generated.
 
 ## Build, install and run
 

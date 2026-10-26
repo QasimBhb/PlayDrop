@@ -777,11 +777,14 @@ impl Host {
         let router = Arc::new(router::HostRouter {
             inner: Arc::clone(&inner),
         });
-        let server_task = tokio::spawn(server.run(acceptor, router, inner.shutdown_rx()));
-        *lock(&inner.server_task) = Some(server_task);
-
+        // Unfinished transfers and outbox items are reloaded before the first connection
+        // is accepted: a sender that reconnects the moment the port answers asks for its
+        // transfer by ID, and a `404` for one still being reloaded would end its send.
         receive::load_persisted(&inner).await;
         outbox::load_persisted(&inner).await;
+
+        let server_task = tokio::spawn(server.run(acceptor, router, inner.shutdown_rx()));
+        *lock(&inner.server_task) = Some(server_task);
 
         if inner.discovery_on {
             let key = inner.pins.read().local_announce_key().key;
