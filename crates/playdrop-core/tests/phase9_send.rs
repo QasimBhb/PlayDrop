@@ -27,6 +27,27 @@ const T: Duration = Duration::from_secs(120);
 const SHORT: Duration = Duration::from_secs(2);
 
 /// The part of a record that changes as the send goes (counts, verified streams).
+/// Wipes the receiver's memory of transfer `id` (its owner record and staging folder), as
+/// if its disk had been cleaned. The host was just stopped; on Windows the folder can stay
+/// locked for a moment by a handle still closing or by Defender, which answers "directory
+/// not empty" or "access denied" to a removal, so the removal is retried for a few seconds.
+fn forget_on_receiver(data_dir: &Path, recv_dir: &Path, id: &str) {
+    std::fs::remove_file(data_dir.join("incoming").join(format!("{id}.json"))).unwrap();
+    let staging = recv_dir.join(".playdrop-partial").join(id);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match std::fs::remove_dir_all(&staging) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => panic!("staging folder {} still locked: {e}", staging.display()),
+        }
+    }
+}
+
 fn state_path(host: &TestHost, id: &str) -> PathBuf {
     host.data_dir.join("outgoing").join(format!("{id}.state"))
 }
@@ -531,8 +552,7 @@ async fn receiver_that_forgot_gets_the_offer_again() {
     wait_sent(&handle, CUT_AT).await;
     let (data_dir, recv_dir) = (b.data_dir.clone(), b.recv_dir.clone());
     let port = stop(b).await;
-    std::fs::remove_file(data_dir.join("incoming").join(format!("{id}.json"))).unwrap();
-    std::fs::remove_dir_all(recv_dir.join(".playdrop-partial").join(&id)).unwrap();
+    forget_on_receiver(&data_dir, &recv_dir, &id);
 
     let mut b = start_host(root.path(), "bravo", port).await;
     let summary = tokio::time::timeout(T, handle.wait())
@@ -656,8 +676,7 @@ async fn reoffers_are_capped() {
     let a_port = stop(a).await;
     let b_port = stop(b).await;
     edit_record(&state, |v| v["reoffers"] = serde_json::json!(3));
-    std::fs::remove_file(b_data.join("incoming").join(format!("{id}.json"))).unwrap();
-    std::fs::remove_dir_all(b_recv.join(".playdrop-partial").join(&id)).unwrap();
+    forget_on_receiver(&b_data, &b_recv, &id);
 
     let b = start_host(root.path(), "bravo", b_port).await;
     let mut a = start_host(root.path(), "alpha", a_port).await;
@@ -758,8 +777,7 @@ async fn reoffer_forgets_verified_streams() {
     let b_port = stop(b).await;
     // As if the receiver had verified the first file before it lost everything.
     edit_record(&rec, |v| v["verified"] = serde_json::json!([0]));
-    std::fs::remove_file(b_data.join("incoming").join(format!("{id}.json"))).unwrap();
-    std::fs::remove_dir_all(b_recv.join(".playdrop-partial").join(&id)).unwrap();
+    forget_on_receiver(&b_data, &b_recv, &id);
 
     let mut b = start_host(root.path(), "bravo", b_port).await;
     let mut a = start_host(root.path(), "alpha", a_port).await;

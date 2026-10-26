@@ -1020,8 +1020,10 @@ impl DeliveryWorker {
                 log_step(log, fid, parents, name, candidate, step)?;
                 #[cfg(test)]
                 {
-                    // Another process takes the member's own name just after its line.
-                    if squat && candidate == name && step == fsx::Step::Rename {
+                    // Another process takes the member's own name just after its line, on
+                    // either path: before the rename that never replaces, or before the
+                    // placeholder is created.
+                    if squat && candidate == name && step != fsx::Step::Reserved {
                         dir.write(name, b"theirs").map_err(Error::Io)?;
                         return Ok(());
                     }
@@ -5629,28 +5631,47 @@ pub(crate) mod tests {
     }
 
     /// Another process takes member 0's own name right after its log line (so the rename
-    /// that never replaces fails and the member goes on to " (1)"), and the process is
-    /// killed at the " (1)" line, before that rename. The reload leaves one copy at the
-    /// " (1)" name and the other file untouched.
+    /// that never replaces, or the placeholder's exclusive create, fails and the member
+    /// goes on to " (1)"), and the process is killed before the " (1)" rename. The reload
+    /// leaves one copy at the " (1)" name and the other file untouched, on both paths.
     #[tokio::test]
     async fn a_kill_during_a_collision_retry_leaves_one_copy() {
         let (_, sample) = bundle_members();
         let n = sample.len();
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("Downloads");
-        let (m, contents) = bundle_members();
-        let rx =
-            receive_kill_reload_with(&root, &m, &contents, None, Crash::Inside(0), false, Some(0))
-                .await;
-        let t = root.join("T");
-        assert_eq!(std::fs::read(t.join("f0.dat")).unwrap(), b"theirs");
-        assert_eq!(std::fs::read(t.join("f0 (1).dat")).unwrap(), contents[0]);
-        let mut want: Vec<String> = (0..n).map(|i| format!("f{i}.dat")).collect();
-        want.push("f0 (1).dat".to_owned());
-        want.push("empty".to_owned());
-        want.sort();
-        assert_eq!(names_in(&t), want, "one copy, at the retried name");
-        assert_eq!(rx.saved_paths()[0], t.join("f0 (1).dat"));
+        // Both paths on every platform: the rename that never replaces, and placeholders
+        // (what Windows always takes).
+        for placeholders in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("Downloads");
+            let (m, contents) = bundle_members();
+            let rx = receive_kill_reload_with(
+                &root,
+                &m,
+                &contents,
+                None,
+                Crash::Inside(0),
+                placeholders,
+                Some(0),
+            )
+            .await;
+            let t = root.join("T");
+            assert_eq!(
+                std::fs::read(t.join("f0.dat")).unwrap(),
+                b"theirs",
+                "placeholders {placeholders}: the other file is untouched"
+            );
+            assert_eq!(std::fs::read(t.join("f0 (1).dat")).unwrap(), contents[0]);
+            let mut want: Vec<String> = (0..n).map(|i| format!("f{i}.dat")).collect();
+            want.push("f0 (1).dat".to_owned());
+            want.push("empty".to_owned());
+            want.sort();
+            assert_eq!(
+                names_in(&t),
+                want,
+                "placeholders {placeholders}: one copy, at the retried name"
+            );
+            assert_eq!(rx.saved_paths()[0], t.join("f0 (1).dat"));
+        }
     }
 
     /// Where the rename that never replaces is missing, names are reserved with
