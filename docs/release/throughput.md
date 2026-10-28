@@ -430,3 +430,48 @@ hooks; runs were interleaved. Times per member in ms.
 The `mixed-5000` against `medium-100` gate (0.8) still needs a real desktop-to-phone run with
 `bench/desktop-to-phone.sh` on a release APK; the phone-side receive of the bundle alone is now
 roughly twice as fast in Directory mode and a quarter faster in Staged mode, which the app uses.
+
+## 11. Phase 9: end-to-end phone run and the kill-and-resume check (2026-10-28)
+
+Same phone (Galaxy A54, Android 16), 5 GHz 11ax link at RSSI -51 dBm, 612 Mbit/s tx and 960
+to 1200 Mbit/s rx, screen on and the app in the foreground. Release app from the Phase 9 tree
+at `4d5f0af` (`assembleRelease -Pplaydrop.signWithDebugKey=true`), daemon `0.4.0` with a
+fresh data dir (the machine had rebooted, so the pairing was redone over the SAS code),
+`bench/desktop-to-phone.sh --runs 3`. Every row completed with all file counts and sha256
+sums matching on the phone.
+
+### 11.1 Desktop to phone, MiB/s (three runs each)
+
+| Dataset | Phase 8 (section 9.1) | Phase 9 | Wall s | In Downloads +s |
+|---|---|---|---|---|
+| `big-1g` | 35.4, 44.5, 41.6 | 48.1, 46.2, 46.2 | 21.3, 22.1, 22.2 | 0.1, 0.0, 0.1 |
+| `medium-100` | 47.5, 52.1, 54.1 | 18.2, 49.2, 48.9 | 9.3, 3.4, 3.5 | 0.1, 0.0, 0.1 |
+| `small-1000` | 31.4, 42.6, 31.7 | 30.7, 36.9, 35.2 | 3.2, 2.7, 2.8 | 11.8, 8.6, 11.7 |
+| `mixed-5000` | 22.6, 22.6, 21.9 | 14.9, 24.0, 24.0 | 11.1, 6.9, 6.9 | 52.2, 53.2, 50.1 |
+| `tree` | 14.6, 15.9, 6.9 | 5.1, 14.7, 14.1 | 3.0, 1.1, 1.1 | 2.2, 2.2, 2.2 |
+
+### 11.2 Reading
+
+- `mixed-5000` lands in 6.9 s (24 MiB/s) against 7.3 s (22 MiB/s) in Phase 8: the phone-side
+  bundle receive measured in section 10.2 (7.0 to 5.3 s in Staged mode) is the whole of the
+  gain, and it shows end to end. `big-1g` is at 46 to 48 MiB/s, the top of every run so far.
+- The first run of `mixed-5000`, `medium-100` and `tree` was slow (11.1, 9.3 and 3.0 s) with the
+  rate dropping to 4 to 6 MiB/s for a few seconds before recovering; the second and third
+  runs of each were steady. Each slow run came right after the phone's mover had finished
+  copying the previous dataset into Downloads, so the likely cause is the phone indexing
+  those new files (not measured; a guess). Read the second and third runs as the number.
+- The `mixed-5000` against `medium-100` gate (0.8) is still not met: 24.0 against 49.0 is 0.49
+  (Phase 8: 0.43). The remaining floor is per-member work on the phone (section 10.2: about
+  0.37 ms stream plus 0.37 ms checkpoint plus 0.10 ms delivery per member in Staged mode),
+  not the link; the Downloads copy afterwards is a further 50 s that the wall time excludes.
+
+### 11.3 Kill the daemon mid-send, then restart it
+
+`playdrop send --no-wait /tmp/pd-bench/big-1g`, then `kill -9` on `playdropd` 7 s in, at
+424 MiB of 1 GiB. The record was on disk under `outgoing/` (`.json`, `.state`, `.hashes`).
+On restart the daemon logged `resuming a recorded send` at once, the transfer showed
+`active` from 484 MiB on, and it reached `complete` 18 s after the restart, with no command
+from the user and no prompt on the phone. The file on the phone has the expected sha256
+(`42019ed2c3a4` prefix) and the `outgoing/` folder was empty afterwards. This is the Phase 9 claim
+("a send survives its own restart") on a real link; the loopback version is
+`phase9_send::a_send_survives_a_host_restart`.

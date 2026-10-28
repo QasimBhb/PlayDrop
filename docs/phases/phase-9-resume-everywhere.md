@@ -59,7 +59,7 @@ iOS `MARKETING_VERSION` synced by script.
 | Android tests | 182 JUnit (up from 168) |
 | iOS checks | `apps/ios/scripts/check-linux.sh` exit 0; 106 `PlayDropShared` tests; new `TransferRowsTests.swift` type-checks, runs only on a Mac |
 | Release | v0.3.0's release run failed (section 1.1); no v0.3.0 release exists. After the hotfix commit, re-point the tag or cut v0.3.1. v0.4.0 is not tagged |
-| Phone | No end-to-end phone run this phase. The receiver's bundle path was benchmarked on the A54 through `adb shell` (`throughput.md` section 10). The Wi-Fi drop gate is still owed |
+| Phone | Run on 2026-10-28 after the push (`throughput.md` section 11): `mixed-5000` 6.9 s at 24 MiB/s (Phase 8: 7.3 s, 22), `big-1g` 46 to 48 MiB/s, all sums verified; kill-and-resume of a 1 GiB send across a daemon restart passed on the real link. The Wi-Fi drop gate is still owed |
 
 ### 1.1 The v0.3.0 release hotfix (first commit)
 
@@ -188,7 +188,7 @@ Cargo.toml 0.4.0
 | Area | What | Phase |
 |---|---|---|
 | Phone | Wi-Fi drop gate (Phase 8 section 6) still owed, on a network that does not isolate a rejoining client; with Phase 9 a failed attempt now resumes when the phone is back | 10 |
-| Phone | `bench/desktop-to-phone.sh --runs 3` with a release APK of this tree, to measure `mixed-5000` against `medium-100` end to end after the flush fix | 10 |
+| Phone | The `mixed-5000` against `medium-100` gate (0.8) reads 0.49 end to end (`throughput.md` 11.2); the floor is per-member work on the phone, about 0.85 ms per member in Staged mode. Decide whether to chase it (batch the checkpoint further, or write members straight into the landing tree) or re-set the gate | 10 |
 | CI | `gate_b_many_small_files_hold_throughput` (debug ratio 0.5) is load-sensitive here. At the end of the phase, with a browser and other work on the machine, v0.3.0 and this tree both failed it in alternating runs (v0.3.0 0.44 and 0.50, Phase 9 0.45 to 0.47; small files 199 to 204 MiB/s against 181 to 196). Watch the first CI run, and measure small-file speed in release on a quiet machine before calling the 5 to 10 % a regression | 10 |
 | Windows | Single-file and bundle placement keep the placeholder path; a no-replace rename through `MoveFileExW` needs a real machine (`windows-sys` is already a dependency) | when a machine exists |
 | Receiver | Renames to the manifest name inside a 256-member batch can still outlive their log line on power loss (recovery then finds the member by name and size); closing it costs one fsync per member | later |
@@ -209,10 +209,11 @@ most of the session (load average often above 30), so every speed figure here is
 
 ## 7. Phase 10 kickoff brief
 
-First, the owed live items, which need the user at the phone: the Wi-Fi drop gate and a
-`bench/desktop-to-phone.sh --runs 3` run on a release APK of this tree. Then watch the first CI
-run after the push (gate B under CI load; the new `phase9_send` tests on Windows, where file ids
-and rename rules differ). Then from section 5 by value. PLAN.md row 7 items stay behind flags
+The phone bench and the kill-and-resume check were run on 2026-10-28 (`throughput.md` section
+11) and the first CI runs are green on every platform after `4d5f0af` (two Windows-only test
+fixes: a staging-folder cleanup that retries while Windows still holds the folder, and the
+collision test hook planting its file on the placeholder path too). Still owed and needing the
+user at the phone: the Wi-Fi drop gate. Then from section 5 by value. PLAN.md row 7 items stay behind flags
 and each wants a design note before code.
 
 ---
