@@ -11,8 +11,8 @@ fast file drop that resumes after a dropped connection and holds its speed for t
 files. There is no account and no cloud: devices talk directly to each other on your LAN, and
 nothing leaves it.
 
-Licence: GPL-3.0-or-later. Version: 0.3.0; the latest release is
-[v0.3.0](https://github.com/QasimBhb/PlayDrop/releases/tag/v0.3.0). See [CHANGELOG.md](CHANGELOG.md).
+Licence: GPL-3.0-or-later. Version: 0.4.0; the latest release is
+[v0.4.0](https://github.com/QasimBhb/PlayDrop/releases/tag/v0.4.0). See [CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
