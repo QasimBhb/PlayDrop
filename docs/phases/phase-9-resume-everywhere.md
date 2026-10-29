@@ -58,7 +58,7 @@ iOS `MARKETING_VERSION` synced by script.
 | Rust tests | 508 passed, 1 failed (gate B, load; section 5), 10 ignored at the last run; 509 of 509 in the run before (`dbus-run-session -- cargo test --workspace --no-fail-fast`, up from 466); clippy `-D warnings` and `fmt --check` clean |
 | Android tests | 182 JUnit (up from 168) |
 | iOS checks | `apps/ios/scripts/check-linux.sh` exit 0; 106 `PlayDropShared` tests; new `TransferRowsTests.swift` type-checks, runs only on a Mac |
-| Release | v0.3.0's release run failed (section 1.1); no v0.3.0 release exists. After the hotfix commit, re-point the tag or cut v0.3.1. v0.4.0 is not tagged |
+| Release | v0.3.0 released on 2026-10-26 from the hotfix commit (the tag was re-pointed). v0.4.0 tagged at `3927547` and released on 2026-10-28, five files plus checksums |
 | Phone | Run on 2026-10-28 after the push (`throughput.md` section 11): `mixed-5000` 6.9 s at 24 MiB/s (Phase 8: 7.3 s, 22), `big-1g` 46 to 48 MiB/s, all sums verified; kill-and-resume of a 1 GiB send across a daemon restart passed on the real link. The Wi-Fi drop gate is still owed |
 
 ### 1.1 The v0.3.0 release hotfix (first commit)
