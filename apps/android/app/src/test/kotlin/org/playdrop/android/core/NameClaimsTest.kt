@@ -72,4 +72,21 @@ class NameClaimsTest {
         assertEquals(400, picked.size)
         assertEquals(400, picked.toSet().size)
     }
+
+    /** Shared storage is case-insensitive: a case variant of a promised name is held too (the core's fold). */
+    @Test
+    fun promisesAndLocksIgnoreCase() {
+        val c = NameClaims()
+        assertTrue(c.reserve("/d/PlayDrop/Report.pdf", "/l/a"))
+        assertTrue(c.heldByOther("/d/PlayDrop/report.pdf", null))
+        assertTrue(c.heldByOther("/d/playdrop/REPORT.PDF", "/l/b"))
+        assertFalse(c.heldByOther("/d/PlayDrop/report.pdf", "/l/a"))
+        assertFalse(c.reserve("/d/PlayDrop/REPORT.pdf", "/l/b"))
+        c.release("/d/PlayDrop/report.PDF", "/l/a")
+        assertFalse(c.heldByOther("/d/PlayDrop/Report.pdf", null))
+        assertEquals(CaseFold.key("STRASSE"), CaseFold.key("stra\u00dfe"))
+        // One lock for case variants of a folder: a nested call on the other spelling would
+        // deadlock with two locks only if they were different objects; here it re-enters.
+        assertEquals(1, c.inFolder("/d/A") { c.inFolder("/d/a") { 1 } })
+    }
 }

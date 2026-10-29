@@ -51,7 +51,9 @@ gives it as `"resumable": true`.
 first column of `playdrop transfers`; the start of it is enough when it is unique. A send that
 could not reach the other device shows as `failed (resumes)`: it continues by itself when the
 device is back or when you send the same files again, and `playdrop cancel <ID>` stops that and
-tells the other device.
+tells the other device. A transfer that has already ended (complete, cancelled, or failed with
+nothing to resume) is left as it is: the command says so, for example `already complete`, and
+exits 0. An ID that matches no transfer exits 2.
 
 **`clip`** sends text to a device's clipboard. `playdrop clip "hello"` sends that text.
 `playdrop clip --stdin` reads the text from standard input, for example

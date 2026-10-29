@@ -30,7 +30,7 @@ use crate::session::{ErrorCode, Limits};
 
 pub use client::{dial, DialError, DialOptions};
 pub use connection::{CloseReason, Connection, Direction, KeepAlive};
-pub use server::{Router, Server, TlsAcceptor};
+pub use server::{ListenSocket, ListenerSetup, Router, Server, TlsAcceptor};
 
 /// HTTP/2 `INITIAL_WINDOW_SIZE` for every stream, both sides: 8 MiB (protocol.md section 10).
 /// The `h2` default of 64 KiB caps throughput.

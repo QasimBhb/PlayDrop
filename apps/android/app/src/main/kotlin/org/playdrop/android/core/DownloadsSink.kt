@@ -1,5 +1,7 @@
 package org.playdrop.android.core
 
+import android.content.ContentProviderOperation
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.media.MediaScannerConnection
@@ -25,6 +27,10 @@ import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
 
 /** File count and total size of a transfer, for [LandingPolicy]. */
 internal data class TransferShape(val fileCount: Long, val totalBytes: Long)
@@ -68,8 +74,12 @@ internal data class TransferShape(val fileCount: Long, val totalBytes: Long)
  * only. Each landed file is
  * promised its final name in Downloads when it lands ([NameClaims]), and [deliver] returns
  * the `content://` URI of that final place. When the transfer completes, [LandingMover]
- * moves the tree into `Download/PlayDrop` with [moveLanded], a journaled copy of each file
- * through the same primitive as direct delivery. The landing tree mirrors the
+ * moves the tree into `Download/PlayDrop` with [moveLandedBatch]: 100 MediaStore rows are
+ * inserted at once and the files copied into them on [MOVE_THREADS] threads, journaled
+ * ([LandedMove.moveBatch], about 5 ms a file on the A54 against 10 to 14 ms for one create
+ * after another, `MoverProbe` in `androidTest`); a file whose promised name was
+ * taken meanwhile goes through [moveLanded], the journaled copy through the same primitive
+ * as direct delivery. The landing tree mirrors the
  * Downloads tree, so a process killed half way leaves nothing a fresh start cannot finish:
  * [rebuildClaims] re-promises every landed name once per process before the core first
  * delivers, and the mover sweeps what is left. Files a pass could not move are retried within
@@ -101,6 +111,12 @@ internal class DownloadsSink(
     stagingDir: File,
     /** Looks up a transfer's file count and size when no offer event carried them. */
     private val shapeOf: (String) -> TransferShape?,
+    /**
+     * Name of the landing area: the `getExternalFilesDir` folder and the prefix of the journal
+     * and relocation files. Only the device tests change it, so the app's own mover (which may
+     * run in the same process) never sees their files.
+     */
+    private val area: String = LANDING_DIR,
     /** Called when the relocation table gained or lost entries, so screens showing locations refresh. */
     private val onRelocationsChanged: () -> Unit = {},
 ) : ReceiveSink {
@@ -118,7 +134,7 @@ internal class DownloadsSink(
      * Where renamed landed files really are, on internal storage; see [Relocations]. The core's
      * stored location of such a file is stale, so every reader goes through [relocated].
      */
-    private val relocations = Relocations(File(app.filesDir, "landing-relocations.txt"))
+    private val relocations = Relocations(File(app.filesDir, "$area-relocations.txt"))
 
     /**
      * Set when a move changed [relocations]; [moveEnded] then flushes the table and tells the
@@ -126,8 +142,17 @@ internal class DownloadsSink(
      */
     private val relocationsDirty = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** Journal of the mover's copy in progress, on internal storage. */
-    private val journal = MoveJournal(File(app.filesDir, "landing-move.journal"))
+    /** Journal of the mover's copies in progress, on internal storage. */
+    private val journal = MoveJournal(File(app.filesDir, "$area-move.journal"))
+
+    /**
+     * Copies a batch of landed files into their MediaStore rows side by side. Idle threads
+     * end after 30 s, so the pool costs nothing between moves.
+     */
+    private val movePool: ExecutorService =
+        ThreadPoolExecutor(MOVE_THREADS, MOVE_THREADS, 30, TimeUnit.SECONDS, LinkedBlockingQueue()) { r ->
+            Thread(r, "pd-move").apply { isDaemon = true }
+        }.apply { allowCoreThreadTimeOut(true) }
 
     /** Folders already created on the direct path, so each costs one `mkdirs` per process. */
     private val madeDirs: MutableSet<String> = ConcurrentHashMap.newKeySet()
@@ -220,7 +245,7 @@ internal class DownloadsSink(
     // ---- Landing area, used by LandingMover -------------------------------------------
 
     /** `getExternalFilesDir("landing")`, or null when shared storage is not available. */
-    fun landingRoot(): File? = app.getExternalFilesDir(LANDING_DIR)
+    fun landingRoot(): File? = app.getExternalFilesDir(area)
 
     /** The landing folder of [transferId] (whether or not it exists). */
     fun landingDir(transferId: String): File? = landingRoot()?.let { File(it, transferId) }
@@ -256,47 +281,98 @@ internal class DownloadsSink(
     }
 
     /**
-     * Settles the copy a stopped pass or a killed process left in the [MoveJournal]: removes
-     * the copy in Downloads (a file or a MediaStore row) when the landed file is still there,
-     * so the move redoes it. The mover calls this from its serial queue before every pass, so
-     * no copy is running meanwhile. Returns false, keeping the entry, when it cannot be settled
-     * now (storage not available, or the copy could not be removed); the pass must then wait,
-     * since its next copy would overwrite the entry.
+     * Settles the copies a stopped pass or a killed process left in the [MoveJournal]
+     * ([JournalRecovery]): removes each copy in Downloads (a file, a MediaStore row, or this
+     * app's rows carrying a batch tag) whose landed file is still there, so the move redoes it.
+     * The mover calls this from its serial queue before every pass, so no copy is running
+     * meanwhile. Returns false, keeping the journal, when it cannot be settled now (storage not
+     * available, or a copy could not be removed); the pass must then wait, since its next copy
+     * would overwrite the entries.
      */
     fun recoverJournal(): Boolean {
-        val e = journal.read() ?: return true
-        val root = landingRoot()
-        if (root == null || Environment.getExternalStorageState() != Environment.MEDIA_MOUNTED) {
-            HostLog.i("landing", "storage is not available; an unfinished copy is settled later")
-            return false
-        }
-        val landingOk = e.landing.startsWith(root.path + "/")
-        val targetOk = if (e.targetIsUri) {
-            Uri.parse(e.target).authority == MediaStore.AUTHORITY
-        } else {
-            e.target.startsWith(receiveRoot().path + "/")
-        }
-        if (!landingOk || !targetOk) {
-            HostLog.w("landing", "ignored a move journal that points outside the landing and Downloads folders")
+        if (journal.readAll().isEmpty()) {
             journal.clear()
             return true
         }
-        val target = File(e.target)
-        return journal.settle(e, File(e.landing).exists(), e.targetIsUri || target.exists()) {
-            val removed = if (e.targetIsUri) {
-                runCatching { app.contentResolver.delete(Uri.parse(e.target), null, null); true }
-                    .onFailure { HostLog.w("landing", "could not remove an unfinished copy from Downloads", it) }
-                    .getOrDefault(false)
-            } else {
-                target.delete() || !target.exists()
-            }
-            if (removed) {
-                HostLog.i("landing", "removed an unfinished copy left by a stopped move; it is moved again")
-            } else {
-                HostLog.w("landing", "could not remove an unfinished copy in Downloads; moving waits")
-            }
-            removed
+        val root = landingRoot()
+        if (root == null || Environment.getExternalStorageState() != Environment.MEDIA_MOUNTED) {
+            HostLog.i("landing", "storage is not available; unfinished copies are settled later")
+            return false
         }
+        val outcome = JournalRecovery(
+            journal, remover, root.path, receiveRoot().path,
+            isRowUri = { Uri.parse(it).authority == MediaStore.AUTHORITY },
+        ).settle()
+        if (outcome.ignored > 0) HostLog.w("landing", "ignored ${outcome.ignored} move journal entries that point outside the landing and Downloads folders")
+        if (outcome.removed > 0) HostLog.i("landing", "removed ${outcome.removed} unfinished copies left by a stopped move; they are moved again")
+        if (!outcome.settled) HostLog.w("landing", "could not remove an unfinished copy in Downloads; moving waits")
+        return outcome.settled
+    }
+
+    /** Removes unfinished copies for [recoverJournal] and the batch half. */
+    private val remover = object : CopyRemover {
+        /**
+         * Deletes the row, and for a published row of this app whose file is exactly its place
+         * ([RowUnlink]) unlinks that file through the file system first. A delete by URI alone
+         * removes the file behind the FUSE layer's back, and FUSE keeps answering "exists" for
+         * that name for a moment (seen on the A54): the move redone at once would then find its
+         * promised name taken and number it. A pending row (a MediaStore delivery) keeps its
+         * file at a hidden `.pending-...` path while its place may be another, finished file of
+         * the same name, so it is deleted by URI only, as is any row whose file is elsewhere.
+         */
+        override fun removeRow(uri: String, maxSize: Long?): Boolean = runCatching {
+            val u = Uri.parse(uri)
+            @Suppress("DEPRECATION") // DATA is still the only column that says where the file is.
+            val projection = arrayOf(
+                MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.IS_PENDING,
+                MediaStore.MediaColumns.OWNER_PACKAGE_NAME, MediaStore.MediaColumns.DATA,
+            )
+            var leave = false
+            val unlink = app.contentResolver.query(u, projection, null, null, null)?.use { c ->
+                if (!c.moveToFirst()) return@use null
+                val data = c.getString(4)
+                if (maxSize != null && data != null && File(data).length() > maxSize) {
+                    leave = true
+                    return@use null
+                }
+                val place = placeFile(c.getString(0), c.getString(1))
+                place.takeIf { RowUnlink.throughFileSystem(c.getInt(2) != 0, c.getString(3), app.packageName, data, it?.path) }
+            }
+            if (leave) {
+                HostLog.w("landing", "a Downloads entry holds a bigger file than PlayDrop wrote there; it is left alone")
+                return@runCatching true
+            }
+            unlink?.delete()
+            app.contentResolver.delete(u, null, null)
+            true
+        }.onFailure { HostLog.w("landing", "could not remove an unfinished copy from Downloads", it) }.getOrDefault(false)
+
+        /**
+         * Only rows this app owns (`OWNER_PACKAGE_NAME`) that carry [tag] in `TITLE` match. A tag
+         * is made for one move alone ([MoveJournal.tag]), so nothing else can be removed, not
+         * even a finished file of the same name. (`DOWNLOAD_URI` would be the natural column,
+         * but MediaProvider refuses it to apps: "Invalid column download_uri" on the A54.)
+         */
+        override fun removeTagged(tag: String, maxSize: Long?): Boolean {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return true
+            val where = "${MediaStore.MediaColumns.OWNER_PACKAGE_NAME} = ? AND ${MediaStore.MediaColumns.TITLE} = ?"
+            return runCatching {
+                @Suppress("DEPRECATION")
+                val found = app.contentResolver.query(
+                    downloadsCollection(), arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DATA), where, arrayOf(app.packageName, tag), null,
+                )?.use { c -> buildList { while (c.moveToNext()) add(c.getLong(0) to c.getString(1)) } }.orEmpty()
+                for ((id, data) in found) {
+                    if (maxSize != null && data != null && File(data).length() > maxSize) {
+                        HostLog.w("landing", "a Downloads entry holds a bigger file than PlayDrop wrote there; it is left alone")
+                        continue
+                    }
+                    app.contentResolver.delete(ContentUris.withAppendedId(downloadsCollection(), id), null, null)
+                }
+                true
+            }.onFailure { HostLog.w("landing", "could not remove an unfinished copy from Downloads", it) }.getOrDefault(false)
+        }
+
+        override fun removeFile(path: String): Boolean = File(path).let { it.delete() || !it.exists() }
     }
 
     /**
@@ -325,11 +401,20 @@ internal class DownloadsSink(
     fun moveLanded(transferId: String, file: File): MoveResult = landedMove.move(transferId, file)
 
     /**
+     * Moves [files] of [transferId] into `Download/PlayDrop` as one batch ([LandedMove.moveBatch]):
+     * one result per file handled, cut short after a [MoveResult.stopPass]. Blocking.
+     */
+    fun moveLandedBatch(transferId: String, files: List<File>): List<MoveResult> = landedMove.moveBatch(transferId, files)
+
+    /** Called by the mover before each pass ([LandedMove.beginPass]). */
+    fun beginMovePass() = landedMove.beginPass()
+
+    /**
      * The platform half of [moveLanded] ([LandedMove] holds the order of the steps and exists so
      * that order runs in JVM tests without a ContentResolver): the direct copy, or MediaStore
      * when direct writes are refused, both journaled.
      */
-    private val placer = DownloadsPlacer { landed, file ->
+    private val placer = DownloadsPlacer { landed, file, avoidRows ->
         val key = moveKey(landed.transferId)
         var input: ParcelFileDescriptor? = null
         val openInput: () -> FileDescriptor = {
@@ -338,14 +423,14 @@ internal class DownloadsSink(
         var mediaStoreUri: String? = null
         try {
             val placed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !directRefused) {
-                placeInDownloads(key, landed.dirs, landed.name, file.path, file.length(), openInput, journalFrom = file.path)
+                placeInDownloads(key, landed.dirs, landed.name, file.path, file.length(), openInput, journalFrom = file.path, avoidRows = avoidRows)
             } else {
                 null
             }
             if (placed == null) {
                 // Direct writes were refused (now or earlier): MediaStore picks the name. The
                 // row is journaled before it is written and published, like a direct copy.
-                mediaStoreUri = deliverToMediaStore(key, landed.downloadsRel, landed.name, guessMime(landed.name), rewound(openInput())) { uri ->
+                mediaStoreUri = deliverToMediaStore(key, landed.downloadsRel, landed.name, guessMime(landed.name), rewound(openInput()), owner = file.path) { uri ->
                     journal.write(MoveJournal.Entry(file.path, uri.toString()))
                 }
             }
@@ -361,6 +446,112 @@ internal class DownloadsSink(
         }
     }
 
+    /**
+     * The batch half of [moveLandedBatch]: MediaStore rows inserted 100 at a time, then each
+     * row's file opened and written. Measured on the A54 (2026-10-28, 1,000 files of 4 to 64
+     * KiB, `MoverProbe` in `androidTest`): 2 ms a file for the insert and 5 ms in all with the
+     * copies on 4 threads, against 10 to 14 ms for one `O_EXCL` create after another. What does
+     * not work: creates on several threads (MediaProvider serialises them, 13 to 16 ms), and
+     * rows inserted pending and published afterwards (the publish renames each file, 10 ms).
+     * A published row has no file until it is opened for writing; see [BatchPlacer.reserve]
+     * for what that shows meanwhile.
+     */
+    @RequiresApi(Build.VERSION_CODES.R)
+    private inner class MediaStoreBatch : BatchPlacer, CopyRemover by remover {
+        override fun relativePath(landed: LandingPaths.Landed): String =
+            (listOf(Environment.DIRECTORY_DOWNLOADS, FileNames.RECEIVE_FOLDER) + landed.dirs).joinToString("/", postfix = "/")
+
+        override fun promisedUri(landed: LandingPaths.Landed): String = receivedUri(downloadsFile(landed), landed.dirs)
+
+        override fun placesWithRows(items: List<BatchItem>): Set<Int> {
+            val key = moveKey(items.first().landed.transferId)
+            val asked = items.groupBy({ relativePath(it.landed) }, { it.landed.name }).mapValues { it.value.toSet() }
+            val held = timed(key, "lookup") { rowsAt(asked) }
+            return items.indices.filter { placeKey(relativePath(items[it].landed), items[it].landed.name) in held }.toSet()
+        }
+
+        override fun reserve(items: List<BatchItem>, tags: List<String>): List<Row> {
+            if (Environment.getExternalStorageState() != Environment.MEDIA_MOUNTED) throw java.io.IOException("shared storage is not mounted")
+            val key = moveKey(items.first().landed.transferId)
+            val resolver = app.contentResolver
+            val collection = downloadsCollection()
+            val ops = items.mapIndexed { k, it ->
+                ContentProviderOperation.newInsert(collection).withValues(
+                    ContentValues().apply {
+                        put(MediaStore.Downloads.DISPLAY_NAME, it.landed.name)
+                        put(MediaStore.Downloads.MIME_TYPE, guessMime(it.landed.name))
+                        put(MediaStore.Downloads.RELATIVE_PATH, relativePath(it.landed))
+                        put(MediaStore.MediaColumns.TITLE, tags[k])
+                    },
+                ).build()
+            }
+            val uris = timed(key, "insert") { resolver.applyBatch(MediaStore.AUTHORITY, ArrayList(ops)) }.map {
+                it.uri ?: throw java.io.IOException("the Downloads collection refused a new entry")
+            }
+            // What each row became: MediaProvider cleans names and folders and numbers a name
+            // whose file exists. The caller removes every row that is not exactly as asked.
+            val ids = uris.map(ContentUris::parseId)
+            data class Placed(val rel: String, val name: String, val title: String?)
+            val placed = HashMap<Long, Placed>()
+            timed(key, "readback") {
+                resolver.query(
+                    collection,
+                    arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.DISPLAY_NAME, MediaStore.MediaColumns.TITLE),
+                    "${MediaStore.MediaColumns._ID} IN (${ids.joinToString(",")})", null, null,
+                )?.use { c -> while (c.moveToNext()) placed[c.getLong(0)] = Placed(c.getString(1).orEmpty(), c.getString(2).orEmpty(), c.getString(3)) }
+            }
+            // No second count of rows per place here: places that had a row went the one-file
+            // way before the insert ([placesWithRows]), so a shared place can only come from
+            // another writer inserting in the same moment. Deleting our row then could unlink
+            // their file once they write it; leaving it is safer, and the copy's size check
+            // ([PlaceTakenException]) refuses to write over a file that is not empty. The count
+            // cost a whole-table LIKE scan (about 45 ms) per batch on the A54.
+            return items.mapIndexed { k, item ->
+                val p = placed[ids[k]] ?: Placed("", "", null)
+                Row(uris[k].toString(), p.rel, p.name, p.title, shared = false)
+            }
+        }
+
+        override fun fill(item: BatchItem, row: Row) {
+            val key = moveKey(item.landed.transferId)
+            // "rw", not "w": "w" truncates, and between the insert and this open another writer
+            // may have put a file at this place (another app through MediaStore). A file that is
+            // not empty is theirs: leave it. Seen on the A54 (`MoverProbe.caseVariant`,
+            // 2026-10-28): a direct create of `case.bin` beside the unwritten row `Case.bin`
+            // fails with EEXIST, so the file API cannot take the place; "rw" creates the row's
+            // file at size 0 like "w".
+            val out = timed(key, "open") { app.contentResolver.openFileDescriptor(Uri.parse(row.ref), "rw") }
+                ?: throw java.io.IOException("Downloads did not open a new file")
+            out.use { o ->
+                val existing = Os.fstat(o.fileDescriptor).st_size
+                if (existing != 0L) throw PlaceTakenException("the place of a Downloads entry already holds $existing bytes")
+                ParcelFileDescriptor.open(item.file, ParcelFileDescriptor.MODE_READ_ONLY).use { input ->
+                    timed(key, "copy") { FileUtils.copy(input.fileDescriptor, o.fileDescriptor) }
+                    if (ReceivePolicy.syncAfterCopy(item.file.length())) timed(key, "sync") { Os.fdatasync(o.fileDescriptor) }
+                }
+                // Closed here so an error the FUSE layer reports at close (a full disk) fails the
+                // copy; the descriptor is then invalid and use() only tells the provider it closed.
+                timed(key, "close") { Os.close(o.fileDescriptor) }
+            }
+            // No media scan here: MediaProvider scans a file written through its own descriptor
+            // when that descriptor closes (the tag in TITLE is replaced within half a second, seen
+            // on the A54). A second scan of every file kept MediaProvider busy long after the
+            // move and slowed the next receive's landing to twice its time (Phase 10 bench).
+        }
+
+        override fun discard(row: Row, written: Boolean): Boolean {
+            if (written) return removeRow(row.ref)
+            // Nothing was written to it: no file system unlink first. MediaProvider's delete
+            // still removes whatever file sits at the row's DATA path, so this relies on the
+            // place holding no one else's file: places with rows went the one-file way before
+            // the insert, and a row sharing its place can only come from an insert race in
+            // the moment between the insert and this discard.
+            return runCatching { app.contentResolver.delete(Uri.parse(row.ref), null, null); true }
+                .onFailure { HostLog.w("landing", "could not remove a Downloads entry", it) }
+                .getOrDefault(false)
+        }
+    }
+
     // Must stay declared after placer, relocations, journal and claims: it captures them at construction.
     private val landedMove = LandedMove(
         landingRoot = ::landingRoot,
@@ -372,6 +563,9 @@ internal class DownloadsSink(
         onRelocationsChanged = { relocationsDirty.set(true) },
         info = { HostLog.i("landing", it) },
         warn = { message, error -> HostLog.w("landing", message, error) },
+        batchPlacer = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) MediaStoreBatch() else null,
+        fillPool = movePool,
+        settleJournal = ::recoverJournal,
     )
 
     /** Called by the mover after a pass: flushes the scans and logs the cost of the pass. */
@@ -479,10 +673,11 @@ internal class DownloadsSink(
         size: Long,
         input: () -> FileDescriptor,
         journalFrom: String?,
+        avoidRows: Boolean = false,
     ): File? {
         if (Environment.getExternalStorageState() != Environment.MEDIA_MOUNTED) return null
         val dir = File(receiveRoot(), dirs.joinToString("/"))
-        val claim = claims.inFolder(dir.path) { claimInFolder(t, dir, name, owner) } ?: return null
+        val claim = claims.inFolder(dir.path) { claimInFolder(t, dir, name, owner, avoidRows) } ?: return null
         val file = claim.file
         val out = claim.out
         try {
@@ -504,13 +699,15 @@ internal class DownloadsSink(
      * Picks the name and creates the file; called holding the folder lock. The create uses
      * `O_EXCL`, so an existing file is never overwritten.
      */
-    private fun claimInFolder(t: String, dir: File, name: String, owner: String?): Claim? {
+    private fun claimInFolder(t: String, dir: File, name: String, owner: String?, avoidRows: Boolean = false): Claim? {
         if (!ensureDir(dir)) return refuse("could not create folder ${dir.name}", null, permanent = false)
         var n = 0
         var retriedDir = false
         while (n <= MAX_NUMBERED) {
             val file = File(dir, FileNames.numberedName(name, n))
-            if (claims.heldByOther(file.path, owner)) {
+            // With avoidRows (a batch found another row at this file's place): a row that has no
+            // file yet is invisible to the create, so ask MediaStore as well.
+            if (claims.heldByOther(file.path, owner) || (avoidRows && hasRow(dir, file.name))) {
                 n++
                 continue
             }
@@ -698,18 +895,31 @@ internal class DownloadsSink(
         name: String,
         mime: String,
         input: InputStream,
+        /** The landed file whose promised name this may take (the mover), or null. */
+        owner: String? = null,
         afterInsert: ((Uri) -> Unit)? = null,
     ): String {
         val resolver = app.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.Downloads.DISPLAY_NAME, name)
-            put(MediaStore.Downloads.MIME_TYPE, mime)
-            put(MediaStore.Downloads.RELATIVE_PATH, FileNames.relativePath(Environment.DIRECTORY_DOWNLOADS, path))
-            put(MediaStore.Downloads.IS_PENDING, 1)
+        val dir = File(receiveRoot(), FileNames.receivedDirs(path).joinToString("/"))
+        // Like claimInFolder: under the folder's lock, a name that exists nowhere and is not
+        // promised to anyone else, held for this write until the row is published.
+        val token = "mediastore:${java.util.UUID.randomUUID()}"
+        val (chosen, uri) = claims.inFolder(dir.path) {
+            val pick = FileNames.firstFree(name, MAX_NUMBERED) { cand ->
+                val target = File(dir, cand).path
+                claims.heldByOther(target, owner) || File(target).exists()
+            } ?: throw PlayDropException.Other("Could not save $name: too many files with that name")
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, pick)
+                put(MediaStore.Downloads.MIME_TYPE, mime)
+                put(MediaStore.Downloads.RELATIVE_PATH, FileNames.relativePath(Environment.DIRECTORY_DOWNLOADS, path))
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val inserted: Uri = timed(t, "insert") { resolver.insert(downloadsCollection(), values) }
+                ?: throw PlayDropException.Other("Could not save $name: the Downloads collection refused a new entry")
+            claims.reserve(File(dir, pick).path, token)
+            pick to inserted
         }
-        val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
-        val uri: Uri = timed(t, "insert") { resolver.insert(collection, values) }
-            ?: throw PlayDropException.Other("Could not save $name: the Downloads collection refused a new entry")
         try {
             afterInsert?.invoke(uri)
             val out = timed(t, "open") { resolver.openFileDescriptor(uri, "w") }
@@ -727,9 +937,71 @@ internal class DownloadsSink(
             runCatching { resolver.delete(uri, null, null) }
                 .onFailure { HostLog.w("sink", "removing a failed download entry failed", it) }
             throw e
+        } finally {
+            claims.release(File(dir, chosen).path, token)
         }
         return uri.toString()
     }
+
+    /**
+     * The file of a row at [rel] (`Download/...`, ending in `/`) named [name], or null when the
+     * row does not lie under `Download/PlayDrop` with clean components (nothing else is touched).
+     */
+    private fun placeFile(rel: String?, name: String?): File? {
+        if (rel == null || name == null || !FileNames.isCleanName(name)) return null
+        val parts = rel.trimEnd('/').split('/')
+        if (parts.size < 2 || parts[0] != Environment.DIRECTORY_DOWNLOADS || parts[1] != FileNames.RECEIVE_FOLDER) return null
+        if (!parts.drop(2).all(FileNames::isCleanName)) return null
+        return File(receiveRoot(), (parts.drop(2) + name).joinToString("/"))
+    }
+
+    /** True when MediaStore has a row (written or not) for [name] in [dir] under `Download/PlayDrop`, whatever its case. */
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun hasRow(dir: File, name: String): Boolean {
+        val rel = dir.relativeTo(receiveRoot()).path.let { sub ->
+            (listOf(Environment.DIRECTORY_DOWNLOADS, FileNames.RECEIVE_FOLDER) + sub.split('/').filter { it.isNotEmpty() }).joinToString("/", postfix = "/")
+        }
+        return rowsAt(mapOf(rel to setOf(name))).isNotEmpty()
+    }
+
+    /** The key [rowsAt] counts a place under: shared storage treats names that differ only in case as one ([CaseFold]). */
+    private fun placeKey(rel: String, name: String): String = CaseFold.key(rel + name)
+
+    /**
+     * How many rows hold each of the places in [places] (relative path to names), counted by
+     * [placeKey]; places with no row are left out. One query of `LIKE` patterns (MediaProvider
+     * takes `LIKE ... ESCAPE`, where a `COLLATE` clause may be refused): `LIKE` ignores ASCII
+     * case only, so every character outside ASCII becomes the one-character wildcard `_`, and
+     * `\`, `%` and `_` in names are escaped. Every row returned is then compared exactly by
+     * [placeKey], so the wildcards only widen the search.
+     */
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun rowsAt(places: Map<String, Set<String>>): Map<String, Int> {
+        val asked = places.flatMap { (rel, names) -> names.map { placeKey(rel, it) } }.toSet()
+        if (asked.isEmpty()) return emptyMap()
+        val args = ArrayList<String>()
+        val like = "LIKE ? ESCAPE '\\'"
+        val where = places.entries.joinToString(" OR ") { (rel, names) ->
+            args += MediaStoreNames.likePattern(rel)
+            names.forEach { args += MediaStoreNames.likePattern(it) }
+            "(${MediaStore.MediaColumns.RELATIVE_PATH} $like AND (" +
+                names.joinToString(" OR ") { "${MediaStore.MediaColumns.DISPLAY_NAME} $like" } + "))"
+        }
+        val seen = HashMap<String, Int>()
+        app.contentResolver.query(
+            downloadsCollection(), arrayOf(MediaStore.MediaColumns.RELATIVE_PATH, MediaStore.MediaColumns.DISPLAY_NAME),
+            where, args.toTypedArray(), null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                val k = placeKey(c.getString(0).orEmpty(), c.getString(1).orEmpty())
+                if (k in asked) seen.merge(k, 1, Int::plus)
+            }
+        }
+        return seen
+    }
+
+    @RequiresApi(Build.VERSION_CODES.Q)
+    private fun downloadsCollection(): Uri = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
 
     private fun deliverToAppFolder(item: DeliverItem, name: String, input: InputStream): String {
         val base = app.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: File(app.filesDir, "downloads")
@@ -774,6 +1046,13 @@ internal class DownloadsSink(
 
         /** `rw-r--r--`. */
         private const val FILE_MODE = 0b110_100_100
+
+        /**
+         * Threads that copy a batch of landed files into their rows. On the A54 4 threads took
+         * the batch from 8.3 to 5.0 ms a file; 8 gained under 10% more, so the mover leaves
+         * MediaProvider room for a receive running at the same time.
+         */
+        const val MOVE_THREADS = 4
 
         /** Gives up on a name after this many " (n)" tries. */
         private const val MAX_NUMBERED = 10_000

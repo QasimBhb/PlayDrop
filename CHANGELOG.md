@@ -8,6 +8,42 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.5.0] - 2026-10-29
+
+### Changed
+
+- On Android, a drop of thousands of small files reaches Downloads about twice as fast after
+  it has arrived: 5,000 files are in Downloads about 31 seconds after the send ends instead of
+  about 48, and 1,000 files after 7 to 8 seconds instead of 9 to 12. The app now registers files with
+  Android in groups of 100 and copies several at a time, and a crash in the middle still never
+  leaves a file twice, loses one or touches a file PlayDrop did not write.
+- A phone spends much less time making received small files durable: it now does so every
+  64 MiB instead of every 16 MiB where it flushes the whole storage at once, because each such
+  flush costs about a tenth of a second on the phone (5,000 small files are written in 1.7 s
+  instead of 3.7 s on the phone itself; over Wi-Fi the link is still the limit). A transfer
+  killed in the middle now sends up to 64 MiB again instead of up to 16 MiB.
+- `playdrop` tables and the progress line line up names written in Chinese, Japanese, Korean
+  or with emoji.
+
+### Fixed
+
+- Windows: the daemon now checks the real free space of the receive drive before accepting a
+  transfer, so the free-space reserve is kept as on the other platforms.
+- Windows: the device's private key and the list of paired devices are now encrypted for the
+  signed-in user (DPAPI), and the data folder is readable only by that user and the system.
+- Windows: the daemon now holds its port exclusively, so another program cannot take over its
+  connections.
+- Android: after the app is updated, its background service now starts again by itself, so
+  the phone keeps receiving without being opened first.
+- `playdrop cancel` on a transfer that has already finished now says so and exits normally
+  instead of reporting that the transfer was not found.
+
+### Notes
+
+- Windows: the first start of 0.5.0 encrypts the key and the paired-device list in place. An
+  older daemon, or `playdrop host`, started on the same data folder afterwards refuses to start
+  with "sealed but this host has no secret store"; stay on 0.5.0 or later.
+
 ## [0.4.0] - 2026-10-28
 
 ### Added

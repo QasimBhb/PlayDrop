@@ -357,3 +357,13 @@ the files again. No event or status was added.
 The `playdrop-ffi` mirror of `TransferSnapshot` carries `resumable` (bool) too, and the ffi
 version is 0.4.0 (an additive type change, like `files_done` in section 11). Hosts that
 build a `TransferSnapshot` by hand (test fixtures) must pass `resumable = false`.
+
+## 13. Phase 10 note (Rust only, no `playdrop-ffi` change)
+
+`HostConfig` gains `listener_setup: Option<Arc<dyn ListenerSetup>>` (default `None`; the
+trait and `ListenSocket`, a re-export of `socket2::Socket`, are in `playdrop_core::host`): a
+hook called on the listening socket before it is bound, through which a Windows daemon sets
+`SO_EXCLUSIVEADDRUSE` (SR-31) because the core forbids `unsafe`. It is Rust only:
+`playdrop-ffi` does not expose it and builds its `HostConfig` through
+`HostConfig::new`/`with_sink`, so mobile hosts keep `None` and the ffi version does not
+change.

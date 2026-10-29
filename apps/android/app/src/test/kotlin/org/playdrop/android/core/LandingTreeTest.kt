@@ -3,6 +3,7 @@ package org.playdrop.android.core
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -126,6 +127,80 @@ class LandingTreeTest {
         assertNull(MoveJournal(f).read())
         f.writeText("\n\n")
         assertNull(MoveJournal(f).read())
+    }
+
+    @Test
+    fun journalHoldsManyEntriesAndTheLatestPerLandedFileWins() {
+        val j = MoveJournal(File(tmp.root, "journal"))
+        val t1 = MoveJournal.tag("0".repeat(8) + "-0000-0000-0000-" + "0".repeat(12), 1)
+        val t2 = MoveJournal.tag("0".repeat(8) + "-0000-0000-0000-" + "0".repeat(12), 2)
+        j.append(listOf(MoveJournal.Entry.forTag("/l/a", t1), MoveJournal.Entry.forTag("/l/b", t2)))
+        j.append(listOf(MoveJournal.Entry.forTag("/l/a", t1, "content://media/external/downloads/1")))
+        val all = j.readAll()
+        assertEquals(listOf("/l/a", "/l/b"), all.map { it.landing })
+        assertTrue(all[0].targetIsTag)
+        assertFalse(all[0].targetIsUri)
+        assertEquals(t1, all[0].tag)
+        assertEquals("content://media/external/downloads/1", all[0].rowUri)
+        assertEquals(t2, all[1].tag)
+        assertNull(all[1].rowUri)
+        assertTrue(MoveJournal.isTag(t1))
+        assertFalse(MoveJournal.isTag("playdrop-move:x:1"))
+        assertNull(MoveJournal.Entry("/l/c", "/d/c").tag)
+        // write() replaces everything: the one-file move after a batch starts clean.
+        j.write(MoveJournal.Entry("/l/c", "/d/c"))
+        assertEquals(listOf(MoveJournal.Entry("/l/c", "/d/c")), j.readAll())
+        j.clear()
+        assertTrue(j.readAll().isEmpty())
+    }
+
+    @Test
+    fun aTornLastJournalLineIsIgnored() {
+        val f = File(tmp.root, "journal")
+        f.writeText("/l/a\tcontent://media/external/downloads/1\n/l/b\tcontent://med")
+        assertEquals(listOf(MoveJournal.Entry("/l/a", "content://media/external/downloads/1")), MoveJournal(f).readAll())
+    }
+
+    @Test
+    fun theOneEntryJournalOfEarlierVersionsIsStillRead() {
+        val f = File(tmp.root, "journal")
+        f.writeText("/l/$tid/a.txt\n/storage/emulated/0/Download/PlayDrop/a.txt\n")
+        assertEquals(listOf(MoveJournal.Entry("/l/$tid/a.txt", "/storage/emulated/0/Download/PlayDrop/a.txt")), MoveJournal(f).readAll())
+    }
+
+    @Test
+    fun aJournalEntryCannotHoldATabOrNewline() {
+        val j = MoveJournal(File(tmp.root, "journal"))
+        assertThrows(IllegalArgumentException::class.java) { j.append(listOf(MoveJournal.Entry("/l/a\tb", "/d/a"))) }
+        assertThrows(IllegalArgumentException::class.java) { j.write(MoveJournal.Entry("/l/a", "/d/a\nb")) }
+    }
+
+    /**
+     * settleAll removes every unfinished copy and keeps the whole journal when one cannot be
+     * removed; settling again later only forgets what was already removed.
+     */
+    @Test
+    fun settleAllKeepsTheJournalUntilEveryCopyIsRemoved() {
+        val base = tmp.newFolder("settle")
+        val landed = (0 until 3).map { File(base, "l$it").apply { writeText("x") } }
+        val copies = (0 until 3).map { File(base, "d$it").apply { writeText("x") } }
+        assertTrue(landed[2].delete()) // the third move had finished
+        val j = MoveJournal(File(base, "journal"))
+        j.append(landed.indices.map { MoveJournal.Entry(landed[it].path, copies[it].path) })
+        var refuse = true
+        fun settle() = j.settleAll({ File(it.landing).exists() }, { File(it.target).exists() }) { e ->
+            if (refuse && e.target == copies[1].path) false else File(e.target).delete()
+        }
+        assertFalse(settle())
+        assertEquals(3, j.readAll().size)
+        assertFalse(copies[0].exists())
+        assertTrue(copies[1].exists())
+        assertTrue(copies[2].exists()) // a finished move is never touched
+        refuse = false
+        assertTrue(settle())
+        assertTrue(j.readAll().isEmpty())
+        assertFalse(copies[1].exists())
+        assertTrue(copies[2].exists())
     }
 
     @Test

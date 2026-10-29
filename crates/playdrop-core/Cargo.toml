@@ -42,8 +42,9 @@ zeroize = "1.9.1"
 
 [target.'cfg(windows)'.dependencies]
 # MoveFileExW without MOVEFILE_REPLACE_EXISTING: a rename that never overwrites (SR-18),
-# which std and cap-std do not offer on Windows. The same version the daemon's crates lock.
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+# which std and cap-std do not offer on Windows; GetDiskFreeSpaceExW (SR-20) and
+# SO_EXCLUSIVEADDRUSE (SR-31). The same version the daemon's crates lock.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 proptest = "1.11.0"

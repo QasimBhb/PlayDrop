@@ -475,3 +475,87 @@ from the user and no prompt on the phone. The file on the phone has the expected
 (`42019ed2c3a4` prefix) and the `outgoing/` folder was empty afterwards. This is the Phase 9 claim
 ("a send survives its own restart") on a real link; the loopback version is
 `phase9_send::a_send_survives_a_host_restart`.
+
+## 12. Phase 10: the mover, the checkpoint cadence, and a USB surprise (2026-10-28 and 29)
+
+Same phone (Galaxy A54, Android 16), daemon `0.5.0` with the same data dir as section 11, release
+app (`assembleRelease -Pplaydrop.signWithDebugKey=true`). Every row below completed with all
+file counts and sha256 sums matching on the phone.
+
+### 12.1 The receive checkpoint (phone, isolated bench)
+
+`cargo test --release -p playdrop-core --test phase9_receiver -- --ignored --nocapture` run
+from `/data/local/tmp` (f2fs) with finer timing hooks, 5,000 members of 4 to 64 KiB, Staged
+mode, medians of 5 to 10 runs. The checkpoint's per-member cost was almost all `syncfs`: about
+105 to 117 ms per call on the A54 (f2fs writes a full checkpoint each time), and each flush also
+stalls the stream's creates and writes.
+
+| Cadence | Checkpoints | Wall s | `syncfs` ms per member |
+|---|---|---|---|
+| 16 MiB or 1 s (0.4.0) | 11 | 3.73 to 4.56 | 0.233 to 0.258 |
+| 64 MiB or 1 s where `syncfs` is used (0.5.0) | 3 | 1.65 to 1.78 | 0.036 to 0.039 |
+
+### 12.2 The mover (phone, 1,000 files of 4 to 64 KiB, `MoverProbe` and `LandedMoveDeviceTest`)
+
+| Way into Downloads | ms per file (median) |
+|---|---|
+| One `O_EXCL` create at a time, one-slot journal (0.4.0) | 10.4 to 14.0 (single runs 7.5 to 22) |
+| Creates on 2 / 4 / 8 threads | 13.5 / 16.2 / 14.9 |
+| MediaStore pending rows, published in batches | 14.4 to 18.3 |
+| Published rows inserted 100 at a time, copies on 4 threads (0.5.0) | 5.0 (probe), 6.3 to 6.7 (real code) |
+
+MediaProvider serialises creates, so threads alone do not help; inserting rows in batches does.
+
+### 12.3 Desktop to phone over USB tethering (2026-10-28, evening)
+
+USB tethering was on, and PlayDrop's connection ran over it (`usb0`, RNDIS on USB 2.0), not over
+Wi-Fi: big files topped out at 26 to 28 MiB/s while raw TCP over Wi-Fi did 48 to 56. The phone's
+engine was checked against 0.4.0 on the phone itself (`phase1_gates` gate A, 500 MiB, both
+hosts on the phone): 0.4.0 102 to 107 MiB/s, 0.5.0 119 to 122 MiB/s. Neither the phone nor the
+desktop (0.4.0 daemon gave the same 26.7 MiB/s) regressed.
+
+| Dataset | Wall s | MiB/s | In Downloads +s |
+|---|---|---|---|
+| `small-1000` | 3.8 | 25.1 to 26.0 | 6.5 (0.4.0 on Wi-Fi: 8.6 to 11.8) |
+| `mixed-5000` | 8.0 to 8.1 | 20.3 to 20.7 | 30.6 to 32.9 (0.4.0 on Wi-Fi: 50 to 53) |
+| `medium-100` | 5.5 to 5.6 | 30.0 to 30.7 | 0.0 to 0.1 |
+| `big-1g` | 36.5 to 36.7 | 27.9 to 28.1 | 0.0 to 0.1 |
+
+### 12.4 Desktop to phone over Wi-Fi (2026-10-29, morning)
+
+Tethering off, 5 GHz, RSSI -53, tx 408 Mbit/s, raw TCP 45.7 to 55.6 MiB/s.
+
+| Dataset | Wall s | MiB/s | In Downloads +s |
+|---|---|---|---|
+| `tree` | 1.3 | 11.7 to 11.9 | 2.2 |
+| `small-1000` | 3.7 to 3.9 | 25.3 to 26.6 | 7.5 to 8.6 |
+| `mixed-5000` | 12.9 to 15.8 | 10.5 to 12.8 | 38.1 to 41.7 |
+| `medium-100` | 4.4 to 4.6 | 36.1 to 38.3 | 0.0 to 0.1 |
+| `big-1g` | 27.0 to 29.8 | 34.3 to 38.0 | 0.0 |
+
+`mixed-5000` sent more slowly than in section 11 (6.9 s). An A/B the same morning first pointed
+at the 0.5.0 Kotlin (0.4.0 Kotlin with the 0.5.0 core: 7.2 to 8.8 s, sink 0.43 ms per file;
+0.5.0: 13.6 to 15.8 s, sink 0.85 to 1.23 ms), but an hour later 0.4.0's Kotlin was just as slow
+(12.5 to 13.6 s, sink 0.73 to 0.75 ms) and 0.4.0's own mover took 80 to 96 s instead of 50: the
+whole phone had slowed down (no heat, no battery saver, MediaProvider restarted without effect;
+the battery was discharging on USB after tethering was turned off). The phone was rebooted to
+repeat the A/B; see 12.5.
+
+### 12.5 The A/B after a reboot (2026-10-29, evening)
+
+Phone rebooted (the mesh then isolated it from the PC until its Wi-Fi was turned off and on
+from Settings), battery charged to 79 %, Wi-Fi, desktop load average 0.7 to 2.5. Old and new
+app installed alternately (`adb install -r`), 45 s settle, two `mixed-5000` runs each. "0.4.0
+Kotlin" is the 0.4.0 app code with the 0.5.0 core (byte-identical `libplaydrop_ffi.so`).
+
+| App | Wall s | MiB/s | Sink ms per file | In Downloads +s |
+|---|---|---|---|---|
+| 0.4.0 Kotlin | 8.08, 6.95 | 20.4, 23.8 | 0.429, 0.415 | 47.7, 47.8 |
+| 0.5.0 | 7.35, 6.95 | 22.5, 23.8 | 0.452, 0.443 | 29.6, 31.7 |
+| 0.4.0 Kotlin | 7.40, 6.89 | 22.3, 24.0 | 0.455, 0.439 | 47.7, 50.1 |
+| 0.5.0 | 7.28, 6.73 | 22.7, 24.5 | 0.426, 0.424 | 31.8, 31.9 |
+
+The receive is the same speed with either app, and the morning's 13 to 15 s were the phone's
+state, not the code. 0.5.0 gets 5,000 files into Downloads about 37 % sooner. The
+`mixed-5000` against `medium-100` ratio stays about 0.5 to 0.6 over Wi-Fi (the 0.8 target is
+not met; the floor is per-member work on the phone, 12.1).

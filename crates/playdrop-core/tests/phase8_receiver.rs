@@ -207,6 +207,7 @@ fn staged(sink: Arc<CountingSink>, policy: SyncPolicy) -> AcceptOptions {
 fn every_chunk() -> SyncPolicy {
     SyncPolicy {
         bytes: u64::from(CS),
+        batched_bytes: u64::from(CS),
         interval: Duration::from_secs(3600),
     }
 }

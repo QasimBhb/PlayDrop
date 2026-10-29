@@ -12,6 +12,7 @@ use playdrop_core::host::{
 };
 use playdrop_ipc::{ClipSkip, DiagnosticsReport, PortProbe, Status};
 use serde::Serialize;
+use unicode_width::UnicodeWidthStr as _;
 
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -67,13 +68,13 @@ pub fn ago(now: u64, then: Option<u64>) -> String {
     }
 }
 
-/// Columns padded to the widest cell, two spaces apart, no trailing spaces.
+/// Columns padded (by display width) to the widest cell, two spaces apart, no trailing spaces.
 pub fn table(header: &[&str], rows: &[Vec<String>]) -> String {
-    let mut widths: Vec<usize> = header.iter().map(|h| h.chars().count()).collect();
+    let mut widths: Vec<usize> = header.iter().map(|h| h.width()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
             if let Some(w) = widths.get_mut(i) {
-                *w = (*w).max(cell.chars().count());
+                *w = (*w).max(cell.width());
             }
         }
     }
@@ -86,7 +87,8 @@ pub fn table(header: &[&str], rows: &[Vec<String>]) -> String {
                 line.push_str("  ");
             }
             line.push_str(cell);
-            let pad = widths.get(i).copied().unwrap_or(0) - cell.chars().count();
+            // Display width, not char count: CJK and emoji take two columns.
+            let pad = widths.get(i).copied().unwrap_or(0) - cell.width();
             line.extend(std::iter::repeat_n(' ', pad));
         }
         out.push_str(line.trim_end());
@@ -586,6 +588,26 @@ mod tests {
         assert_eq!(ago(1_000_000, Some(100)), "11 d ago");
         // A clock that went backwards does not underflow.
         assert_eq!(ago(100, Some(200)), "0 s ago");
+    }
+
+    #[test]
+    fn table_aligns_wide_characters_by_display_width() {
+        let rows = vec![
+            vec!["ab".to_owned(), "x".to_owned()],
+            vec!["日本".to_owned(), "x".to_owned()],
+            vec!["🎉".to_owned(), "x".to_owned()],
+        ];
+        let t = table(&["NAME", "S"], &rows);
+        // Every second column starts after the same number of display columns.
+        let starts: Vec<usize> = t
+            .lines()
+            .map(|l| {
+                let (head, _) = l.split_at(l.rfind(|c: char| c != ' ').expect("text"));
+                head.width()
+            })
+            .collect();
+        assert!(starts.iter().all(|w| *w == starts[0]), "{t}");
+        assert_eq!(t.lines().nth(2).expect("row"), "日本  x");
     }
 
     #[test]

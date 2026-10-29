@@ -45,7 +45,7 @@ class LandedMoveTest {
 
         fun uri(f: File) = "content://test.files/received/" + f.relativeTo(root).path
 
-        override fun place(landed: LandingPaths.Landed, file: File): Placement {
+        override fun place(landed: LandingPaths.Landed, file: File, avoidRows: Boolean): Placement {
             val dir = File(root, landed.dirs.joinToString("/")).apply { mkdirs() }
             var n = 0
             // A name is also taken while it is promised to another landed file.

@@ -18,6 +18,10 @@ import java.util.concurrent.ConcurrentHashMap
  * long before the file reaches Downloads, so its name must stay free until the mover takes
  * it. A reservation maps the Downloads path to its owner (the landed file's path); only the
  * owner may take it.
+ *
+ * Why folded keys: shared storage is case-insensitive (`report.pdf` and `Report.pdf` are one
+ * file), so folders and promises are keyed by [CaseFold.key], the core's rule. Owners are
+ * compared as they are: they always come from the same code path.
  */
 internal class NameClaims {
     private val locks = ConcurrentHashMap<String, Any>()
@@ -25,7 +29,7 @@ internal class NameClaims {
 
     /** Runs [block] holding the lock of [folder] (an absolute path). */
     fun <T> inFolder(folder: String, block: () -> T): T {
-        val lock = locks.computeIfAbsent(folder) { Any() }
+        val lock = locks.computeIfAbsent(CaseFold.key(folder)) { Any() }
         return synchronized(lock) { block() }
     }
 
@@ -34,21 +38,30 @@ internal class NameClaims {
      * was free or already promised to [owner] (so rebuilding the claims is idempotent).
      */
     fun reserve(target: String, owner: String): Boolean {
-        val prev = reserved.putIfAbsent(target, owner)
+        val prev = reserved.putIfAbsent(CaseFold.key(target), owner)
         return prev == null || prev == owner
     }
 
     /** True when [target] is promised to anyone but [owner] (null owner: to anyone at all). */
     fun heldByOther(target: String, owner: String?): Boolean {
-        val holder = reserved[target] ?: return false
+        val holder = reserved[CaseFold.key(target)] ?: return false
         return holder != owner
     }
 
     /** Drops the promise of [target] if [owner] holds it. */
     fun release(target: String, owner: String) {
-        reserved.remove(target, owner)
+        reserved.remove(CaseFold.key(target), owner)
     }
 
     /** Number of open promises. */
     val size: Int get() = reserved.size
+}
+
+/**
+ * The case-fold key of a name or path, the core's rule (`fold` in
+ * `crates/playdrop-core/src/transfer/manifest.rs`): upper then lower case, which also folds
+ * `ß` and `SS` together. Stricter than shared storage needs, never looser. Pure JVM.
+ */
+internal object CaseFold {
+    fun key(s: String): String = s.uppercase(java.util.Locale.ROOT).lowercase(java.util.Locale.ROOT)
 }

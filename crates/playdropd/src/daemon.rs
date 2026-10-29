@@ -181,6 +181,7 @@ fn load_settings(args: &Args) -> anyhow::Result<(PathBuf, Settings, Settings, bo
         .clone()
         .or_else(settings::default_data_dir)
         .context("no data folder could be found; pass --data-dir")?;
+    settings::prepare_data_dir(&data_dir)?;
     let loaded = settings::load(&data_dir)?;
     let first_run = !loaded.existed;
     let mut persisted = loaded.settings;
@@ -560,6 +561,15 @@ impl Shared {
         c.discovery = s.discovery;
         c.lock_state = Box::new((*self.lock).clone());
         c.accepts_input = self.input_support.supported;
+        #[cfg(windows)]
+        {
+            // SR-20, SR-28 and SR-31 on Windows: the core has no unsafe code, so the
+            // daemon supplies free space, DPAPI sealing and the exclusive port
+            // (`free_space.rs`, `at_rest.rs`, `listener.rs`).
+            c.free_space = Arc::new(crate::free_space::WindowsVolumeSpace);
+            c.secret_store = Some(Arc::new(crate::at_rest::DpapiStore));
+            c.listener_setup = Some(Arc::new(crate::listener::ExclusivePort));
+        }
         c
     }
 

@@ -2,7 +2,7 @@
 
 use std::io::Read as _;
 
-use playdrop_core::host::TransferSnapshot;
+use playdrop_core::host::{TransferSnapshot, TransferStatus};
 use playdrop_ipc::{ClipSkip, Ok as Answer, Request};
 
 use super::{
@@ -67,10 +67,30 @@ pub async fn cancel(args: CancelArgs) -> Result<(), Failure> {
     let Answer::Transfers(list) = &answer else {
         return Err(unexpected("transfers", &answer));
     };
-    let id = resolve_transfer(list, &args.id)?.id.clone();
+    let t = resolve_transfer(list, &args.id)?;
+    let id = t.id.clone();
+    // The core answers "not found" for a transfer that already ended and leaves it as it
+    // was, so say what happened instead of passing that on as an error.
+    if let Some(what) = already_ended(t) {
+        println!("{id} is {what}; nothing to cancel");
+        return Ok(());
+    }
     ask(&client, Request::CancelTransfer { id: id.clone() }).await?;
     println!("cancelled {id}");
     Ok(())
+}
+
+/// How to describe `t` when it has already ended and cannot be cancelled, or `None` when a
+/// cancel still means something. A failed send kept for resume (`resumable`) is not ended:
+/// cancelling it forgets the record.
+fn already_ended(t: &TransferSnapshot) -> Option<String> {
+    if !t.state.is_finished() || t.resumable {
+        return None;
+    }
+    Some(match t.state {
+        TransferStatus::Complete => "already complete".to_owned(),
+        other => format!("already ended ({})", output::state_name(other)),
+    })
 }
 
 /// The one transfer whose ID is `want` or starts with it. An exact match wins over a longer
@@ -275,6 +295,26 @@ mod tests {
             "started_at": 0, "file_count": 1, "resumable": true
         }))
         .expect("snapshot")
+    }
+
+    #[test]
+    fn an_ended_transfer_is_reported_not_cancelled() {
+        let mut t = transfer("a1");
+        // A failed send kept for resume can still be cancelled (forgotten).
+        assert_eq!(already_ended(&t), None);
+        t.resumable = false;
+        assert_eq!(already_ended(&t).as_deref(), Some("already ended (failed)"));
+        t.state = TransferStatus::Complete;
+        assert_eq!(already_ended(&t).as_deref(), Some("already complete"));
+        t.state = TransferStatus::Cancelled;
+        assert_eq!(
+            already_ended(&t).as_deref(),
+            Some("already ended (cancelled)")
+        );
+        for live in [TransferStatus::Offered, TransferStatus::Active] {
+            t.state = live;
+            assert_eq!(already_ended(&t), None);
+        }
     }
 
     #[test]

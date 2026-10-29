@@ -2,6 +2,7 @@
 //! request routing. Implements protocol.md section 1 (port rules), 3.1, 6.1 and section 10
 //! (SR-11, SR-13, SR-15, SR-31).
 
+use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -77,14 +78,45 @@ pub struct Server {
     limits: Limits,
 }
 
+/// The listening socket before it is bound, as [`ListenerSetup::before_bind`] sees it.
+pub use socket2::Socket as ListenSocket;
+
+/// A host hook that adjusts the listening socket before it is bound (SR-31). A Windows
+/// daemon sets `SO_EXCLUSIVEADDRUSE` through it: that needs a raw `setsockopt`, which is
+/// `unsafe`, and this crate forbids `unsafe`.
+pub trait ListenerSetup: Send + Sync + fmt::Debug {
+    /// Called once per bind, after the core's own options and before `bind`. An error
+    /// fails the bind with [`Error::Io`].
+    fn before_bind(&self, socket: &ListenSocket) -> std::io::Result<()>;
+}
+
+/// True when a bind failed because another socket holds the port. Windows reports a port
+/// held with `SO_EXCLUSIVEADDRUSE`, or by another user, as `WSAEACCES` as often as
+/// `WSAEADDRINUSE`.
+fn is_port_held(e: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Networking::WinSock::{WSAEACCES, WSAEADDRINUSE};
+        if matches!(e.raw_os_error(), Some(c) if c == WSAEACCES || c == WSAEADDRINUSE) {
+            return true;
+        }
+    }
+    e.kind() == std::io::ErrorKind::AddrInUse
+}
+
 impl Server {
     /// Binds `addr` exclusively (SR-31): never `SO_REUSEPORT`, so a second process cannot
     /// share the port; `SO_REUSEADDR` on Unix only lets a restarted host rebind over
-    /// `TIME_WAIT` sockets, which on Linux never admits a second listener. A held port is
+    /// `TIME_WAIT` sockets, which on Linux never admits a second listener. On Windows the
+    /// host passes a `setup` that sets `SO_EXCLUSIVEADDRUSE`. A held port is
     /// [`Error::PortHeld`]; there is no fallback port (protocol.md section 1). Forbidden
     /// ports are refused with [`Error::BadRequest`]. An unspecified IPv6 address binds
     /// dual-stack.
-    pub fn bind(addr: SocketAddr, limits: Limits) -> Result<Self> {
+    pub fn bind(
+        addr: SocketAddr,
+        limits: Limits,
+        setup: Option<&dyn ListenerSetup>,
+    ) -> Result<Self> {
         use socket2::{Domain, Protocol, Socket, Type};
 
         if is_forbidden_port(addr.port()) {
@@ -101,14 +133,15 @@ impl Server {
         }
         #[cfg(unix)]
         socket.set_reuse_address(true)?;
-        // TODO(SR-31): on Windows set SO_EXCLUSIVEADDRUSE before bind; socket2 does not
-        // expose it, so Phase 2 adds it through windows-sys.
+        // Exclusive use on Windows (SR-31) comes from the host through this hook
+        // (`HostConfig::listener_setup`); socket2 does not expose SO_EXCLUSIVEADDRUSE.
+        if let Some(setup) = setup {
+            setup.before_bind(&socket)?;
+        }
         socket.set_nonblocking(true)?;
         match socket.bind(&addr.into()) {
             Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                return Err(Error::PortHeld { port: addr.port() })
-            }
+            Err(e) if is_port_held(&e) => return Err(Error::PortHeld { port: addr.port() }),
             Err(e) => return Err(e.into()),
         }
         socket.listen(1024)?;
@@ -316,4 +349,75 @@ fn route(
         return;
     }
     tokio::spawn(router.handle(Arc::clone(conn), req, respond));
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    /// Records that it ran on a socket not yet bound, or fails on purpose.
+    #[derive(Debug, Default)]
+    struct Probe {
+        fail: bool,
+        saw_unbound: AtomicBool,
+    }
+
+    impl ListenerSetup for Probe {
+        fn before_bind(&self, socket: &ListenSocket) -> std::io::Result<()> {
+            let port = socket
+                .local_addr()
+                .ok()
+                .and_then(|a| a.as_socket())
+                .map_or(0, |a| a.port());
+            self.saw_unbound.store(port == 0, Ordering::SeqCst);
+            if self.fail {
+                return Err(std::io::Error::other("setup refused"));
+            }
+            Ok(())
+        }
+    }
+
+    fn loopback() -> SocketAddr {
+        SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)
+    }
+
+    /// SR-31: the host hook runs before the bind, and its error fails the bind.
+    #[tokio::test]
+    async fn listener_setup_runs_before_bind_and_can_fail_it() {
+        let probe = Probe::default();
+        let server = Server::bind(loopback(), Limits::default(), Some(&probe)).unwrap();
+        assert!(
+            probe.saw_unbound.load(Ordering::SeqCst),
+            "hook ran before bind"
+        );
+        assert_ne!(server.local_addr().port(), 0);
+
+        let failing = Probe {
+            fail: true,
+            ..Probe::default()
+        };
+        let r = Server::bind(loopback(), Limits::default(), Some(&failing));
+        assert!(
+            matches!(&r, Err(Error::Io(e)) if e.to_string().contains("setup refused")),
+            "{:?}",
+            r.as_ref().err()
+        );
+    }
+
+    /// A second bind on a held port is `PortHeld` without any hook (Linux: no
+    /// `SO_REUSEPORT`).
+    #[tokio::test]
+    async fn second_bind_is_port_held() {
+        let first = Server::bind(loopback(), Limits::default(), None).unwrap();
+        let addr = first.local_addr();
+        let second = Server::bind(addr, Limits::default(), None);
+        assert!(
+            matches!(&second, Err(Error::PortHeld { port }) if *port == addr.port()),
+            "{:?}",
+            second.as_ref().err()
+        );
+    }
 }

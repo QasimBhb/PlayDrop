@@ -89,12 +89,34 @@ pub trait FreeSpace: Send + Sync {
     fn space(&self, path: &Path) -> io::Result<SpaceInfo>;
 }
 
-/// When verified offsets are made durable (protocol.md 7.6): after `bytes` new verified
-/// bytes or `interval`, whichever comes first, and always at the end of a request.
+/// Checkpoint byte threshold where each file is flushed on its own (`fdatasync`): every
+/// streamed file, and bundles whose staging folder is not on a filesystem trusted with
+/// `syncfs`. Protocol.md 7.6.
+pub const PER_FILE_CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Checkpoint byte threshold where a bundle checkpoint flushes all its members with one
+/// `syncfs` (`fsx::Flush::Syncfs`; protocol.md 7.6 and the Phase 10 bullet in 11.1).
+///
+/// On f2fs every `syncfs` writes a full filesystem checkpoint: about 110 ms per call on the
+/// test phone (Galaxy A54), whatever the bytes behind it, and file creates stall while it
+/// runs. Phase 10 benchmark (`tests/phase9_receiver.rs`, 5,000 members of 4 to 64 KiB,
+/// `Staged` mode, medians of 10): 4.56 s at 16 MiB (11 calls), 3.09 s at 32 MiB, 1.78 s at
+/// 64 MiB (3 calls). The cost is a longer re-send after a kill (at most 64 MiB) and
+/// members placed up to one checkpoint later; the 1 s time limit still applies, and on
+/// a real link it usually fires first.
+pub const SYNCFS_CHECKPOINT_BYTES: u64 = 64 * 1024 * 1024;
+
+/// When verified offsets are made durable (protocol.md 7.6): after the byte threshold for
+/// the stream's flush kind or `interval`, whichever comes first, and always at the end of
+/// a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncPolicy {
-    /// Byte threshold (default 16 MiB).
+    /// Byte threshold where files are flushed one by one (default
+    /// [`PER_FILE_CHECKPOINT_BYTES`]).
     pub bytes: u64,
+    /// Byte threshold where a bundle checkpoint flushes with one `syncfs` (default
+    /// [`SYNCFS_CHECKPOINT_BYTES`]).
+    pub batched_bytes: u64,
     /// Time threshold (default 1 s).
     pub interval: Duration,
 }
@@ -102,8 +124,19 @@ pub struct SyncPolicy {
 impl Default for SyncPolicy {
     fn default() -> Self {
         Self {
-            bytes: 16 * 1024 * 1024,
+            bytes: PER_FILE_CHECKPOINT_BYTES,
+            batched_bytes: SYNCFS_CHECKPOINT_BYTES,
             interval: Duration::from_secs(1),
+        }
+    }
+}
+
+impl SyncPolicy {
+    /// The byte threshold for a stream whose checkpoints flush the `flush` way.
+    pub(crate) fn bytes_for(&self, flush: fsx::Flush) -> u64 {
+        match flush {
+            fsx::Flush::Syncfs => self.batched_bytes,
+            fsx::Flush::PerFile => self.bytes,
         }
     }
 }
@@ -692,6 +725,20 @@ struct Timings {
     delivered: AtomicU64,
     /// Delivery thread: time in placing or handing over those members.
     deliver_ns: AtomicU64,
+    /// Parts of `stream_ns`: opening (create and truncate), writing and closing member
+    /// staging files. The rest is the bundle reader.
+    open_ns: AtomicU64,
+    write_ns: AtomicU64,
+    close_ns: AtomicU64,
+    /// Checkpoints taken, and the parts of `checkpoint_ns`: the open member's
+    /// `fdatasync`, the closed members' flush (`syncfs` or one per file), the hash log
+    /// (write and `fdatasync`), the ledger record (atomic replace), feeding the worker.
+    checkpoints: AtomicU64,
+    ck_current_ns: AtomicU64,
+    ck_flush_ns: AtomicU64,
+    ck_hashes_ns: AtomicU64,
+    ck_record_ns: AtomicU64,
+    ck_feed_ns: AtomicU64,
 }
 
 impl Timings {
@@ -715,6 +762,19 @@ pub struct MemberTimings {
     pub delivered: u64,
     /// Delivery thread: time spent placing or handing over those members.
     pub delivery: Duration,
+    /// Parts of `stream`: member staging files opened (create and truncate), written,
+    /// closed.
+    pub open: Duration,
+    pub write: Duration,
+    pub close: Duration,
+    /// Checkpoints taken, and the parts of `checkpoint`: the open member's sync, the
+    /// closed members' flush, the hash log, the ledger record, feeding the worker.
+    pub checkpoints: u64,
+    pub ck_current: Duration,
+    pub ck_flush: Duration,
+    pub ck_hashes: Duration,
+    pub ck_record: Duration,
+    pub ck_feed: Duration,
 }
 
 /// What a bundle and its delivery worker share with the rest of the transfer.
@@ -1111,6 +1171,8 @@ struct Ledger {
     size: u64,
     chunk_size: u32,
     policy: SyncPolicy,
+    /// Byte threshold of [`due`](Self::due): the policy's, for the stream's flush kind.
+    threshold: u64,
     unsynced: u64,
     last_sync: Instant,
     /// Verified offset of the last durable record: every byte below it is synced. Bundle
@@ -1121,6 +1183,15 @@ struct Ledger {
     saved: Vec<SavedFile>,
     /// See [`LedgerRecord::named_before_rename`].
     named_before_rename: bool,
+}
+
+/// The ledger state one [`Ledger::persist`] makes durable.
+#[derive(Debug, Clone, Copy)]
+struct Snapshot {
+    state: FileState,
+    verified: u64,
+    count: usize,
+    root: Option<ChunkHash>,
 }
 
 impl Ledger {
@@ -1141,6 +1212,7 @@ impl Ledger {
             size,
             chunk_size,
             policy,
+            threshold: policy.bytes_for(fsx::Flush::PerFile),
             unsynced: 0,
             last_sync: Instant::now(),
             durable: 0,
@@ -1234,22 +1306,36 @@ impl Ledger {
         self.unsynced += len;
     }
 
+    /// Sets the byte threshold for checkpoints that flush the `flush` way. Streamed files
+    /// keep the per-file one they start with.
+    fn flushed_by(&mut self, flush: fsx::Flush) {
+        self.threshold = self.policy.bytes_for(flush);
+    }
+
     fn due(&self) -> bool {
         self.unsynced > 0
-            && (self.unsynced >= self.policy.bytes
-                || self.last_sync.elapsed() >= self.policy.interval)
+            && (self.unsynced >= self.threshold || self.last_sync.elapsed() >= self.policy.interval)
     }
 
     /// Makes the in-memory verified offset durable. The caller has already synced the data.
     fn persist(&mut self) -> Result<()> {
-        let (state, verified, new_hashes, count, root) = {
+        let snap = self.persist_hashes()?;
+        self.persist_record(snap)
+    }
+
+    /// First half of [`persist`](Self::persist): appends and flushes the new hashes, and
+    /// returns what [`persist_record`](Self::persist_record) then records.
+    fn persist_hashes(&mut self) -> Result<Snapshot> {
+        let (snap, new_hashes) = {
             let p = lock(&self.progress);
             (
-                p.state,
-                p.verified_offset,
+                Snapshot {
+                    state: p.state,
+                    verified: p.verified_offset,
+                    count: p.hashes.len(),
+                    root: p.root,
+                },
                 p.hashes[self.persisted.min(p.hashes.len())..].concat(),
-                p.hashes.len(),
-                p.root,
             )
         };
         if !new_hashes.is_empty() {
@@ -1261,9 +1347,15 @@ impl Ledger {
             f.write_all(&new_hashes).map_err(fsx::map_io)?;
             f.sync_data().map_err(fsx::map_io)?;
         }
-        self.write_record(state, verified, count as u64, root)?;
-        self.persisted = count;
-        self.durable = verified;
+        Ok(snap)
+    }
+
+    /// Second half of [`persist`](Self::persist): the record naming the hashes just
+    /// flushed, which makes them and the verified offset durable.
+    fn persist_record(&mut self, snap: Snapshot) -> Result<()> {
+        self.write_record(snap.state, snap.verified, snap.count as u64, snap.root)?;
+        self.persisted = snap.count;
+        self.durable = snap.verified;
         self.unsynced = 0;
         self.last_sync = Instant::now();
         Ok(())
@@ -1940,8 +2032,9 @@ struct BundleInner {
     /// Members already placed when the stream last went back to 0 or the bundle was
     /// loaded: their bytes are not written to staging again.
     placed_before: HashSet<u32>,
-    /// How checkpoints flush member files ([`fsx::Flush`]), decided at the first one.
-    flush: Option<fsx::Flush>,
+    /// How checkpoints flush member files ([`fsx::Flush`]), looked up once per transfer
+    /// (`fstatfs`) when the bundle is opened. Also sets the ledger's byte threshold.
+    flush: fsx::Flush,
     /// Where members go.
     dest: Dest,
     /// The manifest's files, by fid.
@@ -2002,14 +2095,16 @@ impl Drop for BundleInner {
 impl BundleInner {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        ledger: Ledger,
+        mut ledger: Ledger,
         layout: Arc<BundleLayout>,
         staging: PathBuf,
+        flush: fsx::Flush,
         skipped: Vec<bool>,
         dest: Dest,
         files: Arc<Vec<FileEntry>>,
         delivery: DeliveryShared,
     ) -> Self {
+        ledger.flushed_by(flush);
         Self {
             ledger,
             layout,
@@ -2019,7 +2114,7 @@ impl BundleInner {
             current: None,
             dirty: Vec::new(),
             placed_before: HashSet::new(),
-            flush: None,
+            flush,
             dest,
             files,
             delivery,
@@ -2164,18 +2259,11 @@ impl BundleInner {
 
     fn close_current(&mut self) {
         if let Some(m) = self.current.take() {
+            let t0 = Instant::now();
             drop(m.file);
+            Timings::add(&self.delivery.timings.close_ns, t0);
             self.dirty.push(m.fid);
         }
-    }
-
-    /// How checkpoints flush member files in this staging folder: looked up once per
-    /// transfer (`fstatfs`), not at every checkpoint.
-    fn flush(&mut self) -> fsx::Flush {
-        let staging = &self.staging;
-        *self
-            .flush
-            .get_or_insert_with(|| fsx::Flush::for_dir(staging))
     }
 
     /// True when the stream writes member `fid` to staging: not skipped, and not placed
@@ -2212,8 +2300,10 @@ impl BundleInner {
                         // one create-only open per member made checkpoints about 30% longer
                         // and the 5,000-member bundle about 10% slower on ext4, with no
                         // measurable gain on the test phone's f2fs.
+                        let t1 = Instant::now();
                         let file = fsx::open_or_create(&self.member_path(fid))?;
                         file.set_len(0)?;
+                        Timings::add(&self.delivery.timings.open_ns, t1);
                         self.current = Some(OpenMember { fid, file, pos: 0 });
                     }
                 }
@@ -2235,7 +2325,9 @@ impl BundleInner {
                     if m.pos != offset {
                         m.file.seek(SeekFrom::Start(offset))?;
                     }
+                    let t1 = Instant::now();
                     m.file.write_all(&bytes).map_err(fsx::map_io)?;
+                    Timings::add(&self.delivery.timings.write_ns, t1);
                     m.pos = offset + bytes.len() as u64;
                 }
                 BundleEvent::MemberEnd { .. } => self.close_current(),
@@ -2283,18 +2375,31 @@ impl BundleInner {
     }
 
     fn checkpoint_now(&mut self) -> Result<()> {
+        let t = Arc::clone(&self.delivery.timings);
+        t.checkpoints.fetch_add(1, Ordering::Relaxed);
+        let t0 = Instant::now();
         if let Some(m) = &self.current {
             m.file.sync_data().map_err(fsx::map_io)?;
         }
+        Timings::add(&t.ck_current_ns, t0);
         // Closed members written since the last checkpoint, flushed together.
+        let t0 = Instant::now();
         let dirty: Vec<PathBuf> = std::mem::take(&mut self.dirty)
             .into_iter()
             .map(|fid| self.member_path(fid))
             .collect();
-        let flush = self.flush();
-        fsx::sync_files(&self.staging, &dirty, flush)?;
-        self.ledger.persist()?;
-        self.feed()
+        fsx::sync_files(&self.staging, &dirty, self.flush)?;
+        Timings::add(&t.ck_flush_ns, t0);
+        let t0 = Instant::now();
+        let snap = self.ledger.persist_hashes()?;
+        Timings::add(&t.ck_hashes_ns, t0);
+        let t0 = Instant::now();
+        self.ledger.persist_record(snap)?;
+        Timings::add(&t.ck_record_ns, t0);
+        let t0 = Instant::now();
+        let out = self.feed();
+        Timings::add(&t.ck_feed_ns, t0);
+        out
     }
 
     fn fail(&mut self) -> Result<()> {
@@ -2363,8 +2468,7 @@ impl BundleInner {
             .into_iter()
             .map(|fid| self.member_path(fid))
             .collect();
-        let flush = self.flush();
-        fsx::sync_files(&self.staging, &dirty, flush)?;
+        fsx::sync_files(&self.staging, &dirty, self.flush)?;
         self.checkpoint()?;
         if lock(&self.ledger.progress).root != Some(*claimed) {
             // The root is durable before the last members are handed over, so a kill or an
@@ -3136,6 +3240,7 @@ impl TransferReceiver {
                     ledger,
                     layout.clone(),
                     staging.clone(),
+                    fsx::Flush::for_dir(&staging),
                     mask.clone(),
                     dest.clone(),
                     Arc::new(m.files.clone()),
@@ -3289,6 +3394,15 @@ impl TransferReceiver {
             checkpoint: d(&t.checkpoint_ns),
             delivered: t.delivered.load(Ordering::Relaxed),
             delivery: d(&t.deliver_ns),
+            open: d(&t.open_ns),
+            write: d(&t.write_ns),
+            close: d(&t.close_ns),
+            checkpoints: t.checkpoints.load(Ordering::Relaxed),
+            ck_current: d(&t.ck_current_ns),
+            ck_flush: d(&t.ck_flush_ns),
+            ck_hashes: d(&t.ck_hashes_ns),
+            ck_record: d(&t.ck_record_ns),
+            ck_feed: d(&t.ck_feed_ns),
         }
     }
 
@@ -3640,6 +3754,7 @@ fn placeholder_bundle() -> BundleInner {
         Ledger::fresh(Path::new(""), "", 0, 1, SyncPolicy::default()),
         layout,
         PathBuf::new(),
+        fsx::Flush::PerFile,
         Vec::new(),
         Dest::Directory(PathBuf::new()),
         Arc::new(Vec::new()),
@@ -4235,6 +4350,7 @@ pub(crate) mod tests {
         let chunks = chunks_of(&data, CS);
         let policy = SyncPolicy {
             bytes: 4 * u64::from(CS),
+            batched_bytes: 4 * u64::from(CS),
             interval: Duration::from_secs(3600),
         };
 
@@ -5166,6 +5282,55 @@ pub(crate) mod tests {
         }
     }
 
+    /// The checkpoint byte threshold follows the flush kind: 64 MiB where a bundle
+    /// checkpoint flushes with one `syncfs`, 16 MiB where files are flushed one by one
+    /// (every streamed file, and bundles elsewhere). The 1 s limit is the same for both.
+    #[test]
+    fn checkpoint_threshold_follows_the_flush_kind() {
+        let policy = SyncPolicy::default();
+        assert_eq!(policy.bytes_for(fsx::Flush::PerFile), 16 * 1024 * 1024);
+        assert_eq!(policy.bytes_for(fsx::Flush::Syncfs), 64 * 1024 * 1024);
+        assert_eq!(policy.interval, Duration::from_secs(1));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let due_after = |ledger: &mut Ledger, bytes: u64| {
+            ledger.unsynced = bytes;
+            ledger.last_sync = Instant::now();
+            ledger.due()
+        };
+        // A streamed file keeps the per-file threshold.
+        let mut file = Ledger::fresh(tmp.path(), "0", 1 << 30, CS, policy);
+        assert!(!due_after(&mut file, PER_FILE_CHECKPOINT_BYTES - 1));
+        assert!(due_after(&mut file, PER_FILE_CHECKPOINT_BYTES));
+
+        // A bundle takes the threshold of the flush its staging folder gets.
+        let bundle_with = |flush| {
+            let layout = Arc::clone(&placeholder_bundle().layout);
+            BundleInner::new(
+                Ledger::fresh(tmp.path(), "bundle", 1 << 30, CS, policy),
+                layout,
+                tmp.path().to_path_buf(),
+                flush,
+                Vec::new(),
+                Dest::Directory(tmp.path().to_path_buf()),
+                Arc::new(Vec::new()),
+                DeliveryShared::new(),
+            )
+        };
+        for (flush, limit) in [
+            (fsx::Flush::Syncfs, SYNCFS_CHECKPOINT_BYTES),
+            (fsx::Flush::PerFile, PER_FILE_CHECKPOINT_BYTES),
+        ] {
+            let mut bundle = bundle_with(flush);
+            assert!(!due_after(&mut bundle.ledger, limit - 1), "{flush:?}");
+            assert!(due_after(&mut bundle.ledger, limit), "{flush:?}");
+        }
+        // The folder's own filesystem decides (`syncfs` on a local block filesystem on
+        // Linux and Android, per file elsewhere), as when a receiver opens the bundle.
+        let flush = fsx::Flush::for_dir(tmp.path());
+        assert_eq!(bundle_with(flush).ledger.threshold, policy.bytes_for(flush));
+    }
+
     /// A torn last line in the delivery log (power loss mid-append) is ignored and cut off
     /// before the next append. A version 1 log (Phase 7) is still read, with its root.
     #[test]
@@ -5217,6 +5382,7 @@ pub(crate) mod tests {
     fn every_chunk() -> SyncPolicy {
         SyncPolicy {
             bytes: u64::from(CS),
+            batched_bytes: u64::from(CS),
             interval: Duration::from_secs(3600),
         }
     }

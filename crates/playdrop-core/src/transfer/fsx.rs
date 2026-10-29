@@ -561,7 +561,7 @@ pub(crate) fn map_io(e: io::Error) -> Error {
 ///
 /// Android: `syncfs` is in bionic's app seccomp allowlist from API 26 and rustix issues
 /// the raw syscall. It flushes the whole data partition, other apps' dirty pages
-/// included; at one call per checkpoint (16 MiB or 1 s) that is still far cheaper than a
+/// included; at one call per checkpoint (64 MiB or 1 s) that is still far cheaper than a
 /// flush per member.
 pub(crate) fn sync_files(dir: &Path, files: &[PathBuf], flush: Flush) -> Result<()> {
     #[cfg(any(target_os = "linux", target_os = "android"))]

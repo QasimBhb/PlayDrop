@@ -8,7 +8,9 @@ use std::path::Path;
 use crate::discovery::{InterfaceSource, Ipv4Interface};
 use crate::transfer::{FreeSpace, SpaceInfo};
 
-/// Free space of the volume holding a path (SR-20), from `statvfs` on Unix.
+/// Free space of the volume holding a path (SR-20), from `statvfs` on Unix. Windows hosts
+/// supply their own [`FreeSpace`] (the daemon uses `GetDiskFreeSpaceExW`), because this
+/// crate forbids the `unsafe` a system call needs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VolumeSpace;
 
@@ -42,7 +44,8 @@ fn statvfs_space(path: &Path) -> io::Result<SpaceInfo> {
     reason = "same signature as the Unix version"
 )]
 fn statvfs_space(_path: &Path) -> io::Result<SpaceInfo> {
-    // TODO(SR-20): GetDiskFreeSpaceExW on Windows (Phase 2). Until then report a generous
+    // Only hosts that do not supply `HostConfig::free_space` land here (the CLI `host`
+    // command on Windows); `playdropd` plugs in `GetDiskFreeSpaceExW`. Report a generous
     // fixed volume so offers are not refused; writes still fail cleanly on a full disk.
     Ok(SpaceInfo {
         available: 1 << 50,

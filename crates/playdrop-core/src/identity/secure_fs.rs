@@ -6,8 +6,11 @@
 //! refused for the same reason. Writes go to a fresh temporary file in the same directory,
 //! are flushed, then renamed over the target so a crash never leaves a half-written file.
 //!
-//! On other platforms the mode checks are skipped; Windows DPAPI and the mobile keystores
-//! (SR-28, phases 2 to 4) wrap this layer later.
+//! On other platforms the mode checks are skipped. On Windows `playdropd` gives the data
+//! dir a protected owner-only DACL before the core starts (new files here inherit it) and
+//! seals `identity.key` and `pins.json` with DPAPI through [`super::sealing`]; Android and
+//! iOS seal through the same trait with their keystores. This crate has no `unsafe` and no
+//! Windows security APIs, so it neither sets nor checks the DACL itself.
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};

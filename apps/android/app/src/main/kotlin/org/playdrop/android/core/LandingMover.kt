@@ -16,19 +16,20 @@ import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Moves landed transfers from the app's landing folder into `Download/PlayDrop` (see
- * [DownloadsSink], "Landing"), one file at a time, on one coroutine. One instance per process.
+ * [DownloadsSink], "Landing"), [LandedMove.BATCH] files at a time ([LandedMove.moveBatch]: their
+ * copies run side by side, but every batch is one job of one coroutine). One instance per process.
  *
  * Why one serial queue: every job (a move after a transfer completes or ends early, the sweep
  * of what a killed process left, a retry) touches the same trees, and running them one after
  * another is what makes the whole thing idempotent without further locking:
- * - before each pass the journal of an unfinished copy is settled
+ * - before each pass the journal of unfinished copies is settled
  *   ([DownloadsSink.recoverJournal]); a pass that cannot settle it waits for a retry;
  * - a file is moved by a journaled copy followed by deleting the landed file (never by a
  *   rename into Downloads: MediaProvider serves that as a copy a kill cuts in half, see
  *   [DownloadsSink]), so a pass cut short at any point leaves each file either landed or in
  *   Downloads;
  *   if the landed file cannot be deleted the pass stops so no later copy overwrites that
- *   journal entry;
+ *   journal entry (a batch keeps all of its entries);
  * - a second pass over the same transfer finds only what the first one left;
  * - files that land while a pass runs (a resumed transfer racing a sweep) are not in that
  *   pass's list and are moved by the pass queued when that transfer ends; their folders are
@@ -131,13 +132,14 @@ internal class LandingMover(
             return
         }
         val t0 = System.nanoTime()
+        sink.beginMovePass()
         val tally = MoveTally(files.size)
         val throttle = ProgressThrottle()
         try {
-            for (f in files) {
-                val result = sink.moveLanded(tid, f)
-                tally.record(result)
-                if (result.stopPass) break
+            for (chunk in files.chunked(LandedMove.BATCH)) {
+                val results = sink.moveLandedBatch(tid, chunk)
+                results.forEach(tally::record)
+                if (results.any { it.stopPass }) break
                 if (throttle.due(tally.done, tally.total, System.nanoTime())) {
                     Notifications.moving(app, tid, tally.done, tally.total)
                 }

@@ -11,7 +11,10 @@
 //! Run it on ext4 (`/tmp` here; never under the repo) with a release build:
 //! `cargo test --release -p playdrop-core --test phase9_receiver -- --ignored --nocapture`.
 //! `PD_BENCH_DIR` points it elsewhere (for example `/data/local/tmp` when the test binary
-//! is built with `cargo ndk` and run on a phone over `adb shell`).
+//! is built with `cargo ndk` and run on a phone over `adb shell`). `PD_BENCH_RUNS` sets the
+//! runs per mode, `PD_BENCH_BUNDLE_ONLY` skips the streamed reference and the sender, and
+//! `PD_BENCH_SYNC_MIB` tries another checkpoint cadence (see [`sync_policy`]). A second
+//! table splits the stream and checkpoint time per member into their parts.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -33,6 +36,29 @@ use tokio::io::AsyncReadExt as _;
 const CS: u32 = 1024 * 1024;
 const MEMBERS: usize = 5_000;
 const RUNS: usize = 3;
+
+/// The checkpoint cadence: `PD_BENCH_SYNC_MIB` sets the byte threshold (with no time
+/// threshold, so the cadence is the same however fast the device is), else the host's
+/// default (protocol.md 7.6). For measuring what a different cadence would buy; the host
+/// itself always uses the default.
+fn sync_policy() -> SyncPolicy {
+    std::env::var("PD_BENCH_SYNC_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or_else(SyncPolicy::default, |mib| SyncPolicy {
+            bytes: mib << 20,
+            batched_bytes: mib << 20,
+            interval: Duration::from_secs(3600),
+        })
+}
+
+/// Runs per mode: `PD_BENCH_RUNS`, else [`RUNS`].
+fn runs() -> usize {
+    std::env::var("PD_BENCH_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(RUNS)
+}
 
 /// Where the benchmark writes: `PD_BENCH_DIR`, else `/tmp` (ext4 on the dev machine; the
 /// repo volume is not, and data dirs never go under the repo).
@@ -182,7 +208,7 @@ async fn receive_once(f: &Fixture, staged: bool) -> Run {
             sink: sink.clone(),
             peer: "ab".repeat(32),
         }),
-        sync: SyncPolicy::default(),
+        sync: sync_policy(),
         ..AcceptOptions::default()
     };
     let mut m = f.manifest.clone();
@@ -329,6 +355,43 @@ fn medium_contents(total: u64) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Where the stream and checkpoint time goes, per member (ms), run by run: member files
+/// opened (create and truncate), written and closed, the bundle reader, then each part of
+/// the checkpoints.
+fn print_parts(detail: &[(bool, MemberTimings)], n: u64) {
+    println!(
+        "{:<10} {:>7} {:>7} {:>7} {:>7} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "parts",
+        "open",
+        "write",
+        "close",
+        "reader",
+        "ckpts",
+        "ck cur",
+        "ck flush",
+        "ck hash",
+        "ck rec",
+        "ck feed"
+    );
+    for (staged, t) in detail {
+        let reader = t.stream.saturating_sub(t.open + t.write + t.close);
+        println!(
+            "{:<10} {:>7.4} {:>7.4} {:>7.4} {:>7.4} {:>6} {:>8.4} {:>8.4} {:>8.4} {:>8.4} {:>8.4}",
+            if *staged { "Staged" } else { "Directory" },
+            ms_per(t.open, n),
+            ms_per(t.write, n),
+            ms_per(t.close, n),
+            ms_per(reader, n),
+            t.checkpoints,
+            ms_per(t.ck_current, n),
+            ms_per(t.ck_flush, n),
+            ms_per(t.ck_hashes, n),
+            ms_per(t.ck_record, n),
+            ms_per(t.ck_feed, n),
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "benchmark; prints its numbers with --nocapture"]
 async fn bench_small_member_floor() {
@@ -349,7 +412,7 @@ async fn bench_small_member_floor() {
     let bundle_only = std::env::var_os("PD_BENCH_BUNDLE_ONLY").is_some();
     let member_bytes: u64 = contents.iter().map(|c| c.len() as u64).sum();
     let medium = medium_contents(member_bytes);
-    for _ in 0..if bundle_only { 0 } else { RUNS } {
+    for _ in 0..if bundle_only { 0 } else { runs() } {
         let wall = receive_streamed(&medium).await;
         println!(
             "{:<10} {:>8.3} {:>9} {:>9.1}   (100 streamed files of 1.0 to 2.3 MiB, same bytes)",
@@ -359,9 +422,11 @@ async fn bench_small_member_floor() {
             mib_of(member_bytes) / wall.as_secs_f64(),
         );
     }
+    let mut detail = Vec::new();
     for staged in [false, true] {
-        for _ in 0..RUNS {
+        for _ in 0..runs() {
             let r = receive_once(&f, staged).await;
+            detail.push((staged, r.t));
             println!(
                 "{:<10} {:>8.3} {:>9.3} {:>9.1} {:>14.4} {:>16.4} {:>16.4}",
                 if staged { "Staged" } else { "Directory" },
@@ -376,6 +441,7 @@ async fn bench_small_member_floor() {
             assert_eq!(r.t.delivered, n);
         }
     }
+    print_parts(&detail, n);
 
     if bundle_only {
         return;

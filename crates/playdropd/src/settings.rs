@@ -290,8 +290,8 @@ fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-// TODO(SR-28): on Windows the data dir sits under %LOCALAPPDATA%, which only the user can
-// read by default; an explicit DACL is Phase 2 follow-up work shared with the core.
+/// On Windows the file inherits the data dir's owner-only DACL ([`prepare_data_dir`]), so
+/// no explicit security attributes are needed here.
 #[cfg(not(unix))]
 fn private_file(path: &Path) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
@@ -311,9 +311,38 @@ fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
         .with_context(|| format!("creating {}", dir.display()))
 }
 
-#[cfg(not(unix))]
+/// Windows: a new dir gets the owner-only DACL at once; an existing one is left to
+/// [`prepare_data_dir`], which runs on every start, so a save does not rewrite the DACL of
+/// the whole tree each time.
+#[cfg(windows)]
+fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::at_rest::protect_dir(dir)
+        .with_context(|| format!("restricting {} to this user (SR-28)", dir.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
+}
+
+/// Creates the data dir if needed and makes it private before the core reads or writes
+/// keys in it (SR-28). Unix: mode 0700 on a new dir; the core refuses looser modes on an
+/// existing one. Windows: a protected DACL with only this user and `SYSTEM`, set on every
+/// start so an install made before the DACL existed is tightened too; everything the core
+/// creates inside inherits it.
+pub fn prepare_data_dir(dir: &Path) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        crate::at_rest::protect_dir(dir)
+            .with_context(|| format!("restricting {} to this user (SR-28)", dir.display()))
+    }
+    #[cfg(not(windows))]
+    create_private_dir(dir)
 }
 
 /// Makes the rename durable. Best effort: some filesystems refuse to open a directory.

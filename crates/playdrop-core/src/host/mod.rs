@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 pub use crate::identity::sealing::{SecretStore, SecretStoreError};
+pub use crate::net::{ListenSocket, ListenerSetup};
 pub use crate::transfer::{DeliverItem, ReceiveSink, SinkError, SourceOpener, StreamSource};
 pub use diagnostics::{
     Diagnostics, DialFailure, InterfaceInfo, JoinFailure, MdnsStatus, MulticastStatus,
@@ -161,6 +162,10 @@ pub struct HostConfig {
     /// Seals `identity.key` and `pins.json` at rest (`docs/core-api.md` section 2a).
     /// `None` keeps the 0600 files of the desktop.
     pub secret_store: Option<Arc<dyn SecretStore>>,
+    /// Adjusts the listening socket before it is bound (SR-31). A Windows daemon sets
+    /// `SO_EXCLUSIVEADDRUSE` through it; `None` (the default) binds with the core's own
+    /// options only. Rust only, not exposed through `playdrop-ffi`.
+    pub listener_setup: Option<Arc<dyn ListenerSetup>>,
     /// Advertise `input.pointer`, `input.key` and `input.presenter` in `caps.in`
     /// (protocol.md 5.12): the host has a backend that applies remote input (a desktop
     /// daemon with `SendInput` or the `RemoteDesktop` portal). Off by default; phones never
@@ -194,6 +199,7 @@ impl HostConfig {
             lock_state: Box::new(AlwaysUnlocked),
             free_space: Arc::new(platform::VolumeSpace),
             secret_store: None,
+            listener_setup: None,
             accepts_input: false,
             reconnect_for: send::RECONNECT_FOR,
         }
@@ -225,6 +231,7 @@ impl std::fmt::Debug for HostConfig {
             .field("data_dir", &self.data_dir)
             .field("receive", &self.receive)
             .field("secret_store", &self.secret_store.is_some())
+            .field("listener_setup", &self.listener_setup)
             .field("port", &self.port)
             .field("bind_ip", &self.bind_ip)
             .field("discovery", &self.discovery)
@@ -737,7 +744,11 @@ impl Host {
         };
         let identity = Arc::new(identity);
         let limits = Limits::default();
-        let server = Server::bind(SocketAddr::new(config.bind_ip, config.port), limits.clone())?;
+        let server = Server::bind(
+            SocketAddr::new(config.bind_ip, config.port),
+            limits.clone(),
+            config.listener_setup.as_deref(),
+        )?;
         let local_addr = server.local_addr();
         let pins = Pins::new(store);
         let window_flag = Arc::new(AtomicBool::new(false));

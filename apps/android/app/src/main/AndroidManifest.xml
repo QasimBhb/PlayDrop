@@ -95,6 +95,15 @@
             android:name=".service.ActionReceiver"
             android:exported="false" />
 
+        <!-- MY_PACKAGE_REPLACED reaches an unexported receiver: the system sends it to this app alone. -->
+        <receiver
+            android:name=".service.UpdateReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <receiver
             android:name=".service.BootReceiver"
             android:exported="true"
