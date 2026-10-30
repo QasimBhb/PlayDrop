@@ -140,7 +140,7 @@ apps/ios/project.yml                         MARKETING_VERSION 0.5.0
 |---|---|---|
 | Phone | `mixed-5000` against `medium-100` stays about 0.5 to 0.6 over Wi-Fi (target 0.8); the floor is per-member work on the phone (`throughput.md` 12.1, 12.5). A morning of 13 to 15 s sends was the phone's state (cleared by a reboot), not the code | 11 |
 | Phone | USB tethering wins the dial race when it is on and caps sends at about 27 MiB/s; prefer the faster path, or Wi-Fi when both answer | 11 |
-| Windows | First CI run of the DPAPI, DACL, free-space and exclusive-port tests; `playdrop host` on Windows gets none of the daemon's Windows pieces | 11 |
+| Windows | `playdrop host` on Windows gets none of the daemon's Windows pieces (the daemon's tests passed on the CI runner on 2026-10-29) | 11 |
 | Windows | The data dir no longer grants Administrators; check an elevated uninstaller on a real machine | when a machine exists |
 | Android | A direct create of a name with `: ? * < > \| " \` gets `EPERM` and turns direct writes off for the process (unreachable from peers: the core rejects those names) | later |
 | Earlier phases | `unicode-width` done; SR-34, iOS App Group, Windows live items | later |
@@ -157,8 +157,7 @@ or toggled, could reach the router but not the PC for over 10 minutes each time.
 
 ## 7. Phase 11 kickoff brief
 
-Start with the first Windows CI results for the new tests (the release run of v0.5.0 is the
-first time they run). Then by value: path choice when USB tethering and
+v0.5.0 is released and the new Windows tests passed on the CI runner. Start by value: path choice when USB tethering and
 Wi-Fi both answer; PLAN.md row 7 items each want a design note before code. Build with
 `CARGO_TARGET_DIR=$HOME/.cache/playdrop-target` (the repo's drive is NTFS through ntfs-3g).
 
