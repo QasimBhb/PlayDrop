@@ -2687,12 +2687,6 @@ async fn a_check_under_way_does_not_undo_a_network_change() {
     stop(s).await;
 }
 
-/// A loopback address nothing listens on: refused at once.
-fn refused_addr() -> SocketAddr {
-    let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    l.local_addr().unwrap()
-}
-
 /// An address that accepts and closes at once, so a dial to it fails within milliseconds on
 /// every system. A refused connect does not do here: Windows retries it for about 2 s, by when
 /// the slots are full and the attempt counts as stopped rather than failed.
