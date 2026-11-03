@@ -8,6 +8,35 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.6.0] - 2026-11-02
+
+### Added
+
+- PlayDrop now picks the faster connection when a phone and a computer can reach each other more
+  than one way, such as USB tethering and Wi-Fi. The fastest path used to lose to whichever
+  answered first; a USB 2.0 tether capped a phone at about 27 MiB/s while its Wi-Fi could do 45
+  to 55. It measures with a short test and moves only when no transfer is running and the other
+  path is at least 1.25 times faster. It skips the test on low battery and on sleeping devices.
+
+### Changed
+
+- On Android, sending thousands of small files to a phone takes about half the time: 5,000 files
+  took 7 to 11 seconds in clean runs, against 14 to 19 before, measured on a Galaxy A54 with both
+  apps taking turns. How soon they reach Downloads afterwards has not changed.
+- The desktop command-line host (`playdrop host`) on Windows now has the daemon's protections: an
+  encrypted key and device list, a private data folder, a real free-space check, and exclusive
+  use of its port.
+
+### Known limits
+
+- Choosing between USB tethering and Wi-Fi has been tested with simulated links on one computer,
+  not yet on a real phone with both turned on.
+- A kill in the middle of a large drop of small files can leave up to four files in Downloads
+  twice, the second with a name such as `a (1).txt`. No file is lost or damaged.
+- Sending a 1 GiB file to the phone gave mixed results in this release's tests: 24 to 35 seconds,
+  against 22 to 34 before. There were too few runs to tell whether it changed. Resuming after a
+  kill was tested on a computer for this release, not on a phone.
+
 ## [0.5.0] - 2026-10-29
 
 ### Changed

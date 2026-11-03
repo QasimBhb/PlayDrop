@@ -559,3 +559,235 @@ The receive is the same speed with either app, and the morning's 13 to 15 s were
 state, not the code. 0.5.0 gets 5,000 files into Downloads about 37 % sooner. The
 `mixed-5000` against `medium-100` ratio stays about 0.5 to 0.6 over Wi-Fi (the 0.8 target is
 not met; the floor is per-member work on the phone, 12.1).
+
+## 13. Phase 11: the small-file critical path (2026-10-30 and 2026-11-02)
+
+Same phone (Galaxy A54, Android 16), 5 GHz 11ax, RSSI -46 to -53, tx 544 to 680 Mbit/s, on USB for
+adb with tethering off. Release apps only (`assembleRelease -Pplaydrop.signWithDebugKey=true`), each
+built from an isolated copy of the tree. Sections 13.1 and 13.3 hold only these changes on top of
+`80d0272` (v0.5.0), without the parallel path-choice work, on a daemon of that tree whose sending is
+unchanged; another agent's load tests (many `yes` processes) and builds ran on the desktop during 13.3
+(load average 3 to 20). Sections 13.4 and 13.7 are the final tree with the path-choice work, on a quiet
+desktop.
+
+Bench rows ran through `bench/desktop-to-phone.sh`; each ended with all counts and sha256 sums
+matching on the phone unless a row says otherwise. The phone was in the slow state of 12.4 throughout
+(`mixed-5000` on 0.5.0 takes 13 to 17 s here, against 7 s in 12.5), so read the old against new
+columns of one table, and do not compare them with earlier sections.
+
+### 13.1 Where the seconds went (`mixed-5000`, per-thread timers, all runs of 2026-10-30)
+
+Three runs of 0.5.0 and two of the final design (that day's build, before write-ahead was tried, so
+it holds exactly the changes that stayed). The sender was never the limit: reading and hashing the bundle took 0.12 to 0.86 s of the send, and
+on the desktop the isolated bench gives the sender 0.14 s and the whole receive 0.52 s
+(`phase9_receiver`, 5,000 members, this tree; the daemon-to-second-host run of 3.2 was not repeated).
+The remaining time is two slow lines on the phone, side by side.
+
+| | 0.5.0 (3 runs) | Final design (2 runs) |
+|---|---|---|
+| Wall | 14.7 to 15.1 s | 6.9 to 8.3 s |
+| Body received, last byte in | 7.1 to 8.1 s | 4.7 to 6.6 s |
+| of that: waiting for the network and hashing | 1.3 to 1.6 s | 1.4 to 3.2 s |
+| of that: chunk writes on the stream thread | 5.3 to 6.4 s | 2.5 s |
+| of that: `syncfs` on the stream thread | 3.5 to 4.4 s (11 calls) | none (4 to 5 calls in the background, 3.9 s in all) |
+| Members already with the sink at that point | 2,217 to 2,846 | 2,595 (one run) |
+| Tail: last byte to all members delivered | 6.3 to 7.4 s | 1.5 s (one run; the sender saw 2.1 to 2.5 s after its trailer) |
+| First to last delivery | 13.0 to 13.4 s | 5.1 to 6.3 s |
+
+The delivery thread was the longer line: a sink call took 2.4 to 2.6 ms per member against the 1 ms
+the sink itself counted. The parts, with the one-thread build on the same day:
+
+| Part of one delivery | ms |
+|---|---|
+| Call through JNA and UniFFI, not counting the sink body | about 0.75 |
+| Name check: one `stat` through MediaProvider, under the folder lock | 0.50 to 0.58 |
+| Rename from staging into the landing folder | 0.25 to 0.77 |
+| `getExternalStorageState` (binder) | 0.155 |
+| `getExternalFilesDir` | 0.15 |
+| `readlink` of the descriptor | 0.06 |
+| Core: `stat` and `open` of the staged member | 0.06 each |
+
+JNA also attached and detached the thread for every call: `top -H` showed the thread's name counting
+up (`Thread-82`, `Thread-194`, and so on), one `java.lang.Thread` per file. More threads alone did not
+help the name check: with 4 threads and the `stat` outside the lock it still cost 1.3 ms per file,
+so MediaProvider handles those lookups one at a time.
+
+### 13.2 What changed
+
+- **Four sink threads** for bundle members in `Staged` mode (`DeliveryWorker::serve_sink`). One thread
+  keeps the log. `Directory` mode stays on one thread: placing costs 0.02 ms there.
+- **The checkpoint's flush runs in the background** (`BundleInner::checkpoint_due`). The stream goes on
+  while `syncfs` runs; the ledger then records the snapshot taken before the flush began.
+- **One folder listing instead of one `stat` per name** when promising a landing name
+  (`FolderListings`, `NameClaims.generation`): at most one listing per folder per 2 s. The pick stands
+  only if nothing in this process could have created a file in that folder since.
+- **The native thread stays attached to the VM** between sink calls (`CallbackThreads`).
+- **`getExternalStorageState` at most once a second and the landing root cached.**
+
+Tried and dropped: **writing each bundle chunk while reading the next one.** It looked right on paper
+(the stream thread's writes and the wait for the network added up), but 13.3 shows no gain, and it
+widened the time the bundle state is off in another thread, so it is gone. FFI batching (one call per
+many members) was not tried: it needs an API change, and the threads got most of what it would.
+
+### 13.3 One change taken out at a time
+
+`mixed-5000`, one run per install after a 45 s settle, interleaved, wall seconds. Second runs straight
+after a mover are in the notes below, not here. The row with everything is the build that still had
+write-ahead, compared with the same build without it.
+
+| Build | Wall s | Median | Against all changes |
+|---|---|---|---|
+| All changes | 7.27, 7.98, 7.86, 8.09, 8.30 | 7.98 | |
+| No write-ahead | 8.10, 7.85, 7.92, 9.18, 7.84 | 7.92 | 0.0 (dropped) |
+| No `getExternalStorageState` and root caching | 8.26, 8.32, 8.28, 8.21, 7.81 | 8.26 | +0.3 |
+| No JNA keep-attached | 8.44, 8.30, 9.60, 8.64, 8.46 | 8.46 | +0.5 |
+| No folder listing | 8.25, 13.25, 9.25, 9.01, 8.54 | 9.01 | +1.0 |
+| No background flush | 9.60, 9.93 | 9.77 | +1.8 |
+| One sink thread | 10.44, 10.32 | 10.38 | +2.4 |
+
+The caching row is near the noise of these runs. It stays because it is the smallest of the changes
+and each of the five runs but one is slower without it; another sitting could overturn that.
+
+### 13.4 Old against new on the final tree (2026-11-02)
+
+Old is the 0.5.0 app, new is the final tree with the path-choice work. Both ran against one daemon, the
+final tree's, so the phone side is what differs and "old" is not a full 0.5.0 stack. Each install got a
+45 s settle, then the four runs in the table's order. All sums verified on every row here. Three new
+rounds and four old rounds completed:
+
+- 15:33 to 16:03: old, new, old, new, old. Desktop load 0.3 to 2.2, no load tests running. The next new
+  round was lost to the link (13.7), so it is not in the table.
+- 17:33 to 17:45, after the link came back and the phone had cooled and charged (battery 28.6 C): new,
+  then old. Load 0.7 to 2.8. Ping just before the runs was 2 to 10 ms from desktop to phone, 2 to 12 ms
+  from desktop to router, 4 to 7 ms from phone to router.
+
+| Dataset | 0.5.0 wall s | New wall s | 0.5.0 MiB/s | New MiB/s | In Downloads +s, 0.5.0 | New |
+|---|---|---|---|---|---|---|
+| `mixed-5000`, first after the install | 18.1, 19.4, 16.8, 14.5 | 8.6, 8.2, 10.6 | 9.1, 8.5, 9.9, 11.4 | 19.3, 20.1, 15.6 | 39.3, 42.8, 81.3, 41.4 | 40.7, 41.5, 40.5 |
+| `mixed-5000`, second | 14.0, 14.5, 39.3, 13.6 | 7.4, 16.8, 8.0 | 11.8, 11.4, 4.2, 12.2 | 22.3, 9.9, 20.8 | 39.4, 40.5, 79.4, 40.5 | 39.3, 74.9, 41.5 |
+| `medium-100` | 6.8, 7.8, 8.0, 4.4 | 4.0, 8.1, 4.1 | 25.0, 21.6, 21.1, 38.2 | 42.3, 20.8, 41.1 | 0.0 | 0.1, 0.0, 0.0 |
+| `big-1g` | 22.1, 22.1, 34.3, 24.7 | 27.3, 34.6, 23.7 | 46.4, 46.4, 29.9, 41.4 | 37.5, 29.6, 43.3 | 0.0 | 0.0 |
+
+An earlier sitting (09:50 to 10:21, a build that still had write-ahead, with another agent's load tests
+on the desktop) read the same way: `mixed-5000` first after the install 15.9 to 16.6 s old, 7.7 to 8.3 s
+new; into Downloads 37 to 46 s on both.
+
+### 13.5 Reading
+
+- **`mixed-5000` takes about half the time.** First after an install: 14.5 to 19.4 s old, 8.2 to 10.6 s
+  new, in one phone state and on one daemon.
+- **The 0.8 target was missed.** In the two new rounds with a fast `medium-100` (41 to 42 MiB/s),
+  `mixed-5000` at 15.6 to 22.3 MiB/s is 0.38 to 0.53 of it. In the slow round both sit near 20 MiB/s;
+  that is a slower `medium-100`, not a better small-file path. Measured in the phone's present state
+  only; it was never in the good state of 12.5 during this work.
+- **Slow rounds are not explained by desktop load.** The slow period seen from 10:08 came back from
+  about 15:50 at load 2.2 or below: `medium-100` near 21 MiB/s and `big-1g` near 30, for both apps, and
+  second runs of up to 39 s old and 17 s new, each with a mover of 75 to 81 s. So the earlier guess that
+  the load tests may explain them does not hold. The cause is not known. Seen alongside it: the battery
+  warmed from 29.4 to 33 C while discharging on USB, and after a pause to 28.6 C the 17:33 rounds were
+  fast again. That fits a phone-side cause without showing one. Second runs straight after a mover are
+  also slower more often, which fits the indexing guess in 11.2, not measured.
+- **`big-1g` is UNEXPLAINED.** In the fast rounds of the 15:33 sitting old beat new, 22.1 and 22.1 s
+  against 27.3 s, with no change in this path from the small-file work. The 17:33 pair did not repeat it
+  (new 23.7 s, old 24.7 s), which is too few runs to clear it. It was not investigated further, by the
+  user's choice to cut testing, so whether the new phone build slows a big file is open. Reading the code
+  afterwards found a real gap: a path check on the sending side did not run during a send, but the
+  phone's own check was not held back while it received, so its probes could compete with a transfer on the same link. That is
+  fixed in the released tree (`a_receive_in_progress_blocks_a_path_check`, after these rows were
+  measured). Whether it caused this result is not known, because `big-1g` was not measured again.
+- **Into Downloads did not get worse.** Clean runs read about 40 to 41 s on both apps, and both reached
+  75 to 81 s in the slow period. This settles the doubt from the earlier sitting.
+- **Left on the table:** the staging creates (0.3 ms per member, 1.6 s, on the stream thread and stalled
+  by the flush), a flush thread that is nearly always busy (3.9 s out of 4.7 s), the renames at 0.6 ms,
+  and about 0.75 ms per call in JNA and UniFFI, which only an API that batches calls would remove.
+
+### 13.6 Durability
+
+Nothing here changes the wire. Tests (`transfer/receiver.rs`):
+`a_background_flush_records_only_what_it_flushed` holds a flush back and shows the verified offset
+moving in memory while the ledger, the record on disk and the sink stay put, then that the ledger
+records only the snapshot, only members inside it are delivered, and a kill reopens at exactly that
+offset and resumes to one delivery per member. `a_failed_flush_keeps_its_members_owed` shows a failed
+flush records nothing and its members stay owed. `parallel_sink_delivery_survives_a_kill` bounds
+second deliveries by the threads.
+
+A failed flush goes back to the last checkpoint instead of trying again in place, because Linux may
+mark pages clean when their writeback fails, so a second flush could succeed with the bytes not on
+disk: the bytes past that checkpoint leave staging and the ledger, the request fails and the sender
+resumes from there (`a_failed_flush_goes_back_to_the_last_checkpoint`,
+`a_failed_final_flush_is_received_again`). A member whose data starts exactly at that checkpoint keeps
+its empty staging file, by the same rule a load uses (`a_failed_flush_at_a_member_start_can_resume`);
+staging that no longer matches means starting again from 0. Streamed files go back to their durable
+offset the same way and overwrite what is there
+(`a_failed_flush_of_a_streamed_file_goes_back_to_its_checkpoint`).
+
+Behaviour that did change: after a process kill up to four members can reach the sink twice, not one.
+On Android each such member then **shows twice in Downloads** (`a.txt` and `a (1).txt`), because the
+first copy is already landed and its name promised (up to four such files per kill, none lost, none
+overwritten). A kill can also lose up to one more checkpoint of already-received bytes, which are sent
+again. Android's sink renames the staged file away, so a kill between that rename and the log line
+finds the member missing, and the bundle's bytes start again from 0 with logged members kept (existing
+behaviour, now up to four members wide instead of one).
+
+Checked on the A54 with small sends (1,500 files of 4 KiB, 2026-11-02):
+
+- **A listing can miss what a `stat` sees.** A probe build in the app process, with three files
+  written by `adb shell` into `Download/PlayDrop` (owner `com.android.shell`; `.txt`, `.bin`, `.jpg`):
+  `File.list()` returned none, while `File.exists()` said true, `canRead` false and an `O_EXCL` create
+  `EEXIST`. So the shortcut can promise such a name. The outcome is safe: with two such files in the
+  destination the send finished, the other app's files were unchanged, ours arrived as
+  `c0001 (1).txt` and `c0100 (1).txt` with the right sums, 1,502 files in all, and the mover logged the
+  renumbering and recorded the relocation. Until then the promised `content://` location names a file
+  the app cannot read, so opening it fails rather than showing the other app's file. The old `stat`
+  would have picked the " (1)" name at the start; the file ends in the same place.
+- **The native threads stay attached and leave cleanly.** Over two sends, each of the four sink threads
+  kept one Java thread name for the whole transfer (`Thread-60` to `Thread-63`) where 0.5.0 counted up
+  once per file. They were gone after the transfer, logcat had no `Native thread exiting`, JNA or fatal
+  line, and the process stayed the same.
+
+- **Listing a large folder.** `ls -f` over shared storage took 0.39 s for 5,000 names (0.10 s for
+  1,500), about 80 us per name against 0.5 ms per `stat`. Listing is at most once per 2 s and folder,
+  one thread at a time, and pays until about 18,000 names at full delivery speed; a folder of more than
+  10,000 names keeps no listing, is listed again only every minute, and goes the `stat` way.
+
+### 13.7 What was checked on the final build, and what was not
+
+**Two small files, 2026-11-02, 17:45.** New app, new daemon at debug level, USB tethering off:
+`p11-a.bin` (300,000 bytes, sha256 `24cbb3c62c74119b4999b04d23a901ea6f32df1bf256be3682cef14e754ebaef`)
+and `p11-b.bin` (1,500,000 bytes, sha256
+`b0e8823dba1556b7cbae4cfd0bcd28474a08974b92d808cd54f65b190e22bd87`) both completed, and the sums on the
+phone match.
+
+**The same two files on the released code, 18:10.** After the fix noted in 13.5, version 0.6.0 of both the
+app and the daemon: both completed with the same sums, and the phone stayed `online` on the same address.
+Nothing else was run on this build.
+
+**One path.** `playdrop peers`, read every 2 s for 90 s through those sends, said `online` on the same
+address every time (one empty first reading while the daemon was starting). The daemon's debug log has
+one path check, 0.5 s after it started, set off by an mDNS advert from an address that was not the one
+in use; it lasted 0.66 s and ended `path kept`, with no switch and no check during the sends. This is
+the daemon's side only: the phone's release log does not show its checks.
+
+**The "kept ... MiB/s" line.** The phone has one radio but answers on three addresses: link-local IPv6,
+IPv4-mapped IPv6 and plain IPv4. The check treats each as a candidate and probes it, up to 4 MiB each,
+and `playdrop diagnose` lists the rates: `kept 43 s ago; [fe80::...%3]:42187 35.2 MiB/s,
+[::ffff:192.168.86.74]:42187 35.8 MiB/s, 192.168.86.74:42187 32.8 MiB/s`. A switch needs a clearly higher
+rate than the path in use, so these stay put. The 46.0 MiB/s seen earlier was the same kind of reading.
+So one-path hosts do carry a little probe traffic at a check; it is three names for one radio.
+
+**Link losses.** Twice the phone and desktop stopped reaching each other with no Wi-Fi toggle by anyone
+here: at about 12:18 and about 16:03 on 2026-11-02. Both came on the first `mixed-5000` soon after an app
+install, after 30 minutes to 2 hours of runs. Both sides stayed on the same access point
+(`B4:23:A2:6D:DA:5D`, channel 149), each still reached the router, ARP entries looked fine, and ping
+between them failed both ways. Desktop to router read 84 to 200 ms in the outages against 2 to 12 ms
+normally, while phone to router stayed at 6 to 12 ms, so the desktop's radio may be involved as well as
+the mesh isolation of 9.4. Each send waited its 10 minute window and ended `failed`, at 740 and 622 s;
+those rows are out of the tables. Each cleared only when the user rejoined the phone's Wi-Fi. Two events
+are too few to name a cause.
+
+**Not run on the phone on the final build:**
+
+- **Force-stop resume.** Only the desktop tests in 13.6 cover these fixes, in-process. The phone runs in
+  8.5 and 11.3 were on older builds with one delivery thread.
+- A separate old-peer check. The old rounds above show the 0.5.0 app staying connected through the 45 s
+  settle and transferring with the new daemon, and no more than that.

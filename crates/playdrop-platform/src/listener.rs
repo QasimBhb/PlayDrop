@@ -2,7 +2,7 @@
 //!
 //! Without `SO_EXCLUSIVEADDRUSE`, another program running as the same user can bind the
 //! port with `SO_REUSEADDR` and take incoming connections over. The core cannot set it (it
-//! forbids `unsafe` and socket2 does not expose the option), so the daemon hands it this
+//! forbids `unsafe` and socket2 does not expose the option), so the desktop hosts hand it this
 //! hook through `HostConfig::listener_setup`.
 //!
 //! Not compiled or tested on the Linux build machine; Windows CI runs the test below.

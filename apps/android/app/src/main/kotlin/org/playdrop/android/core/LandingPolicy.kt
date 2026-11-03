@@ -111,11 +111,13 @@ internal class RenameGate(val route: String) {
 
     /**
      * Records a failed rename of kind [kind]. Returns the decision, and whether this call is
-     * the one that closed the gate (so the caller logs the reason exactly once).
+     * the one that closed the gate (so the caller logs the reason exactly once). While
+     * shared storage is not [mounted] a refusal says nothing about the route, so the gate
+     * stays open.
      */
     @Synchronized
-    fun failed(kind: ErrnoKind): Pair<RenameDecision, Boolean> {
-        val decision = decide(kind)
+    fun failed(kind: ErrnoKind, mounted: Boolean = true): Pair<RenameDecision, Boolean> {
+        val decision = if (mounted) decide(kind) else RenameDecision.COPY_THIS_FILE
         val closedNow = decision == RenameDecision.COPY_FROM_NOW_ON && open
         if (decision == RenameDecision.COPY_FROM_NOW_ON) open = false
         return decision to closedNow

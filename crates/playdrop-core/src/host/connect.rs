@@ -2,6 +2,7 @@
 //! verified adverts, and the "which layer failed" diagnostic (protocol.md 3.2, 8.3;
 //! SR-1; PLAN.md discovery).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,11 +11,11 @@ use tokio::sync::mpsc;
 use super::diagnostics::DialFailure;
 use super::events::{DiscoveryPath, HostEvent};
 use super::registry::Placement;
-use super::{lock, session, Inner};
+use super::{lock, path, session, Inner};
 use crate::discovery::{DiscoveryEvent, Via};
 use crate::identity::DeviceId;
-use crate::net::connection::short;
-use crate::net::{dial, Connection, DialOptions};
+use crate::net::connection::{short, Heard, REPLACED_PING_DEADLINE};
+use crate::net::{dial_with_alternatives, CloseReason, Connection, DialOptions};
 use crate::tls;
 use crate::{Error, Result};
 
@@ -40,16 +41,44 @@ pub(crate) fn watch_connection(inner: &Arc<Inner>, conn: &Arc<Connection>) {
     });
 }
 
-fn dial_lock(inner: &Inner, peer: DeviceId) -> Arc<tokio::sync::Mutex<()>> {
+/// The per-peer dial lock. A path switch holds it too (protocol.md 3.5).
+pub(crate) fn dial_lock(inner: &Inner, peer: DeviceId) -> Arc<tokio::sync::Mutex<()>> {
     Arc::clone(lock(&inner.dial_locks).entry(peer).or_default())
+}
+
+/// A replaced connection gets the 10 s drain only if it is alive (protocol.md 3.5). After
+/// a silent path loss its open `PUT` still holds the file the resume needs, so a connection
+/// from which nothing at all arrives closes at once. One that is delivering is alive even
+/// if the ACK is late: closing it would throw away the session frames still queued on it.
+pub(crate) fn close_if_silent(inner: &Arc<Inner>, old: Arc<Connection>) {
+    inner.spawn(async move {
+        loop {
+            match old.heard_from(REPLACED_PING_DEADLINE).await {
+                // A normal end: a drained connection goes when its last stream is done.
+                Heard::Ack | Heard::Closed => return,
+                Heard::Bytes => {}
+                Heard::Nothing => {
+                    tracing::debug!(peer = %short(&old.device_id()), "replaced connection is silent; closed");
+                    old.close(CloseReason::Dead);
+                    return;
+                }
+            }
+        }
+    });
 }
 
 /// Our outbound connection to a pinned peer, dialling its last-known and discovered
 /// addresses with the pinned TLS configuration if none is up (protocol.md 3.2, SR-1). A
-/// fresh connection also tries to open the session stream (5.1).
+/// fresh connection also tries to open the session stream (5.1), and the other addresses
+/// that answer within the grace go to a path check (3.5).
+///
+/// While a path switch to the peer is under way, waits for it and returns the new
+/// connection, so no new request starts on the one being retired (3.5).
 pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<Connection>> {
     if let Some(c) = inner.registry.outbound(&peer) {
-        return Ok(c);
+        if !path::switching(inner, peer) {
+            return Ok(c);
+        }
     }
     let guard = dial_lock(inner, peer);
     let _held = guard.lock().await;
@@ -72,7 +101,9 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
         return Err(Error::NotFound);
     }
     let config = tls::build_client_config(&inner.identity, pin.spki_hash);
-    let conn = match dial(&addrs, &DialOptions::new(config, Some(pin.spki_hash))).await {
+    let opts = DialOptions::new(config, Some(pin.spki_hash));
+    let grace = path::dial_grace(inner, peer);
+    let (conn, alternatives) = match dial_with_alternatives(&addrs, &opts, grace).await {
         Ok(c) => c,
         Err(e) => {
             record_failure(inner, peer, path, e.to_string());
@@ -81,7 +112,16 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
     };
     tracing::debug!(peer = %short(&peer), addr = %conn.remote_addr(), "dialled");
     watch_connection(inner, &conn);
-    inner.registry.attach(&conn);
+    // Unpaired while this dial ran: attaching would bring back a link for a forgotten
+    // peer. Unpair removes the pin before it lists the tracked connections, so tracking
+    // first and then checking the pin leaves no gap (SR-14).
+    if !inner.pins.contains(&peer) {
+        conn.close(CloseReason::Unpaired);
+        return Err(Error::NotPaired);
+    }
+    if let Some(old) = inner.registry.attach(&conn).replaced {
+        close_if_silent(inner, old);
+    }
     let addr = conn.remote_addr();
     if pin.last_known.first() != Some(&addr) {
         if let Err(e) = inner
@@ -92,7 +132,8 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
             tracing::debug!(error = %e, "last-known address not stored");
         }
     }
-    try_open_session(inner, &conn);
+    let session_attempt = try_open_session(inner, &conn);
+    path::after_dial(inner, &conn, alternatives, Some(session_attempt));
     Ok(conn)
 }
 
@@ -108,18 +149,42 @@ fn record_failure(inner: &Inner, peer: DeviceId, path: DiscoveryPath, failure: S
     r.last_failure = Some(DialFailure { path, failure, at });
 }
 
-/// Opens a session on `conn` unless a preferred one is live (protocol.md 3.3).
-fn try_open_session(inner: &Arc<Inner>, conn: &Arc<Connection>) {
-    if inner.registry.placement(conn) == Placement::Reject {
-        return;
-    }
+/// How long [`try_open_session`] waits for the session to be placed before it reports
+/// the attempt settled.
+const SESSION_SETTLE: Duration = Duration::from_secs(10);
+
+/// Opens a session on `conn` unless a preferred one is live (protocol.md 3.3); then it
+/// only sends [`path::keep`], so the peer counts the connection in use (3.5). The
+/// receiver fires once the attempt settled: the session was placed, refused or timed
+/// out, or the keep request was answered (a path check waits for it, 3.5).
+fn try_open_session(
+    inner: &Arc<Inner>,
+    conn: &Arc<Connection>,
+) -> tokio::sync::oneshot::Receiver<()> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
     let i2 = Arc::clone(inner);
     let c = Arc::clone(conn);
+    if inner.registry.placement(conn) == Placement::Reject {
+        inner.spawn(async move {
+            if let Err(e) = path::keep(&c).await {
+                tracing::debug!(peer = %short(&c.device_id()), error = %e, "keep request failed");
+            }
+            let _ = tx.send(());
+        });
+        return rx;
+    }
     inner.spawn(async move {
-        if let Err(e) = session::open_outbound(&i2, &c).await {
-            tracing::debug!(peer = %short(&c.device_id()), error = %e, "session not opened");
+        match session::open_outbound(&i2, &c).await {
+            Ok(sess) => {
+                path::wait_installed(&i2, &sess, SESSION_SETTLE).await;
+            }
+            Err(e) => {
+                tracing::debug!(peer = %short(&c.device_id()), error = %e, "session not opened");
+            }
         }
+        let _ = tx.send(());
     });
+    rx
 }
 
 /// Makes sure a session with `peer` is up or being set up.
@@ -130,7 +195,7 @@ pub(crate) async fn ensure_session(inner: &Arc<Inner>, peer: DeviceId) -> Result
     let had = inner.registry.outbound(&peer);
     let conn = outbound(inner, peer).await?;
     if had.is_some() {
-        try_open_session(inner, &conn);
+        drop(try_open_session(inner, &conn));
     }
     Ok(())
 }
@@ -179,35 +244,7 @@ pub(crate) async fn discovery_events(inner: Arc<Inner>, mut rx: mpsc::Receiver<D
                 let Ok(id) = device_id.parse::<DeviceId>() else {
                     continue;
                 };
-                {
-                    let mut reach = lock(&inner.reach);
-                    let r = reach.entry(id).or_default();
-                    match via {
-                        Via::Mdns => r.mdns = true,
-                        Via::Beacon => r.beacon = true,
-                    }
-                    r.last_via = Some(match via {
-                        Via::Mdns => DiscoveryPath::Mdns,
-                        Via::Beacon => DiscoveryPath::Beacon,
-                    });
-                    if !r.discovered.contains(&addr) {
-                        r.discovered.insert(0, addr);
-                        r.discovered.truncate(MAX_DISCOVERED);
-                    }
-                }
-                if inner.registry.session(&id).is_some() {
-                    continue;
-                }
-                let allowed =
-                    lock(&inner.dial_limiter).try_dial(&device_id, tokio::time::Instant::now());
-                if allowed {
-                    let i2 = Arc::clone(&inner);
-                    inner.spawn(async move {
-                        if let Err(e) = ensure_session(&i2, id).await {
-                            tracing::debug!(peer = %short(&id), error = %e, "dial after advert failed");
-                        }
-                    });
-                }
+                on_verified_advert(&inner, id, addr, via);
             }
             DiscoveryEvent::Unpaired {
                 name,
@@ -226,6 +263,42 @@ pub(crate) async fn discovery_events(inner: Arc<Inner>, mut rx: mpsc::Receiver<D
                 }
             }
         }
+    }
+}
+
+/// A verified advert (protocol.md 8.3): remembers the address, then re-checks the paths of
+/// a peer that is online or dials one that is not, rate-limited per peer.
+pub(crate) fn on_verified_advert(inner: &Arc<Inner>, id: DeviceId, addr: SocketAddr, via: Via) {
+    {
+        let mut reach = lock(&inner.reach);
+        let r = reach.entry(id).or_default();
+        match via {
+            Via::Mdns => r.mdns = true,
+            Via::Beacon => r.beacon = true,
+        }
+        r.last_via = Some(match via {
+            Via::Mdns => DiscoveryPath::Mdns,
+            Via::Beacon => DiscoveryPath::Beacon,
+        });
+        if !r.discovered.contains(&addr) {
+            r.discovered.insert(0, addr);
+            r.discovered.truncate(MAX_DISCOVERED);
+        }
+    }
+    if inner.registry.session(&id).is_some() {
+        // Online already: an advert from another address may be a faster
+        // path (protocol.md 3.5).
+        path::on_advert(inner, id, addr);
+        return;
+    }
+    let allowed = lock(&inner.dial_limiter).try_dial(&id.to_hex(), tokio::time::Instant::now());
+    if allowed {
+        let i2 = Arc::clone(inner);
+        inner.spawn(async move {
+            if let Err(e) = ensure_session(&i2, id).await {
+                tracing::debug!(peer = %short(&id), error = %e, "dial after advert failed");
+            }
+        });
     }
 }
 

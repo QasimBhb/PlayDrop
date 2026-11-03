@@ -40,6 +40,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
             .ok_or_else(|| anyhow!("no data folder; pass --data-dir"))?,
     };
     let receive_dir = args.receive_dir.unwrap_or_else(default_receive_dir);
+    // Same SR-28 data dir rules as the daemon: owner-only before any key is written.
+    playdrop_platform::prepare_data_dir(&data_dir)
+        .with_context(|| format!("preparing {} for keys (SR-28)", data_dir.display()))?;
     let mut cfg = HostConfig::new(
         &data_dir,
         &receive_dir,
@@ -51,6 +54,9 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     if args.mobile {
         cfg.keep_alive_profile = KeepAliveProfile::Mobile;
     }
+    // Windows free space, DPAPI sealing and the exclusive port, as in the daemon
+    // (SR-20, SR-28, SR-31).
+    playdrop_platform::apply_hooks(&mut cfg);
     let (host, mut events) = match Host::start(cfg).await {
         Ok(v) => v,
         Err(playdrop_core::Error::PortHeld { port }) => {

@@ -958,10 +958,16 @@ async fn drive(job: Arc<Job>, done_tx: watch::Sender<Option<Outcome>>) {
             (end, Err(reason))
         }
     };
-    // The list is updated while the ID is still running, so a resume that claims it
-    // right after never has its own snapshot moved to the finished list.
-    i2.transfer_ended(&id2, &peer, TransferDirection::Send, transfer_end);
-    lock(&i2.sends).live.remove(&id2);
+    // One step under the lock of the running sends. The list is updated while the ID is
+    // still running, so a resume that claims it right after never has its own snapshot
+    // moved to the finished list; and whoever sees the end event finds the ID gone, so
+    // the same files sent again take over the kept record instead of starting a second
+    // transfer beside it. Only the book's lock is taken inside, and the event never blocks.
+    {
+        let mut sends = lock(&i2.sends);
+        i2.transfer_ended(&id2, &peer, TransferDirection::Send, transfer_end);
+        sends.live.remove(&id2);
+    }
     done_tx.send_replace(Some(outcome));
     if kept {
         if *job.cancel.borrow() {
@@ -1810,18 +1816,28 @@ async fn put_body<R: AsyncRead + Unpin + Send>(
         Ok(v) => v,
         Err(e) => return PutResult::Conn(e.to_string()),
     };
+    let began = Instant::now();
+    // Where the body's time goes, for one debug line per request: reading and hashing
+    // the source, waiting for the connection to take each record (flow control and the
+    // socket), and the receiver's reply after the trailer.
+    let (mut read_ns, mut write_ns, mut ended) = (0u128, 0u128, None);
     let body = async {
         let mut checkpoint = (0u64, Instant::now());
-        while let Some(rec) = enc.next().await {
+        loop {
+            let t0 = Instant::now();
+            let Some(rec) = enc.next().await else { break };
+            read_ns += t0.elapsed().as_nanos();
             if *cancel.borrow() {
                 upload.send_reset(h2::Reason::CANCEL);
                 return Err("cancelled".to_owned());
             }
             let rec = rec.map_err(|e| e.to_string())?;
             let n = rec.len().saturating_sub(HASH_LEN) as u64;
+            let t0 = Instant::now();
             send_all(&mut upload, rec, false)
                 .await
                 .map_err(|e| e.to_string())?;
+            write_ns += t0.elapsed().as_nanos();
             sent.fetch_add(n, Ordering::Relaxed);
             job.mark_streaming();
             checkpoint.0 += n;
@@ -1835,9 +1851,18 @@ async fn put_body<R: AsyncRead + Unpin + Send>(
         let value = HeaderValue::from_str(&hash_to_hex(&root)).map_err(|e| e.to_string())?;
         trailers.insert(ROOT_TRAILER, value);
         upload.send_trailers(trailers).map_err(|e| e.to_string())?;
+        ended = Some(Instant::now());
         Ok::<(), String>(())
     };
     let (body_res, resp_res) = tokio::join!(body, resp);
+    tracing::debug!(
+        ?stream,
+        total_ms = began.elapsed().as_millis(),
+        read_ms = read_ns / 1_000_000,
+        send_wait_ms = write_ns / 1_000_000,
+        reply_after_trailer_ms = ended.map(|t| t.elapsed().as_millis()),
+        "upload timing"
+    );
     let resp = match resp_res {
         Ok(r) => r,
         Err(e) => {

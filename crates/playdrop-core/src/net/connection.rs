@@ -8,14 +8,17 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use h2::client::{ResponseFuture, SendRequest};
 use h2::{Ping, PingPong, SendStream};
 use http::Request;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
 use crate::identity::DeviceId;
@@ -61,7 +64,29 @@ pub enum CloseReason {
     Protocol,
     /// Pairing ended without success (protocol.md 6.2).
     PairingEnded,
+    /// Replaced by a newer connection (protocol.md 3.3, 3.5): no new requests, and the
+    /// open streams get [`DRAIN_GRACE`] to finish before the connection is dropped.
+    Drain,
 }
+
+impl CloseReason {
+    /// True for the reasons that let open streams finish first (a connection replaced by
+    /// a newer one, protocol.md 3.3, 3.5). Any other reason overrides them.
+    pub fn is_graceful(self) -> bool {
+        matches!(self, Self::Drain | Self::Duplicate)
+    }
+}
+
+/// How long a replaced connection may stay silent, no ACK and no bytes at all, before it
+/// counts as dead and closes at once (protocol.md 3.5). *Choice:* 1 s, the close grace every
+/// replaced connection had before the 10 s drain: a dialler usually redials because the old
+/// path died, and the dead connection's open `PUT` holds its file until the connection goes,
+/// so a resume waits this long at worst, as it did then.
+pub const REPLACED_PING_DEADLINE: Duration = Duration::from_secs(1);
+
+/// How long a replaced connection keeps its open streams (protocol.md 3.5): a request
+/// that started on it before a path switch finishes there.
+pub const DRAIN_GRACE: Duration = Duration::from_secs(10);
 
 /// Keep-alive intervals of the two ends (protocol.md 3.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +115,86 @@ impl KeepAlive {
     }
 }
 
+/// The HTTP/2 PING handle and whether a PING is still waiting for its ACK.
+struct PingState {
+    handle: Option<PingPong>,
+    unanswered: bool,
+}
+
+/// What [`Connection::heard_from`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Heard {
+    /// The PING was acknowledged.
+    Ack,
+    /// No ACK in time, but bytes arrived: the path is alive and slow, and the ACK is queued
+    /// behind what it is still delivering.
+    Bytes,
+    /// Nothing at all arrived.
+    Nothing,
+    /// The connection has ended.
+    Closed,
+}
+
+/// Counts the bytes read from a connection's stream, so a path that is slow can be told
+/// from one that is dead (protocol.md 3.5). Sits above TLS: only authenticated bytes count.
+#[derive(Debug)]
+pub(crate) struct ActivityIo<T> {
+    inner: T,
+    bytes_read: Arc<AtomicU64>,
+}
+
+impl<T> ActivityIo<T> {
+    pub(crate) fn new(inner: T, bytes_read: Arc<AtomicU64>) -> Self {
+        Self { inner, bytes_read }
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for ActivityIo<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        let read = buf.filled().len().saturating_sub(before);
+        if read > 0 {
+            self.bytes_read.fetch_add(read as u64, Ordering::Relaxed);
+        }
+        polled
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One authenticated HTTP/2 connection (protocol.md 3.1). Shared as `Arc<Connection>`.
@@ -100,13 +205,15 @@ pub struct Connection {
     trusted: AtomicBool,
     remote: SocketAddr,
     exporter: [u8; EXPORTER_LEN],
-    send: Option<SendRequest<Bytes>>,
+    send: Mutex<Option<SendRequest<Bytes>>>,
     close_tx: watch::Sender<Option<CloseReason>>,
     closed_tx: watch::Sender<bool>,
-    ping: tokio::sync::Mutex<Option<PingPong>>,
+    ping: tokio::sync::Mutex<PingState>,
     resets: Mutex<ResetRateCounter>,
     keepalive_started: AtomicBool,
     session_claimed: AtomicBool,
+    probes: Mutex<super::probe::ProbeLimiter>,
+    bytes_read: Arc<AtomicU64>,
     opened_at: Instant,
 }
 
@@ -133,6 +240,10 @@ impl Connection {
     /// Wraps a freshly handshaken connection. The caller drives the `h2` connection and
     /// watches [`Connection::close_requested`]; it calls [`Connection::mark_closed`] once
     /// the connection is gone.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call each from client and server"
+    )]
     pub(crate) fn new(
         direction: Direction,
         peer: PeerIdentity,
@@ -141,6 +252,7 @@ impl Connection {
         send: Option<SendRequest<Bytes>>,
         ping: Option<PingPong>,
         max_resets_per_second: usize,
+        bytes_read: Arc<AtomicU64>,
     ) -> Arc<Self> {
         let trusted = peer.trust == PeerTrust::Pinned;
         Arc::new(Self {
@@ -150,13 +262,18 @@ impl Connection {
             trusted: AtomicBool::new(trusted),
             remote,
             exporter,
-            send,
+            send: Mutex::new(send),
             close_tx: watch::Sender::new(None),
             closed_tx: watch::Sender::new(false),
-            ping: tokio::sync::Mutex::new(ping),
+            ping: tokio::sync::Mutex::new(PingState {
+                handle: ping,
+                unanswered: false,
+            }),
             resets: Mutex::new(ResetRateCounter::new(max_resets_per_second)),
             keepalive_started: AtomicBool::new(false),
             session_claimed: AtomicBool::new(false),
+            probes: Mutex::new(super::probe::ProbeLimiter::default()),
+            bytes_read,
             opened_at: Instant::now(),
         })
     }
@@ -225,16 +342,64 @@ impl Connection {
         self.session_claimed.store(false, Ordering::Release);
     }
 
-    /// Asks the driver to close the connection. Idempotent; the first reason wins.
+    /// Takes this connection's probe slot if the protocol.md 3.5 limits allow (one in
+    /// flight, 10 per minute, SR-15).
+    pub(crate) fn probe_try_start(&self) -> bool {
+        self.probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_start(Instant::now())
+    }
+
+    /// Frees the probe slot.
+    pub(crate) fn probe_finished(&self) {
+        self.probes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish();
+    }
+
+    /// Asks the driver to close the connection. Idempotent; the first reason wins,
+    /// except that a harder reason (shutdown, unpair, dead, a protocol error) overrides a
+    /// graceful one while it waits for open streams, and the connection then goes at
+    /// once (SR-14: unpair closes within 1 s).
     pub fn close(&self, reason: CloseReason) {
-        self.close_tx.send_if_modified(|r| {
-            if r.is_none() {
+        self.close_tx.send_if_modified(|r| match r {
+            None => {
                 *r = Some(reason);
                 true
-            } else {
-                false
             }
+            Some(old) if old.is_graceful() && !reason.is_graceful() => {
+                *r = Some(reason);
+                true
+            }
+            Some(_) => false,
         });
+    }
+
+    /// Retires the connection gracefully (protocol.md 3.5): no new requests; streams
+    /// already open may finish within [`DRAIN_GRACE`]. On a connection we dialled, `h2`
+    /// then ends it once its last stream is done; on one the peer dialled, the server
+    /// sends GOAWAY and waits the same grace.
+    pub fn drain(&self) {
+        drop(
+            self.send
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+        );
+        self.close(CloseReason::Drain);
+    }
+
+    /// True once [`Connection::drain`] retired a connection this host dialled: it takes
+    /// no new requests.
+    pub fn is_draining(&self) -> bool {
+        self.direction == Direction::Outbound
+            && self
+                .send
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
     }
 
     /// The close request channel, for the driver.
@@ -281,7 +446,18 @@ impl Connection {
         req: Request<()>,
         end_of_stream: bool,
     ) -> Result<(ResponseFuture, SendStream<Bytes>)> {
-        let Some(send) = self.send.clone() else {
+        let send = self
+            .send
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(send) = send else {
+            if self.direction == Direction::Outbound {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "connection replaced",
+                )));
+            }
             return Err(Error::Protocol(
                 "requests go only on connections this host dialled".into(),
             ));
@@ -301,18 +477,62 @@ impl Connection {
     /// Sends an HTTP/2 PING and waits for the ACK up to `deadline` (protocol.md 3.3, 3.4).
     /// Returns the round-trip time.
     pub async fn ping(&self, deadline: Duration) -> Result<Duration> {
-        let mut guard = self.ping.lock().await;
-        let pp = guard
-            .as_mut()
-            .ok_or_else(|| Error::Protocol("no ping handle".into()))?;
         let started = Instant::now();
-        match tokio::time::timeout(deadline, pp.ping(Ping::opaque())).await {
-            Ok(Ok(_)) => Ok(started.elapsed()),
-            Ok(Err(e)) => Err(Error::Io(super::h2_io(e))),
+        let waited = tokio::time::timeout(deadline, async {
+            let mut guard = self.ping.lock().await;
+            let state = &mut *guard;
+            let pp = state
+                .handle
+                .as_mut()
+                .ok_or_else(|| Error::Protocol("no ping handle".into()))?;
+            // `h2` allows one user PING at a time and refuses another until the first is
+            // acknowledged, so after a timeout the next call waits for that ACK instead of
+            // failing: a stall that passes must not read as a dead connection. Its late
+            // ACK proves the connection answers.
+            if !state.unanswered {
+                pp.send_ping(Ping::opaque())
+                    .map_err(|e| Error::Io(super::h2_io(e)))?;
+                state.unanswered = true;
+            }
+            std::future::poll_fn(|cx| pp.poll_pong(cx))
+                .await
+                .map_err(|e| Error::Io(super::h2_io(e)))?;
+            state.unanswered = false;
+            Ok(())
+        })
+        .await;
+        match waited {
+            Ok(Ok(())) => Ok(started.elapsed()),
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "ping not acknowledged",
             ))),
+        }
+    }
+
+    /// Whether the peer can still be heard, within `deadline` (protocol.md 3.5). A PING
+    /// alone cannot tell: on a slow path its ACK queues behind what is being delivered, so
+    /// any bytes arriving meanwhile also count as alive.
+    pub async fn heard_from(&self, deadline: Duration) -> Heard {
+        if self.is_closed() {
+            return Heard::Closed;
+        }
+        let before = self.bytes_read.load(Ordering::Relaxed);
+        match self.ping(deadline).await {
+            Ok(_) => Heard::Ack,
+            // Only running out of time says anything about the path; any other error is the
+            // connection already ending.
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => {
+                if self.is_closed() {
+                    Heard::Closed
+                } else if self.bytes_read.load(Ordering::Relaxed) > before {
+                    Heard::Bytes
+                } else {
+                    Heard::Nothing
+                }
+            }
+            Err(_) => Heard::Closed,
         }
     }
 

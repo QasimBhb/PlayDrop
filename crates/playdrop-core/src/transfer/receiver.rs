@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
-use super::bundle::{BundleEvent, BundleLayout, BundleReader};
+use super::bundle::{BundleEvent, BundleLayout, BundleMember, BundleReader};
 use super::chunk::{
     check_range, chunk_count, prefix_hash, root_hash, ChunkDecoder, ChunkHash, VerifiedChunk,
     HASH_LEN,
@@ -476,6 +476,13 @@ fn hand_to_sink(
 /// File name of the bundle's delivery log in the staging folder.
 const DELIVERY_LOG: &str = "bundle.delivered";
 
+/// Threads that hand bundle members to the sink at once in `Staged` mode (see
+/// `DeliveryWorker::serve_sink`). Phase 11 phone run (`throughput.md` 13.1): one thread
+/// spent 2.4 to 2.6 ms per member, about 0.75 ms of it in the call into the app and 0.5 ms
+/// waiting on the media provider for a name check, so 5,000 small files took 13 s to hand
+/// over against 3.5 s on the link.
+pub const SINK_THREADS: usize = 4;
+
 /// Members handed over between two flushes of the delivery log. In `Staged` mode the
 /// staging files of a batch are deleted only after its flush.
 const DELIVERY_BATCH: usize = 256;
@@ -739,6 +746,14 @@ struct Timings {
     ck_hashes_ns: AtomicU64,
     ck_record_ns: AtomicU64,
     ck_feed_ns: AtomicU64,
+    /// Delivery thread: time with nothing in flight, waiting for the stream to make a
+    /// member eligible.
+    deliver_idle_ns: AtomicU64,
+    /// Upload task: chunks received, time waiting for the next verified chunk (the body
+    /// and its hash), and time writing chunks (stream work and checkpoints).
+    chunks: AtomicU64,
+    body_ns: AtomicU64,
+    body_write_ns: AtomicU64,
 }
 
 impl Timings {
@@ -746,6 +761,29 @@ impl Timings {
         let ns = u64::try_from(since.elapsed().as_nanos()).unwrap_or(u64::MAX);
         counter.fetch_add(ns, Ordering::Relaxed);
     }
+}
+
+/// One debug line with where a bundle's time went so far (milliseconds), for timing a
+/// real transfer from the log (`throughput.md` section 13). `step` took `since` until now.
+fn log_bundle_timings(step: &str, since: Instant, t: &MemberTimings) {
+    let ms = |d: Duration| d.as_millis();
+    tracing::debug!(
+        step_ms = ms(since.elapsed()),
+        chunks = t.chunks,
+        body_ms = ms(t.body),
+        write_ms = ms(t.body_write),
+        stream_ms = ms(t.stream),
+        open_ms = ms(t.open),
+        member_write_ms = ms(t.write),
+        close_ms = ms(t.close),
+        checkpoints = t.checkpoints,
+        checkpoint_ms = ms(t.checkpoint),
+        flush_ms = ms(t.ck_flush),
+        delivered = t.delivered,
+        delivery_ms = ms(t.delivery),
+        deliver_idle_ms = ms(t.deliver_idle),
+        "{step}"
+    );
 }
 
 /// A reading of a bundle's per-member timings (see [`TransferReceiver::member_timings`]).
@@ -775,6 +813,14 @@ pub struct MemberTimings {
     pub ck_hashes: Duration,
     pub ck_record: Duration,
     pub ck_feed: Duration,
+    /// The delivery thread's time with nothing in flight, waiting for an eligible member
+    /// (not part of `delivery`, which in `Staged` mode is summed over the sink threads).
+    pub deliver_idle: Duration,
+    /// The upload task: chunks received, time waiting for the next verified chunk (body
+    /// bytes and their hash), and time writing them.
+    pub chunks: u64,
+    pub body: Duration,
+    pub body_write: Duration,
 }
 
 /// What a bundle and its delivery worker share with the rest of the transfer.
@@ -898,6 +944,9 @@ struct DeliveryWorker {
     /// Test hook: another process takes this member's own name just after its first line.
     #[cfg(test)]
     squat: Option<u32>,
+    /// Test hook: sink threads for this worker instead of [`SINK_THREADS`].
+    #[cfg(test)]
+    sink_threads: Option<usize>,
 }
 
 /// What a delivery worker leaves behind when it stops.
@@ -949,8 +998,18 @@ impl DeliveryWorker {
         };
         let mut handed: Vec<PathBuf> = Vec::new();
         let mut fresh = 0usize;
+        if let Dest::Sink {
+            binding,
+            transfer_id,
+        } = &dest
+        {
+            self.serve_sink(jobs, binding, transfer_id, &mut handed, &mut fresh)?;
+        }
         let cancelled = Arc::clone(&self.shared.cancelled);
-        while let Ok(fid) = jobs.recv() {
+        let mut idle = Instant::now();
+        while let Some(placer) = placer.as_mut() {
+            let Ok(fid) = jobs.recv() else { break };
+            Timings::add(&self.shared.timings.deliver_idle_ns, idle);
             if self.stop.load(Ordering::Acquire) || self.shared.is_cancelled() {
                 break;
             }
@@ -960,23 +1019,14 @@ impl DeliveryWorker {
             }
             let t0 = Instant::now();
             let before = fresh;
-            match (&dest, placer.as_mut()) {
-                (Dest::Directory(_), Some(placer)) => self.place(fid, placer, &mut fresh)?,
-                (
-                    Dest::Sink {
-                        binding,
-                        transfer_id,
-                    },
-                    _,
-                ) => self.hand(fid, binding, transfer_id, &mut handed, &mut fresh)?,
-                (Dest::Directory(_), None) => unreachable!("Directory mode opens a placer"),
-            }
+            self.place(fid, placer, &mut fresh)?;
             if fresh > before {
                 let t = &self.shared.timings;
                 Timings::add(&t.deliver_ns, t0);
                 t.delivered.fetch_add(1, Ordering::Relaxed);
             }
             drop(gate);
+            idle = Instant::now();
         }
         // The log first: each line was written before its rename, and a power loss must not
         // keep a rename whose line it lost.
@@ -1106,25 +1156,166 @@ impl DeliveryWorker {
         Ok(())
     }
 
-    /// `Staged` mode, one member: the sink takes the staged file, then a log line records
-    /// its location. Staging files are deleted a batch at a time, only after the log
-    /// lines naming them are durable, so a member whose staging file is gone is always in
-    /// the log. A kill after the sink took a member but before its line was written hands
-    /// that one member to the sink once more (the sink trait cannot make the two atomic);
-    /// no member is ever delivered more than twice, and only the one in flight can be.
-    fn hand(
+    /// `Staged` mode: members go to the sink on up to [`SINK_THREADS`] threads at once,
+    /// each with its own staged file; this thread hands them out and keeps the log. A sink
+    /// call costs far more than the file work around it on a phone (the call into the
+    /// app, then the app's own file system calls), so one thread at a time cannot keep up
+    /// with the link (`throughput.md` section 13).
+    ///
+    /// The sink takes a staged file, then a log line records its location. Staging files
+    /// are deleted a batch at a time, only after the log lines naming them are durable,
+    /// so a member whose staging file is gone is always in the log. A kill after the sink
+    /// took a member but before its line was written hands that member to the sink once
+    /// more (the sink trait cannot make the two atomic); no member is ever delivered more
+    /// than twice, and only the members in flight (at most [`SINK_THREADS`]) can be. A sink
+    /// that keeps each copy shows them twice (on Android `a.txt` and `a (1).txt`). After
+    /// a sink error no new member starts; the members already in flight finish and are
+    /// logged, then the error is returned. The cancel gate is held while any member is in
+    /// flight, so a cancel waits for all of them, as it waits for the one member of
+    /// `Directory` mode.
+    fn serve_sink(
         &mut self,
-        fid: u32,
+        jobs: &mpsc::Receiver<u32>,
         binding: &SinkBinding,
         transfer_id: &str,
         handed: &mut Vec<PathBuf>,
         fresh: &mut usize,
     ) -> Result<()> {
+        let threads = self.sink_threads();
+        std::thread::scope(|scope| {
+            let (work_tx, work_rx) = mpsc::channel::<(u32, PathBuf)>();
+            let work_rx = Arc::new(StdMutex::new(work_rx));
+            let (done_tx, done_rx) = mpsc::channel::<(u32, PathBuf, Result<String>)>();
+            for n in 0..threads {
+                let (work_rx, done_tx) = (Arc::clone(&work_rx), done_tx.clone());
+                let (files, timings) = (Arc::clone(&self.files), Arc::clone(&self.shared.timings));
+                let (binding, transfer_id) = (binding.clone(), transfer_id.to_owned());
+                std::thread::Builder::new()
+                    .name(format!("playdrop-sink-{n}"))
+                    .spawn_scoped(scope, move || loop {
+                        // One helper waits on the queue at a time; the others wait for it.
+                        let next = lock(&work_rx).recv();
+                        let Ok((fid, staged)) = next else { break };
+                        let t0 = Instant::now();
+                        // A panicking sink becomes an error: the loop waiting for this
+                        // member would otherwise wait for ever.
+                        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let entry = files.get(fid as usize).ok_or_else(|| {
+                                Error::BadRequest(format!("unknown bundle member {fid}"))
+                            })?;
+                            // File names are allowed at DEBUG and below only (SR-32).
+                            tracing::debug!(fid, path = %entry.path.join("/"), "verified file placed");
+                            hand_to_sink(&binding, &transfer_id, &staged, entry)
+                        }))
+                        .unwrap_or_else(|_| {
+                            Err(Error::Io(io::Error::other("the sink panicked on a member")))
+                        });
+                        Timings::add(&timings.deliver_ns, t0);
+                        if done_tx.send((fid, staged, r)).is_err() {
+                            break;
+                        }
+                    })
+                    .map_err(Error::Io)?;
+            }
+            drop(done_tx);
+            // Dropping `work_tx` on return ends the helpers after their member in flight;
+            // the scope waits for them.
+            self.hand_out(jobs, &work_tx, &done_rx, threads, handed, fresh)
+        })
+    }
+
+    /// The loop of [`serve_sink`](Self::serve_sink): takes members from `jobs`, starts up
+    /// to `threads` of them, and logs each one the sink took.
+    fn hand_out(
+        &mut self,
+        jobs: &mpsc::Receiver<u32>,
+        work: &mpsc::Sender<(u32, PathBuf)>,
+        done: &mpsc::Receiver<(u32, PathBuf, Result<String>)>,
+        threads: usize,
+        handed: &mut Vec<PathBuf>,
+        fresh: &mut usize,
+    ) -> Result<()> {
+        let cancelled = Arc::clone(&self.shared.cancelled);
+        let mut gate: Option<MutexGuard<'_, bool>> = None;
+        let (mut in_flight, mut started) = (0usize, 0usize);
+        let mut failure: Option<Error> = None;
+        let mut open = true;
+        loop {
+            while open && failure.is_none() && in_flight < threads {
+                let fid = if in_flight == 0 {
+                    // Nothing in flight, so nothing for a cancel to wait for: it must not
+                    // wait for the next member either, which may never come.
+                    gate = None;
+                    let idle = Instant::now();
+                    let next = jobs.recv().ok();
+                    Timings::add(&self.shared.timings.deliver_idle_ns, idle);
+                    next
+                } else {
+                    match jobs.try_recv() {
+                        Ok(fid) => Some(fid),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => None,
+                    }
+                };
+                let Some(fid) = fid else {
+                    open = false;
+                    break;
+                };
+                if self.stop.load(Ordering::Acquire) || self.shared.is_cancelled() {
+                    open = false;
+                    break;
+                }
+                if gate.is_none() {
+                    let g = lock(&cancelled);
+                    if *g {
+                        open = false;
+                        break;
+                    }
+                    gate = Some(g);
+                }
+                match self.ready_to_hand(fid, started) {
+                    Ok(Some(staged)) => {
+                        started += 1;
+                        if work.send((fid, staged)).is_err() {
+                            failure =
+                                Some(Error::Io(io::Error::other("bundle delivery threads ended")));
+                        } else {
+                            in_flight += 1;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => failure = Some(e),
+                }
+            }
+            if in_flight == 0 {
+                gate = None;
+                if failure.is_some() || !open {
+                    break;
+                }
+                continue;
+            }
+            let Ok((fid, staged, r)) = done.recv() else {
+                failure.get_or_insert(Error::Io(io::Error::other("bundle delivery threads ended")));
+                break;
+            };
+            in_flight -= 1;
+            let logged = r.and_then(|location| self.handed(fid, staged, location, handed, fresh));
+            if let Err(e) = logged {
+                failure.get_or_insert(e);
+            }
+        }
+        drop(gate);
+        failure.map_or(Ok(()), Err)
+    }
+
+    /// Checks member `fid` before it goes to the sink: the staging file it is handed over
+    /// from, unless it was delivered before a restart of the stream (`None`; its bytes
+    /// came again and are dropped). `started` counts the members handed out so far.
+    fn ready_to_hand(&mut self, fid: u32, started: usize) -> Result<Option<PathBuf>> {
         let staged = self.staging.join(member_name(fid));
         if self.done.contains_key(&fid) {
-            // Delivered before a restart of the stream; its bytes came again.
             fsx::remove_if_exists(&staged)?;
-            return Ok(());
+            return Ok(None);
         }
         if !exists(&staged)? {
             return Err(Error::Io(io::Error::new(
@@ -1132,19 +1323,32 @@ impl DeliveryWorker {
                 "a verified bundle member is missing from staging",
             )));
         }
-        let files = Arc::clone(&self.files);
-        let entry = files
-            .get(fid as usize)
-            .ok_or_else(|| Error::BadRequest(format!("unknown bundle member {fid}")))?;
         #[cfg(test)]
-        self.crash_at(Crash::Before(*fresh))?;
-        tracing::debug!(fid, path = %entry.path.join("/"), "verified file placed");
-        let location = hand_to_sink(binding, transfer_id, &staged, entry)?;
+        self.crash_at(Crash::Before(started))?;
+        #[cfg(not(test))]
+        let _ = started;
+        Ok(Some(staged))
+    }
+
+    /// Records a member the sink took: its log line, then its staging file joins the
+    /// batch deleted after the next log flush.
+    fn handed(
+        &mut self,
+        fid: u32,
+        staged: PathBuf,
+        location: String,
+        handed: &mut Vec<PathBuf>,
+        fresh: &mut usize,
+    ) -> Result<()> {
         #[cfg(test)]
         self.crash_at(Crash::Inside(*fresh))?;
         let saved = SavedFile::delivered(fid, location);
         self.log.append(&saved)?;
         self.record(saved);
+        self.shared
+            .timings
+            .delivered
+            .fetch_add(1, Ordering::Relaxed);
         handed.push(staged);
         *fresh += 1;
         if handed.len() >= DELIVERY_BATCH {
@@ -1154,6 +1358,21 @@ impl DeliveryWorker {
             }
         }
         Ok(())
+    }
+
+    /// Sink threads for this worker: [`SINK_THREADS`], or one under a test kill point so
+    /// the kill lands on an exact member.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn sink_threads(&self) -> usize {
+        #[cfg(test)]
+        if let Some(n) = self.sink_threads {
+            return n;
+        }
+        #[cfg(test)]
+        if self.crash.is_some() || self.transient.is_some() {
+            return 1;
+        }
+        SINK_THREADS
     }
 }
 
@@ -1326,17 +1545,28 @@ impl Ledger {
     /// First half of [`persist`](Self::persist): appends and flushes the new hashes, and
     /// returns what [`persist_record`](Self::persist_record) then records.
     fn persist_hashes(&mut self) -> Result<Snapshot> {
-        let (snap, new_hashes) = {
+        let snap = self.snapshot();
+        self.persist_hashes_upto(snap)?;
+        Ok(snap)
+    }
+
+    /// The in-memory state a checkpoint makes durable.
+    fn snapshot(&self) -> Snapshot {
+        let p = lock(&self.progress);
+        Snapshot {
+            state: p.state,
+            verified: p.verified_offset,
+            count: p.hashes.len(),
+            root: p.root,
+        }
+    }
+
+    /// Appends and flushes the hashes up to `snap` (not those pushed since).
+    fn persist_hashes_upto(&mut self, snap: Snapshot) -> Result<()> {
+        let new_hashes = {
             let p = lock(&self.progress);
-            (
-                Snapshot {
-                    state: p.state,
-                    verified: p.verified_offset,
-                    count: p.hashes.len(),
-                    root: p.root,
-                },
-                p.hashes[self.persisted.min(p.hashes.len())..].concat(),
-            )
+            let upto = snap.count.min(p.hashes.len());
+            p.hashes[self.persisted.min(upto)..upto].concat()
         };
         if !new_hashes.is_empty() {
             if self.hashes_file.is_none() {
@@ -1347,7 +1577,7 @@ impl Ledger {
             f.write_all(&new_hashes).map_err(fsx::map_io)?;
             f.sync_data().map_err(fsx::map_io)?;
         }
-        Ok(snap)
+        Ok(())
     }
 
     /// Second half of [`persist`](Self::persist): the record naming the hashes just
@@ -1356,7 +1586,9 @@ impl Ledger {
         self.write_record(snap.state, snap.verified, snap.count as u64, snap.root)?;
         self.persisted = snap.count;
         self.durable = snap.verified;
-        self.unsynced = 0;
+        // Bytes verified after the snapshot (a checkpoint whose flush ran while the stream
+        // went on) wait for the next checkpoint.
+        self.unsynced = self.verified().saturating_sub(snap.verified);
         self.last_sync = Instant::now();
         Ok(())
     }
@@ -1380,6 +1612,17 @@ impl Ledger {
             named_before_rename: self.named_before_rename,
         };
         fsx::write_atomic(&self.json, &serde_json::to_vec(&rec)?)
+    }
+
+    /// Forgets everything verified since the last checkpoint (see
+    /// `BundleInner::flush_failed`).
+    fn back_to_durable(&mut self) {
+        let mut p = lock(&self.progress);
+        p.hashes.truncate(self.persisted);
+        p.verified_offset = self.durable;
+        drop(p);
+        self.unsynced = 0;
+        self.last_sync = Instant::now();
     }
 
     /// Back to offset 0 (restart, protocol.md 7.6).
@@ -1445,6 +1688,9 @@ struct PartInner {
     /// Test hook: place with a placeholder, as where no rename that never replaces exists.
     #[cfg(test)]
     placeholders: bool,
+    /// Test hook: flushes fail.
+    #[cfg(test)]
+    flush_refuse: bool,
 }
 
 impl PartInner {
@@ -1489,10 +1735,33 @@ impl PartInner {
         if self.ledger.unsynced == 0 {
             return Ok(());
         }
-        if let Some(f) = &self.file {
-            f.sync_data().map_err(fsx::map_io)?;
-        }
+        self.sync_data()?;
         self.ledger.persist()
+    }
+
+    /// Flushes the file. A failed flush may not be believed again, however a retry ends
+    /// (see `BundleInner::flush_failed`): the file goes back to its durable offset, and the
+    /// bytes past it are sent again and overwrite what is there.
+    fn sync_data(&mut self) -> Result<()> {
+        #[cfg(test)]
+        let refused = self
+            .flush_refuse
+            .then(|| io::Error::other("simulated flush failure"));
+        #[cfg(not(test))]
+        let refused: Option<io::Error> = None;
+        let synced = match (refused, &self.file) {
+            (Some(e), _) => Err(e),
+            (None, Some(f)) => f.sync_data(),
+            (None, None) => Ok(()),
+        };
+        synced.map_err(|e| {
+            tracing::warn!(
+                "flushing received data failed; it is received again from the last checkpoint"
+            );
+            self.file = None;
+            self.ledger.back_to_durable();
+            fsx::map_io(e)
+        })
     }
 
     fn restart(&mut self) -> Result<()> {
@@ -1533,8 +1802,8 @@ impl PartInner {
             self.fail()?;
             return Err(Error::RootMismatch);
         }
-        if let Some(f) = &self.file {
-            f.sync_data().map_err(fsx::map_io)?;
+        if self.file.is_some() {
+            self.sync_data()?;
         } else if self.ledger.size == 0 {
             self.file()?;
         }
@@ -1783,6 +2052,8 @@ impl PartFile {
                 crash: None,
                 #[cfg(test)]
                 placeholders: false,
+                #[cfg(test)]
+                flush_refuse: false,
             })),
             progress,
         }
@@ -1971,6 +2242,17 @@ impl PartFile {
 // Bundle sink
 // ---------------------------------------------------------------------------------------
 
+/// A bundle checkpoint in flight: its data flush runs on its own thread; once it is done,
+/// the ledger records `snap` (taken before the flush began, so every byte it counts was
+/// written before the flush) and the members it completed are handed over.
+#[derive(Debug)]
+struct Flushing {
+    snap: Snapshot,
+    /// When the flush began: the next checkpoint's time limit counts from here.
+    started: Instant,
+    thread: std::thread::JoinHandle<Result<()>>,
+}
+
 /// The staging file of the bundle member being written, with the offset of its next byte
 /// (`u64::MAX` when unknown), so in-order writes need no seek.
 #[derive(Debug)]
@@ -2019,6 +2301,7 @@ struct OpenMember {
 ///   delivery instead and answers `409 offset_mismatch` at the full size, so the sender
 ///   asks for the state again and finds the bundle verified, with nothing downloaded twice.
 #[derive(Debug)]
+#[cfg_attr(test, allow(clippy::struct_excessive_bools, reason = "test hooks"))]
 struct BundleInner {
     ledger: Ledger,
     layout: Arc<BundleLayout>,
@@ -2029,6 +2312,12 @@ struct BundleInner {
     current: Option<OpenMember>,
     /// Members closed since the last checkpoint, flushed by it.
     dirty: Vec<u32>,
+    /// A checkpoint whose data flush runs while the stream goes on (see
+    /// [`checkpoint_due`](Self::checkpoint_due)).
+    flushing: Option<Flushing>,
+    /// Staging does not match the verified offset and starting again from 0 has not worked
+    /// yet: the next upload request does it before it writes anything.
+    must_restart: bool,
     /// Members already placed when the stream last went back to 0 or the bundle was
     /// loaded: their bytes are not written to staging again.
     placed_before: HashSet<u32>,
@@ -2065,13 +2354,26 @@ struct BundleInner {
     /// Test hook: see `DeliveryWorker::squat`.
     #[cfg(test)]
     squat: Option<u32>,
+    /// Test hook: see `DeliveryWorker::sink_threads`.
+    #[cfg(test)]
+    sink_threads: Option<usize>,
+    /// Test hook: a background flush waits for this lock before it flushes anything.
+    #[cfg(test)]
+    flush_gate: Option<Arc<StdMutex<()>>>,
+    /// Test hook: background flushes fail.
+    #[cfg(test)]
+    flush_refuse: bool,
+    /// Test hook: starting the bundle again fails with an I/O error.
+    #[cfg(test)]
+    restart_refuse: bool,
 }
 
 impl Drop for BundleInner {
     fn drop(&mut self) {
         // A receiver going away (host shutdown, or a test standing in for a kill) stops
-        // the worker after the member in flight; the log on disk lets a load resume.
-        if self.worker.is_none() {
+        // the worker after the member in flight; the log on disk lets a load resume. A
+        // flush in flight is waited for too (unrecorded), so no thread outlives its files.
+        if self.worker.is_none() && self.flushing.is_none() {
             return;
         }
         // The last receiver clone is often dropped on an async task (peer removal, idle
@@ -2084,9 +2386,11 @@ impl Drop for BundleInner {
             .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
         if multi_thread {
             tokio::task::block_in_place(|| {
+                self.abandon_flush();
                 let _ = self.stop_worker(false);
             });
         } else {
+            self.abandon_flush();
             let _ = self.stop_worker(false);
         }
     }
@@ -2113,6 +2417,8 @@ impl BundleInner {
             reader: None,
             current: None,
             dirty: Vec::new(),
+            flushing: None,
+            must_restart: false,
             placed_before: HashSet::new(),
             flush,
             dest,
@@ -2132,6 +2438,14 @@ impl BundleInner {
             placeholders: false,
             #[cfg(test)]
             squat: None,
+            #[cfg(test)]
+            sink_threads: None,
+            #[cfg(test)]
+            flush_gate: None,
+            #[cfg(test)]
+            flush_refuse: false,
+            #[cfg(test)]
+            restart_refuse: false,
         }
     }
 
@@ -2159,27 +2473,8 @@ impl BundleInner {
             if self.is_skipped(m.fid) || done.contains(&m.fid) {
                 continue;
             }
-            let path = self.member_path(m.fid);
-            if verified >= m.data_offset() {
-                let want = m.bytes_below(verified);
-                match std::fs::symlink_metadata(&path) {
-                    Ok(meta) if meta.len() >= want => {
-                        fsx::open_existing_regular(&path)?.set_len(want)?;
-                    }
-                    Err(e) if e.kind() == io::ErrorKind::NotFound && want == 0 => {
-                        fsx::open_or_create(&path)?;
-                    }
-                    // A durable member renamed into place whose log line a power loss
-                    // lost; the worker reports it at its manifest name. Believed only
-                    // when a regular file of the member's size is there.
-                    Err(e)
-                        if e.kind() == io::ErrorKind::NotFound
-                            && m.data_end() <= verified
-                            && self.placed_at_manifest_name(m.fid)? => {}
-                    _ => consistent = false,
-                }
-            } else {
-                fsx::remove_if_exists(&path)?;
+            if !self.trim_member(m, verified)? {
+                consistent = false;
             }
         }
         if !consistent {
@@ -2187,6 +2482,41 @@ impl BundleInner {
             self.ledger.reset()?;
         }
         Ok(())
+    }
+
+    /// Makes member `m`'s staging file hold exactly its bytes below stream offset `offset`,
+    /// as a stream resuming there expects: no file before the member's data starts (the
+    /// resume begins at or before its header), a file at the start of its data even when
+    /// that is empty (the resume begins inside the member, with no `MemberStart`). False
+    /// when the bytes are not there, so the stream cannot resume at `offset`.
+    fn trim_member(&self, m: &BundleMember, offset: u64) -> Result<bool> {
+        let path = self.member_path(m.fid);
+        if offset < m.data_offset() {
+            fsx::remove_if_exists(&path)?;
+            return Ok(true);
+        }
+        let want = m.bytes_below(offset);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.len() >= want => {
+                fsx::open_existing_regular(&path)?.set_len(want)?;
+                Ok(true)
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound && want == 0 => {
+                fsx::open_or_create(&path)?;
+                Ok(true)
+            }
+            // A durable member renamed into place whose log line a power loss lost; the
+            // worker reports it at its manifest name. Believed only when a regular file of
+            // the member's size is there.
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    && m.data_end() <= offset
+                    && self.placed_at_manifest_name(m.fid)? =>
+            {
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
     }
 
     /// `Directory` mode: true when a regular file of member `fid`'s size sits at its
@@ -2220,10 +2550,17 @@ impl BundleInner {
     }
 
     fn begin(&mut self, start: u64) -> Result<()> {
+        // A request that ended without its closing checkpoint can leave a flush behind.
+        self.finish_flush()?;
         // Every upload request is a point to try a stopped delivery again.
         self.stalled = None;
-        if start == 0 && self.ledger.verified() > 0 {
+        if self.must_restart || (start == 0 && self.ledger.verified() > 0) {
             self.restart()?;
+            self.must_restart = false;
+            if start != 0 {
+                // The sender was told the old offset: it asks for the state and starts over.
+                return Err(Error::OffsetMismatch { expected: 0 });
+            }
         }
         self.reader = Some(BundleReader::new(self.layout.clone(), start)?);
         // The log exists from the start of the upload, before any member is placed.
@@ -2238,6 +2575,11 @@ impl BundleInner {
 
     /// Starts the stream again at 0 without placing any member twice (see the type doc).
     fn restart(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.restart_refuse {
+            return Err(Error::Io(io::Error::other("simulated restart failure")));
+        }
+        self.abandon_flush();
         if let Err(e) = self.stop_worker(false) {
             if matches!(e, Error::Sink(_)) {
                 self.fail()?;
@@ -2315,6 +2657,14 @@ impl BundleInner {
                         // Resuming inside this member: append after its durable bytes.
                         self.close_current();
                         let file = fsx::open_existing_regular(&self.member_path(fid))?;
+                        // Seeking past the end would leave a hole of zeros, and nothing reads
+                        // the bytes back against their hashes after they arrived.
+                        if file.metadata()?.len() < offset {
+                            self.must_restart = true;
+                            return Err(Error::Io(io::Error::other(
+                                "a bundle member's staging file is shorter than its verified bytes",
+                            )));
+                        }
                         self.current = Some(OpenMember {
                             fid,
                             file,
@@ -2335,10 +2685,181 @@ impl BundleInner {
         }
         Timings::add(&self.delivery.timings.stream_ns, t0);
         self.ledger.push(chunk.hash, chunk.data.len() as u64);
-        if self.ledger.due() {
-            self.checkpoint()?;
+        self.checkpoint_due()
+    }
+
+    /// The checkpoint while chunks stream in. The flush, the slow part (one `syncfs` costs
+    /// 100 to 400 ms on the test phone, during which the stream used to stop and the link
+    /// with it once the receive window filled), runs on its own thread while later chunks
+    /// are written; the ledger records the verified offset of the moment the flush began,
+    /// and only once the flush is done, so it never names a byte that was not on disk
+    /// (protocol.md 7.6). At most one flush is in flight; a checkpoint that falls due
+    /// meanwhile starts when it ends.
+    fn checkpoint_due(&mut self) -> Result<()> {
+        if self
+            .flushing
+            .as_ref()
+            .is_some_and(|f| !f.thread.is_finished())
+        {
+            return Ok(());
         }
+        let t0 = Instant::now();
+        let mut out = self.finish_flush();
+        if out.is_ok() && self.ledger.due() {
+            out = self.start_flush();
+        }
+        Timings::add(&self.delivery.timings.checkpoint_ns, t0);
+        out
+    }
+
+    /// Starts the data flush of a checkpoint on its own thread (see
+    /// [`checkpoint_due`](Self::checkpoint_due)).
+    fn start_flush(&mut self) -> Result<()> {
+        let t = Arc::clone(&self.delivery.timings);
+        t.checkpoints.fetch_add(1, Ordering::Relaxed);
+        let snap = self.ledger.snapshot();
+        let current = match &self.current {
+            Some(m) => Some(m.file.try_clone()?),
+            None => None,
+        };
+        let paths: Vec<PathBuf> = std::mem::take(&mut self.dirty)
+            .into_iter()
+            .map(|fid| self.member_path(fid))
+            .collect();
+        let (staging, flush) = (self.staging.clone(), self.flush);
+        #[cfg(test)]
+        let (gate, refuse) = (self.flush_gate.clone(), self.flush_refuse);
+        let spawned = std::thread::Builder::new()
+            .name("playdrop-flush".into())
+            .spawn(move || {
+                #[cfg(test)]
+                {
+                    if let Some(gate) = &gate {
+                        drop(lock(gate));
+                    }
+                    if refuse {
+                        return Err(Error::Io(io::Error::other("simulated flush failure")));
+                    }
+                }
+                let t0 = Instant::now();
+                if let Some(f) = current {
+                    f.sync_data().map_err(fsx::map_io)?;
+                }
+                fsx::sync_files(&staging, &paths, flush)?;
+                Timings::add(&t.ck_flush_ns, t0);
+                Ok(())
+            });
+        let thread = match spawned {
+            Ok(thread) => thread,
+            // No flush ran, but the list of what to flush is gone with the thread's closure.
+            Err(e) => return Err(self.flush_failed(Error::Io(e))),
+        };
+        self.flushing = Some(Flushing {
+            snap,
+            started: Instant::now(),
+            thread,
+        });
         Ok(())
+    }
+
+    /// Waits for the flush in flight, if any, then records its snapshot and hands over
+    /// the members it completed. A failed flush records nothing ([`flush_failed`]).
+    ///
+    /// [`flush_failed`]: Self::flush_failed
+    fn finish_flush(&mut self) -> Result<()> {
+        let Some(f) = self.flushing.take() else {
+            return Ok(());
+        };
+        let flushed = f
+            .thread
+            .join()
+            .unwrap_or_else(|_| Err(Error::Io(io::Error::other("bundle flush thread panicked"))));
+        if let Err(e) = flushed {
+            return Err(self.flush_failed(e));
+        }
+        let t = Arc::clone(&self.delivery.timings);
+        let t0 = Instant::now();
+        self.ledger.persist_hashes_upto(f.snap)?;
+        Timings::add(&t.ck_hashes_ns, t0);
+        let t0 = Instant::now();
+        self.ledger.persist_record(f.snap)?;
+        self.ledger.last_sync = f.started;
+        Timings::add(&t.ck_record_ns, t0);
+        let t0 = Instant::now();
+        let out = self.feed();
+        Timings::add(&t.ck_feed_ns, t0);
+        out
+    }
+
+    /// Flushes the closed members written since the last checkpoint.
+    fn flush_dirty(&mut self) -> Result<()> {
+        #[cfg(test)]
+        if self.flush_refuse {
+            let e = Error::Io(io::Error::other("simulated flush failure"));
+            return Err(self.flush_failed(e));
+        }
+        let paths: Vec<PathBuf> = self.dirty.iter().map(|f| self.member_path(*f)).collect();
+        match fsx::sync_files(&self.staging, &paths, self.flush) {
+            Ok(()) => {
+                self.dirty.clear();
+                Ok(())
+            }
+            Err(e) => Err(self.flush_failed(e)),
+        }
+    }
+
+    /// After a failed flush nothing written since the last checkpoint can be trusted: Linux
+    /// may mark pages clean when their writeback fails, so a later flush could succeed
+    /// with the bytes not on disk, and a checkpoint would then record them (protocol.md
+    /// 7.6). So nothing is flushed again: the stream goes back to the durable offset, as
+    /// after a kill. The bytes past it are dropped from staging and from the ledger, and
+    /// the request fails; the sender asks for the state and sends them again, so they are
+    /// written and flushed anew. Members handed over stay: they were inside the durable
+    /// offset. Returns `e` for the caller to return.
+    fn flush_failed(&mut self, e: Error) -> Error {
+        tracing::warn!(
+            "flushing received data failed; it is received again from the last checkpoint"
+        );
+        tracing::debug!(error = %e, "bundle flush error");
+        self.abandon_flush();
+        self.close_current();
+        self.dirty.clear();
+        self.reader = None;
+        self.ledger.back_to_durable();
+        let durable = self.ledger.durable;
+        let layout = Arc::clone(&self.layout);
+        let mut consistent = true;
+        for m in layout.members() {
+            if m.data_end() <= durable || !self.writes_member(m.fid) {
+                continue;
+            }
+            consistent &= self.trim_member(m, durable).unwrap_or_else(|e| {
+                tracing::debug!(error = %e, "dropping unflushed bundle data failed");
+                false
+            });
+        }
+        if !consistent {
+            // Staging does not match the durable offset: all of it comes again, members
+            // already handed over excepted, as when a load finds the same.
+            match self.restart() {
+                Ok(()) => {}
+                // The bundle failed for the sink's reason, which is the one to report.
+                Err(sink @ Error::Sink(_)) => return sink,
+                Err(e) => {
+                    tracing::debug!(error = %e, "starting the bundle again failed");
+                    self.must_restart = true;
+                }
+            }
+        }
+        e
+    }
+
+    /// Drops the flush in flight without recording it (the stream goes back to 0 or
+    /// fails), after it ended: its thread must not outlive the files it flushes.
+    fn abandon_flush(&mut self) {
+        if let Some(f) = self.flushing.take() {
+            let _ = f.thread.join();
+        }
     }
 
     /// Removes the empty placeholder a `reserved` log line of member `fid` names, if it is
@@ -2365,6 +2886,10 @@ impl BundleInner {
     /// Makes the verified offset durable, then hands every member it completed to the
     /// delivery worker.
     fn checkpoint(&mut self) -> Result<()> {
+        let t0 = Instant::now();
+        let settled = self.finish_flush();
+        Timings::add(&self.delivery.timings.checkpoint_ns, t0);
+        settled?;
         if self.ledger.unsynced == 0 {
             return Ok(());
         }
@@ -2379,16 +2904,14 @@ impl BundleInner {
         t.checkpoints.fetch_add(1, Ordering::Relaxed);
         let t0 = Instant::now();
         if let Some(m) = &self.current {
-            m.file.sync_data().map_err(fsx::map_io)?;
+            if let Err(e) = m.file.sync_data() {
+                return Err(self.flush_failed(fsx::map_io(e)));
+            }
         }
         Timings::add(&t.ck_current_ns, t0);
         // Closed members written since the last checkpoint, flushed together.
         let t0 = Instant::now();
-        let dirty: Vec<PathBuf> = std::mem::take(&mut self.dirty)
-            .into_iter()
-            .map(|fid| self.member_path(fid))
-            .collect();
-        fsx::sync_files(&self.staging, &dirty, self.flush)?;
+        self.flush_dirty()?;
         Timings::add(&t.ck_flush_ns, t0);
         let t0 = Instant::now();
         let snap = self.ledger.persist_hashes()?;
@@ -2406,6 +2929,7 @@ impl BundleInner {
         // Nothing more is handed over. Members already placed stay where they are: their
         // bytes were chunk-verified, and landed files are never discarded. The failed
         // record still lists them, so the transfer reports where they went.
+        self.abandon_flush();
         let _ = self.stop_worker(false);
         let done = match self.parked.take() {
             Some((_, done)) => done,
@@ -2464,11 +2988,7 @@ impl BundleInner {
             return Err(Error::RootMismatch);
         }
         self.close_current();
-        let dirty: Vec<PathBuf> = std::mem::take(&mut self.dirty)
-            .into_iter()
-            .map(|fid| self.member_path(fid))
-            .collect();
-        fsx::sync_files(&self.staging, &dirty, self.flush)?;
+        self.flush_dirty()?;
         self.checkpoint()?;
         if lock(&self.ledger.progress).root != Some(*claimed) {
             // The root is durable before the last members are handed over, so a kill or an
@@ -2720,6 +3240,8 @@ impl BundleInner {
             placeholders: self.placeholders,
             #[cfg(test)]
             squat: self.squat,
+            #[cfg(test)]
+            sink_threads: self.sink_threads,
         };
         let (jobs, inbox) = mpsc::channel();
         let thread = std::thread::Builder::new()
@@ -3403,6 +3925,10 @@ impl TransferReceiver {
             ck_hashes: d(&t.ck_hashes_ns),
             ck_record: d(&t.ck_record_ns),
             ck_feed: d(&t.ck_feed_ns),
+            deliver_idle: d(&t.deliver_idle_ns),
+            chunks: t.chunks.load(Ordering::Relaxed),
+            body: d(&t.body_ns),
+            body_write: d(&t.body_write_ns),
         }
     }
 
@@ -4118,17 +4644,30 @@ impl Upload {
     ) -> std::result::Result<(), PutError> {
         let cs = self.receiver.shared.chunk_size;
         let mut dec = ChunkDecoder::new(body, self.start, self.end_inclusive, cs);
+        let timings = Arc::clone(&self.receiver.shared.delivery.timings);
+        let bundle = self.target == Target::Bundle;
+        let began = Instant::now();
         let outcome = loop {
             if let Err(e) = self.receiver.check_open() {
                 break Err(e);
             }
-            match dec.next_chunk().await {
+            let t0 = Instant::now();
+            let next = dec.next_chunk().await;
+            if bundle {
+                Timings::add(&timings.body_ns, t0);
+            }
+            match next {
                 Ok(Some(chunk)) => {
                     if let Err(e) = self.check_space(chunk.data.len() as u64) {
                         break Err(e.into());
                     }
+                    let t0 = Instant::now();
                     if let Err(e) = self.write(chunk).await {
                         break Err(e.into());
+                    }
+                    if bundle {
+                        Timings::add(&timings.body_write_ns, t0);
+                        timings.chunks.fetch_add(1, Ordering::Relaxed);
                     }
                     lock(&self.receiver.shared.status).1 = SystemTime::now();
                 }
@@ -4175,6 +4714,13 @@ impl Upload {
             self.receiver.shared.set_failure(why.clone());
             self.settle().await?;
         }
+        if bundle && tracing::enabled!(tracing::Level::DEBUG) {
+            log_bundle_timings(
+                "bundle body received",
+                began,
+                &self.receiver.member_timings(),
+            );
+        }
         outcome
     }
 
@@ -4212,6 +4758,7 @@ impl Upload {
                 .await
             }
             Target::Bundle => {
+                let began = Instant::now();
                 // On a failure the bundle's record still lists the members that stayed
                 // where they were placed.
                 let out = self
@@ -4221,6 +4768,13 @@ impl Upload {
                     Ok((r, kept)) => {
                         if r.is_err() {
                             self.receiver.shared.record_saved(&kept);
+                        }
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            log_bundle_timings(
+                                "bundle delivered",
+                                began,
+                                &self.receiver.member_timings(),
+                            );
                         }
                         r
                     }
@@ -5280,6 +5834,866 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(staged, [std::ffi::OsString::from("transfer.json")]);
         }
+    }
+
+    /// `Staged` mode with several sink threads: a kill while members are in flight hands
+    /// each member to the sink at least once and at most twice, and only members that
+    /// were in flight (at most [`SINK_THREADS`]) twice; the reopened transfer lists every
+    /// member once and leaves nothing staged.
+    #[tokio::test]
+    async fn parallel_sink_delivery_survives_a_kill() {
+        let n = 40usize;
+        let sizes: Vec<(usize, bool)> = (0..n).map(|i| (100 + i * 37, true)).collect();
+        for crash in [
+            Crash::Before(0),
+            Crash::Before(17),
+            Crash::Inside(0),
+            Crash::Inside(17),
+            Crash::Inside(n - 1),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (m, contents) = manifest(&sizes);
+            let sink = Arc::new(MemSink::default());
+            let binding = SinkBinding {
+                sink: sink.clone(),
+                peer: "ef".repeat(32),
+            };
+            let opts = AcceptOptions {
+                sink: Some(binding.clone()),
+                ..AcceptOptions::default()
+            };
+            let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+                .await
+                .unwrap();
+            let btok = rx.state().bundle.unwrap().token.unwrap();
+            let bundle = bundle_of(&m, &contents).await;
+            let bsize = bundle.len() as u64;
+            set_crash(&rx, crash);
+            {
+                let slot = rx.shared.bundle.as_ref().expect("manifest has a bundle");
+                let mut io = slot.io.try_lock().expect("no upload running");
+                let SlotIo::Bundle(inner) = &mut *io else {
+                    panic!("bundle slot holds the bundle");
+                };
+                inner.sink_threads = Some(SINK_THREADS);
+            }
+            let mut up = rx.begin_bundle(&btok, 0, bsize - 1).await.unwrap();
+            up.receive(&body(&bundle, 0, bsize).await[..])
+                .await
+                .unwrap();
+            let r = up.finish(Some(root_of(&bundle))).await;
+            assert!(
+                matches!(r, Err(PutError::Core(Error::OffsetMismatch { expected })) if expected == bsize),
+                "{crash:?}: {r:?}"
+            );
+            assert!(kill_fired(&rx), "{crash:?}");
+            drop(rx);
+            let rx = TransferReceiver::load_with(
+                tmp.path(),
+                &m.id,
+                FakeSpace::plenty(),
+                SyncPolicy::default(),
+                Some(binding),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rx.transfer_state(), TransferState::Complete, "{crash:?}");
+            let mut counts = vec![0usize; n];
+            for (item, bytes) in lock(&sink.got).iter() {
+                let name = &item.path[1];
+                let fid: usize = name[1..name.len() - 4].parse().unwrap();
+                assert_eq!(bytes, &contents[fid], "{crash:?}: {name}");
+                counts[fid] += 1;
+            }
+            assert!(
+                counts.iter().all(|c| (1..=2).contains(c)),
+                "{crash:?}: {counts:?}"
+            );
+            let twice = counts.iter().filter(|&&c| c == 2).count();
+            if matches!(crash, Crash::Before(_)) {
+                // The members already in flight finish and are logged before the stop.
+                assert_eq!(twice, 0, "{crash:?}: {counts:?}");
+            } else {
+                assert!(
+                    (1..=SINK_THREADS).contains(&twice),
+                    "{crash:?}: {twice} members delivered twice"
+                );
+            }
+            let mut paths: Vec<String> = rx.delivered().into_iter().map(|d| d.path).collect();
+            paths.sort();
+            paths.dedup();
+            assert_eq!(
+                paths.len(),
+                n,
+                "{crash:?}: delivered lists every member once"
+            );
+            let staged: Vec<_> = std::fs::read_dir(rx.staging_dir())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert_eq!(
+                staged,
+                [std::ffi::OsString::from("transfer.json")],
+                "{crash:?}"
+            );
+        }
+    }
+
+    /// A checkpoint whose flush ran while more chunks arrived records only what was
+    /// verified when the flush began: the hashes and offset of its snapshot, never the
+    /// chunks pushed since, which stay counted for the next checkpoint.
+    #[test]
+    fn a_flushed_snapshot_records_only_its_own_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cs = u64::from(CS);
+        let mut l = Ledger::fresh(tmp.path(), "b", 4 * cs, CS, every_chunk());
+        l.push([1; HASH_LEN], cs);
+        l.push([2; HASH_LEN], cs);
+        let snap = l.snapshot();
+        // Written while the flush ran.
+        l.push([3; HASH_LEN], cs);
+        l.persist_hashes_upto(snap).unwrap();
+        l.persist_record(snap).unwrap();
+        assert_eq!(l.durable, 2 * cs);
+        assert_eq!(
+            l.unsynced, cs,
+            "the third chunk waits for the next checkpoint"
+        );
+        assert!(l.due());
+        let back = Ledger::load(tmp.path(), "b", 4 * cs, CS, every_chunk()).unwrap();
+        assert_eq!(back.verified(), 2 * cs);
+        assert_eq!(
+            lock(&back.progress).hashes,
+            vec![[1; HASH_LEN], [2; HASH_LEN]]
+        );
+        // The next checkpoint appends the third hash after the first two.
+        l.persist().unwrap();
+        let back = Ledger::load(tmp.path(), "b", 4 * cs, CS, every_chunk()).unwrap();
+        assert_eq!(back.verified(), 3 * cs);
+        assert_eq!(lock(&back.progress).hashes.len(), 3);
+    }
+
+    /// Runs `f` on the bundle state of a receiver with no upload running.
+    fn with_bundle<T>(rx: &TransferReceiver, f: impl FnOnce(&mut BundleInner) -> T) -> T {
+        let slot = rx.shared.bundle.as_ref().expect("manifest has a bundle");
+        let mut io = slot.io.try_lock().expect("no upload running");
+        let SlotIo::Bundle(inner) = &mut *io else {
+            panic!("bundle slot holds the bundle");
+        };
+        f(inner)
+    }
+
+    /// One chunk size of data per member: every chunk completes exactly one member, up
+    /// to the padding of the tar headers.
+    fn one_chunk_members(n: usize) -> Vec<(usize, bool)> {
+        vec![(CS as usize - 2048, true); n]
+    }
+
+    /// Protocol 7.6 with the flush in the background. While a flush is held back, the
+    /// verified offset moves on in memory but nothing is recorded and no member reaches
+    /// the sink; once it ended, the ledger names only what was verified when it began and
+    /// only members inside that are handed over; a kill then reopens at exactly that
+    /// offset and the resume delivers every member once, with the right bytes.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines, reason = "one scenario, read top to bottom")]
+    async fn a_background_flush_records_only_what_it_flushed() {
+        use bytes::Bytes;
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&one_chunk_members(6));
+        let sink = Arc::new(MemSink::default());
+        let binding = SinkBinding {
+            sink: sink.clone(),
+            peer: "ef".repeat(32),
+        };
+        let opts = AcceptOptions {
+            sink: Some(binding.clone()),
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let layout = BundleLayout::new(&m).unwrap();
+        let cs = u64::from(CS);
+        let chunks: Vec<VerifiedChunk> = bundle
+            .chunks(CS as usize)
+            .enumerate()
+            .map(|(i, data)| VerifiedChunk {
+                offset: i as u64 * cs,
+                data: Bytes::copy_from_slice(data),
+                hash: *blake3::hash(data).as_bytes(),
+            })
+            .collect();
+        let gate = Arc::new(StdMutex::new(()));
+        let held = lock(&gate);
+        with_bundle(&rx, |b| {
+            b.flush_gate = Some(Arc::clone(&gate));
+            b.begin(0).unwrap();
+            // Chunk 0 starts the flush, which is now held; chunks 1 and 2 go on.
+            for c in &chunks[..3] {
+                b.write_chunk(c).unwrap();
+            }
+            assert!(b.flushing.is_some());
+            assert_eq!(b.flushing.as_ref().unwrap().snap.verified, cs);
+            assert_eq!(b.ledger.verified(), 3 * cs);
+            assert_eq!(
+                b.ledger.durable, 0,
+                "nothing recorded before the flush ended"
+            );
+        });
+        assert!(
+            lock(&sink.got).is_empty(),
+            "no member before a durable offset"
+        );
+        let on_disk = |dir: &Path| {
+            Ledger::load(dir, "bundle", bundle.len() as u64, CS, every_chunk())
+                .unwrap()
+                .verified()
+        };
+        assert_eq!(on_disk(rx.staging_dir()), 0);
+        drop(held);
+        with_bundle(&rx, |b| {
+            b.finish_flush().unwrap();
+            assert_eq!(
+                b.ledger.durable, cs,
+                "the snapshot, not the verified offset"
+            );
+            assert_eq!(b.ledger.unsynced, 2 * cs);
+            b.flush_gate = None;
+            // Waits for the hand-over of what that flush made eligible, no further.
+            b.stop_worker(true).unwrap();
+        });
+        assert_eq!(on_disk(rx.staging_dir()), cs);
+        for (item, _) in lock(&sink.got).iter() {
+            let name = &item.path[1];
+            let fid: u32 = name[1..name.len() - 4].parse().unwrap();
+            assert!(
+                layout.member(fid).unwrap().data_end() <= cs,
+                "member {fid} delivered past the durable offset"
+            );
+        }
+        let before_kill = lock(&sink.got).len();
+        assert!(
+            before_kill > 0,
+            "a member inside the durable offset was delivered"
+        );
+        // A kill: the stream state goes, chunks 1 and 2 were never recorded.
+        drop(rx);
+        let rx = TransferReceiver::load_with(
+            tmp.path(),
+            &m.id,
+            FakeSpace::plenty(),
+            every_chunk(),
+            Some(binding),
+        )
+        .await
+        .unwrap();
+        let view = rx.state().bundle.unwrap();
+        assert_eq!(view.verified_offset, cs, "reopens at the durable offset");
+        let token = view.token.unwrap();
+        let size = bundle.len() as u64;
+        let mut up = rx.begin_bundle(&token, cs, size - 1).await.unwrap();
+        up.receive(&body(&bundle, cs, size).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        let got = lock(&sink.got);
+        assert!(got.len() >= before_kill);
+        let mut seen = vec![0usize; contents.len()];
+        for (item, bytes) in got.iter() {
+            let name = &item.path[1];
+            let fid: usize = name[1..name.len() - 4].parse().unwrap();
+            assert_eq!(bytes, &contents[fid], "{name}");
+            seen[fid] += 1;
+        }
+        assert_eq!(seen, vec![1usize; contents.len()], "each member once");
+    }
+
+    /// `Staged` mode, a resume: the worker skips the members delivered before the reload and
+    /// waits for more. A cancel then returns at once: the worker holds nothing while it
+    /// waits for members.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancel_is_not_blocked_by_a_worker_waiting_after_delivered_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&one_chunk_members(4));
+        let sink = Arc::new(MemSink::default());
+        let binding = SinkBinding {
+            sink: sink.clone(),
+            peer: "ef".repeat(32),
+        };
+        let opts = AcceptOptions {
+            sink: Some(binding.clone()),
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let size = bundle.len() as u64;
+        let token = rx.state().bundle.unwrap().token.unwrap();
+        let cs = u64::from(CS);
+        let mut up = rx.begin_bundle(&token, 0, 2 * cs - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, 2 * cs).await[..])
+            .await
+            .unwrap();
+        drop(up);
+        with_bundle(&rx, |b| b.stop_worker(true).unwrap());
+        assert!(
+            !lock(&sink.got).is_empty(),
+            "some members went before the reload"
+        );
+        drop(rx);
+        let rx = TransferReceiver::load_with(
+            tmp.path(),
+            &m.id,
+            FakeSpace::plenty(),
+            every_chunk(),
+            Some(binding),
+        )
+        .await
+        .unwrap();
+        let view = rx.state().bundle.unwrap();
+        let up = rx
+            .begin_bundle(&view.token.unwrap(), view.verified_offset, size - 1)
+            .await
+            .unwrap();
+        // Time for the worker to go past the delivered members and wait for more.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let cancelled = tokio::time::timeout(Duration::from_secs(10), rx.cancel()).await;
+        assert!(
+            cancelled.is_ok(),
+            "the cancel is blocked by the waiting worker"
+        );
+        cancelled.unwrap().unwrap();
+        drop(up);
+    }
+
+    /// A failed flush, in the background or in a blocking checkpoint, sends the stream back
+    /// to the last checkpoint: nothing past it is recorded or handed over, and the sender
+    /// resumes from there, so those bytes are written and flushed anew (a flush that
+    /// failed once may not be believed again, however a retry ends).
+    #[tokio::test]
+    async fn a_failed_flush_goes_back_to_the_last_checkpoint() {
+        use bytes::Bytes;
+        // Background: the flush started by a chunk fails; blocking: the one closing a request.
+        for background in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (m, contents) = manifest(&one_chunk_members(4));
+            let sink = Arc::new(MemSink::default());
+            let opts = AcceptOptions {
+                sink: Some(SinkBinding {
+                    sink: sink.clone(),
+                    peer: "ef".repeat(32),
+                }),
+                sync: if background {
+                    every_chunk()
+                } else {
+                    SyncPolicy {
+                        bytes: u64::MAX,
+                        batched_bytes: u64::MAX,
+                        interval: Duration::from_secs(3600),
+                    }
+                },
+                ..AcceptOptions::default()
+            };
+            let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+                .await
+                .unwrap();
+            let bundle = bundle_of(&m, &contents).await;
+            let size = bundle.len() as u64;
+            let cs = u64::from(CS);
+            let chunk = |i: usize| {
+                let data = &bundle[i * CS as usize..(i + 1) * CS as usize];
+                VerifiedChunk {
+                    offset: i as u64 * cs,
+                    data: Bytes::copy_from_slice(data),
+                    hash: *blake3::hash(data).as_bytes(),
+                }
+            };
+            with_bundle(&rx, |b| {
+                b.begin(0).unwrap();
+                b.write_chunk(&chunk(0)).unwrap();
+                b.checkpoint().unwrap();
+                assert_eq!(b.ledger.durable, cs);
+                b.flush_refuse = true;
+                b.write_chunk(&chunk(1)).unwrap();
+                assert_ne!(b.ledger.verified(), cs, "the chunk went in");
+                let failed = if background {
+                    b.finish_flush()
+                } else {
+                    b.checkpoint()
+                };
+                assert!(failed.is_err());
+                assert_eq!(b.ledger.verified(), cs, "back at the last checkpoint");
+                assert_eq!(b.ledger.durable, cs);
+                assert_eq!(b.dirty, [] as [u32; 0]);
+                assert!(!b.member_path(2).exists(), "members past it are dropped");
+                // Nothing is owed: even a flush that would work now records nothing new.
+                b.flush_refuse = false;
+                b.checkpoint().unwrap();
+                assert_eq!(b.ledger.durable, cs);
+                b.stop_worker(true).unwrap();
+            });
+            let delivered = lock(&sink.got).len();
+            assert!(
+                delivered <= 1,
+                "only what the first checkpoint made durable"
+            );
+            // The sender asks for the state and goes on from there.
+            let view = rx.state().bundle.unwrap();
+            assert_eq!(view.verified_offset, cs);
+            let token = view.token.unwrap();
+            let mut up = rx.begin_bundle(&token, cs, size - 1).await.unwrap();
+            up.receive(&body(&bundle, cs, size).await[..])
+                .await
+                .unwrap();
+            up.finish(Some(root_of(&bundle))).await.unwrap();
+            assert_eq!(rx.transfer_state(), TransferState::Complete);
+            let mut seen = vec![0usize; contents.len()];
+            for (item, bytes) in lock(&sink.got).iter() {
+                let name = &item.path[1];
+                let fid: usize = name[1..name.len() - 4].parse().unwrap();
+                assert_eq!(bytes, &contents[fid], "{name}");
+                seen[fid] += 1;
+            }
+            assert_eq!(seen, vec![1usize; contents.len()], "each member once");
+        }
+    }
+
+    /// A failed flush with the durable offset exactly at the start of a member's data: a
+    /// resume starts inside that member with no `MemberStart`, so its empty staging file
+    /// must still be there (a load keeps it too, see `reconcile`). The send goes on.
+    #[tokio::test]
+    async fn a_failed_flush_at_a_member_start_can_resume() {
+        use bytes::Bytes;
+        let cs = CS as usize;
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&[(cs - 1024, true), (cs + 100, true), (5000, true)]);
+        let opts = AcceptOptions {
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let root = tmp.path().join("Downloads");
+        let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let size = bundle.len() as u64;
+        let chunk = |i: usize| {
+            let data = &bundle[i * cs..(i + 1) * cs];
+            VerifiedChunk {
+                offset: (i * cs) as u64,
+                data: Bytes::copy_from_slice(data),
+                hash: *blake3::hash(data).as_bytes(),
+            }
+        };
+        with_bundle(&rx, |b| {
+            assert_eq!(b.layout.member(1).unwrap().data_offset(), cs as u64);
+            b.begin(0).unwrap();
+            b.write_chunk(&chunk(0)).unwrap();
+            b.checkpoint().unwrap();
+            b.flush_refuse = true;
+            b.write_chunk(&chunk(1)).unwrap();
+            assert!(b.finish_flush().is_err());
+            b.flush_refuse = false;
+            assert_eq!(b.ledger.verified(), cs as u64);
+            let kept = std::fs::metadata(b.member_path(1)).unwrap().len();
+            assert_eq!(kept, 0, "the member's empty staging file stays");
+            assert!(!b.member_path(2).exists(), "a member not started yet goes");
+        });
+        let token = rx.state().bundle.unwrap().token.unwrap();
+        let mut up = rx.begin_bundle(&token, cs as u64, size - 1).await.unwrap();
+        up.receive(&body(&bundle, cs as u64, size).await[..])
+            .await
+            .unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        for (i, want) in contents.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(root.join(format!("T/f{i}.dat"))).unwrap(),
+                want
+            );
+        }
+    }
+
+    /// A failed flush that finds staging not matching the durable offset (a member's file
+    /// gone): everything comes again from 0, and the send still ends.
+    #[tokio::test]
+    async fn a_failed_flush_with_staging_damaged_starts_again() {
+        use bytes::Bytes;
+        let cs = CS as usize;
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&[(cs + 100, true), (2 * cs, true)]);
+        let opts = AcceptOptions {
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let root = tmp.path().join("Downloads");
+        let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let size = bundle.len() as u64;
+        let chunk = |i: usize| {
+            let data = &bundle[i * cs..(i + 1) * cs];
+            VerifiedChunk {
+                offset: (i * cs) as u64,
+                data: Bytes::copy_from_slice(data),
+                hash: *blake3::hash(data).as_bytes(),
+            }
+        };
+        with_bundle(&rx, |b| {
+            b.begin(0).unwrap();
+            b.write_chunk(&chunk(0)).unwrap();
+            b.checkpoint().unwrap();
+            b.flush_refuse = true;
+            b.write_chunk(&chunk(1)).unwrap();
+            // Member 0 straddles the durable offset: without its file there is no resume.
+            std::fs::remove_file(b.member_path(0)).unwrap();
+            assert!(b.finish_flush().is_err());
+            b.flush_refuse = false;
+            assert_eq!(b.ledger.verified(), 0);
+            assert_eq!(b.ledger.durable, 0);
+        });
+        let token = rx.state().bundle.unwrap().token.unwrap();
+        let mut up = rx.begin_bundle(&token, 0, size - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, size).await[..]).await.unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        for (i, want) in contents.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(root.join(format!("T/f{i}.dat"))).unwrap(),
+                want
+            );
+        }
+    }
+
+    /// Starting again after a failed flush fails too: the next request does it first and
+    /// tells the sender to start over, so it never resumes into the damaged member.
+    #[tokio::test]
+    async fn a_restart_that_failed_is_done_by_the_next_request() {
+        use bytes::Bytes;
+        let cs = CS as usize;
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&[(cs + 100, true), (2 * cs, true)]);
+        let opts = AcceptOptions {
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let root = tmp.path().join("Downloads");
+        let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let size = bundle.len() as u64;
+        let chunk = |i: usize| {
+            let data = &bundle[i * cs..(i + 1) * cs];
+            VerifiedChunk {
+                offset: (i * cs) as u64,
+                data: Bytes::copy_from_slice(data),
+                hash: *blake3::hash(data).as_bytes(),
+            }
+        };
+        with_bundle(&rx, |b| {
+            b.begin(0).unwrap();
+            b.write_chunk(&chunk(0)).unwrap();
+            b.checkpoint().unwrap();
+            b.flush_refuse = true;
+            b.restart_refuse = true;
+            b.write_chunk(&chunk(1)).unwrap();
+            std::fs::remove_file(b.member_path(0)).unwrap();
+            assert!(matches!(b.finish_flush(), Err(Error::Io(_))));
+            assert!(b.must_restart);
+            b.flush_refuse = false;
+            b.restart_refuse = false;
+        });
+        let token = rx.state().bundle.unwrap().token.unwrap();
+        let r = rx.begin_bundle(&token, cs as u64, size - 1).await;
+        assert!(
+            matches!(
+                r,
+                Err(PutError::Core(Error::OffsetMismatch { expected: 0 }))
+            ),
+            "{r:?}"
+        );
+        let mut up = rx.begin_bundle(&token, 0, size - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, size).await[..]).await.unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        for (i, want) in contents.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(root.join(format!("T/f{i}.dat"))).unwrap(),
+                want
+            );
+        }
+    }
+
+    /// A resume into a member whose staging file is shorter than its durable bytes is
+    /// refused, where seeking past the end would hand over a hole of zeros. The next
+    /// request starts again from 0, and every byte arrives right.
+    #[tokio::test]
+    async fn a_resume_into_a_short_member_file_starts_again() {
+        use bytes::Bytes;
+        let cs = CS as usize;
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&[(cs + 100, true), (2 * cs, true)]);
+        let opts = AcceptOptions {
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let root = tmp.path().join("Downloads");
+        let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let size = bundle.len() as u64;
+        let data = &bundle[..cs];
+        let first = VerifiedChunk {
+            offset: 0,
+            data: Bytes::copy_from_slice(data),
+            hash: *blake3::hash(data).as_bytes(),
+        };
+        with_bundle(&rx, |b| {
+            b.begin(0).unwrap();
+            b.write_chunk(&first).unwrap();
+            b.checkpoint().unwrap();
+            b.close_current();
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(b.member_path(0))
+                .unwrap();
+            f.set_len(10).unwrap();
+        });
+        let token = rx.state().bundle.unwrap().token.unwrap();
+        let mut up = rx.begin_bundle(&token, cs as u64, size - 1).await.unwrap();
+        let r = up.receive(&body(&bundle, cs as u64, size).await[..]).await;
+        assert!(r.is_err(), "{r:?}");
+        drop(up);
+        let r = rx.begin_bundle(&token, cs as u64, size - 1).await;
+        assert!(
+            matches!(
+                r,
+                Err(PutError::Core(Error::OffsetMismatch { expected: 0 }))
+            ),
+            "{r:?}"
+        );
+        let mut up = rx.begin_bundle(&token, 0, size - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, size).await[..]).await.unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        for (i, want) in contents.iter().enumerate() {
+            assert_eq!(
+                &std::fs::read(root.join(format!("T/f{i}.dat"))).unwrap(),
+                want
+            );
+        }
+    }
+
+    /// The fallback restart meets a sink refusal: the bundle fails for that reason, and the
+    /// caller gets the sink's error, not the flush error.
+    #[tokio::test]
+    async fn a_sink_refusal_met_by_the_fallback_restart_is_reported() {
+        use bytes::Bytes;
+        let cs = CS as usize;
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&[(100, true), (cs + 100, true), (2 * cs, true)]);
+        let sink = Arc::new(MemSink {
+            refuse: true,
+            ..MemSink::default()
+        });
+        let opts = AcceptOptions {
+            sink: Some(SinkBinding {
+                sink,
+                peer: "ef".repeat(32),
+            }),
+            sync: every_chunk(),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let chunk = |i: usize| {
+            let data = &bundle[i * cs..(i + 1) * cs];
+            VerifiedChunk {
+                offset: (i * cs) as u64,
+                data: Bytes::copy_from_slice(data),
+                hash: *blake3::hash(data).as_bytes(),
+            }
+        };
+        with_bundle(&rx, |b| {
+            b.begin(0).unwrap();
+            b.write_chunk(&chunk(0)).unwrap();
+            b.checkpoint().unwrap();
+            let t0 = Instant::now();
+            while !b.worker.as_ref().unwrap().failed.load(Ordering::Acquire) {
+                assert!(
+                    t0.elapsed() < Duration::from_secs(10),
+                    "the sink was not called"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            b.flush_refuse = true;
+            b.write_chunk(&chunk(1)).unwrap();
+            std::fs::remove_file(b.member_path(1)).unwrap();
+            let r = b.finish_flush();
+            assert!(matches!(r, Err(Error::Sink(_))), "{r:?}");
+            assert!(!b.must_restart);
+        });
+    }
+
+    /// A streamed file whose flush fails goes back to its durable offset, in a checkpoint
+    /// and in the last flush before placing, and the resume writes those bytes anew.
+    #[tokio::test]
+    async fn a_failed_flush_of_a_streamed_file_goes_back_to_its_checkpoint() {
+        use bytes::Bytes;
+        let cs = CS as usize;
+        for at_finalize in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (m, contents) = manifest(&[(3 * cs + 10, false)]);
+            let data = &contents[0];
+            let size = data.len() as u64;
+            let opts = AcceptOptions {
+                sync: every_chunk(),
+                ..AcceptOptions::default()
+            };
+            let root = tmp.path().join("Downloads");
+            let rx = TransferReceiver::accept(&root, m.clone(), FakeSpace::plenty(), opts)
+                .await
+                .unwrap();
+            let token = rx.state().files[0].token.clone().unwrap();
+            let chunk = |i: usize| {
+                let bytes = &data[i * cs..(i + 1) * cs];
+                VerifiedChunk {
+                    offset: (i * cs) as u64,
+                    data: Bytes::copy_from_slice(bytes),
+                    hash: *blake3::hash(bytes).as_bytes(),
+                }
+            };
+            let with_part = |f: &mut dyn FnMut(&mut PartInner)| {
+                let mut io = rx.shared.files[0].io.try_lock().expect("no upload running");
+                let SlotIo::File(part) = &mut *io else {
+                    panic!("file slot holds a file");
+                };
+                f(part.inner.as_mut().unwrap());
+            };
+            with_part(&mut |p| {
+                p.write_chunk(&chunk(0)).unwrap();
+                assert_eq!(p.ledger.durable, cs as u64);
+                if !at_finalize {
+                    p.flush_refuse = true;
+                    assert!(p.write_chunk(&chunk(1)).is_err());
+                    assert_eq!(p.ledger.verified(), cs as u64, "back at the checkpoint");
+                    assert_eq!(p.ledger.durable, cs as u64);
+                    p.flush_refuse = false;
+                }
+            });
+            assert_eq!(rx.state().files[0].verified_offset, cs as u64);
+            if at_finalize {
+                // Everything arrives; the closing flush fails, then all but the first chunk comes again.
+                let mut up = rx.begin_file(0, &token, cs as u64, size - 1).await.unwrap();
+                with_part_refuse(&mut up, true);
+                let r = up.receive(&body(data, cs as u64, size).await[..]).await;
+                assert!(r.is_err(), "{r:?}");
+                drop(up);
+                assert_eq!(rx.state().files[0].verified_offset, cs as u64);
+                with_part(&mut |p| p.flush_refuse = false);
+            }
+            let mut up = rx.begin_file(0, &token, cs as u64, size - 1).await.unwrap();
+            up.receive(&body(data, cs as u64, size).await[..])
+                .await
+                .unwrap();
+            up.finish(Some(root_of(data))).await.unwrap();
+            assert_eq!(&std::fs::read(root.join("T/f0.dat")).unwrap(), data);
+        }
+    }
+
+    /// Makes the flushes of the file behind a running upload fail, or work again.
+    fn with_part_refuse(up: &mut Upload, refuse: bool) {
+        let SlotIo::File(part) = &mut *up.guard else {
+            panic!("file upload");
+        };
+        part.inner.as_mut().unwrap().flush_refuse = refuse;
+    }
+
+    /// The flush closing the whole bundle fails: the members written since the last
+    /// checkpoint are received again, and the upload then completes.
+    #[tokio::test]
+    async fn a_failed_final_flush_is_received_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (m, contents) = manifest(&one_chunk_members(3));
+        let sink = Arc::new(MemSink::default());
+        let opts = AcceptOptions {
+            sink: Some(SinkBinding {
+                sink: sink.clone(),
+                peer: "ef".repeat(32),
+            }),
+            sync: SyncPolicy {
+                bytes: u64::MAX,
+                batched_bytes: u64::MAX,
+                interval: Duration::from_secs(3600),
+            },
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let size = bundle.len() as u64;
+        let token = rx.state().bundle.unwrap().token.unwrap();
+        with_bundle(&rx, |b| b.flush_refuse = true);
+        let mut up = rx.begin_bundle(&token, 0, size - 1).await.unwrap();
+        let r = up.receive(&body(&bundle, 0, size).await[..]).await;
+        assert!(r.is_err(), "the closing checkpoint failed: {r:?}");
+        drop(up);
+        assert_eq!(rx.state().bundle.unwrap().verified_offset, 0);
+        with_bundle(&rx, |b| b.flush_refuse = false);
+        let mut up = rx.begin_bundle(&token, 0, size - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, size).await[..]).await.unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        assert_eq!(lock(&sink.got).len(), contents.len());
+    }
+
+    /// An I/O error while handing out members on several threads: the members in flight
+    /// finish and are logged, the fresh worker of `finish` delivers the rest, and each
+    /// member reaches the sink once.
+    #[tokio::test]
+    async fn a_delivery_error_with_several_sink_threads_is_retried() {
+        let tmp = tempfile::tempdir().unwrap();
+        let n = 40usize;
+        let sizes: Vec<(usize, bool)> = (0..n).map(|i| (100 + i * 37, true)).collect();
+        let (m, contents) = manifest(&sizes);
+        let sink = Arc::new(MemSink::default());
+        let opts = AcceptOptions {
+            sink: Some(SinkBinding {
+                sink: sink.clone(),
+                peer: "ef".repeat(32),
+            }),
+            ..AcceptOptions::default()
+        };
+        let rx = TransferReceiver::accept(tmp.path(), m.clone(), FakeSpace::plenty(), opts)
+            .await
+            .unwrap();
+        let bundle = bundle_of(&m, &contents).await;
+        let size = bundle.len() as u64;
+        let token = rx.state().bundle.unwrap().token.unwrap();
+        with_bundle(&rx, |b| {
+            b.sink_threads = Some(SINK_THREADS);
+            b.transient = Some(17);
+        });
+        let mut up = rx.begin_bundle(&token, 0, size - 1).await.unwrap();
+        up.receive(&body(&bundle, 0, size).await[..]).await.unwrap();
+        up.finish(Some(root_of(&bundle))).await.unwrap();
+        assert_eq!(rx.transfer_state(), TransferState::Complete);
+        let mut seen = vec![0usize; n];
+        for (item, bytes) in lock(&sink.got).iter() {
+            let name = &item.path[1];
+            let fid: usize = name[1..name.len() - 4].parse().unwrap();
+            assert_eq!(bytes, &contents[fid], "{name}");
+            seen[fid] += 1;
+        }
+        assert_eq!(seen, vec![1usize; n], "each member once");
     }
 
     /// The checkpoint byte threshold follows the flush kind: 64 MiB where a bundle

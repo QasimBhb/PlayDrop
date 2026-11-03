@@ -13,6 +13,7 @@
 //! - [`transfers`]: snapshots of live and recent transfers for late UIs.
 //! - [`router`]: request routing for the server (7.1).
 //! - [`connect`]: last-known dial, discovery wiring and the 10 s report (3.2, 8).
+//! - [`path`]: measuring each path to a peer and moving to a clearly faster one (3.5).
 //! - [`diagnostics`]: the on-demand report for the daemon's diagnostics screen.
 //! - [`platform`]: free space and interface adapters.
 //! - [`blobs`]: clipboard blobs, held and fetched (5.15, SR-24).
@@ -28,6 +29,7 @@ mod input;
 pub mod lock;
 mod outbox;
 mod pairing;
+mod path;
 mod pins;
 pub mod platform;
 mod receive;
@@ -63,6 +65,7 @@ pub use events::{
 };
 pub use lock::{AlwaysUnlocked, LockFlag, LockState};
 pub use outbox::OutboxItem;
+pub use path::{PathOutcome, PathReport, PathTiming, ProbeReport};
 pub use send::{SendSource, TransferHandle, TransferSummary};
 pub use status::MediaState;
 pub use transfers::{TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISHED, KEEP_FOR};
@@ -176,6 +179,14 @@ pub struct HostConfig {
     /// that gives up keeps its record and resumes when the device is back
     /// (`docs/core-api.md` section 12); tests shorten the window.
     pub reconnect_for: Duration,
+    /// Path choice (protocol.md 3.5): serve `GET /v1/probe`, let a connection replace an
+    /// older one only at its first request other than a probe, and measure each path to
+    /// a peer that answers on several addresses. On by default. Off, the host behaves as
+    /// one from before 3.5; only compatibility tests turn it off. Rust only, not exposed
+    /// through `playdrop-ffi`.
+    pub path_choice: bool,
+    /// The intervals of path checks (protocol.md 3.5). Rust only; tests shorten them.
+    pub path_timing: PathTiming,
 }
 
 impl HostConfig {
@@ -202,6 +213,8 @@ impl HostConfig {
             listener_setup: None,
             accepts_input: false,
             reconnect_for: send::RECONNECT_FOR,
+            path_choice: true,
+            path_timing: PathTiming::default(),
         }
     }
 
@@ -348,6 +361,12 @@ pub(crate) struct Inner {
     /// Wakes the last-known dial loop early (OS network change).
     pub(crate) dial_nudge: tokio::sync::Notify,
     pub(crate) reach: Mutex<HashMap<DeviceId, Reach>>,
+    /// Path checks and their last results per peer (protocol.md 3.5).
+    pub(crate) paths: Mutex<path::Paths>,
+    /// [`HostConfig::path_choice`].
+    pub(crate) path_choice: bool,
+    /// [`HostConfig::path_timing`].
+    pub(crate) path_timing: PathTiming,
     pub(crate) clipboard_echo: Mutex<ClipboardEcho>,
     /// Unix seconds of the last hello or frame per paired peer, updated on every frame.
     /// The pin store holds the persisted copy (written at session start and end only, so
@@ -748,7 +767,8 @@ impl Host {
             SocketAddr::new(config.bind_ip, config.port),
             limits.clone(),
             config.listener_setup.as_deref(),
-        )?;
+        )?
+        .with_path_probe(config.path_choice);
         let local_addr = server.local_addr();
         let pins = Pins::new(store);
         let window_flag = Arc::new(AtomicBool::new(false));
@@ -784,6 +804,9 @@ impl Host {
             dial_locks: Mutex::new(HashMap::new()),
             dial_nudge: tokio::sync::Notify::new(),
             reach: Mutex::new(HashMap::new()),
+            paths: Mutex::new(HashMap::new()),
+            path_choice: config.path_choice,
+            path_timing: config.path_timing,
             clipboard_echo: Mutex::new(ClipboardEcho::default()),
             last_seen: Mutex::new(HashMap::new()),
             free_space: config.free_space,
@@ -1386,12 +1409,35 @@ impl Host {
     /// Tells the host the OS reported a network change (Wi-Fi switch, cable, VPN): re-reads
     /// interfaces, rejoins the beacon group, sends a fresh beacon burst and rotates the
     /// mDNS record (protocol.md 8.1, SR-4), and runs the last-known dial round now instead
-    /// of at the next 5 s tick (still at most one dial per peer per 5 s, 8.3 rule 1).
+    /// of at the next 5 s tick (still at most one dial per peer per 5 s, 8.3 rule 1). Peers
+    /// online over a connection this host dialled get a path check (protocol.md 3.5, at most
+    /// one per peer per 60 s).
     pub fn network_changed(&self) {
         if let Some(d) = lock(&self.inner.discovery).as_ref() {
             d.network_changed();
         }
         self.inner.dial_nudge.notify_one();
+        path::on_network_changed(&self.inner);
+    }
+
+    /// Which path each paired peer is reached over and what the last path check measured
+    /// (protocol.md 3.5), for diagnostics. Lists peers with an outbound connection or a
+    /// past check.
+    pub fn path_reports(&self) -> Vec<PathReport> {
+        path::reports(&self.inner)
+    }
+
+    /// What discovery does with a verified advert (protocol.md 8.3), for tests, which run
+    /// with discovery off. The caller vouches for the address: this skips the tag check.
+    #[doc(hidden)]
+    pub fn verified_advert_for_test(&self, peer: &DeviceId, addr: SocketAddr) {
+        connect::on_verified_advert(&self.inner, *peer, addr, crate::discovery::Via::Beacon);
+    }
+
+    /// How many peers path choice keeps state for, for tests: unpair clears a peer's.
+    #[doc(hidden)]
+    pub fn path_entries_for_test(&self) -> usize {
+        lock(&self.inner.paths).len()
     }
 
     /// Dials a paired peer now if no session is up, using its last-known addresses.

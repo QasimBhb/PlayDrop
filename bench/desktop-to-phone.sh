@@ -4,6 +4,7 @@
 #
 # Usage: bench/desktop-to-phone.sh [--root /tmp/pd-bench] [--peer LABEL] [--runs N]
 #                                  [--datasets "big-1g small-1000 ..."] [--no-verify]
+#                                  [--playdrop PATH]
 #
 # Needs: playdropd running and paired with the phone (CLAUDE.md "Commands" has the start
 # line), the phone on adb and online in `playdrop peers`, bench/make-dataset.sh already
@@ -44,7 +45,8 @@ while [[ $# -gt 0 ]]; do
         --runs) runs="$2"; shift 2 ;;
         --datasets) datasets="$2"; shift 2 ;;
         --no-verify) verify=0; shift ;;
-        -h | --help) sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --playdrop) playdrop="$2"; shift 2 ;;
+        -h | --help) sed -n '2,24p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done

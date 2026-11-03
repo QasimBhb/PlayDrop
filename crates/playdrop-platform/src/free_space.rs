@@ -2,7 +2,7 @@
 //!
 //! The core reads free space through [`FreeSpace`] and uses `statvfs` on Unix. It forbids
 //! `unsafe`, so on Windows its built-in fallback cannot call the system and reports a fixed
-//! huge volume; the daemon plugs this adapter into `HostConfig::free_space` instead, so the
+//! huge volume; the desktop hosts plug this adapter into `HostConfig::free_space` instead, so the
 //! reserve of max(2 GiB, 5%) is enforced at accept and on every write.
 //!
 //! Not compiled or tested on the Linux build machine; Windows CI runs the test below.

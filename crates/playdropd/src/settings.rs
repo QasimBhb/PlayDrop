@@ -320,7 +320,7 @@ fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    crate::at_rest::protect_dir(dir)
+    playdrop_platform::at_rest::protect_dir(dir)
         .with_context(|| format!("restricting {} to this user (SR-28)", dir.display()))
 }
 
@@ -335,14 +335,8 @@ fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
 /// start so an install made before the DACL existed is tightened too; everything the core
 /// creates inside inherits it.
 pub fn prepare_data_dir(dir: &Path) -> anyhow::Result<()> {
-    #[cfg(windows)]
-    {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        crate::at_rest::protect_dir(dir)
-            .with_context(|| format!("restricting {} to this user (SR-28)", dir.display()))
-    }
-    #[cfg(not(windows))]
-    create_private_dir(dir)
+    playdrop_platform::prepare_data_dir(dir)
+        .with_context(|| format!("preparing {} for keys (SR-28)", dir.display()))
 }
 
 /// Makes the rename durable. Best effort: some filesystems refuse to open a directory.

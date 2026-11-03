@@ -105,6 +105,37 @@ impl Incoming {
             _ => false,
         }
     }
+
+    /// True while the owner is delivering this transfer: accepted and moving. An offer
+    /// still waiting for the user carries no bytes, and a transfer quiet for
+    /// [`RECEIVE_QUIET`] has stalled, so neither should keep a host on a worse path.
+    fn is_delivering(&self) -> bool {
+        match &self.state {
+            OfferState::Accepting => true,
+            OfferState::Accepted(rx) => {
+                matches!(
+                    rx.transfer_state(),
+                    TransferState::Accepted | TransferState::Active | TransferState::Pending
+                ) && rx
+                    .last_activity()
+                    .elapsed()
+                    .is_ok_and(|quiet| quiet < RECEIVE_QUIET)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// How long an accepted transfer may go without a byte and still count as being delivered
+/// (protocol.md 3.5).
+const RECEIVE_QUIET: Duration = Duration::from_secs(30);
+
+/// True while `peer` is delivering a transfer to this host. A path check now would compete
+/// with the transfer for the link, slow it down and measure the link as slower than it is.
+pub(crate) fn receiving_from(inner: &Inner, peer: DeviceId) -> bool {
+    lock(&inner.incoming)
+        .values()
+        .any(|e| e.owner == peer && e.is_delivering())
 }
 
 /// The 201 body (protocol.md 7.3).

@@ -4571,7 +4571,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playdrop-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4582,6 +4582,7 @@ dependencies = [
  "http",
  "playdrop-core",
  "playdrop-ipc",
+ "playdrop-platform",
  "serde",
  "serde_json",
  "terminal_size",
@@ -4593,7 +4594,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "base64",
  "blake3",
@@ -4632,7 +4633,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-desktop"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "futures-util",
@@ -4671,7 +4672,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ipc"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "futures-util",
  "playdrop-core",
@@ -4690,8 +4691,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "playdrop-platform"
+version = "0.6.0"
+dependencies = [
+ "playdrop-core",
+ "tempfile",
+ "tokio",
+ "windows",
+]
+
+[[package]]
 name = "playdropd"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4704,6 +4715,7 @@ dependencies = [
  "open",
  "playdrop-core",
  "playdrop-ipc",
+ "playdrop-platform",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -6664,7 +6676,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "uniffi",
 ]

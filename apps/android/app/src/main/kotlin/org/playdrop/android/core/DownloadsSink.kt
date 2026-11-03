@@ -10,6 +10,7 @@ import android.os.Build
 import android.os.Environment
 import android.os.FileUtils
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.MediaStore
 import android.system.ErrnoException
 import android.system.Os
@@ -124,6 +125,7 @@ internal class DownloadsSink(
     private val timings = SinkTimings()
     private val scans = ScanBatcher()
     private val claims = NameClaims()
+    private val listings = FolderListings(LISTING_MS, LISTING_MAX_NAMES, SystemClock::elapsedRealtime)
 
     /** `<staging>/`, the only place a staging file may be renamed from. */
     private val stagingPrefix = stagingDir.absolutePath.trimEnd('/') + "/"
@@ -178,6 +180,7 @@ internal class DownloadsSink(
 
     /** Moves the verified file to its final place (or the landing folder) and returns its `content://` URI. */
     override fun deliver(item: DeliverItem, fd: Int): String {
+        CallbackThreads.keepAttached()
         val start = System.nanoTime()
         // Adopt first so the descriptor is closed on every path, including failures below.
         ParcelFileDescriptor.adoptFd(fd).use { pfd ->
@@ -238,6 +241,8 @@ internal class DownloadsSink(
      */
     fun transferEnded(transferId: String) {
         landingChoice.remove(transferId)
+        // Nothing is delivering: the names of the last folders need not stay in memory.
+        if (landingChoice.isEmpty()) listings.clear()
         scan(transferId, scans.drain(transferId))
         timings.finish(transferId)?.let { HostLog.d("sink", "transfer ${transferId.take(8)}: ${it.line()}") }
     }
@@ -246,6 +251,39 @@ internal class DownloadsSink(
 
     /** `getExternalFilesDir("landing")`, or null when shared storage is not available. */
     fun landingRoot(): File? = app.getExternalFilesDir(area)
+
+    /**
+     * The landing root for delivery only, once found: `getExternalFilesDir` checks (and may
+     * create) the folder on every call, about 0.15 ms on the test phone, paid once per
+     * received file otherwise. Folders below it are still created on demand
+     * ([ensureLandingDir]), and a landing that fails goes straight to Downloads. The mover
+     * asks [landingRoot] each time: it must see that storage has gone, or it would take
+     * files it cannot see for files that are gone.
+     */
+    private fun deliveryLandingRoot(): File? =
+        deliveryRootCache ?: landingRoot()?.also { deliveryRootCache = it }
+
+    @Volatile
+    private var deliveryRootCache: File? = null
+
+    /** When shared storage was last seen mounted ([storageMountedForLanding]). */
+    @Volatile
+    private var mountedSeenAt = -MOUNT_CHECK_MS
+
+    /**
+     * For landing only: true when shared storage is mounted, asking the platform at most once
+     * per [MOUNT_CHECK_MS] while it is (a binder call, about 0.15 ms on the test phone, which
+     * once per received file added up to most of a second per 5,000 files). A landing during
+     * an unmount in that window fails and the file goes the direct way, which asks again
+     * before anything it does can turn direct writes off.
+     */
+    private fun storageMountedForLanding(): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (now - mountedSeenAt in 0 until MOUNT_CHECK_MS) return true
+        val mounted = Environment.getExternalStorageState() == Environment.MEDIA_MOUNTED
+        if (mounted) mountedSeenAt = now
+        return mounted
+    }
 
     /** The landing folder of [transferId] (whether or not it exists). */
     fun landingDir(transferId: String): File? = landingRoot()?.let { File(it, transferId) }
@@ -745,20 +783,14 @@ internal class DownloadsSink(
     @RequiresApi(Build.VERSION_CODES.R)
     private fun deliverToLanding(item: DeliverItem, name: String, input: FileDescriptor, fd: Int): String? {
         val t = item.transferId
-        if (Environment.getExternalStorageState() != Environment.MEDIA_MOUNTED) return null
-        val root = landingRoot() ?: return null
+        if (!storageMountedForLanding()) return null
+        val root = deliveryLandingRoot() ?: return null
         val dirs = FileNames.receivedDirs(item.path)
         val downloadsDir = File(receiveRoot(), dirs.joinToString("/"))
         val landingDir = File(root, LandingPaths.landingRel(t, dirs, name).dropLast(1).joinToString("/"))
         // Promise a Downloads name that exists nowhere and is promised to nobody else.
-        val promised = timed(t, "claim") {
-            claims.inFolder(downloadsDir.path) {
-                FileNames.firstFree(name, MAX_NUMBERED) { cand ->
-                    val target = File(downloadsDir, cand).path
-                    claims.heldByOther(target, null) || File(target).exists()
-                }?.also { cand -> claims.reserve(File(downloadsDir, cand).path, File(landingDir, cand).path) }
-            }
-        } ?: throw PlayDropException.Other("Could not save $name: too many files with that name")
+        val promised = timed(t, "claim") { promiseName(downloadsDir, landingDir, name) }
+            ?: throw PlayDropException.Other("Could not save $name: too many files with that name")
         val target = File(downloadsDir, promised)
         val landed = File(landingDir, promised)
         try {
@@ -770,6 +802,41 @@ internal class DownloadsSink(
         }
         landedTransfers.add(t)
         return timed(t, "uri") { receivedUri(target, dirs) }
+    }
+
+    /**
+     * Picks and promises the first name for [name] in [downloadsDir] that exists nowhere and
+     * is promised to nobody else, for a file landing in [landingDir]; null when every
+     * numbered name is taken.
+     *
+     * A `stat` per name on shared storage is a call into MediaProvider (0.5 ms and more on
+     * the test phone, and it does not get faster from several threads), so the first pick
+     * comes from a listing of the folder ([FolderListings]) taken at most [LISTING_MS] ago and
+     * since which nothing in this process could have created a file there
+     * ([NameClaims.generation]). The pick stands when that still holds under the folder
+     * lock; else the names are checked again under the lock, one `stat` each, as before.
+     * Another app creating the name meanwhile is not covered, as before: the mover then
+     * puts the file at the next free name and records the move.
+     */
+    private fun promiseName(downloadsDir: File, landingDir: File, name: String): String? {
+        val folder = downloadsDir.path
+        val held = { cand: String -> claims.heldByOther(File(downloadsDir, cand).path, null) }
+        val seen = claims.generation(folder)
+        val listed = listings.names(folder, seen) {
+            downloadsDir.list()?.toList() ?: if (downloadsDir.exists()) null else emptyList()
+        }
+        val guess = listed?.let { names ->
+            FileNames.firstFree(name, MAX_NUMBERED) { cand -> held(cand) || CaseFold.key(cand) in names }
+        }
+        return claims.inFolder(folder, changesFiles = false) {
+            val stands = guess != null && claims.generation(folder) == seen && !held(guess)
+            val cand = if (stands) {
+                guess
+            } else {
+                FileNames.firstFree(name, MAX_NUMBERED) { cand -> held(cand) || File(downloadsDir, cand).exists() }
+            }
+            cand?.also { claims.reserve(File(downloadsDir, it).path, File(landingDir, it).path) }
+        }
     }
 
     /** Renames the staging file to [file] in [dir], else copies it there. Throws on failure. */
@@ -828,7 +895,10 @@ internal class DownloadsSink(
     }
 
     private fun renameFailed(gate: RenameGate, e: ErrnoException) {
-        val (decision, closedNow) = gate.failed(errnoKind(e.errno))
+        // Asked only now, and of the platform: "mounted" may be up to a second old, and a
+        // rename refused because storage just went says nothing about the route.
+        val mounted = Environment.getExternalStorageState() == Environment.MEDIA_MOUNTED
+        val (decision, closedNow) = gate.failed(errnoKind(e.errno), mounted)
         val why = OsConstants.errnoName(e.errno) ?: e.errno.toString()
         when {
             closedNow -> HostLog.i("sink", "rename ${gate.route} refused ($why) after ${gate.renamed} renames; copying from now on")
@@ -1056,6 +1126,20 @@ internal class DownloadsSink(
 
         /** Gives up on a name after this many " (n)" tries. */
         private const val MAX_NUMBERED = 10_000
+
+        /** How long a Downloads folder listing serves name checks ([FolderListings]). */
+        private const val LISTING_MS = 2_000L
+
+        /**
+         * A folder with more names than this is not kept as a listing ([FolderListings]). A
+         * listing costs about 80 us per name on the test phone (5,000 names: 0.39 s) and a
+         * `stat` about 0.5 ms, so at 2,800 files per [LISTING_MS] listing stops paying at
+         * about 18,000 names; 10,000 keeps a margin and at most about 1.4 MB of names.
+         */
+        private const val LISTING_MAX_NAMES = 10_000
+
+        /** How long a "mounted" answer from the platform is reused ([storageMountedForLanding]). */
+        private const val MOUNT_CHECK_MS = 1_000L
 
         /** MIME type from the file extension, or `application/octet-stream`. */
         fun guessMime(name: String): String =

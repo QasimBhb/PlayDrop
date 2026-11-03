@@ -1,12 +1,14 @@
 //! The listening side: exclusive bind, connection limits, TLS accept, HTTP/2 accept and
-//! request routing. Implements protocol.md section 1 (port rules), 3.1, 6.1 and section 10
-//! (SR-11, SR-13, SR-15, SR-31).
+//! request routing. Implements protocol.md section 1 (port rules), 3.1, 3.5 (the probe
+//! endpoint, and no connection counted as a replacement before its first other request),
+//! 6.1 and section 10 (SR-11, SR-13, SR-15, SR-31).
 
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,9 +19,11 @@ use http::{Method, Request, StatusCode};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
-use super::connection::{short, CloseReason, Connection, Direction};
+use super::connection::{short, ActivityIo, CloseReason, Connection, Direction, DRAIN_GRACE};
+use super::probe;
 use super::{respond_error, server_builder, stopped, tune_socket, HttpError};
 use crate::constants::FORBIDDEN_PORTS;
+use crate::identity::DeviceId;
 use crate::session::{ConnectionCounter, ErrorCode, HandshakeGate, Limits};
 use crate::tls::{self, PeerTrust, PinLookup};
 use crate::{Error, Result};
@@ -31,6 +35,10 @@ pub const SESSION_PATH: &str = "/v1/session";
 /// How long a closing connection may take to flush its GOAWAY before it is dropped.
 const CLOSE_GRACE: Duration = Duration::from_secs(1);
 
+/// The same for an unpaired peer. *Choice:* 300 ms: with the 200 ms the host waits for the
+/// `unpair` frame to go out, the connection is gone well inside the 1 s of SR-14.
+const UNPAIR_CLOSE_GRACE: Duration = Duration::from_millis(300);
+
 /// A boxed request handler future.
 pub type HandlerFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 
@@ -39,6 +47,16 @@ pub trait Router: Send + Sync + 'static {
     /// A connection finished its TLS and HTTP/2 handshakes. Pinned or unpaired, see
     /// [`Connection::is_trusted`].
     fn connection_opened(&self, conn: &Arc<Connection>);
+
+    /// The connection carried its first request other than a path probe (protocol.md 3.5:
+    /// a dialler may hold a second connection for probing only, and that one must not
+    /// replace the connection in use under 3.3). Called at most once per connection,
+    /// after [`Router::connection_opened`] and before that request is handled; never for
+    /// a connection that only probed. A server without path probes calls it right after
+    /// the handshake.
+    fn connection_in_use(&self, conn: &Arc<Connection>) {
+        let _ = conn;
+    }
 
     /// Handles one request. The server has already applied the SR-13 gate: an unpaired
     /// connection only reaches `POST /v1/session` here.
@@ -76,6 +94,8 @@ pub struct Server {
     listener: TcpListener,
     local: SocketAddr,
     limits: Limits,
+    path_probe: bool,
+    not_in_use_timeout: Duration,
 }
 
 /// The listening socket before it is bound, as [`ListenerSetup::before_bind`] sees it.
@@ -151,7 +171,28 @@ impl Server {
             listener,
             local,
             limits,
+            path_probe: true,
+            not_in_use_timeout: NOT_IN_USE_TIMEOUT,
         })
+    }
+
+    /// Whether to serve `GET /v1/probe` and report a connection in use
+    /// ([`Router::connection_in_use`]) only at its first other request (protocol.md 3.5).
+    /// On by default. Off, the server behaves as one from before 3.5: the probe path is
+    /// the router's (`404`) and every connection is in use right after its handshake.
+    /// Hosts turn it off only to test compatibility.
+    #[must_use]
+    pub fn with_path_probe(mut self, on: bool) -> Self {
+        self.path_probe = on;
+        self
+    }
+
+    /// How long a connection may stay open without a request other than a probe. The
+    /// default is [`NOT_IN_USE_TIMEOUT`]; tests shorten it.
+    #[must_use]
+    pub fn with_not_in_use_timeout(mut self, timeout: Duration) -> Self {
+        self.not_in_use_timeout = timeout;
+        self
     }
 
     /// The bound address (the real port when bound to port 0).
@@ -175,6 +216,7 @@ impl Server {
             self.limits.max_connections_total,
         );
         let gate = HandshakeGate::new(self.limits.max_pending_handshakes);
+        let unused = UnusedBook::default();
         let limits = Arc::new(self.limits);
         let mut conns = tokio::task::JoinSet::new();
         loop {
@@ -209,6 +251,9 @@ impl Server {
                 limits: Arc::clone(&limits),
                 unpaired: unpaired.clone(),
                 shutdown: shutdown.clone(),
+                path_probe: self.path_probe,
+                not_in_use_timeout: self.not_in_use_timeout,
+                unused: unused.clone(),
             };
             conns.spawn(async move {
                 let _permit = permit;
@@ -228,6 +273,62 @@ struct ConnCtx {
     limits: Arc<Limits>,
     unpaired: ConnectionCounter,
     shutdown: watch::Receiver<bool>,
+    path_probe: bool,
+    not_in_use_timeout: Duration,
+    unused: UnusedBook,
+}
+
+/// How long a connection may stay open without a request other than a probe
+/// (protocol.md 3.5, SR-15). *Choice:* a dialler's held alternatives are probed and
+/// either put in use or closed within a few seconds; 20 s leaves room for a slow phone.
+pub const NOT_IN_USE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Most connections from one peer that are open but not yet in use (protocol.md 3.5,
+/// SR-15); a newer one closes the oldest. A dialler holds at most two alternatives.
+pub const MAX_NOT_IN_USE_PER_PEER: usize = 2;
+
+/// Connections per peer that have carried no request other than a probe, oldest first,
+/// so a pinned peer cannot fill the per-address and total limits with them (SR-15).
+#[derive(Clone, Default)]
+struct UnusedBook(Arc<std::sync::Mutex<HashMap<DeviceId, VecDeque<Arc<Connection>>>>>);
+
+impl UnusedBook {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<DeviceId, VecDeque<Arc<Connection>>>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Adds a fresh connection; closes the oldest beyond the per-peer cap.
+    fn add(&self, conn: &Arc<Connection>) {
+        let evicted = {
+            let mut book = self.lock();
+            let list = book.entry(conn.device_id()).or_default();
+            list.push_back(Arc::clone(conn));
+            if list.len() > MAX_NOT_IN_USE_PER_PEER {
+                list.pop_front()
+            } else {
+                None
+            }
+        };
+        if let Some(old) = evicted {
+            tracing::debug!(peer = %short(&old.device_id()), "too many connections not in use; oldest closed");
+            // Nothing in use runs on it, so the short close grace is enough.
+            old.close(CloseReason::Dead);
+        }
+    }
+
+    /// Forgets a connection that went into use or ended.
+    fn remove(&self, conn: &Connection) {
+        let mut book = self.lock();
+        let id = conn.device_id();
+        if let Some(list) = book.get_mut(&id) {
+            list.retain(|c| c.id() != conn.id());
+            if list.is_empty() {
+                book.remove(&id);
+            }
+        }
+    }
 }
 
 async fn serve_connection(
@@ -269,7 +370,9 @@ async fn serve_connection(
             return;
         }
     };
-    let handshake = server_builder(&ctx.limits).handshake::<_, Bytes>(stream);
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let handshake = server_builder(&ctx.limits)
+        .handshake::<_, Bytes>(ActivityIo::new(stream, Arc::clone(&bytes_read)));
     let mut h2conn = match tokio::time::timeout(ctx.limits.handshake_timeout, handshake).await {
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
@@ -291,46 +394,141 @@ async fn serve_connection(
         None,
         ping,
         ctx.limits.max_resets_per_second,
+        bytes_read,
     );
     tracing::debug!(peer = %short(&conn.device_id()), trusted = conn.is_trusted(), "inbound connection");
-    ctx.router.connection_opened(&conn);
+    // Before the router can ask for a close: a `watch` receiver does not report a value set
+    // before it subscribed, and `connection_opened` closes a connection unpaired meanwhile.
     let mut close_rx = conn.close_requested();
+    ctx.router.connection_opened(&conn);
+    // protocol.md 3.5: the router hears the connection is in use at its first request
+    // other than a probe, so one held only for probing never replaces another (3.3).
+    let mut in_use = !ctx.path_probe;
+    if in_use {
+        ctx.router.connection_in_use(&conn);
+    } else {
+        ctx.unused.add(&conn);
+    }
+    let idle_deadline = tokio::time::Instant::now() + ctx.not_in_use_timeout;
+    let mut idle_armed = true;
     loop {
         tokio::select! {
             biased;
             () = stopped(&mut ctx.shutdown) => break,
+            () = tokio::time::sleep_until(idle_deadline), if idle_armed && !in_use => {
+                tracing::debug!(peer = %short(&conn.device_id()), "connection never used; closed");
+                idle_armed = false;
+                conn.close(CloseReason::Dead);
+            }
+            // Before `accept`: once a close is asked for (unpair, SR-14), no further
+            // request reaches the router except as `shut_down` allows.
+            _ = close_rx.changed() => {
+                shut_down(&mut h2conn, &mut close_rx, &ctx, &conn, &mut in_use).await;
+                break;
+            }
             next = h2conn.accept() => match next {
-                Some(Ok((req, respond))) => route(&ctx.router, &conn, req, respond),
+                Some(Ok((req, respond))) => dispatch(&ctx, &conn, &mut in_use, req, respond),
                 Some(Err(e)) => {
                     tracing::debug!(error = %e, "HTTP/2 connection error");
                     break;
                 }
                 None => break,
             },
-            _ = close_rx.changed() => {
-                let reason = *close_rx.borrow();
-                match reason {
-                    // Host shutdown: drop at once, no grace period.
-                    Some(CloseReason::Shutdown) => break,
-                    Some(CloseReason::ResetFlood) => h2conn.abrupt_shutdown(Reason::ENHANCE_YOUR_CALM),
-                    Some(CloseReason::Protocol) => h2conn.abrupt_shutdown(Reason::PROTOCOL_ERROR),
-                    // GOAWAY NO_ERROR. `h2` cannot attach the `duplicate_connection` debug
-                    // data of protocol.md 3.3; see the implementation notes.
-                    _ => h2conn.graceful_shutdown(),
-                }
-                let _ = tokio::time::timeout(
-                    CLOSE_GRACE,
-                    std::future::poll_fn(|cx| h2conn.poll_closed(cx)),
-                )
-                .await;
-                break;
-            }
         }
     }
     drop(h2conn);
     drop(unpaired_permit);
+    ctx.unused.remove(&conn);
     conn.mark_closed();
     ctx.router.connection_closed(&conn);
+}
+
+/// Ends a connection the host asked to close: at once at shutdown, with an error after
+/// a flood or protocol error, otherwise with GOAWAY and a grace for open streams. A
+/// connection replaced by a newer one from the same dialler still serves what the dialler
+/// sent before it saw the GOAWAY (protocol.md 3.5), so such a request is answered instead
+/// of hanging for the grace; any other closing connection serves nothing more (SR-14).
+async fn shut_down<T>(
+    h2conn: &mut h2::server::Connection<T, Bytes>,
+    close_rx: &mut watch::Receiver<Option<CloseReason>>,
+    ctx: &ConnCtx,
+    conn: &Arc<Connection>,
+    in_use: &mut bool,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let reason = *close_rx.borrow_and_update();
+    match reason {
+        // Host shutdown: drop at once, no grace period.
+        Some(CloseReason::Shutdown) => return,
+        Some(CloseReason::ResetFlood) => h2conn.abrupt_shutdown(Reason::ENHANCE_YOUR_CALM),
+        Some(CloseReason::Protocol) => h2conn.abrupt_shutdown(Reason::PROTOCOL_ERROR),
+        // GOAWAY NO_ERROR. `h2` cannot attach the `duplicate_connection` debug data of
+        // protocol.md 3.3; see the implementation notes.
+        _ => h2conn.graceful_shutdown(),
+    }
+    let grace = match reason {
+        Some(r) if r.is_graceful() => DRAIN_GRACE,
+        Some(CloseReason::Unpaired) => UNPAIR_CLOSE_GRACE,
+        _ => CLOSE_GRACE,
+    };
+    let serving = reason.is_some_and(CloseReason::is_graceful);
+    let deadline = tokio::time::sleep(grace);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            () = &mut deadline => return,
+            // A harder close (unpair, shutdown, dead) while open streams finish: drop
+            // the connection at once (SR-14).
+            r = close_rx.changed() => {
+                if r.is_err() || !close_rx.borrow().is_some_and(CloseReason::is_graceful) {
+                    return;
+                }
+            }
+            next = h2conn.accept() => match next {
+                Some(Ok((req, respond))) => {
+                    if serving {
+                        dispatch(ctx, conn, in_use, req, respond);
+                    }
+                }
+                Some(Err(_)) | None => return,
+            },
+        }
+    }
+}
+
+/// Sends a probe to [`route_probe`] and anything else to the router, telling the router
+/// the connection is in use first if this is its first such request (protocol.md 3.5).
+fn dispatch(
+    ctx: &ConnCtx,
+    conn: &Arc<Connection>,
+    in_use: &mut bool,
+    req: Request<RecvStream>,
+    respond: SendResponse<Bytes>,
+) {
+    if ctx.path_probe && probe::is_probe(&req) {
+        route_probe(conn, req, respond);
+        return;
+    }
+    if !*in_use {
+        *in_use = true;
+        ctx.unused.remove(conn);
+        ctx.router.connection_in_use(conn);
+    }
+    route(&ctx.router, conn, req, respond);
+}
+
+/// `GET /v1/probe` (protocol.md 3.5): pinned connections only (SR-13), then the probe
+/// limits of SR-15.
+fn route_probe(conn: &Arc<Connection>, req: Request<RecvStream>, mut respond: SendResponse<Bytes>) {
+    if !conn.is_trusted() {
+        tokio::spawn(async move {
+            let err = HttpError::new(StatusCode::FORBIDDEN, ErrorCode::NotPaired, "");
+            let _ = respond_error(&mut respond, &err).await;
+        });
+        return;
+    }
+    tokio::spawn(probe::serve(Arc::clone(conn), req, respond));
 }
 
 /// Applies the SR-13 gate, then hands the request to the router on its own task.

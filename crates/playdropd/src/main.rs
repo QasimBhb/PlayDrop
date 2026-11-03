@@ -24,24 +24,17 @@
 //! - `media`: local media players (MPRIS on Linux, GSMTC on Windows) for the `media`
 //!   frames (protocol.md 5.9). Phase 5.
 //! - `control`: the glue for both: one injector task per controlling peer, the media feed.
-//! - `at_rest` (Windows): DPAPI sealing of keys and pins, the owner-only data dir DACL
-//!   (SR-28).
-//! - `free_space` (Windows): free space of the receive volume for the SR-20 reserve.
-//! - `listener` (Windows): `SO_EXCLUSIVEADDRUSE` on the listening port (SR-31).
+//!
+//! Windows free space, DPAPI sealing and the exclusive port (SR-20, SR-28, SR-31) live in
+//! `playdrop-platform`, shared with `playdrop host`.
 
-#[cfg(windows)]
-mod at_rest;
 mod autostart;
 mod battery;
 mod cli;
 mod clipboard;
 mod control;
 mod daemon;
-#[cfg(windows)]
-mod free_space;
 mod input;
-#[cfg(windows)]
-mod listener;
 mod lock;
 mod media;
 mod network;

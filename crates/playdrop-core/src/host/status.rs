@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
 use super::session::Session;
-use super::{lock, Inner};
+use super::{lock, path, Inner};
 use crate::identity::DeviceId;
 use crate::session::types::{
     Battery, Capability, Frame, Media, MediaAction, MediaCommand, MediaStateFrame, Presence,
@@ -235,6 +235,7 @@ pub(crate) fn set_battery(inner: &Arc<Inner>, level: u8, charging: bool, low: bo
     for s in inner.registry.sessions() {
         battery_to(inner, &s);
     }
+    path::on_own_power_changed(inner);
 }
 
 /// Sends the remembered battery to one session, now or deferred (5.8).
@@ -277,6 +278,7 @@ pub(crate) fn set_presence(
     for s in inner.registry.sessions() {
         s.send(Frame::Presence(p.clone()));
     }
+    path::on_own_power_changed(inner);
 }
 
 /// At session start: the remembered battery (always, 5.8), presence (5.10) and, for a

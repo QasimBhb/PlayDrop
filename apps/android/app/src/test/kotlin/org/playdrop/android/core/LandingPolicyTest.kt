@@ -83,4 +83,13 @@ class LandingPolicyTest {
         assertFalse(g.succeeded())
         assertEquals(2L, g.renamed)
     }
+
+    @Test
+    fun aRefusalWhileStorageIsGoneLeavesTheGateOpen() {
+        val gate = RenameGate("test")
+        assertEquals(RenameDecision.COPY_THIS_FILE to false, gate.failed(ErrnoKind.ACCESS, mounted = false))
+        assertTrue(gate.open)
+        assertEquals(RenameDecision.COPY_FROM_NOW_ON to true, gate.failed(ErrnoKind.ACCESS))
+        assertFalse(gate.open)
+    }
 }

@@ -64,9 +64,11 @@ pub trait ReceiveSink: Send + Sync + fmt::Debug {
     /// Called once per verified file (and once per empty file), from a blocking thread:
     /// for a streamed file after the root hash check; for a bundle member as soon as the
     /// member's bytes are chunk-verified and durable, before the bundle root arrives (so
-    /// while the bundle still streams, from the core's own delivery thread; Phase 8,
-    /// section 11). After a process kill the one file in flight may be delivered a second
-    /// time. `file` is the verified staging file, open read-only at offset 0. The sink copies or moves it to its final place and returns where it went
+    /// while the bundle still streams, from the core's own delivery threads; Phase 8,
+    /// section 11). Calls overlap: streamed files and bundle members each go out several
+    /// at a time. After a process kill the files in flight (for a bundle at most four)
+    /// may be delivered a second time, and a sink that keeps every copy then shows them twice
+    /// (Android: `a.txt` and `a (1).txt` in Downloads). `file` is the verified staging file, open read-only at offset 0. The sink copies or moves it to its final place and returns where it went
     /// (an Android `content://` URI, a path, or any string the UI can open). The core
     /// deletes the staging file afterwards whatever the sink did.
     fn deliver(&self, item: DeliverItem, file: std::fs::File) -> Result<String, SinkError>;

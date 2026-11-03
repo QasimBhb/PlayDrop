@@ -13,9 +13,10 @@ use h2::{RecvStream, SendStream};
 use http::{Method, Request, StatusCode};
 use tokio::sync::{mpsc, watch};
 
-use super::events::{HostEvent, Secret};
+use super::events::{HostEvent, Secret, TransferDirection};
 use super::registry::Placement;
-use super::{blobs, input, lock, outbox, pairing, receive, send, send_resume, status, Inner};
+use super::transfers::TransferStatus;
+use super::{blobs, input, lock, outbox, pairing, path, receive, send, send_resume, status, Inner};
 use crate::identity::DeviceId;
 use crate::net::connection::short;
 use crate::net::server::SESSION_PATH;
@@ -27,6 +28,7 @@ use crate::pin_store::{AnnounceKey as PinAnnounceKey, Grants};
 use crate::session::types::{
     AnnounceKey, CapabilitiesFrame, Capability, Caps, Frame, GrantKind, Hello, Media, Trust,
 };
+use crate::session::types::{PresenceState, TransferFrame, TransferState as FrameState};
 use crate::session::{
     may_send_frame, validate_hello, ErrorCode, Inbound, InboundDecoder, OutboundEncoder,
     TrustCheck, ValidatedHello,
@@ -78,6 +80,9 @@ pub(crate) const LOCAL_OUT: &[Capability] = &[
     Capability::InputPresenter,
 ];
 
+/// How long a replaced session stays open if the peer sends nothing on the new one.
+const REPLACED_SESSION_WAIT: Duration = Duration::from_secs(5);
+
 /// Time allowed for a closing session to flush its last frames.
 const FLUSH_GRACE: Duration = Duration::from_millis(200);
 
@@ -113,6 +118,9 @@ struct State {
     forbidden_sent: HashSet<String>,
     /// `(seq, type)` of the last frames we sent, newest last, for `error.re` lookups.
     sent_types: VecDeque<(u64, String)>,
+    /// The session this one replaced, still open until the peer has placed this one too
+    /// ([`Session::end_replaced`]).
+    replaced: Option<Arc<Session>>,
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -125,6 +133,8 @@ pub(crate) struct Session {
     state: Mutex<State>,
     hello_tx: watch::Sender<bool>,
     live: AtomicBool,
+    /// Turns true when the stream has ended and every frame it carried has been handled.
+    ended_tx: watch::Sender<bool>,
 }
 
 impl std::fmt::Debug for Session {
@@ -146,6 +156,7 @@ impl Session {
             state: Mutex::new(State::default()),
             hello_tx: watch::Sender::new(false),
             live: AtomicBool::new(true),
+            ended_tx: watch::Sender::new(false),
         });
         (s, rx)
     }
@@ -227,6 +238,38 @@ impl Session {
         let _ = self.tx.send(Out::Frame(frame, re));
     }
 
+    /// Ends the session this one replaced, if any (protocol.md 3.3). Called once the peer
+    /// has shown it placed this one: ending the old stream sooner could reach the peer
+    /// before our `hello` on the other connection, and for that moment it would have no
+    /// session, would report this host offline and would lose what it was sending.
+    fn end_replaced(&self) {
+        let replaced = lock(&self.state).replaced.take();
+        if let Some(old) = replaced {
+            old.end();
+        }
+    }
+
+    /// Called with the first frame after `hello`, which shows the peer placed this session:
+    /// ends the old stream, then waits until every frame it still carries has been handled,
+    /// so frames stay in order across the move. Ending it first is what makes the peer end
+    /// its side too, so the two sides cannot wait for each other; the wait is bounded for a
+    /// path too slow to drain in time, and frames can then overtake older ones.
+    async fn settle_replaced(&self) {
+        let replaced = lock(&self.state).replaced.take();
+        let Some(old) = replaced else {
+            return;
+        };
+        old.end();
+        let mut ended = old.ended_tx.subscribe();
+        tokio::select! {
+            _ = ended.wait_for(|e| *e) => {}
+            () = tokio::time::sleep(REPLACED_SESSION_WAIT) => {
+                tracing::debug!(peer = %short(&self.peer()), "old session did not end in time");
+            }
+            () = self.conn.closed() => {}
+        }
+    }
+
     /// Ends our direction of the stream after queued frames.
     pub(crate) fn end(&self) {
         let _ = self.tx.send(Out::End);
@@ -305,8 +348,10 @@ pub(crate) async fn accept_inbound(
     req: Request<RecvStream>,
     mut respond: SendResponse<Bytes>,
 ) {
-    let conflict = !conn.claim_session()
-        || (conn.is_trusted() && inner.registry.placement(&conn) == Placement::Reject);
+    // Placement first: a `409` because a preferred session is live must not take the claim,
+    // or this connection could never carry a session once that one ends (3.3, 5.1).
+    let conflict = (conn.is_trusted() && inner.registry.placement(&conn) == Placement::Reject)
+        || !conn.claim_session();
     if conflict {
         let err = HttpError::from_code(ErrorCode::Conflict, "a session stream already exists");
         let _ = respond_error(&mut respond, &err).await;
@@ -316,7 +361,10 @@ pub(crate) async fn accept_inbound(
     let send = match respond.send_response(head, false) {
         Ok(s) => s,
         Err(e) => {
+            // The dialler cancelled the request (a stalled path switch, 3.5). Give the
+            // claim back, or every later session request on this connection gets `409`.
             tracing::debug!(error = %e, "session response failed");
+            conn.release_session();
             return;
         }
     };
@@ -437,7 +485,9 @@ fn on_end(inner: &Arc<Inner>, sess: &Arc<Session>) {
     tracing::debug!(peer = %short(&sess.peer()), session = sess.id, conn = sess.conn.id(), "session ended");
     sess.live.store(false, Ordering::Release);
     sess.end();
+    sess.end_replaced();
     sess.conn.release_session();
+    sess.ended_tx.send_replace(true);
     if inner.registry.uninstall(sess) {
         let id = sess.peer();
         input::on_session_end(inner, id);
@@ -505,9 +555,16 @@ async fn handle_frame(
         sess.conn.close(CloseReason::Protocol);
         return Err(Fatal);
     }
+    // Any frame after `hello` means the peer has placed this session: it sends
+    // `announce_key` right after placing one (`activate`).
+    sess.settle_replaced().await;
     let peer = sess.peer();
     let t = env.frame.type_name().to_owned();
     if sess.conn.is_trusted() {
+        // Unpaired while this frame was held, or just now: it is not handled (SR-14).
+        if !inner.pins.contains(&peer) {
+            return Ok(());
+        }
         // Authorisation uses the TLS-authenticated Device ID only (SR-13, SR-14).
         if let Some(g) = env.frame.required_grant() {
             let ok = inner
@@ -562,16 +619,22 @@ async fn handle_frame(
                 sensitive: c.sensitive,
             });
         }
-        Frame::Battery(b) => inner.emit(HostEvent::Battery {
-            peer: hex,
-            level: b.level,
-            charging: b.charging,
-            low: b.low,
-        }),
-        Frame::Presence(p) => inner.emit(HostEvent::Presence {
-            peer: hex,
-            state: p.state.to_string(),
-        }),
+        Frame::Battery(b) => {
+            path::note_peer_battery(inner, peer, b.low && !b.charging);
+            inner.emit(HostEvent::Battery {
+                peer: hex,
+                level: b.level,
+                charging: b.charging,
+                low: b.low,
+            });
+        }
+        Frame::Presence(p) => {
+            path::note_peer_presence(inner, peer, p.state == PresenceState::Asleep);
+            inner.emit(HostEvent::Presence {
+                peer: hex,
+                state: p.state.to_string(),
+            });
+        }
         Frame::Media(Media::State(m)) => inner.emit(HostEvent::MediaState {
             peer: hex,
             state: m.into(),
@@ -680,6 +743,19 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
         sess.end();
         return;
     }
+    // Unpaired while this session was opening: it must not stay placed for a forgotten peer,
+    // or be reported online after `Unpaired`. Unpair removes the pin and then forgets the
+    // link, so with the session placed first, either this check sees the pin gone or the
+    // forget removes the session.
+    if !inner.pins.contains(&peer) {
+        tracing::debug!(peer = %short(&peer), "session for an unpaired peer not placed");
+        inner.registry.uninstall(sess);
+        sess.end();
+        if let Some(old) = old {
+            old.end();
+        }
+        return;
+    }
     // Record the time before announcing the peer: a UI that reads `peers()` on the
     // online event must already see a last-seen time (SR-8).
     inner.touch_peer(peer);
@@ -694,18 +770,58 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
     }
     if let Some(old) = old {
         tracing::debug!(peer = %short(&peer), "session moved to the preferred connection (3.3)");
-        old.end();
+        // Stays open until the peer has placed this session too (`end_replaced`), so
+        // neither side is ever without a session. A peer that never sends another frame
+        // must not keep it for good.
+        lock(&sess.state).replaced = Some(old);
+        let s2 = Arc::clone(sess);
+        inner.spawn(async move {
+            tokio::time::sleep(REPLACED_SESSION_WAIT).await;
+            s2.end_replaced();
+        });
     }
     sess.conn.start_keepalive(KeepAlive {
         local: inner.keepalive,
         peer: Duration::from_secs(u64::from(v.keep_alive.max(1))),
     });
+    // A session placed anew: what the peer said about its battery and presence is old, and
+    // it repeats what it has right after its `hello` (5.8, 5.10). A moved one keeps it.
+    if matches!(placement, Placement::Install) {
+        path::on_session_placed(inner, peer);
+    }
     sess.send_raw(announce_key_frame(inner), None);
+    // A decision made while no session was up never reached the sender, which only waits
+    // for the frame (7.3): say again which of its offers were accepted.
+    resend_accepted(inner, sess);
     // Session start: remembered battery and presence (5.8, 5.10), waiting outbox (5.11).
     status::on_activate(inner, sess);
     outbox::notify(inner, peer);
     // Sends that gave up while the peer was away resume now (protocol.md 7.6).
     send_resume::resume_for_peer(inner, peer);
+}
+
+/// Sends `accepted` again for every receive from this peer still running. Harmless to a
+/// sender that already had it, and without it one that lost it (the session was moving to
+/// another path or had dropped when the user accepted) waits until the offer expires.
+fn resend_accepted(inner: &Inner, sess: &Session) {
+    let hex = sess.peer().to_hex();
+    let ids: Vec<String> = lock(&inner.transfers)
+        .list()
+        .into_iter()
+        .filter(|t| {
+            t.peer == hex
+                && t.direction == TransferDirection::Receive
+                && t.state == TransferStatus::Active
+        })
+        .map(|t| t.id)
+        .collect();
+    for id in ids {
+        sess.send(Frame::Transfer(TransferFrame {
+            id,
+            state: FrameState::Accepted,
+            reason: None,
+        }));
+    }
 }
 
 async fn store_announce_key(inner: &Arc<Inner>, peer: DeviceId, k: &AnnounceKey) {
@@ -750,6 +866,8 @@ pub(crate) async fn unpair(inner: &Arc<Inner>, peer: DeviceId, notify: bool) -> 
     send_resume::drop_peer(inner, &peer).await;
     outbox::drop_peer(inner, &peer).await;
     lock(&inner.status).forget(&peer);
+    // A device paired again starts fresh: no tried addresses, no back-off.
+    lock(&inner.paths).remove(&peer);
     for s in inner.registry.sessions() {
         if s.peer() != peer {
             s.send_raw(announce_key_frame(inner), None);

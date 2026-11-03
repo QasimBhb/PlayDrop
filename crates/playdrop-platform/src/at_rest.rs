@@ -4,13 +4,13 @@
 //! [`SecretStore`] (`docs/core-api.md` section 2a).
 //!
 //! The core seals a plain file the first time it reads it with a store configured, so an
-//! existing install migrates on its first start with this daemon. A sealed file cannot be
-//! read by a daemon without the store (an older release), which then refuses to start
+//! existing install migrates on its first start with these hooks. A sealed file cannot be
+//! read by a host without the store (an older release), which then refuses to start
 //! instead of making a new identity.
 //!
 //! The DACL lives here, not in the core: the core forbids `unsafe` and has no Windows
-//! security APIs. The daemon secures the data dir before it starts the core
-//! ([`crate::settings::prepare_data_dir`]), and everything the core creates inside it later
+//! security APIs. Each desktop host secures the data dir before it starts the core
+//! ([`crate::prepare_data_dir`]), and everything the core creates inside it later
 //! inherits the two entries.
 //!
 //! Every FFI call sits in a small function under a scoped `#[allow(unsafe_code)]` with a
@@ -425,7 +425,7 @@ mod tests {
     fn data_dir_gets_owner_only_protected_dacl() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("data");
-        crate::settings::prepare_data_dir(&dir).unwrap();
+        crate::prepare_data_dir(&dir).unwrap();
         // A file created afterwards (as the core does) inherits the same two entries.
         std::fs::write(dir.join("pins.json"), b"{}").unwrap();
 
@@ -445,7 +445,7 @@ mod tests {
         assert_eq!(file_sids, want, "files inside inherit only the two entries");
 
         // Running it again on the existing dir is fine (every start does).
-        crate::settings::prepare_data_dir(&dir).unwrap();
+        crate::prepare_data_dir(&dir).unwrap();
         assert_eq!(read_dacl(&dir).1.len(), 2);
     }
 }

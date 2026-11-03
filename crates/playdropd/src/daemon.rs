@@ -561,15 +561,9 @@ impl Shared {
         c.discovery = s.discovery;
         c.lock_state = Box::new((*self.lock).clone());
         c.accepts_input = self.input_support.supported;
-        #[cfg(windows)]
-        {
-            // SR-20, SR-28 and SR-31 on Windows: the core has no unsafe code, so the
-            // daemon supplies free space, DPAPI sealing and the exclusive port
-            // (`free_space.rs`, `at_rest.rs`, `listener.rs`).
-            c.free_space = Arc::new(crate::free_space::WindowsVolumeSpace);
-            c.secret_store = Some(Arc::new(crate::at_rest::DpapiStore));
-            c.listener_setup = Some(Arc::new(crate::listener::ExclusivePort));
-        }
+        // SR-20, SR-28 and SR-31 on Windows: the core has no unsafe code, so the platform
+        // crate supplies free space, DPAPI sealing and the exclusive port.
+        playdrop_platform::apply_hooks(&mut c);
         c
     }
 
@@ -1253,6 +1247,20 @@ impl Shared {
                 let port = probe::probe(core.port, &core.interfaces).await;
                 let mut summary = probe::summary(&core, &port);
                 summary.extend(self.diagnose_notes(core.port));
+                // Which path each peer is reached over and what the last check measured
+                // (protocol.md 3.5).
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or_default();
+                summary.extend(host.path_reports().iter().map(|r| {
+                    let label = core
+                        .peers
+                        .iter()
+                        .find(|p| p.peer == r.peer)
+                        .map_or(r.short_id.as_str(), |p| p.label.as_str());
+                    r.summary_line(label, now)
+                }));
                 Ok(IpcOk::Diagnostics(DiagnosticsReport {
                     core,
                     port,

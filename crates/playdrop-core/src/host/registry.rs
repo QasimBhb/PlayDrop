@@ -32,6 +32,14 @@ pub(crate) enum Placement {
     Reject,
 }
 
+/// What [`Registry::attach`] found.
+pub(crate) struct Attached {
+    /// The other direction's live connection.
+    pub(crate) other: Option<Arc<Connection>>,
+    /// The older connection from the same dialler, now finishing its open streams.
+    pub(crate) replaced: Option<Arc<Connection>>,
+}
+
 /// Connections and sessions by peer.
 pub(crate) struct Registry {
     local: DeviceId,
@@ -68,9 +76,11 @@ impl Registry {
     }
 
     /// Adds a trusted connection to its peer's link. A newer connection from the same
-    /// dialler replaces the older one, which is closed (protocol.md 3.3). Returns the other
-    /// direction's live connection, if any, for the 3.3 liveness check.
-    pub(crate) fn attach(&self, conn: &Arc<Connection>) -> Option<Arc<Connection>> {
+    /// dialler replaces the older one, which is closed after its open streams finish
+    /// (protocol.md 3.3, 3.5). Returns the other direction's live connection for the 3.3
+    /// liveness check, and the one replaced, which must prove it is alive to get that time
+    /// ([`Attached::replaced`]).
+    pub(crate) fn attach(&self, conn: &Arc<Connection>) -> Attached {
         let mut links = lock(&self.links);
         let link = links.entry(conn.device_id()).or_default();
         let (slot, other) = match conn.direction() {
@@ -78,12 +88,19 @@ impl Registry {
             Direction::Outbound => (&mut link.outbound, &link.inbound),
         };
         let other = other.clone().filter(|c| !c.is_closed());
+        let mut replaced = None;
         if let Some(old) = slot.replace(Arc::clone(conn)) {
             if old.id() != conn.id() {
-                old.close(CloseReason::Duplicate);
+                // Our own older outbound drains: requests already on it finish
+                // (protocol.md 3.5). The server side sends GOAWAY with the same grace.
+                match old.direction() {
+                    Direction::Outbound => old.drain(),
+                    Direction::Inbound => old.close(CloseReason::Duplicate),
+                }
+                replaced = Some(old);
             }
         }
-        other
+        Attached { other, replaced }
     }
 
     /// Forgets a closed connection. A session on it is left for its own reader to end, so
@@ -100,12 +117,13 @@ impl Registry {
         }
     }
 
-    /// Our live outbound connection to `peer`.
+    /// Our live outbound connection to `peer`; one that drains (replaced, protocol.md
+    /// 3.5) takes no new requests and does not count.
     pub(crate) fn outbound(&self, peer: &DeviceId) -> Option<Arc<Connection>> {
         lock(&self.links)
             .get(peer)
             .and_then(|l| l.outbound.clone())
-            .filter(|c| !c.is_closed())
+            .filter(|c| !c.is_closed() && !c.is_draining())
     }
 
     /// Every live connection with `peer`.
