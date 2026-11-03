@@ -15,7 +15,7 @@ use super::{lock, path, session, Inner};
 use crate::discovery::{DiscoveryEvent, Via};
 use crate::identity::DeviceId;
 use crate::net::connection::{short, Heard, REPLACED_PING_DEADLINE};
-use crate::net::{dial_with_alternatives, CloseReason, Connection, DialOptions};
+use crate::net::{canonical_addr, dial_with_alternatives, CloseReason, Connection, DialOptions};
 use crate::tls;
 use crate::{Error, Result};
 
@@ -86,7 +86,7 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
         return Ok(c);
     }
     let pin = inner.pins.get(&peer).ok_or(Error::NotPaired)?;
-    let mut addrs = pin.last_known.clone();
+    let mut addrs: Vec<SocketAddr> = pin.last_known.iter().copied().map(canonical_addr).collect();
     let mut path = DiscoveryPath::LastKnown;
     if let Some(r) = lock(&inner.reach).get(&peer) {
         for a in &r.discovered {
@@ -101,7 +101,8 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
         return Err(Error::NotFound);
     }
     let config = tls::build_client_config(&inner.identity, pin.spki_hash);
-    let opts = DialOptions::new(config, Some(pin.spki_hash));
+    let mut opts = DialOptions::new(config, Some(pin.spki_hash));
+    opts.never_hold = path::merged_addresses(inner, peer);
     let grace = path::dial_grace(inner, peer);
     let (conn, alternatives) = match dial_with_alternatives(&addrs, &opts, grace).await {
         Ok(c) => c,
@@ -269,6 +270,7 @@ pub(crate) async fn discovery_events(inner: Arc<Inner>, mut rx: mpsc::Receiver<D
 /// A verified advert (protocol.md 8.3): remembers the address, then re-checks the paths of
 /// a peer that is online or dials one that is not, rate-limited per peer.
 pub(crate) fn on_verified_advert(inner: &Arc<Inner>, id: DeviceId, addr: SocketAddr, via: Via) {
+    let addr = canonical_addr(addr);
     {
         let mut reach = lock(&inner.reach);
         let r = reach.entry(id).or_default();

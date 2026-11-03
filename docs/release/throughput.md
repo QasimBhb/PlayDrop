@@ -791,3 +791,43 @@ are too few to name a cause.
   8.5 and 11.3 were on older builds with one delivery thread.
 - A separate old-peer check. The old rounds above show the 0.5.0 app staying connected through the 45 s
   settle and transferring with the new daemon, and no more than that.
+
+## 14. Phase 12: the three owed phone runs (2026-11-03)
+
+Released 0.6.0 daemon, Galaxy A54 on Wi-Fi with USB tethering off (`ss` showed the Wi-Fi addresses on
+every row), desktop load 0.4 to 2.3, battery 30.2 to 30.8 C. No agent builds ran during these rows.
+
+### 14.1 `big-1g`, old against new
+
+Android refuses a downgrade on a release build, so each APK got a higher version code in its manifest
+and was signed again; a byte comparison shows the manifest is the only entry that differs from the
+original. Each install got a 45 s settle. The first three 0.6.0 rows ran before this was found, while
+every 0.5.0 install failed, so they are not interleaved; the last five rows are.
+
+| Time | App | Wall s | MiB/s |
+|---|---|---|---|
+| 13:21 | 0.6.0 | 25.4 | 40.4 |
+| 13:22 | 0.6.0 | 24.9 | 41.1 |
+| 13:24 | 0.6.0 | 23.3 | 44.0 |
+| 13:26 | 0.5.0 | 23.8 | 43.1 |
+| 13:27 | 0.6.0 | 23.8 | 43.0 |
+| 13:29 | 0.5.0 | 25.2 | 40.7 |
+| 13:30 | 0.6.0 | 23.1 | 44.3 |
+| 13:31 | 0.5.0 | 23.2 | 44.1 |
+
+All sums match. Means: 0.5.0 42.6 MiB/s (3 runs), 0.6.0 42.6 MiB/s (all 5) or 43.6 (the 2 interleaved).
+**So 0.6.0 does not slow a big file.** The gap in 13.5 (22.1 s against 27.3 s) fits the slow rounds
+described there. This does not show whether the `busy` fix helped, because every 0.6.0 row has it.
+
+### 14.2 Force-stop resume on 0.6.0
+
+The app was force-stopped mid-send, relaunched after 4 s, and the send carried on by itself.
+
+| Dataset | Stopped at | Wall s | Result |
+|---|---|---|---|
+| `small-1000` (102,400,000 bytes) | 40,894,464 bytes | 10.9 | All 1,000 files correct, plus 2 duplicates |
+| `big-1g` | 392,167,424 bytes | 29.6 | Sum matches, no duplicate |
+
+The duplicates are `s0330 (1).bin` and `s0331 (1).bin`, with the same bytes as their originals, inside
+the limit of 4 per kill in 13.6. The bench's `verify.sh` printed `comm` order warnings for
+`small-1000`, so its counts were rechecked by name and hash, which agreed.

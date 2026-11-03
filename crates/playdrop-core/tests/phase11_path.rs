@@ -12,13 +12,18 @@
 //!   `429`, a connection that only probes never counts as in use (3.3), and at most two
 //!   such connections per peer stay open.
 //!
+//! - One radio's addresses are one path: mapped and plain forms are one candidate, IPv4 gets
+//!   the held slots first, and an alternative on a path already measured is cancelled at its
+//!   first head. Loopback gets no path id, so the tests that need ids supply the interface
+//!   names, which is also why all the others measure every address.
+//!
 //! Rates differ by orders of magnitude (2 MiB/s against unthrottled loopback), so a loaded
 //! machine does not change any outcome.
 
 mod common;
 
 use std::collections::BTreeSet;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,18 +34,20 @@ use common::{init_logs, pair, start_host_with, temp_root, write_random_file, Tes
 use h2::server::SendResponse;
 use h2::RecvStream;
 use http::{Request, StatusCode};
-use playdrop_core::host::{HostConfig, HostEvent, PathOutcome, PathReport, PathTiming};
+use playdrop_core::host::{
+    HostConfig, HostEvent, InterfaceLookup, PathOutcome, PathReport, PathTiming,
+};
 use playdrop_core::identity::{DeviceId, DeviceIdentity};
 use playdrop_core::net::client::ALTERNATIVE_GRACE;
 use playdrop_core::net::connection::{Heard, DRAIN_GRACE};
 use playdrop_core::net::probe::{
-    parse_probe_bytes, probe, probe_in_use, InUseProbe, ProbeOutcome, PROBES_PER_MINUTE,
-    PROBE_MAX_BYTES, PROBE_PATH,
+    parse_probe_bytes, probe, probe_in_use, probe_noting, InUseProbe, ProbeOutcome,
+    PROBES_PER_MINUTE, PROBE_BYTES, PROBE_MAX_BYTES, PROBE_PATH,
 };
 use playdrop_core::net::server::{HandlerFuture, NOT_IN_USE_TIMEOUT};
 use playdrop_core::net::{
-    dial, dial_held, response_head, send_all, CloseReason, Connection, DialOptions, Router, Server,
-    TlsAcceptor,
+    dial, dial_held, response_head, send_all, CloseReason, Connection, DialOptions, HeldTls,
+    Router, Server, TlsAcceptor,
 };
 use playdrop_core::session::types::{
     Battery, Capability, Caps, DeviceType, Frame, Hello, Ping, PresenceState, Trust,
@@ -67,6 +74,8 @@ struct Proxy {
     open: Arc<AtomicUsize>,
     /// Connections the dialler has made.
     accepted: Arc<AtomicUsize>,
+    /// Bytes that came back from the host, over all connections.
+    returned: Arc<AtomicU64>,
     /// Bytes per second, per direction.
     rate: Arc<AtomicU64>,
     /// Added to every 16 KiB read, each way, in ms: a path that is slow and latent, with its
@@ -86,7 +95,19 @@ impl Proxy {
     /// [`Proxy::release`].
     async fn start(target: SocketAddr, rate: u64, flowing: bool, stall_after: Option<u64>) -> Self {
         let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        Self::on(l, target, rate, flowing, stall_after)
+    }
+
+    /// [`Proxy::start`] on a listener the test bound.
+    fn on(
+        l: TcpListener,
+        target: SocketAddr,
+        rate: u64,
+        flowing: bool,
+        stall_after: Option<u64>,
+    ) -> Self {
         let addr = l.local_addr().unwrap();
+        let returned = Arc::new(AtomicU64::new(0));
         let open = Arc::new(AtomicUsize::new(0));
         let accepted = Arc::new(AtomicUsize::new(0));
         let rate = Arc::new(AtomicU64::new(rate));
@@ -101,11 +122,11 @@ impl Proxy {
             Arc::clone(&upstream),
             Arc::clone(&cuts),
         );
+        let returned_all = Arc::clone(&returned);
         tokio::spawn(async move {
-            let returned = Arc::new(AtomicU64::new(0));
             while let Ok((inbound, _)) = l.accept().await {
                 let (open, upstream) = (Arc::clone(&o2), Arc::clone(&u2));
-                let (mut flow, returned) = (flow_rx.clone(), Arc::clone(&returned));
+                let (mut flow, returned) = (flow_rx.clone(), Arc::clone(&returned_all));
                 let (rate, latency) = (Arc::clone(&r2.0), Arc::clone(&r2.1));
                 let cut = c2.subscribe();
                 let born = *cut.borrow();
@@ -163,6 +184,7 @@ impl Proxy {
             addr,
             open,
             accepted,
+            returned,
             rate,
             latency,
             flowing: flow_tx,
@@ -177,6 +199,10 @@ impl Proxy {
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn returned(&self) -> u64 {
+        self.returned.load(Ordering::SeqCst)
     }
 
     fn set_flowing(&self, on: bool) {
@@ -252,13 +278,13 @@ impl Pump {
             }
             if let Some(StallCount {
                 returned,
-                limit: Some(limit),
+                limit,
                 upstream,
             }) = &self.count
             {
                 // Trips once: after `release` the dialler's bytes keep flowing.
                 let before = returned.fetch_add(n as u64, Ordering::SeqCst);
-                if before < *limit && before + n as u64 >= *limit {
+                if limit.is_some_and(|l| before < l && before + n as u64 >= l) {
                     upstream.send_replace(false);
                 }
             }
@@ -341,6 +367,8 @@ struct Addrs {
     gated: SocketAddr,
     /// See [`Proxy::latency`]; of the `slow` proxy, to set before alpha dials.
     slow_latency: Arc<AtomicU64>,
+    /// See [`Proxy::upstream`]; of the `slow` proxy.
+    slow_upstream: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 /// Inside a probe's second request, whatever size that is (it follows a 128 KiB estimate):
@@ -416,6 +444,7 @@ where
         cuttable: [cuttable[0].addr, cuttable[1].addr, cuttable[2].addr],
         gated: gated.addr,
         slow_latency: Arc::clone(&slow_proxy.latency),
+        slow_upstream: Arc::clone(&slow_proxy.upstream),
     };
     a.host.shutdown().await;
     b.host.shutdown().await;
@@ -755,6 +784,15 @@ fn bare_server_opts(
     path_probe: bool,
     not_in_use_timeout: Option<Duration>,
 ) -> (Arc<CountingRouter>, SocketAddr, DialOptions) {
+    bare_server_named(path_probe, not_in_use_timeout, None)
+}
+
+/// [`bare_server_opts`] with its interfaces named by `lookup`.
+fn bare_server_named(
+    path_probe: bool,
+    not_in_use_timeout: Option<Duration>,
+    lookup: Option<Arc<dyn InterfaceLookup>>,
+) -> (Arc<CountingRouter>, SocketAddr, DialOptions) {
     let server_id = DeviceIdentity::generate().unwrap();
     let client_id = DeviceIdentity::generate().unwrap();
     let pins: Arc<dyn tls::PinLookup> = Arc::new(BTreeSet::from([*client_id.device_id()]));
@@ -773,6 +811,9 @@ fn bare_server_opts(
     .with_path_probe(path_probe);
     if let Some(t) = not_in_use_timeout {
         server = server.with_not_in_use_timeout(t);
+    }
+    if let Some(lookup) = lookup {
+        server = server.with_interface_lookup(lookup);
     }
     let addr = server.local_addr();
     let router = Arc::new(CountingRouter::default());
@@ -819,9 +860,10 @@ async fn probe_limits_and_probe_only_connections_never_in_use() {
         get(&conn, "/v1/probe?x=1&bytes=1000&y").await,
         (StatusCode::OK, 1000)
     );
-    // The client measurement on a real body: two requests (estimate, then measured).
+    // The client measurement on a real body: three requests (the id, the estimate, then
+    // measured).
     assert!(matches!(probe(&conn, 2 * 1024 * 1024).await, ProbeOutcome::Rate(r) if r > 0.0));
-    for _ in 3..PROBES_PER_MINUTE {
+    for _ in 4..PROBES_PER_MINUTE {
         assert_eq!(get(&conn, "/v1/probe?bytes=0").await, (StatusCode::OK, 0));
     }
     assert_eq!(
@@ -1460,7 +1502,7 @@ async fn a_connection_that_starts_http2_after_unpair_is_closed() {
     let a_id = a.host.device_id();
     let opts = raw_opts(&identity_of(&a), &identity_of(&b));
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, b.port));
-    let mut held = dial_held(&[addr], &opts, Duration::from_secs(1)).await;
+    let mut held = dial_held(&[addr], &opts, Duration::from_secs(1)).await.held;
     assert_eq!(held.len(), 1);
     // The client finishes TLS first; give the server time to finish its side too, so this
     // tests the gap and not the certificate check, which would refuse after the unpair.
@@ -2029,6 +2071,922 @@ async fn a_probe_past_its_read_limit_stops_the_sender() {
         .expect("answered");
     assert_eq!(status, StatusCode::OK, "the slot is free");
     conn.close(CloseReason::Shutdown);
+}
+
+/// Names the interface by the turn of whoever asks: the first ask gets the first name, and
+/// any past the end the last. Each side asks once per connection per check, and a check
+/// probes one at a time with the one in use first, so the turn is the connection.
+#[derive(Debug)]
+struct ByTurn {
+    names: &'static [&'static str],
+    asked: AtomicUsize,
+}
+
+impl InterfaceLookup for ByTurn {
+    fn interface_of(&self, _local: SocketAddr) -> Option<String> {
+        let turn = self.asked.fetch_add(1, Ordering::SeqCst);
+        let name = self.names[turn.min(self.names.len() - 1)];
+        Some(name.to_owned())
+    }
+}
+
+/// One name per turn. With one name every connection is on one interface.
+fn named(names: &'static [&'static str]) -> Arc<dyn InterfaceLookup> {
+    Arc::new(ByTurn {
+        names,
+        asked: AtomicUsize::new(0),
+    })
+}
+
+/// A listing that fails.
+#[derive(Debug)]
+struct NoListing;
+
+impl InterfaceLookup for NoListing {
+    fn interface_of(&self, _local: SocketAddr) -> Option<String> {
+        None
+    }
+}
+
+fn mapped(addr: SocketAddr) -> SocketAddr {
+    let IpAddr::V4(v4) = addr.ip() else {
+        panic!("{addr} is not IPv4");
+    };
+    SocketAddr::new(IpAddr::V6(v4.to_ipv6_mapped()), addr.port())
+}
+
+/// A check where both hosts' interfaces are named: `alpha`'s are the dialler's own.
+async fn setup_named<O>(
+    order: O,
+    alpha: &'static [&'static str],
+    bravo: &'static [&'static str],
+) -> Setup
+where
+    O: FnOnce(&Addrs) -> Vec<SocketAddr>,
+{
+    setup_with(
+        order,
+        |c| c.path_interfaces = named(alpha),
+        |c| c.path_interfaces = named(bravo),
+        false,
+    )
+    .await
+}
+
+/// protocol.md 3.2: a dual-stack listener stores IPv4 peers in the mapped form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mapped_and_plain_forms_of_one_address_are_dialled_once() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_router, addr, opts) = bare_server_opts(true, None);
+    let proxy = Proxy::start(addr, UNTHROTTLED, true, None).await;
+    let candidates = [mapped(proxy.addr), proxy.addr];
+    let held = dial_held(&candidates, &opts, Duration::from_millis(800))
+        .await
+        .held;
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(
+        held[0].remote_addr(),
+        proxy.addr,
+        "dialled in the plain form"
+    );
+    assert_eq!(proxy.accepted(), 1);
+}
+
+/// protocol.md 3.2: a pins file from before canonical addresses still works, its entries
+/// count once, and what the host stores from then on is canonical.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stored_mapped_addresses_still_work_and_count_once() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup(
+        |a| vec![mapped(a.slow), a.slow, mapped(a.direct), a.direct],
+        |_| {},
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert_eq!(r.chosen, Some(s.direct), "{r:?}");
+    assert_eq!(
+        r.probes.len(),
+        2,
+        "two addresses, whatever their forms: {r:?}"
+    );
+    assert_eq!(r.probes[0].addr, s.slow, "{r:?}");
+    assert_eq!(s.slow_proxy.accepted(), 1);
+    let pin =
+        s.a.host
+            .peers()
+            .into_iter()
+            .find(|p| p.device_id == s.b_id.to_hex())
+            .unwrap();
+    assert_eq!(pin.last_known, [s.direct, s.slow]);
+    stop(s).await;
+}
+
+/// protocol.md 3.5: the mapped form of the address in use is the address in use, and so is
+/// not a reason to check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_advert_in_the_mapped_form_of_the_address_in_use_does_nothing() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let mut s = setup_with(
+        |a| vec![a.fast],
+        |c| {
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: Duration::from_millis(100),
+            };
+        },
+        |_| {},
+        false,
+    )
+    .await;
+    s.a.events
+        .wait_for(WAIT, |e| matches!(e, HostEvent::PeerOnline { .. }))
+        .await;
+    for _ in 0..10 {
+        s.a.host
+            .verified_advert_for_test(&s.b_id, mapped(s.fast.addr));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(s.fast.accepted(), 1, "dialled its own address again");
+    let r = s.a.host.path_reports();
+    assert!(
+        r.iter().all(|r| r.outcome.is_none()),
+        "a check ran, so the back-off took it for another address: {r:?}"
+    );
+    stop(s).await;
+}
+
+/// protocol.md 3.2: two addresses of a class later in the order, here global IPv6 standing
+/// in for link-local (a test cannot count on answering on one), do not take the two held
+/// slots from an IPv4 address given after them. Which class goes where, link-local included,
+/// is in the unit tests of `plan_candidates`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ipv4_gets_a_held_slot_ahead_of_duplicates_of_a_later_class() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let bind_v6 = || TcpListener::bind((Ipv6Addr::LOCALHOST, 0));
+    let (Ok(l1), Ok(l2)) = (bind_v6().await, bind_v6().await) else {
+        eprintln!("no IPv6 loopback here; skipped");
+        return;
+    };
+    let (_router, addr, opts) = bare_server_opts(true, None);
+    let dup1 = Proxy::on(l1, addr, UNTHROTTLED, true, None);
+    let dup2 = Proxy::on(l2, addr, UNTHROTTLED, true, None);
+    let radio = Proxy::start(addr, UNTHROTTLED, true, None).await;
+    let dialled = dial_held(
+        &[dup1.addr, dup2.addr, radio.addr],
+        &opts,
+        ALTERNATIVE_GRACE,
+    )
+    .await;
+    let got: Vec<SocketAddr> = dialled.held.iter().map(HeldTls::remote_addr).collect();
+    assert_eq!(dialled.failed, []);
+    assert_eq!(got, [radio.addr, dup1.addr]);
+    assert_eq!(radio.accepted(), 1, "the other radio was measured");
+    assert_eq!(dup2.accepted(), 0, "the slots were full by its turn");
+}
+
+/// protocol.md 3.5: the point of it. An alternative on the path in use costs at most its
+/// estimate request, and is not switched to although it would have measured far faster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alternative_on_the_path_in_use_ends_at_its_head() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_named(|a| vec![a.slow, a.fast], &["wlan0"], &["wlan0"]).await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Kept), "{r:?}");
+    assert_eq!(r.chosen, Some(s.slow), "{r:?}");
+    assert_eq!(r.probes.len(), 2, "{r:?}");
+    assert!(
+        r.probes[0].current && r.probes[0].bytes_per_sec.is_some(),
+        "{r:?}"
+    );
+    let alt = &r.probes[1];
+    assert_eq!(alt.addr, s.fast.addr, "{r:?}");
+    assert_eq!(alt.same_path_as, Some(s.slow), "{r:?}");
+    assert_eq!(alt.bytes_per_sec, None, "{r:?}");
+    let line = r.summary_line("bravo", r.checked_at.unwrap());
+    assert!(
+        line.contains(&format!(
+            "{} same path as {}, not measured",
+            s.fast.addr, s.slow
+        )),
+        "{line}"
+    );
+    // The handshakes and an empty response, against more than 4 MiB when measured.
+    let cost = s.fast.returned();
+    assert!(cost < HEAD_ONLY, "{cost} bytes came back");
+    until("the alternative is closed", || s.fast.open() == 0).await;
+    assert_eq!(s.fast.accepted(), 1);
+    assert!(s.a.host.is_online(&s.b_id));
+    stop(s).await;
+}
+
+/// protocol.md 3.5: an alternative is compared with the alternatives measured before it too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alternative_on_the_path_of_a_measured_alternative_ends_at_its_head() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_named(
+        |a| vec![a.slow, a.fast, a.direct],
+        &["wlan0"],
+        &["wlan0", "usb0", "usb0"],
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.probes.len(), 3, "{r:?}");
+    assert!(r.probes[1].bytes_per_sec.is_some(), "{r:?}");
+    assert_eq!(r.probes[2].same_path_as, Some(r.probes[1].addr), "{r:?}");
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert_eq!(r.chosen, Some(r.probes[1].addr), "{r:?}");
+    stop(s).await;
+}
+
+/// protocol.md 3.5: two of the peer's interfaces are two paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_peer_interfaces_are_both_measured_and_the_faster_wins() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_named(|a| vec![a.slow, a.direct], &["wlan0"], &["wlan0", "usb0"]).await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert_eq!(r.chosen, Some(s.direct), "{r:?}");
+    assert!(r.probes.iter().all(|p| p.bytes_per_sec.is_some()), "{r:?}");
+    assert!(r.probes.iter().all(|p| p.same_path_as.is_none()), "{r:?}");
+    stop(s).await;
+}
+
+/// protocol.md 3.5: why the dialler's own interface is part of the key: one interface of the
+/// peer, reached over two of the dialler's, is two paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_dialler_interfaces_to_one_peer_interface_are_both_measured() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_named(|a| vec![a.slow, a.direct], &["eth0", "wlan0"], &["wlan0"]).await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert_eq!(r.chosen, Some(s.direct), "{r:?}");
+    assert!(r.probes.iter().all(|p| p.same_path_as.is_none()), "{r:?}");
+    stop(s).await;
+}
+
+/// protocol.md 3.5: a peer that sends no id, as one from before the header, is measured as
+/// before: nothing is ever merged on a missing id.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_peer_with_no_header_is_measured_as_before() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_with(
+        |a| vec![a.slow, a.direct],
+        |c| c.path_interfaces = named(&["wlan0"]),
+        |c| c.path_interfaces = Arc::new(NoListing),
+        false,
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert_eq!(r.chosen, Some(s.direct), "{r:?}");
+    assert!(r.probes.iter().all(|p| p.same_path_as.is_none()), "{r:?}");
+    stop(s).await;
+}
+
+/// protocol.md 3.5: a dialler whose own listing fails has no key either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dialler_with_no_listing_measures_as_before() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_with(
+        |a| vec![a.slow, a.direct],
+        |c| c.path_interfaces = Arc::new(NoListing),
+        |c| c.path_interfaces = named(&["wlan0"]),
+        false,
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert_eq!(r.chosen, Some(s.direct), "{r:?}");
+    stop(s).await;
+}
+
+/// protocol.md 3.5: an address found to be on a measured path did answer, so its adverts
+/// wait the long wait, not the short one for an address that is silent, nor bring a check as
+/// a new address would.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_advert_from_an_address_on_a_measured_path_waits_the_long_wait() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_with(
+        |a| vec![a.direct, a.fast, a.slow],
+        |c| {
+            c.path_interfaces = named(&["wlan0"]);
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: Duration::from_secs(600),
+            };
+        },
+        |c| c.path_interfaces = named(&["wlan0", "wlan0", "usb0", "wlan0", "usb0", "eth0"]),
+        false,
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Kept), "{r:?}");
+    assert_eq!(r.probes[1].same_path_as, Some(s.direct), "{r:?}");
+    assert_eq!(s.slow_proxy.accepted(), 1);
+    for _ in 0..30 {
+        s.a.host.verified_advert_for_test(&s.b_id, s.fast.addr);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(s.slow_proxy.accepted(), 1, "the advert brought a check");
+    assert_eq!(s.fast.accepted(), 1);
+
+    // Still so after a check that left it out, and so no longer lists it as tried.
+    s.a.host
+        .verified_advert_for_test(&s.b_id, s.cuttable[0].addr);
+    until("the next check dials", || s.slow_proxy.accepted() == 2).await;
+    // Long enough for it to end: the slow alternative reads for 1 s at most per request.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    for _ in 0..30 {
+        s.a.host.verified_advert_for_test(&s.b_id, s.fast.addr);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(s.slow_proxy.accepted(), 2, "the advert brought a check");
+    assert_eq!(s.fast.accepted(), 1);
+    stop(s).await;
+}
+
+/// protocol.md 3.5: with both slots taken by addresses of the radio in use, a third radio
+/// behind them would never be measured. Merged addresses stay out of the next check, so it
+/// is, and the network changing brings them back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn merged_addresses_leave_the_slots_to_a_radio_behind_them() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_with(
+        |a| vec![a.direct, a.fast, a.gated, a.cuttable[0]],
+        |c| {
+            c.path_interfaces = named(&["wlan0"]);
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: Duration::from_secs(600),
+            };
+        },
+        // Three times the radio in use, then the one in use again and the cable.
+        |c| c.path_interfaces = named(&["wlan0", "wlan0", "wlan0", "wlan0", "usb0", "wlan0"]),
+        false,
+    )
+    .await;
+    s.gated.set_flowing(true);
+    let (cable, short) = (s.cuttable[0].addr, s.b_id.to_hex()[..8].to_owned());
+    let rep = |s: &Setup| {
+        s.a.host
+            .path_reports()
+            .into_iter()
+            .find(|r| r.peer == short && r.outcome.is_some())
+    };
+    let started = tokio::time::Instant::now();
+    let first = loop {
+        if let Some(r) = rep(&s) {
+            break r;
+        }
+        assert!(started.elapsed() < WAIT, "no first check");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(first.outcome, Some(PathOutcome::Kept), "{first:?}");
+    assert_eq!(first.probes.len(), 3, "{first:?}");
+    assert!(
+        first.probes[1..].iter().all(|p| p.same_path_as.is_some()),
+        "{first:?}"
+    );
+    assert_eq!(
+        s.cuttable[0].accepted(),
+        0,
+        "the slots were full by its turn"
+    );
+
+    // Any trigger will do; the cable is advertising because it is there.
+    while s.cuttable[0].accepted() == 0 {
+        assert!(started.elapsed() < WAIT, "the cable was never dialled");
+        s.a.host.verified_advert_for_test(&s.b_id, cable);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    until("the cable is measured", || {
+        rep(&s).is_some_and(|r| {
+            r.probes
+                .iter()
+                .any(|p| p.addr == cable && p.bytes_per_sec.is_some())
+        })
+    })
+    .await;
+    assert_eq!(
+        s.fast.accepted(),
+        1,
+        "dialled though it is known to be merged"
+    );
+    assert_eq!(
+        s.gated.accepted(),
+        1,
+        "dialled though it is known to be merged"
+    );
+
+    // What was one path may not be any more.
+    s.a.host.network_changed();
+    until("merged addresses are back after a network change", || {
+        s.fast.accepted() == 2
+    })
+    .await;
+    stop(s).await;
+}
+
+/// protocol.md 3.5: a merged address keeps its usual turn in a dial but takes no held slot,
+/// so others behind it still get theirs, and it can still carry the dial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merged_address_is_never_held_and_takes_no_slot() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_router, addr, mut opts) = bare_server_opts(true, None);
+    let merged = Proxy::start(addr, UNTHROTTLED, true, None).await;
+    let radio1 = Proxy::start(addr, UNTHROTTLED, true, None).await;
+    let radio2 = Proxy::start(addr, UNTHROTTLED, true, None).await;
+    opts.never_hold = vec![merged.addr];
+    let candidates = [merged.addr, radio1.addr, radio2.addr];
+    let held = dial_held(&candidates, &opts, ALTERNATIVE_GRACE).await.held;
+    let got: Vec<SocketAddr> = held.iter().map(HeldTls::remote_addr).collect();
+    assert_eq!(got, [radio1.addr, radio2.addr]);
+    assert_eq!(merged.accepted(), 1, "it was dialled in its turn");
+    drop(held);
+    until("the refused hold is closed", || merged.open() == 0).await;
+    // Nothing else answers: it carries the dial.
+    let conn = dial(&[merged.addr], &opts).await.unwrap();
+    assert_eq!(conn.remote_addr(), merged.addr);
+    conn.close(CloseReason::Shutdown);
+}
+
+/// The first check of [`a_redial_where_only_merged_addresses_answer_runs_no_check`] and its
+/// neighbours: `cuttable[0]` in use, `fast` found to be on its path.
+async fn setup_merged_fast() -> Setup {
+    let s = setup_with(
+        |a| vec![a.cuttable[0], a.fast],
+        |c| {
+            c.path_interfaces = named(&["wlan0"]);
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: Duration::from_secs(600),
+            };
+        },
+        |c| c.path_interfaces = named(&["wlan0"]),
+        false,
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.outcome, Some(PathOutcome::Kept), "{r:?}");
+    assert_eq!(r.probes[1].same_path_as, Some(s.cuttable[0].addr), "{r:?}");
+    s
+}
+
+/// protocol.md 3.5: a redial must not cost a measurement of the path in use for addresses
+/// already known to be on it: nothing is held, so no check runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redial_where_only_merged_addresses_answer_runs_no_check() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_merged_fast().await;
+    let in_use = &s.cuttable[0];
+    let before = in_use.returned();
+    in_use.cut();
+    until("the redial", || {
+        in_use.accepted() == 2 && s.fast.accepted() == 2
+    })
+    .await;
+    until("back online", || s.a.host.is_online(&s.b_id)).await;
+    // Past the wait after a dial, with time left for a check to have read its 4 MiB.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let cost = in_use.returned() - before;
+    assert!(cost < 1024 * 1024, "{cost} bytes came back: a check ran");
+    stop(s).await;
+}
+
+/// protocol.md 3.5: a merged address that wins a dial is the path now, as any other winner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merged_address_that_wins_a_dial_is_a_path_move() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_merged_fast().await;
+    s.cuttable[0].set_flowing(false);
+    s.cuttable[0].cut();
+    let short = s.b_id.to_hex()[..8].to_owned();
+    until("it carries the peer", || {
+        s.a.host.is_online(&s.b_id)
+            && s.a
+                .host
+                .path_reports()
+                .iter()
+                .any(|r| r.peer == short && r.chosen == Some(s.fast.addr))
+    })
+    .await;
+    let pin =
+        s.a.host
+            .peers()
+            .into_iter()
+            .find(|p| p.device_id == s.b_id.to_hex())
+            .unwrap();
+    assert_eq!(pin.last_known.first(), Some(&s.fast.addr));
+    s.cuttable[0].set_flowing(true);
+    stop(s).await;
+}
+
+/// protocol.md 3.5: not every platform reports a network change, so what was set aside lapses
+/// at the longest back-off, and a faster path on that address can still be found.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_merged_address_lapses_at_the_longest_wait() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    // The longest wait is 16 times this.
+    let base = Duration::from_millis(250);
+    let s = setup_with(
+        |a| vec![a.direct, a.fast],
+        |c| {
+            c.path_interfaces = named(&["wlan0"]);
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: base,
+            };
+        },
+        |c| c.path_interfaces = named(&["wlan0"]),
+        false,
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.probes[1].same_path_as, Some(s.direct), "{r:?}");
+    let started = tokio::time::Instant::now();
+    while s.fast.accepted() < 2 {
+        assert!(started.elapsed() < WAIT, "never dialled again");
+        s.a.host.verified_advert_for_test(&s.b_id, s.fast.addr);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let took = started.elapsed();
+    assert!(
+        took + Duration::from_secs(1) >= base * 16,
+        "lapsed early: {took:?}"
+    );
+    stop(s).await;
+}
+
+/// protocol.md 3.5: a clear during a check wins: what the check found was about the paths
+/// before the change, so it does not set the address aside again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_check_under_way_does_not_undo_a_network_change() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    // Long enough that the lapse cannot pass for the fix: 16 s.
+    let base = Duration::from_secs(1);
+    let s = setup_with(
+        |a| vec![a.slow, a.fast],
+        |c| {
+            c.path_interfaces = named(&["wlan0"]);
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: base,
+            };
+        },
+        |c| c.path_interfaces = named(&["wlan0"]),
+        false,
+    )
+    .await;
+    // Past the estimate of the slow path's probe: the check is reading its measured request.
+    until("the check is under way", || {
+        s.slow_proxy.returned() > 300 * 1024
+    })
+    .await;
+    s.a.host.network_changed();
+    let r = wait_outcome(&s).await;
+    assert_eq!(r.probes[1].same_path_as, Some(s.slow), "{r:?}");
+    let started = tokio::time::Instant::now();
+    while s.fast.accepted() < 2 {
+        assert!(
+            started.elapsed() < base * 8,
+            "it was set aside after the clear"
+        );
+        s.a.host.verified_advert_for_test(&s.b_id, s.fast.addr);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop(s).await;
+}
+
+/// A loopback address nothing listens on: refused at once.
+fn refused_addr() -> SocketAddr {
+    let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    l.local_addr().unwrap()
+}
+
+/// protocol.md 3.5: an address that was refused got its chance, unlike one the full slots
+/// stopped. A tether refusing while it comes up is tried again at the short wait, and nothing
+/// is probed until it answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_advert_with_the_slots_full_is_not_recorded_as_answered() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let refused = refused_addr();
+    let s = setup_with(
+        |a| vec![a.direct, refused, a.slow, a.cuttable[0]],
+        |c| {
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: Duration::from_secs(600),
+            };
+        },
+        |_| {},
+        false,
+    )
+    .await;
+    let first = wait_outcome(&s).await;
+    assert_eq!(first.probes.len(), 3, "{first:?}");
+    assert_eq!(s.slow_proxy.accepted(), 1);
+    // The wait from this address doubles per quiet check from 100 ms: a good few dials in
+    // the time, against one and then 10 minutes if it counted as answered.
+    let started = tokio::time::Instant::now();
+    while s.slow_proxy.accepted() < 4 {
+        assert!(
+            started.elapsed() < WAIT,
+            "waiting the long wait: {} dials",
+            s.slow_proxy.accepted()
+        );
+        s.a.host.verified_advert_for_test(&s.b_id, refused);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    stop(s).await;
+}
+
+/// protocol.md 3.5: an advertised address can lose its chance to the order: two addresses
+/// ahead of it take the slots. That does not read as silence: the others are measured, and
+/// its next advert waits the long wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_advert_that_lost_its_slot_still_brings_a_check() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let s = setup_with(
+        |a| vec![a.direct, a.slow, a.cuttable[0]],
+        |c| {
+            c.path_timing = PathTiming {
+                recheck_every: Duration::from_millis(100),
+                same_address_recheck: Duration::from_secs(600),
+            };
+        },
+        |_| {},
+        false,
+    )
+    .await;
+    let first = wait_outcome(&s).await;
+    assert_eq!(first.probes.len(), 3, "{first:?}");
+    assert_eq!(s.slow_proxy.accepted(), 1);
+    let (late, short) = (s.cuttable[1].addr, s.b_id.to_hex()[..8].to_owned());
+    let started = tokio::time::Instant::now();
+    while s.slow_proxy.accepted() < 2 {
+        assert!(started.elapsed() < WAIT, "the advert brought no check");
+        s.a.host.verified_advert_for_test(&s.b_id, late);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Long enough for the check to end: the slow alternative reads for 1 s at most per request.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let r =
+        s.a.host
+            .path_reports()
+            .into_iter()
+            .find(|r| r.peer == short)
+            .unwrap();
+    assert_eq!(r.outcome, Some(PathOutcome::Kept), "{r:?}");
+    assert_eq!(r.probes.len(), 3, "{r:?}");
+    assert_eq!(s.cuttable[1].accepted(), 0, "it never got its turn");
+    for _ in 0..20 {
+        s.a.host.verified_advert_for_test(&s.b_id, late);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        s.slow_proxy.accepted(),
+        2,
+        "dialled again at the short wait"
+    );
+    stop(s).await;
+}
+
+/// `GET /v1/probe?bytes=n`: the status, the path id, and the body length.
+async fn probe_head(conn: &Connection, bytes: u64) -> (StatusCode, Option<String>, usize) {
+    let req = Request::get(format!("{PROBE_PATH}?bytes={bytes}"))
+        .body(())
+        .unwrap();
+    let (resp, _send) = conn.request(req, true).await.unwrap();
+    let resp = resp.await.unwrap();
+    let status = resp.status();
+    let id = resp
+        .headers()
+        .get("x-playdrop-path")
+        .map(|v| v.to_str().unwrap().to_owned());
+    let mut body = resp.into_body();
+    let mut n = 0;
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        n += chunk.len();
+        let _ = body.flow_control().release_capacity(chunk.len());
+    }
+    (status, id, n)
+}
+
+/// protocol.md 3.5: the header on the wire: opaque, the same for one interface, on the empty
+/// first request only, so listing never lands in a timed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_head_carries_an_opaque_id_of_the_interface() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_router, addr, opts) = bare_server_named(true, None, Some(named(&["wlan0"])));
+    let conn = dial(&[addr], &opts).await.unwrap();
+    let (status, id, n) = probe_head(&conn, 0).await;
+    assert_eq!((status, n), (StatusCode::OK, 0));
+    let id = id.expect("a pinned peer gets the header");
+    assert_eq!(id.len(), 16, "{id}");
+    assert!(
+        id.chars()
+            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+        "{id}"
+    );
+    assert_eq!(probe_head(&conn, 0).await.1.as_ref(), Some(&id), "stable");
+    // Another connection on that interface.
+    let other = dial(&[addr], &opts).await.unwrap();
+    assert_eq!(probe_head(&other, 0).await.1.as_ref(), Some(&id));
+    // A timed request says nothing, and neither does anything but a `200`.
+    assert_eq!(
+        probe_head(&conn, 1024).await,
+        (StatusCode::OK, None, 1024),
+        "no listing in a timed request"
+    );
+    let (status, none, _) = probe_head(&conn, PROBE_MAX_BYTES + 1).await;
+    assert_eq!((status, none), (StatusCode::BAD_REQUEST, None));
+    conn.close(CloseReason::Shutdown);
+    other.close(CloseReason::Shutdown);
+}
+
+/// protocol.md 3.5: an address that moved to another interface while its connection lived on
+/// is seen for what it is now, on both sides: nothing is merged on an old answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interface_change_under_a_live_connection_is_seen() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_router, addr, opts) = bare_server_named(true, None, Some(named(&["wlan0", "br0"])));
+    let conn = dial(&[addr], &opts).await.unwrap();
+    let before = probe_head(&conn, 0).await.1.unwrap();
+    let after = probe_head(&conn, 0).await.1.unwrap();
+    assert_ne!(before, after, "the server answered from an old listing");
+    let own = named(&["wlan0", "br0"]);
+    assert_ne!(
+        conn.own_path_id(&own).await,
+        conn.own_path_id(&own).await,
+        "the dialler answered from an old listing"
+    );
+    conn.close(CloseReason::Shutdown);
+}
+
+/// protocol.md 3.5: a listing that fails means no header, never an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_server_whose_listing_fails_sends_no_header_and_still_serves_the_probe() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_router, addr, opts) = bare_server_named(true, None, Some(Arc::new(NoListing)));
+    let conn = dial(&[addr], &opts).await.unwrap();
+    assert_eq!(probe_head(&conn, 0).await, (StatusCode::OK, None, 0));
+    assert!(matches!(
+        probe(&conn, 256 * 1024).await,
+        ProbeOutcome::Rate(_)
+    ));
+    conn.close(CloseReason::Shutdown);
+}
+
+/// Most bytes that come back for connection setup and empty responses; the smallest timed
+/// probe request is twice this.
+const HEAD_ONLY: u64 = 64 * 1024;
+
+/// protocol.md 3.5: a probe stopped at its first head has asked for no body at all, and the
+/// connection and its probe slot stay good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_stopped_at_its_head_costs_no_body() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_router, addr, opts) = bare_server_named(true, None, Some(named(&["wlan0"])));
+    let proxy = Proxy::start(addr, UNTHROTTLED, true, None).await;
+    let conn = dial(&[proxy.addr], &opts).await.unwrap();
+    let mut saw = None;
+    let outcome = probe_noting(&conn, PROBE_BYTES, &mut |id| {
+        saw = id;
+        false
+    })
+    .await;
+    assert_eq!(outcome, ProbeOutcome::Stopped);
+    assert!(saw.is_some(), "the head named the interface");
+    // Unthrottled, so a body asked for would have come back by now.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let cost = proxy.returned();
+    assert!(cost < HEAD_ONLY, "{cost} bytes came back");
+    let (status, _, _) = probe_head(&conn, 0).await;
+    assert_eq!(status, StatusCode::OK, "the slot is free");
+    conn.close(CloseReason::Shutdown);
+}
+
+/// A listing that hangs until the test is done with it.
+#[derive(Debug)]
+struct HungListing(Arc<AtomicBool>);
+
+impl InterfaceLookup for HungListing {
+    fn interface_of(&self, _local: SocketAddr) -> Option<String> {
+        let deadline = std::time::Instant::now() + WAIT;
+        while !self.0.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Some("wlan0".to_owned())
+    }
+}
+
+/// protocol.md 3.5: a listing that hangs, on either side, costs the id and not the check,
+/// which would otherwise hold the peer's check slot until a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_listing_does_not_hold_the_check() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let release = Arc::new(AtomicBool::new(false));
+    let hung = |c: &mut HostConfig, r: &Arc<AtomicBool>| {
+        c.path_interfaces = Arc::new(HungListing(Arc::clone(r)));
+    };
+    let s = setup_with(
+        |a| vec![a.slow, a.direct],
+        |c| hung(c, &release),
+        |c| hung(c, &release),
+        false,
+    )
+    .await;
+    let r = tokio::time::timeout(Duration::from_secs(20), wait_outcome(&s)).await;
+    release.store(true, Ordering::SeqCst);
+    let r = r.expect("the check never ended");
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert!(r.probes.iter().all(|p| p.same_path_as.is_none()), "{r:?}");
+    stop(s).await;
+}
+
+/// Names one interface, and holds back the dialler's bytes at the first ask: the head goes
+/// out, and what the dialler sends after it never arrives, as when a path dies right there.
+#[derive(Debug)]
+struct DiesAfterFirstHead {
+    upstream: Arc<std::sync::OnceLock<Arc<tokio::sync::watch::Sender<bool>>>>,
+    asked: AtomicBool,
+}
+
+impl InterfaceLookup for DiesAfterFirstHead {
+    fn interface_of(&self, _local: SocketAddr) -> Option<String> {
+        if !self.asked.swap(true, Ordering::SeqCst) {
+            if let Some(upstream) = self.upstream.get() {
+                upstream.send_replace(false);
+            }
+        }
+        Some("wlan0".to_owned())
+    }
+}
+
+/// protocol.md 3.5: the connection in use showed its id and then died. A dead connection
+/// gives no key, so another address of that radio is measured and takes over: it may well be
+/// the one way left to the peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_connection_in_use_that_dies_after_its_head_gives_no_key() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let upstream = Arc::new(std::sync::OnceLock::new());
+    let lookup: Arc<dyn InterfaceLookup> = Arc::new(DiesAfterFirstHead {
+        upstream: Arc::clone(&upstream),
+        asked: AtomicBool::new(false),
+    });
+    let s = setup_with(
+        |a| {
+            upstream.set(Arc::clone(&a.slow_upstream)).unwrap();
+            vec![a.slow, a.direct]
+        },
+        |c| c.path_interfaces = named(&["wlan0"]),
+        |c| c.path_interfaces = lookup,
+        false,
+    )
+    .await;
+    let r = wait_outcome(&s).await;
+    assert!(
+        r.probes[0].current && r.probes[0].bytes_per_sec.is_none(),
+        "{r:?}"
+    );
+    assert!(r.probes[0].error.is_some(), "{r:?}");
+    assert_eq!(
+        r.probes[1].same_path_as, None,
+        "merged with a dead path: {r:?}"
+    );
+    assert!(r.probes[1].bytes_per_sec.is_some(), "{r:?}");
+    assert_eq!(r.outcome, Some(PathOutcome::Switched), "{r:?}");
+    assert_eq!(r.chosen, Some(s.direct), "{r:?}");
+    s.slow_proxy.release();
+    stop(s).await;
 }
 
 /// protocol.md 3.5: a blip moves a host to a slower path. Once the better path is back its

@@ -20,6 +20,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 
 use super::connection::{short, ActivityIo, CloseReason, Connection, Direction, DRAIN_GRACE};
+use super::path_id::{InterfaceLookup, SystemInterfaceLookup};
 use super::probe;
 use super::{respond_error, server_builder, stopped, tune_socket, HttpError};
 use crate::constants::FORBIDDEN_PORTS;
@@ -96,6 +97,7 @@ pub struct Server {
     limits: Limits,
     path_probe: bool,
     not_in_use_timeout: Duration,
+    interfaces: Arc<dyn InterfaceLookup>,
 }
 
 /// The listening socket before it is bound, as [`ListenerSetup::before_bind`] sees it.
@@ -173,6 +175,7 @@ impl Server {
             limits,
             path_probe: true,
             not_in_use_timeout: NOT_IN_USE_TIMEOUT,
+            interfaces: Arc::new(SystemInterfaceLookup),
         })
     }
 
@@ -192,6 +195,14 @@ impl Server {
     #[must_use]
     pub fn with_not_in_use_timeout(mut self, timeout: Duration) -> Self {
         self.not_in_use_timeout = timeout;
+        self
+    }
+
+    /// How to find the interface behind a connection, for the id in a probe's head
+    /// (protocol.md 3.5). The default is the system's list; tests supply their own.
+    #[must_use]
+    pub fn with_interface_lookup(mut self, lookup: Arc<dyn InterfaceLookup>) -> Self {
+        self.interfaces = lookup;
         self
     }
 
@@ -254,6 +265,7 @@ impl Server {
                 path_probe: self.path_probe,
                 not_in_use_timeout: self.not_in_use_timeout,
                 unused: unused.clone(),
+                interfaces: Arc::clone(&self.interfaces),
             };
             conns.spawn(async move {
                 let _permit = permit;
@@ -276,6 +288,7 @@ struct ConnCtx {
     path_probe: bool,
     not_in_use_timeout: Duration,
     unused: UnusedBook,
+    interfaces: Arc<dyn InterfaceLookup>,
 }
 
 /// How long a connection may stay open without a request other than a probe
@@ -338,6 +351,7 @@ async fn serve_connection(
     mut ctx: ConnCtx,
 ) {
     tune_socket(&tcp);
+    let local = tcp.local_addr().ok();
     let accepted = tls::accept(
         Arc::clone(&ctx.tls.config),
         ctx.tls.pins.as_ref(),
@@ -390,6 +404,7 @@ async fn serve_connection(
         Direction::Inbound,
         peer,
         remote,
+        local,
         exporter,
         None,
         ping,
@@ -397,17 +412,34 @@ async fn serve_connection(
         bytes_read,
     );
     tracing::debug!(peer = %short(&conn.device_id()), trusted = conn.is_trusted(), "inbound connection");
+    accept_requests(&mut h2conn, &conn, &mut ctx).await;
+    drop(h2conn);
+    drop(unpaired_permit);
+    ctx.unused.remove(&conn);
+    conn.mark_closed();
+    ctx.router.connection_closed(&conn);
+}
+
+/// Tells the router about a connection, then hands its requests on until it ends or the host
+/// asks to close it.
+async fn accept_requests<T>(
+    h2conn: &mut h2::server::Connection<T, Bytes>,
+    conn: &Arc<Connection>,
+    ctx: &mut ConnCtx,
+) where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     // Before the router can ask for a close: a `watch` receiver does not report a value set
     // before it subscribed, and `connection_opened` closes a connection unpaired meanwhile.
     let mut close_rx = conn.close_requested();
-    ctx.router.connection_opened(&conn);
+    ctx.router.connection_opened(conn);
     // protocol.md 3.5: the router hears the connection is in use at its first request
     // other than a probe, so one held only for probing never replaces another (3.3).
     let mut in_use = !ctx.path_probe;
     if in_use {
-        ctx.router.connection_in_use(&conn);
+        ctx.router.connection_in_use(conn);
     } else {
-        ctx.unused.add(&conn);
+        ctx.unused.add(conn);
     }
     let idle_deadline = tokio::time::Instant::now() + ctx.not_in_use_timeout;
     let mut idle_armed = true;
@@ -423,11 +455,11 @@ async fn serve_connection(
             // Before `accept`: once a close is asked for (unpair, SR-14), no further
             // request reaches the router except as `shut_down` allows.
             _ = close_rx.changed() => {
-                shut_down(&mut h2conn, &mut close_rx, &ctx, &conn, &mut in_use).await;
+                shut_down(h2conn, &mut close_rx, ctx, conn, &mut in_use).await;
                 break;
             }
             next = h2conn.accept() => match next {
-                Some(Ok((req, respond))) => dispatch(&ctx, &conn, &mut in_use, req, respond),
+                Some(Ok((req, respond))) => dispatch(ctx, conn, &mut in_use, req, respond),
                 Some(Err(e)) => {
                     tracing::debug!(error = %e, "HTTP/2 connection error");
                     break;
@@ -436,11 +468,6 @@ async fn serve_connection(
             },
         }
     }
-    drop(h2conn);
-    drop(unpaired_permit);
-    ctx.unused.remove(&conn);
-    conn.mark_closed();
-    ctx.router.connection_closed(&conn);
 }
 
 /// Ends a connection the host asked to close: at once at shutdown, with an error after
@@ -507,7 +534,7 @@ fn dispatch(
     respond: SendResponse<Bytes>,
 ) {
     if ctx.path_probe && probe::is_probe(&req) {
-        route_probe(conn, req, respond);
+        route_probe(conn, &ctx.interfaces, req, respond);
         return;
     }
     if !*in_use {
@@ -519,8 +546,13 @@ fn dispatch(
 }
 
 /// `GET /v1/probe` (protocol.md 3.5): pinned connections only (SR-13), then the probe
-/// limits of SR-15.
-fn route_probe(conn: &Arc<Connection>, req: Request<RecvStream>, mut respond: SendResponse<Bytes>) {
+/// limits of SR-15. So only a pinned peer ever sees a path id.
+fn route_probe(
+    conn: &Arc<Connection>,
+    interfaces: &Arc<dyn InterfaceLookup>,
+    req: Request<RecvStream>,
+    mut respond: SendResponse<Bytes>,
+) {
     if !conn.is_trusted() {
         tokio::spawn(async move {
             let err = HttpError::new(StatusCode::FORBIDDEN, ErrorCode::NotPaired, "");
@@ -528,7 +560,12 @@ fn route_probe(conn: &Arc<Connection>, req: Request<RecvStream>, mut respond: Se
         });
         return;
     }
-    tokio::spawn(probe::serve(Arc::clone(conn), req, respond));
+    tokio::spawn(probe::serve(
+        Arc::clone(conn),
+        Arc::clone(interfaces),
+        req,
+        respond,
+    ));
 }
 
 /// Applies the SR-13 gate, then hands the request to the router on its own task.

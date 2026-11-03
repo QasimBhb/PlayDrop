@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::sealing::{self, Sealer};
 use crate::identity::{fill_random, inspect_certificate, secure_fs, DeviceId};
+use crate::net::canonical_addr;
 use crate::tls::PinLookup;
 use crate::{Error, Result};
 
@@ -425,12 +426,21 @@ impl PinStore {
     }
 
     /// Records that `id` was reached at `addr`: moves or inserts it at the front and keeps
-    /// at most [`MAX_LAST_KNOWN`] entries (protocol.md 3.2).
+    /// at most [`MAX_LAST_KNOWN`] entries (protocol.md 3.2). What it stores is canonical
+    /// ([`canonical_addr`]); a file from before that still loads and dials as it is, and
+    /// this is what tidies its mapped entries away, so two forms of one address do not hold
+    /// two of the slots.
     pub fn push_last_known(&mut self, id: &DeviceId, addr: SocketAddr) -> Result<()> {
         let list = &mut self.get_mut(id)?.last_known;
-        list.retain(|a| *a != addr);
-        list.insert(0, addr);
-        list.truncate(MAX_LAST_KNOWN);
+        let mut tidy = Vec::with_capacity(list.len() + 1);
+        tidy.push(canonical_addr(addr));
+        for a in list.iter().copied().map(canonical_addr) {
+            if !tidy.contains(&a) {
+                tidy.push(a);
+            }
+        }
+        tidy.truncate(MAX_LAST_KNOWN);
+        *list = tidy;
         Ok(())
     }
 
@@ -511,6 +521,36 @@ mod tests {
     fn new_pin(label: &str) -> Pin {
         let id = DeviceIdentity::generate().unwrap();
         Pin::new(id.certificate_der().to_vec(), label).unwrap()
+    }
+
+    #[test]
+    fn last_known_stores_canonical_addresses_and_tidies_old_mapped_ones() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state").join(PIN_FILE);
+        let mut store = PinStore::open(&path).unwrap();
+        let pin = new_pin("phone");
+        let id = pin.device_id;
+        store.insert(pin).unwrap();
+        let addr = |a: &str| a.parse::<SocketAddr>().unwrap();
+        store
+            .get_mut(&id)
+            .unwrap()
+            .last_known
+            .extend([addr("[::ffff:10.0.0.2]:1"), addr("10.0.0.3:1")]);
+        store
+            .push_last_known(&id, addr("[::ffff:10.0.0.1]:1"))
+            .unwrap();
+        assert_eq!(
+            store.get(&id).unwrap().last_known,
+            [addr("10.0.0.1:1"), addr("10.0.0.2:1"), addr("10.0.0.3:1")]
+        );
+        store.push_last_known(&id, addr("10.0.0.2:1")).unwrap();
+        assert_eq!(
+            store.get(&id).unwrap().last_known,
+            [addr("10.0.0.2:1"), addr("10.0.0.1:1"), addr("10.0.0.3:1")]
+        );
+        store.push_last_known(&id, addr("[fe80::1%3]:1")).unwrap();
+        assert_eq!(store.get(&id).unwrap().last_known[0], addr("[fe80::1%3]:1"));
     }
 
     #[test]

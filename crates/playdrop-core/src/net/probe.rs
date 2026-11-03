@@ -8,7 +8,9 @@
 //!   connection (`429 rate_limited` otherwise, SR-15).
 //! - Measuring ([`probe`]): a small estimating request, then one sized to take about
 //!   [`PROBE_TARGET`], measured after a warm-up so TCP slow start does not decide it
-//!   ([`ProbeMeter`]).
+//!   ([`ProbeMeter`]). Before those, a `bytes=0` request names the serving interface
+//!   ([`super::path_id`]), so the dialler can stop there, at no cost, if it has measured that
+//!   path already ([`probe_noting`]).
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -17,9 +19,10 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use h2::server::SendResponse;
 use h2::RecvStream;
-use http::{HeaderValue, Method, Request, StatusCode};
+use http::{HeaderName, HeaderValue, Method, Request, StatusCode};
 
 use super::connection::{short, Connection, Heard, DUPLICATE_PING_DEADLINE};
+use super::path_id::{InterfaceLookup, PathId, PATH_HEADER};
 use super::{respond_error, response_head, send_all, HttpError};
 use crate::session::ErrorCode;
 
@@ -154,6 +157,7 @@ impl Drop for InFlight {
 /// Answers `GET /v1/probe` on a pinned connection (protocol.md 3.5).
 pub(crate) async fn serve(
     conn: Arc<Connection>,
+    interfaces: Arc<dyn InterfaceLookup>,
     req: Request<RecvStream>,
     mut respond: SendResponse<Bytes>,
 ) {
@@ -175,6 +179,15 @@ pub(crate) async fn serve(
     let mut head = response_head(StatusCode::OK, Some("application/octet-stream"));
     head.headers_mut()
         .insert(http::header::CONTENT_LENGTH, HeaderValue::from(bytes));
+    // Any failure means no header, and the probe is served all the same. *Choice:* only
+    // on `bytes=0`, the request a dialler asks it with: listing takes time, which must not
+    // land in a request whose timing is the measurement.
+    if bytes == 0 {
+        if let Some(id) = conn.own_path_id(&interfaces).await {
+            head.headers_mut()
+                .insert(HeaderName::from_static(PATH_HEADER), id.header_value());
+        }
+    }
     let mut stream = match respond.send_response(head, bytes == 0) {
         Ok(s) => s,
         Err(e) => {
@@ -257,16 +270,48 @@ pub enum ProbeOutcome {
     Unsupported,
     /// The probe failed; the text says how.
     Failed(String),
+    /// The caller stopped it at the first head ([`probe_noting`]); nothing was measured.
+    Stopped,
 }
 
-/// Probes `conn` (a connection this host dialled) in two requests (protocol.md 3.5):
-/// [`PROBE_ESTIMATE_BYTES`] for a first estimate, then as many bytes as that estimate
+/// Told what the first head of a probe said about the peer's interface: `None` if nothing (a
+/// peer from before the header, or a listing that failed). True goes on to measure; false
+/// ends the probe, which has cost one empty response.
+pub type OnFirstHead<'a> = &'a mut (dyn FnMut(Option<PathId>) -> bool + Send);
+
+/// Probes `conn` (a connection this host dialled) in three requests (protocol.md 3.5): an
+/// empty one that names the path ([`probe_noting`]), [`PROBE_ESTIMATE_BYTES`] for a first
+/// estimate, then as many bytes as that estimate
 /// says arrive in [`PROBE_TARGET`], between the estimate size and `bytes`, measured after
 /// a warm-up. Sizing the second request keeps the server from pushing much more than the
 /// dialler reads: the unread rest of a large probe would drain at path speed and hold up
 /// session frames on a slow connection for seconds. If the second request fails, the
 /// estimate stands.
 pub async fn probe(conn: &Connection, bytes: u64) -> ProbeOutcome {
+    probe_noting(conn, bytes, &mut |_| true).await
+}
+
+/// [`probe`], first asking for `bytes=0`, which has `on_first_head` decide whether to go on.
+/// *Choice:* a request of its own gets the id for nothing on a path not worth measuring and
+/// keeps the server's interface listing out of the timed requests. It takes one more of the 10
+/// probes per minute, and a check uses at most 5 per connection (a failed probe
+/// and its retry, 3.5). A peer from before the
+/// header answers it with an empty `200`, and one from before 3.5 with its `404`.
+pub async fn probe_noting(
+    conn: &Connection,
+    bytes: u64,
+    on_first_head: OnFirstHead<'_>,
+) -> ProbeOutcome {
+    let peer_path = match request_probe(conn, 0).await {
+        Ok((resp, _)) => resp
+            .headers()
+            .get(PATH_HEADER)
+            .and_then(PathId::from_header),
+        Err(outcome) => return outcome,
+    };
+    if !on_first_head(peer_path) {
+        return ProbeOutcome::Stopped;
+    }
     let first = PROBE_ESTIMATE_BYTES.min(bytes);
     let estimate = match fetch(conn, first, 0).await {
         ProbeOutcome::Rate(r) => r,
@@ -304,10 +349,22 @@ pub enum InUseProbe {
 /// that is still heard from gets one more probe, so a passing stall never moves the peer to
 /// a slower path.
 pub async fn probe_in_use(conn: &Connection, bytes: u64) -> InUseProbe {
-    let first = match probe(conn, bytes).await {
+    probe_in_use_noting(conn, bytes, &mut |_| true).await
+}
+
+/// [`probe_in_use`], telling `on_first_head` what each probe's first head said. Stopping it
+/// reads as unmeasured: nothing was learned about the path.
+pub async fn probe_in_use_noting(
+    conn: &Connection,
+    bytes: u64,
+    on_first_head: OnFirstHead<'_>,
+) -> InUseProbe {
+    const STOPPED: &str = "the probe was stopped";
+    let first = match probe_noting(conn, bytes, &mut *on_first_head).await {
         ProbeOutcome::Rate(r) => return InUseProbe::Rate(r),
         ProbeOutcome::Unsupported => return InUseProbe::Unsupported,
         ProbeOutcome::Failed(e) => e,
+        ProbeOutcome::Stopped => return InUseProbe::Unmeasured(STOPPED.to_owned()),
     };
     if matches!(
         conn.heard_from(DUPLICATE_PING_DEADLINE).await,
@@ -315,10 +372,11 @@ pub async fn probe_in_use(conn: &Connection, bytes: u64) -> InUseProbe {
     ) {
         return InUseProbe::Dead(first);
     }
-    match probe(conn, bytes).await {
+    match probe_noting(conn, bytes, on_first_head).await {
         ProbeOutcome::Rate(r) => InUseProbe::Rate(r),
         ProbeOutcome::Unsupported => InUseProbe::Unsupported,
         ProbeOutcome::Failed(e) => InUseProbe::Unmeasured(e),
+        ProbeOutcome::Stopped => InUseProbe::Unmeasured(STOPPED.to_owned()),
     }
 }
 
@@ -339,32 +397,41 @@ pub fn second_size(estimate: f64, first: u64, max: u64) -> u64 {
     want.clamp(first, max.max(first))
 }
 
-/// One `GET /v1/probe?bytes=n`, read for at most [`PROBE_BODY_LIMIT`] and measured after
-/// `warmup` bytes.
-async fn fetch(conn: &Connection, bytes: u64, warmup: u64) -> ProbeOutcome {
-    let req = match Request::builder()
+/// Sends `GET /v1/probe?bytes=n` and waits for its head, which must be a `200`.
+async fn request_probe(
+    conn: &Connection,
+    bytes: u64,
+) -> Result<(http::Response<RecvStream>, h2::SendStream<Bytes>), ProbeOutcome> {
+    let failed = |e: String| ProbeOutcome::Failed(e);
+    let req = Request::builder()
         .method(Method::GET)
         .uri(format!("{PROBE_PATH}?bytes={bytes}"))
         .body(())
-    {
-        Ok(r) => r,
-        Err(e) => return ProbeOutcome::Failed(e.to_string()),
-    };
-    let started = Instant::now();
-    let (resp, mut send) = match conn.request(req, true).await {
-        Ok(v) => v,
-        Err(e) => return ProbeOutcome::Failed(e.to_string()),
-    };
+        .map_err(|e| failed(e.to_string()))?;
+    let (resp, send) = conn
+        .request(req, true)
+        .await
+        .map_err(|e| failed(e.to_string()))?;
     let resp = match tokio::time::timeout(PROBE_HEAD_TIMEOUT, resp).await {
         Ok(Ok(r)) => r,
-        Ok(Err(e)) => return ProbeOutcome::Failed(e.to_string()),
-        Err(_) => return ProbeOutcome::Failed("no answer".into()),
+        Ok(Err(e)) => return Err(failed(e.to_string())),
+        Err(_) => return Err(failed("no answer".into())),
     };
     match resp.status() {
-        StatusCode::OK => {}
-        StatusCode::NOT_FOUND => return ProbeOutcome::Unsupported,
-        s => return ProbeOutcome::Failed(format!("answered {}", s.as_u16())),
+        StatusCode::OK => Ok((resp, send)),
+        StatusCode::NOT_FOUND => Err(ProbeOutcome::Unsupported),
+        s => Err(failed(format!("answered {}", s.as_u16()))),
     }
+}
+
+/// One `GET /v1/probe?bytes=n`, read for at most [`PROBE_BODY_LIMIT`] and measured after
+/// `warmup` bytes.
+async fn fetch(conn: &Connection, bytes: u64, warmup: u64) -> ProbeOutcome {
+    let started = Instant::now();
+    let (resp, mut send) = match request_probe(conn, bytes).await {
+        Ok(v) => v,
+        Err(outcome) => return outcome,
+    };
     let mut body = resp.into_body();
     let mut meter = ProbeMeter::new(warmup, started);
     let deadline = tokio::time::Instant::now() + PROBE_BODY_LIMIT;

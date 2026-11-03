@@ -7,6 +7,8 @@
 //! - [`client`]: staggered dialling of candidate addresses (3.2), the HTTP/2 client
 //!   handshake, and holding the other candidates that answered for a path check (3.5).
 //! - [`probe`]: the path probe endpoint and its measurement (3.5).
+//! - [`path_id`]: the opaque interface id that tells two addresses of one radio from two
+//!   radios (3.5).
 //! - [`connection`]: one authenticated HTTP/2 connection with its peer identity, TLS exporter
 //!   value, close signal and keep-alive (3.4).
 //!
@@ -15,6 +17,7 @@
 
 pub mod client;
 pub mod connection;
+pub mod path_id;
 pub mod probe;
 pub mod server;
 
@@ -31,7 +34,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use crate::session::{ErrorCode, Limits};
 
 pub use client::{
-    dial, dial_held, dial_with_alternatives, Alternatives, DialError, DialOptions, HeldTls,
+    canonical_addr, canonical_unique, dial, dial_held, dial_with_alternatives, plan_candidates,
+    Alternatives, DialError, DialOptions, HeldDial, HeldTls,
 };
 pub use connection::{CloseReason, Connection, Direction, KeepAlive};
 pub use server::{ListenSocket, ListenerSetup, Router, Server, TlsAcceptor};

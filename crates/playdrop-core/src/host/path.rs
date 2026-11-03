@@ -18,6 +18,9 @@
 //! - Probes run one at a time, the connection in use first: a `404` means a peer from
 //!   before 3.5 and the alternatives are dropped before HTTP/2, so that peer never sees
 //!   them.
+//! - One radio's addresses are one path: an alternative whose first probe head shows a
+//!   path already measured is closed there ([`PathKey`]), and not held again until the
+//!   network changes, the path moves, or 160 minutes pass, so it takes no slot meanwhile.
 //! - A switch opens the session on the new connection first (it replaces the old one,
 //!   3.3: same dialler, newer), then makes it the outbound connection, which drains the
 //!   old one, and moves its address to the front of the pin's last-known list. A session
@@ -36,10 +39,14 @@ use super::connect::{close_if_silent, dial_lock, watch_connection};
 use super::session::Session;
 use super::{lock, session, unix_now, Inner};
 use crate::identity::DeviceId;
-use crate::net::client::ALTERNATIVE_GRACE;
+use crate::net::client::{HeldDial, ALTERNATIVE_GRACE, MAX_ALTERNATIVES};
 use crate::net::connection::{short, Heard, REPLACED_PING_DEADLINE};
-use crate::net::probe::{probe, probe_in_use, InUseProbe, ProbeOutcome, PROBE_BYTES};
-use crate::net::{dial_held, Alternatives, CloseReason, Connection, DialOptions, HeldTls};
+use crate::net::path_id::{PathId, PathKey};
+use crate::net::probe::{probe_in_use_noting, probe_noting, InUseProbe, ProbeOutcome, PROBE_BYTES};
+use crate::net::{
+    canonical_addr, canonical_unique, dial_held, Alternatives, CloseReason, Connection,
+    DialOptions, HeldTls,
+};
 use crate::session::types::PresenceState;
 use crate::tls;
 
@@ -71,6 +78,11 @@ impl Default for PathTiming {
         }
     }
 }
+
+/// Most addresses set aside per peer. *Choice:* a peer has at most 8 last-known addresses and
+/// a few discovered ones; this only stops a peer that keeps changing address from growing the
+/// list. The oldest goes first, and costs at most one more check.
+const MAX_MERGED: usize = 16;
 
 /// How much faster an alternative must measure before the dialler moves to it.
 /// *Choice:* 1.25 keeps two paths of about the same speed from trading places on noise,
@@ -136,6 +148,10 @@ pub struct ProbeReport {
     pub bytes_per_sec: Option<u64>,
     /// Why the probe failed, if it did.
     pub error: Option<String>,
+    /// This address turned out to be on the same path as that one, which was measured, so
+    /// this one was not (protocol.md 3.5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_path_as: Option<SocketAddr>,
 }
 
 /// What [`Host::path_reports`](super::Host::path_reports) lists per peer.
@@ -169,10 +185,13 @@ impl PathReport {
             let probes: Vec<String> = self
                 .probes
                 .iter()
-                .map(|p| match (p.bytes_per_sec, &p.error) {
-                    (Some(r), _) => format!("{} {}", p.addr, mib_per_s(r)),
-                    (None, Some(e)) => format!("{} {e}", p.addr),
-                    (None, None) => p.addr.to_string(),
+                .map(|p| match (p.same_path_as, p.bytes_per_sec, &p.error) {
+                    (Some(same), _, _) => {
+                        format!("{} same path as {same}, not measured", p.addr)
+                    }
+                    (None, Some(r), _) => format!("{} {}", p.addr, mib_per_s(r)),
+                    (None, None, Some(e)) => format!("{} {e}", p.addr),
+                    (None, None, None) => p.addr.to_string(),
                 })
                 .collect();
             let ago = now.saturating_sub(at);
@@ -208,6 +227,15 @@ pub(crate) struct PathState {
     quiet_checks: u32,
     /// Addresses that finished TLS in the last check that dialled any.
     answered: Vec<SocketAddr>,
+    /// Addresses found to be on a path a check measured, oldest first, with when each was
+    /// found: not held for a check until the network changes, the path in use moves or the
+    /// entry lapses ([`merged_lapse`]).
+    merged: Vec<(SocketAddr, tokio::time::Instant)>,
+    /// Raised each time `merged` is cleared, so a check that began before does not write back
+    /// what it found on the paths as they were.
+    merged_epoch: u64,
+    /// `merged_epoch` when the running check began.
+    check_epoch: u64,
     /// Switches in a row whose session request got no answer, or no session.
     failed_switches: u32,
     /// After a failed switch, no check before this.
@@ -305,19 +333,27 @@ fn note_dialled(inner: &Inner, peer: DeviceId, addr: SocketAddr) -> bool {
         st.quiet_checks = 0;
         st.tried.clear();
         st.answered.clear();
+        clear_merged(st);
     }
     moved
 }
 
-/// Remembers which addresses answered, for the wait on their adverts.
+/// Remembers which addresses answered, for the wait on their adverts. An alternative later
+/// found to be on a path already measured stays in here: it did answer, so an advert from it
+/// waits the long wait, and a radio advertising on several addresses costs no more for that.
 fn note_answered(inner: &Inner, peer: DeviceId, held: &[HeldTls]) {
+    note_answered_addrs(inner, peer, held.iter().map(HeldTls::remote_addr));
+}
+
+/// [`note_answered`] for bare addresses.
+fn note_answered_addrs(inner: &Inner, peer: DeviceId, addrs: impl IntoIterator<Item = SocketAddr>) {
     let mut paths = lock(&inner.paths);
     let Some(st) = pinned_state(inner, &mut paths, peer) else {
         return;
     };
-    for h in held {
-        if !st.answered.contains(&h.remote_addr()) {
-            st.answered.push(h.remote_addr());
+    for a in addrs {
+        if !st.answered.contains(&a) {
+            st.answered.push(a);
         }
     }
 }
@@ -473,6 +509,7 @@ fn begin(inner: &Inner, peer: DeviceId, tried: &[SocketAddr]) -> bool {
     st.running = true;
     st.last_check = Some(now);
     st.tried = tried.to_vec();
+    st.check_epoch = st.merged_epoch;
     true
 }
 
@@ -496,9 +533,17 @@ fn end(inner: &Inner, peer: DeviceId, outcome: PathOutcome, probes: Vec<ProbeRep
     };
     st.outcome = Some(outcome);
     st.checked_at = Some(unix_now());
+    if outcome == PathOutcome::Switched {
+        clear_merged(st);
+    }
+    let still_true = outcome != PathOutcome::Switched && st.check_epoch == st.merged_epoch;
+    let now = tokio::time::Instant::now();
     for p in &probes {
         if !st.tried.contains(&p.addr) {
             st.tried.push(p.addr);
+        }
+        if still_true && p.same_path_as.is_some() {
+            note_merged(st, p.addr, now);
         }
     }
     st.probes = probes;
@@ -604,13 +649,82 @@ pub(crate) async fn wait_installed(inner: &Inner, sess: &Session, timeout: Durat
     }
 }
 
-/// A verified advert for a peer that is online (protocol.md 3.5, 8.3).
+/// A verified advert for a peer that is online (protocol.md 3.5, 8.3). `addr` is canonical
+/// ([`connect::on_verified_advert`]), like every address the path state holds.
+///
+/// [`connect::on_verified_advert`]: super::connect::on_verified_advert
 pub(crate) fn on_advert(inner: &Arc<Inner>, peer: DeviceId, addr: SocketAddr) {
     recheck(inner, peer, Trigger::Advert(addr));
 }
 
-/// The OS reported a network change: re-check every online peer we dialled.
+/// The addresses of `peer` not to hold for a check.
+pub(crate) fn merged_addresses(inner: &Inner, peer: DeviceId) -> Vec<SocketAddr> {
+    let lapse_after = merged_lapse(inner.path_timing);
+    let now = tokio::time::Instant::now();
+    let mut paths = lock(&inner.paths);
+    let Some(st) = paths.get_mut(&peer) else {
+        return Vec::new();
+    };
+    lapse_merged(st, lapse_after, now);
+    st.merged.iter().map(|(a, _)| *a).collect()
+}
+
+/// How long an address stays set aside. *Choice:* the back-off's longest wait (160 minutes
+/// by default): not every platform reports a network change (Windows and `playdrop host` have
+/// no watcher, Linux sees only overall state), so a faster path that appears on a known
+/// address must still get found. An address that lapsed costs one check of about 4 MiB, and
+/// only when something triggers one.
+fn merged_lapse(timing: PathTiming) -> Duration {
+    advert_wait(timing.same_address_recheck, u32::MAX)
+}
+
+/// Drops the entries older than `lapse_after`. Each stays known as tried, so its next advert
+/// waits like any other tried address's, rather than resetting the back-off as a new one does.
+fn lapse_merged(st: &mut PathState, lapse_after: Duration, now: tokio::time::Instant) {
+    let tried = &mut st.tried;
+    st.merged.retain(|(addr, at)| {
+        let keep = now.saturating_duration_since(*at) < lapse_after;
+        if !keep && !tried.contains(addr) {
+            tried.push(*addr);
+        }
+        keep
+    });
+}
+
+/// Sets `addr` aside from `now`, within [`MAX_MERGED`].
+fn note_merged(st: &mut PathState, addr: SocketAddr, now: tokio::time::Instant) {
+    st.merged.retain(|(a, _)| *a != addr);
+    if st.merged.len() >= MAX_MERGED {
+        st.merged.remove(0);
+    }
+    st.merged.push((addr, now));
+}
+
+/// Forgets what was set aside; a check under way will not bring it back.
+fn clear_merged(st: &mut PathState) {
+    st.merged.clear();
+    st.merged_epoch = st.merged_epoch.wrapping_add(1);
+}
+
+/// What a re-check may dial out of `known`, newest first: canonical, each once, without the
+/// address in use or those set aside. Only [`dial_held`] plans the order, as planning loses
+/// which address is newest.
+fn recheck_candidates(
+    known: &[SocketAddr],
+    in_use: SocketAddr,
+    merged: &[SocketAddr],
+) -> Vec<SocketAddr> {
+    let mut addrs = canonical_unique(known);
+    addrs.retain(|a| *a != in_use && !merged.contains(a));
+    addrs
+}
+
+/// The OS reported a network change: what was one path may not be any more, and every online
+/// peer we dialled is re-checked.
 pub(crate) fn on_network_changed(inner: &Arc<Inner>) {
+    for st in lock(&inner.paths).values_mut() {
+        clear_merged(st);
+    }
     for s in inner.registry.sessions() {
         recheck(inner, s.peer(), Trigger::NetworkChanged);
     }
@@ -623,6 +737,7 @@ fn limits_allow(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) -> bool {
     let timing = inner.path_timing;
     let mut paths = lock(&inner.paths);
     if let Some(st) = paths.get_mut(&peer) {
+        lapse_merged(st, merged_lapse(timing), now);
         if matches!(why, Trigger::NetworkChanged) {
             st.blocked_until = None;
             st.failed_switches = 0;
@@ -641,7 +756,9 @@ fn limits_allow(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) -> bool {
             // address answered, the wait is the back-off; if it did not, the device says
             // it is there now, so it is tried again much sooner, and only costs a dial
             // (below). An address not tried yet means the paths changed.
-            Trigger::Advert(addr) if st.tried.contains(&addr) => {
+            Trigger::Advert(addr)
+                if st.tried.contains(&addr) || st.merged.iter().any(|(a, _)| *a == addr) =>
+            {
                 let base = if st.answered.contains(&addr) {
                     timing.same_address_recheck
                 } else {
@@ -674,8 +791,9 @@ fn recheck(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) {
     let Some(current) = inner.registry.outbound(&peer) else {
         return;
     };
+    let in_use = canonical_addr(current.remote_addr());
     if let Trigger::Advert(addr) = why {
-        if addr == current.remote_addr() {
+        if addr == in_use {
             return;
         }
     }
@@ -707,7 +825,15 @@ fn recheck(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) {
             addrs.push(addr);
         }
     }
-    addrs.retain(|a| *a != current.remote_addr());
+    // Canonical, so a stored mapped form neither dials the address in use again nor makes the
+    // back-off take one address for two. Addresses on a path already measured would only take
+    // the held slots from one that is not, check after check (protocol.md 3.5). With nothing
+    // else to dial nothing is measured, and the last report stands.
+    let merged = merged_addresses(inner, peer);
+    let addrs = recheck_candidates(&addrs, in_use, &merged);
+    if addrs.is_empty() && !merged.is_empty() {
+        return;
+    }
     // A re-check dials at most once per peer per 60 s (`begin`), within the rate SR-1
     // and protocol.md 8.3 rule 1 allow. It does not take the 5 s reconnect budget of the
     // dial limiter: after a network change the session may be about to die, and its
@@ -731,14 +857,26 @@ fn recheck(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) {
         .unwrap_or_default();
     inner.spawn(async move {
         // Unpair closes `current`; dropping `dial_held` closes the held sockets (SR-14).
-        let held = tokio::select! {
-            held = dial_held(&addrs, &opts, ALTERNATIVE_GRACE) => held,
-            () = current.closed() => Vec::new(),
+        let HeldDial { held, failed } = tokio::select! {
+            dialled = dial_held(&addrs, &opts, ALTERNATIVE_GRACE) => dialled,
+            () = current.closed() => HeldDial::default(),
         };
+        let advertised = match why {
+            Trigger::Advert(a) if !held.iter().any(|h| h.remote_addr() == a) => Some(a),
+            _ => None,
+        };
+        // Every slot went to an address ahead of the advertised one, so it was stopped before
+        // it could answer. That says nothing against it, and the others are still worth
+        // measuring. It counts as answered, or each of its adverts would bring a check at
+        // the short wait. An attempt that failed did get its chance.
+        let lost_its_slot =
+            held.len() >= MAX_ALTERNATIVES && advertised.is_some_and(|a| !failed.contains(&a));
+        if let (true, Some(a)) = (lost_its_slot, advertised) {
+            note_answered_addrs(&i2, peer, [a]);
+        }
         // Retried because an address that did not answer advertised again: it still does
         // not answer, so nothing new is known and nothing is probed.
-        let retry_in_vain = matches!(why, Trigger::Advert(a)
-            if !earlier.contains(&a) && !held.iter().any(|h| h.remote_addr() == a));
+        let retry_in_vain = !lost_its_slot && advertised.is_some_and(|a| !earlier.contains(&a));
         if held.is_empty() || retry_in_vain {
             end(&i2, peer, PathOutcome::NoAlternative, Vec::new());
             return;
@@ -769,20 +907,59 @@ fn defer(inner: &Arc<Inner>, peer: DeviceId) {
     });
 }
 
-/// Probes one connection and records the result.
-async fn probe_one(conn: &Connection, current: bool, probes: &mut Vec<ProbeReport>) -> Option<f64> {
+/// This host's id for `conn`, given up on if the connection in use closes: unpair and
+/// shutdown close it, and a check must not outlast them for a listing.
+async fn own_id(inner: &Inner, conn: &Connection, current: &Connection) -> Option<PathId> {
+    tokio::select! {
+        id = conn.own_path_id(&inner.path_interfaces) => id,
+        () = current.closed() => None,
+    }
+}
+
+/// Probes one alternative and records the result. It ends at its first head if that shows a
+/// path in `measured`, and is then closed: it is not eligible for [`decide`], and has cost
+/// one empty response rather than a whole probe. With an id missing on either side there is
+/// no key, and it is measured as any other.
+async fn probe_alternative(
+    conn: &Connection,
+    own: Option<PathId>,
+    measured: &mut Vec<(PathKey, SocketAddr)>,
+    probes: &mut Vec<ProbeReport>,
+) -> Option<f64> {
     let addr = conn.remote_addr();
-    match probe(conn, PROBE_BYTES).await {
+    let mut key = None;
+    let mut same_as = None;
+    let outcome = probe_noting(conn, PROBE_BYTES, &mut |peer| {
+        key = PathKey::new(peer, own);
+        same_as = measured
+            .iter()
+            .find(|(m, _)| Some(*m) == key)
+            .map(|(_, a)| *a);
+        same_as.is_none()
+    })
+    .await;
+    match outcome {
         ProbeOutcome::Rate(r) => {
-            probes.push(report(addr, current, Some(r), None));
+            if let Some(k) = key {
+                measured.push((k, addr));
+            }
+            probes.push(report(addr, false, Some(r), None));
             Some(r)
         }
+        ProbeOutcome::Stopped => {
+            conn.close(CloseReason::Duplicate);
+            probes.push(ProbeReport {
+                same_path_as: same_as,
+                ..report(addr, false, None, None)
+            });
+            None
+        }
         ProbeOutcome::Unsupported => {
-            probes.push(report(addr, current, None, Some("404".into())));
+            probes.push(report(addr, false, None, Some("404".into())));
             None
         }
         ProbeOutcome::Failed(e) => {
-            probes.push(report(addr, current, None, Some(e)));
+            probes.push(report(addr, false, None, Some(e)));
             None
         }
     }
@@ -811,13 +988,25 @@ async fn check(inner: &Arc<Inner>, peer: DeviceId, current: &Arc<Connection>, he
         return end(inner, peer, PathOutcome::Failed, probes);
     }
     let addr = current.remote_addr();
-    let current_rate = match probe_in_use(current, PROBE_BYTES).await {
+    // The paths measured so far, by key, with the address that measured each.
+    let mut measured = Vec::with_capacity(MAX_ALTERNATIVES + 1);
+    let mut current_peer_id = None;
+    let on_head = &mut |peer| {
+        current_peer_id = peer;
+        true
+    };
+    let current_rate = match probe_in_use_noting(current, PROBE_BYTES, on_head).await {
         InUseProbe::Rate(r) => {
             probes.push(report(addr, true, Some(r), None));
+            if let Some(key) = PathKey::new(current_peer_id, own_id(inner, current, current).await)
+            {
+                measured.push((key, addr));
+            }
             r
         }
         InUseProbe::Dead(e) => {
-            // Any alternative that measures wins.
+            // Any alternative that measures wins, on this radio too: a connection can die
+            // while its radio lives on (a roam, a new address), so a dead one merges nothing.
             probes.push(report(addr, true, None, Some(e)));
             0.0
         }
@@ -860,7 +1049,8 @@ async fn check(inner: &Arc<Inner>, peer: DeviceId, current: &Arc<Connection>, he
             end(inner, peer, PathOutcome::Failed, probes);
             return;
         }
-        rates.push(probe_one(c, false, &mut probes).await);
+        let own = own_id(inner, c, current).await;
+        rates.push(probe_alternative(c, own, &mut measured, &mut probes).await);
     }
     let Some(best) = decide(current_rate, &rates) else {
         tracing::debug!(peer = %short(&peer), "path kept");
@@ -932,6 +1122,7 @@ fn report(
         current,
         bytes_per_sec,
         error,
+        same_path_as: None,
     }
 }
 
@@ -1181,12 +1372,14 @@ mod tests {
                     current: true,
                     bytes_per_sec: Some(27 * 1024 * 1024),
                     error: None,
+                    same_path_as: None,
                 },
                 ProbeReport {
                     addr: "192.168.1.20:42187".parse().unwrap(),
                     current: false,
                     bytes_per_sec: Some(48 * 1024 * 1024),
                     error: None,
+                    same_path_as: None,
                 },
             ],
         };
@@ -1205,5 +1398,103 @@ mod tests {
             fresh.summary_line("Phone", 112),
             "note: path to Phone: 192.168.1.20:42187"
         );
+    }
+
+    fn addr(a: &str) -> SocketAddr {
+        a.parse().unwrap()
+    }
+
+    #[test]
+    fn set_aside_addresses_are_bounded_and_lapse_into_tried() {
+        let mut st = PathState::default();
+        let t0 = tokio::time::Instant::now();
+        for i in 0..MAX_MERGED + 3 {
+            let a = SocketAddr::from(([10, 0, 0, u8::try_from(i).unwrap()], 1));
+            note_merged(&mut st, a, t0);
+        }
+        assert_eq!(st.merged.len(), MAX_MERGED);
+        assert_eq!(st.merged[0].0, addr("10.0.0.3:1"), "the oldest went first");
+        // Found again: not twice, and its time starts over.
+        let later = t0 + Duration::from_secs(10);
+        note_merged(&mut st, addr("10.0.0.3:1"), later);
+        assert_eq!(st.merged.len(), MAX_MERGED);
+        lapse_merged(&mut st, Duration::from_secs(5), later);
+        assert_eq!(st.merged.len(), 1);
+        assert_eq!(st.merged[0].0, addr("10.0.0.3:1"));
+        assert!(
+            st.tried.contains(&addr("10.0.0.4:1")),
+            "stays known as tried"
+        );
+    }
+
+    /// Planning here as well would hand `dial_held` a list that no longer says which of the
+    /// others is newest.
+    #[test]
+    fn a_recheck_keeps_the_addresses_newest_first_without_those_left_out() {
+        let known = [
+            addr("[::ffff:10.0.0.1]:1"),
+            addr("[fe80::9%3]:1"),
+            addr("[fe80::1%3]:1"),
+            addr("[2001:db8::1]:1"),
+            addr("10.0.0.2:1"),
+            addr("10.0.0.3:1"),
+            addr("10.0.0.2:1"),
+            addr("10.0.0.4:1"),
+        ];
+        let got = recheck_candidates(&known, addr("10.0.0.1:1"), &[addr("[fe80::9%3]:1")]);
+        assert_eq!(
+            got,
+            [
+                addr("[fe80::1%3]:1"),
+                addr("[2001:db8::1]:1"),
+                addr("10.0.0.2:1"),
+                addr("10.0.0.3:1"),
+                addr("10.0.0.4:1"),
+            ]
+        );
+        // So the newest of the others is the one that gets the early start.
+        assert_eq!(
+            crate::net::plan_candidates(&got, false)[2],
+            addr("[fe80::1%3]:1")
+        );
+    }
+
+    #[test]
+    fn summary_line_says_an_address_was_the_same_path() {
+        let in_use: SocketAddr = "192.168.86.74:42187".parse().unwrap();
+        let r = PathReport {
+            peer: "abcdef01".into(),
+            short_id: "K3QD".into(),
+            chosen: Some(in_use),
+            outcome: Some(PathOutcome::Kept),
+            checked_at: Some(100),
+            probes: vec![
+                ProbeReport {
+                    addr: in_use,
+                    current: true,
+                    bytes_per_sec: Some(35 * 1024 * 1024),
+                    error: None,
+                    same_path_as: None,
+                },
+                ProbeReport {
+                    addr: "[fe80::1%3]:42187".parse().unwrap(),
+                    current: false,
+                    bytes_per_sec: None,
+                    error: None,
+                    same_path_as: Some(in_use),
+                },
+            ],
+        };
+        assert_eq!(
+            r.summary_line("Phone", 100),
+            "note: path to Phone: 192.168.86.74:42187 (kept 0 s ago; \
+             192.168.86.74:42187 35.0 MiB/s, \
+             [fe80::1%3]:42187 same path as 192.168.86.74:42187, not measured)"
+        );
+        // Older reports have no such field, and a report without one writes none.
+        let json = serde_json::to_string(&r.probes[0]).unwrap();
+        assert!(!json.contains("same_path_as"), "{json}");
+        let back: ProbeReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, r.probes[0]);
     }
 }

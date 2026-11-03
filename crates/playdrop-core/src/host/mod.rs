@@ -53,6 +53,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 
 pub use crate::identity::sealing::{SecretStore, SecretStoreError};
+pub use crate::net::path_id::InterfaceLookup;
 pub use crate::net::{ListenSocket, ListenerSetup};
 pub use crate::transfer::{DeliverItem, ReceiveSink, SinkError, SourceOpener, StreamSource};
 pub use diagnostics::{
@@ -73,6 +74,7 @@ pub use transfers::{TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISH
 use crate::discovery::{BeaconSchedule, DialLimiter, Discovery, DiscoveryConfig, InterfaceSource};
 use crate::identity::{DeviceId, DeviceIdentity};
 use crate::net::connection::{short, CloseReason, DESKTOP_KEEPALIVE, MOBILE_KEEPALIVE};
+use crate::net::path_id::SystemInterfaceLookup;
 use crate::net::{Server, TlsAcceptor};
 use crate::pin_store::{Grants, PinStore, PIN_FILE};
 use crate::session::types::Input;
@@ -187,6 +189,10 @@ pub struct HostConfig {
     pub path_choice: bool,
     /// The intervals of path checks (protocol.md 3.5). Rust only; tests shorten them.
     pub path_timing: PathTiming,
+    /// Finds the interface behind a connection, for the path id of protocol.md 3.5. The
+    /// default is the system's list. Rust only; tests supply their own, as loopback gets
+    /// no id.
+    pub path_interfaces: Arc<dyn InterfaceLookup>,
 }
 
 impl HostConfig {
@@ -215,6 +221,7 @@ impl HostConfig {
             reconnect_for: send::RECONNECT_FOR,
             path_choice: true,
             path_timing: PathTiming::default(),
+            path_interfaces: Arc::new(SystemInterfaceLookup),
         }
     }
 
@@ -367,6 +374,8 @@ pub(crate) struct Inner {
     pub(crate) path_choice: bool,
     /// [`HostConfig::path_timing`].
     pub(crate) path_timing: PathTiming,
+    /// [`HostConfig::path_interfaces`].
+    pub(crate) path_interfaces: Arc<dyn InterfaceLookup>,
     pub(crate) clipboard_echo: Mutex<ClipboardEcho>,
     /// Unix seconds of the last hello or frame per paired peer, updated on every frame.
     /// The pin store holds the persisted copy (written at session start and end only, so
@@ -768,7 +777,8 @@ impl Host {
             limits.clone(),
             config.listener_setup.as_deref(),
         )?
-        .with_path_probe(config.path_choice);
+        .with_path_probe(config.path_choice)
+        .with_interface_lookup(Arc::clone(&config.path_interfaces));
         let local_addr = server.local_addr();
         let pins = Pins::new(store);
         let window_flag = Arc::new(AtomicBool::new(false));
@@ -807,6 +817,7 @@ impl Host {
             paths: Mutex::new(HashMap::new()),
             path_choice: config.path_choice,
             path_timing: config.path_timing,
+            path_interfaces: config.path_interfaces,
             clipboard_echo: Mutex::new(ClipboardEcho::default()),
             last_seen: Mutex::new(HashMap::new()),
             free_space: config.free_space,

@@ -21,6 +21,7 @@ use http::Request;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::watch;
 
+use super::path_id::{path_id_of, InterfaceLookup, PathId};
 use crate::identity::DeviceId;
 use crate::session::ResetRateCounter;
 use crate::tls::{PeerIdentity, PeerTrust, EXPORTER_LEN};
@@ -195,6 +196,11 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for ActivityIo<T> {
     }
 }
 
+/// How long listing the interfaces may take before a connection goes without a path id.
+/// *Choice:* a listing takes milliseconds; 500 ms leaves a probe's head well inside its 2 s
+/// timeout, and a listing that hangs must not hold a path check for good.
+const LISTING_TIMEOUT: Duration = Duration::from_millis(500);
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One authenticated HTTP/2 connection (protocol.md 3.1). Shared as `Arc<Connection>`.
@@ -204,6 +210,7 @@ pub struct Connection {
     peer: PeerIdentity,
     trusted: AtomicBool,
     remote: SocketAddr,
+    local: Option<SocketAddr>,
     exporter: [u8; EXPORTER_LEN],
     send: Mutex<Option<SendRequest<Bytes>>>,
     close_tx: watch::Sender<Option<CloseReason>>,
@@ -248,6 +255,7 @@ impl Connection {
         direction: Direction,
         peer: PeerIdentity,
         remote: SocketAddr,
+        local: Option<SocketAddr>,
         exporter: [u8; EXPORTER_LEN],
         send: Option<SendRequest<Bytes>>,
         ping: Option<PingPong>,
@@ -261,6 +269,7 @@ impl Connection {
             peer,
             trusted: AtomicBool::new(trusted),
             remote,
+            local,
             exporter,
             send: Mutex::new(send),
             close_tx: watch::Sender::new(None),
@@ -302,6 +311,22 @@ impl Connection {
     /// The peer's socket address.
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote
+    }
+
+    /// This host's id of the interface this connection runs over (protocol.md 3.5): what a
+    /// server sends in a probe's first head, and a dialler's own half of the path key. `None`
+    /// if it cannot be told in [`LISTING_TIMEOUT`]. Listed afresh at each ask, off the runtime:
+    /// an address can move to another interface while its TCP connections live on, and a
+    /// wrong answer here would merge two paths. A check asks once per connection.
+    pub async fn own_path_id(&self, lookup: &Arc<dyn InterfaceLookup>) -> Option<PathId> {
+        let local = self.local?;
+        let lookup = Arc::clone(lookup);
+        let listing = tokio::task::spawn_blocking(move || path_id_of(lookup.as_ref(), local));
+        tokio::time::timeout(LISTING_TIMEOUT, listing)
+            .await
+            .ok()?
+            .ok()
+            .flatten()
     }
 
     /// When the connection was established.

@@ -44,6 +44,7 @@ Modelled facts: TCP 42187 with TLS 1.3 mutual auth and HTTP/2; UDP 42187 beacon 
 | B5 Phone entry points | Only the user-facing share target is exported |
 | B6 Storage at rest | OS-protected per platform, never in backups |
 | B7 Other OS users | Separate keys, folders and IPC; a port collision is DoS only |
+| B8 Relay (only with the `iroh` build feature, a named relay and the `remote` grant) | Never trusted. Carries encrypted packets and learns who talks to whom, when and how much |
 
 ---
 
@@ -111,6 +112,12 @@ L = likelihood on a hostile LAN. Mitigations cite section 4.
 | T37 | I | Logs leak clipboard, names, tokens, SAS, QR secrets | Logs | Leak via bug reports | H | Redaction, canary test (SR-32) | Debug builds | P1 |
 | T38 | I | Another local user reads the receive folder | B7 | Disclosure | L | 0700 folder (SR-23) | Admin or root | P2 |
 | T39 | T | Parser bugs before authentication | B1, B2 | Crash, corruption | M | Caps, fuzzing (SR-33) | Dependency bugs | P1, P6 |
+| **Reach across networks (only with the `iroh` feature)** | | | | | | | | |
+| T40 | I | The relay records who talks to whom, when and how much | B8 | Metadata leak, and a stable ID to track | M | No default relay, user names it, statement to the user (SR-35, SR-39) | Whoever runs the named relay | P12 |
+| T41 | S | A relay or stranger forges an Endpoint ID or redirects a dial | B8, B1 | Impersonation | M | Inner TLS against the pin decides trust; the ID decides nothing (SR-37) | None | P12 |
+| T42 | E | A stranger on the internet reaches the pairing code or session plane | B8, B1 | Pairing from afar, new attack surface | H | Pinned and granted endpoints only, closed before TLS, no pairing over reach (SR-36) | Parser bugs in iroh | P12 |
+| T43 | D | Connection or stream floods through the relay | B8 | Daemon down, memory | M | One connection and one stream per endpoint, SR-15 limits apply inside (SR-38) | A paired peer can still waste bandwidth | P12 |
+| T44 | I | Relay URLs or Endpoint IDs in logs and bug reports | Logs | Reveals a private relay and tracks a device | L | Debug only, redacted in diagnostics (SR-40) | Debug builds | P12 |
 
 ---
 
@@ -142,7 +149,7 @@ Each item names its test. The tag is the phase that must pass it.
 - **SR-13 (P1)** Every request and frame is checked against the authenticated Device ID's grants. Transfer IDs and file tokens are 128-bit random, bound to the creating Device ID, valid only on its connections. The outbox returns only the caller's items. *Test:* peer B touching peer A's transfer gets 404.
 - **SR-14 (P1, P2)** Per-device grants: files (auto-accept), clipboard in, clipboard out, input, media, find. Defaults: all on except input. Grants change only from the local UI. Unpair closes connections within 1 s and deletes grants and tokens. *Test:* a frame lacking its grant is dropped.
   - *Path choice (protocol.md 3.5, Phase 11):* unpair also closes at once a connection draining for its 10 s grace and any candidate a path check holds, before or after HTTP/2; a session opening at that moment is not placed, a dial finishing after it is not kept, and a connection that finished TLS before it and starts HTTP/2 after it is closed and serves nothing. A serving connection gets 200 ms for the `unpair` frame plus 300 ms for GOAWAY, so it is gone within the 1 s. *Test:* `tests/phase11_path.rs`.
-- **SR-15 (P1)** Limits: 16 pending handshakes, 10 s handshake timeout, 4 connections per IP, 64 total; unpinned peers dropped after the handshake outside pairing mode. HTTP/2: 128 streams, 16 KiB headers, over 100 resets/s closes, CONTINUATION bounded, `h2` pinned at a version with the 2023 rapid-reset and 2024 CONTINUATION fixes. Session frames over 64 KiB close the connection. *Test:* slowloris, rapid reset and a 10,000-handshake flood leave a pinned session working.
+- **SR-15 (P1)** Limits: 16 pending handshakes, 10 s handshake timeout, 4 connections per IP, 64 total; unpinned peers dropped after the handshake outside pairing mode. HTTP/2: 128 streams, 16 KiB headers, over 100 resets/s closes, CONTINUATION bounded, `h2` pinned at a version with the 2023 rapid-reset and 2024 CONTINUATION fixes. Session frames over 64 KiB close the connection. A path check still holds at most two alternatives per dial, and one found to be on a path already measured closes at its first, empty probe response (protocol.md 3.5). *Test:* slowloris, rapid reset and a 10,000-handshake flood leave a pinned session working.
   - *Path probe (protocol.md 3.5, Phase 11):* `GET /v1/probe` is served only on a pinned connection (`403 not_paired` otherwise, never in pairing mode), for at most 8 MiB (`400 bad_request` above), one probe in flight and 10 per minute per connection (`429 rate_limited` otherwise). The body is zeros, so serving costs only the TLS encryption, and a peer can make a host send at most about 80 MiB per connection per minute, no more than one transfer it could already request. A dialler holds at most two extra connections per check, so with the one in use it stays under the 4 per source address. On the serving side at most two connections per peer may be open without a request other than a probe (a third closes the oldest), and one still unused 20 s after its handshake is closed, so a pinned peer cannot fill the per-address and total limits with idle connections. *Test:* `tests/phase11_path.rs`.
 - **SR-16 (P1)** Frames carry a per-connection sequence number; duplicates are dropped; unknown types ignored; malformed frames close the stream. *Test:* a duplicated clipboard frame has no effect.
 
@@ -172,9 +179,15 @@ Each item names its test. The tag is the phase that must pass it.
 
 **Hygiene and assurance**
 
-- **SR-32 (P1)** Never logged: private and announce keys, QR secrets, SAS, nonces, tokens, clipboard text, input events. File names at debug level only. Device IDs truncated to 8 characters. Log files 0600; diagnostics export redacts the same way. *Test:* CI seeds canary strings and greps all logs.
+- **SR-32 (P1)** Never logged: private and announce keys, QR secrets, SAS, nonces, tokens, clipboard text, input events. File names at debug level only. Device IDs truncated to 8 characters. The path id of protocol.md 3.5 is a salted hash that says nothing about the interface name, goes only to pinned peers in the `200` to a `bytes=0` probe, and is not logged or put in reports. Log files 0600; diagnostics export redacts the same way. *Test:* CI seeds canary strings and greps all logs.
 - **SR-33 (P1, gate P6)** `cargo-fuzz` targets for beacon, TXT, manifest, bundle and frame decoders run nightly; `#![forbid(unsafe_code)]` in parsers. P6 needs 8 CPU-hours per target with no crash. *Test:* fuzz report in the ship gate.
 - **SR-34 (P6)** An external review checks every SR against release builds on the P6 matrix, including a hostile-LAN run with ARP spoofing and forged mDNS. *Test:* signed checklist.
+- **SR-35 (P12)** Reach is off unless all three hold: the build has the `iroh` feature, the user named a relay, and both sides gave that device the `remote` grant (default off; grants change only from the local UI, SR-14). Without a named relay no endpoint exists and no host outside the LAN is contacted. No third-party address lookup, and no port mapping on the router. *Test:* with no relay named no endpoint exists; in network namespaces a packet counter shows nothing went to any host but the relay and the peer.
+- **SR-36 (P12)** A reach connection is accepted only from a stored Endpoint ID of a pinned peer holding the `remote` grant, and is closed before any TLS otherwise. Only such IDs are dialled. Pairing never runs over reach, even with the "Add device" window open. *Test:* an unknown endpoint, an unpinned one, and a pinned one with the grant off are all refused; a reach connection during pairing mode gets no pairing.
+- **SR-37 (P12)** The Endpoint ID never decides trust. The inner TLS 1.3 mutual authentication against the pin (SR-11) and the grants (SR-13, SR-14) are the same code on this path. The endpoint key is derived from the device key with a separate context, so one key is not used in two protocols. *Test:* a peer with the right Endpoint ID and the wrong device key fails the inner handshake.
+- **SR-38 (P12)** One QUIC connection and one bidirectional stream per endpoint; a second stream or an unknown ALPN closes it. SR-15's limits apply to what the stream carries, with the synthetic address making the per-address limit per-peer. *Test:* extra streams are refused and a pinned session keeps working.
+- **SR-39 (P12)** The user is told plainly, wherever reach is turned on, that the relay can see which devices connect, when, and how much data moves, though not the contents; the Endpoint ID is stable until the device key changes. `playdrop peers` and `playdrop diagnose` say when a peer is on the relay or a direct path across networks, and that it is the slow path (anti-patterns 13, 18). *Test:* the status line is asserted in a test.
+- **SR-40 (P12)** Relay URLs and Endpoint IDs appear only at debug level and are redacted from the diagnostics report (SR-32). *Test:* added to the canary test.
 
 ---
 
@@ -187,7 +200,7 @@ Each item names its test. The tag is the phase that must pass it.
 | Rooted or jailbroken phones | OS boundaries no longer hold |
 | Key rotation without re-pair | A signed handover adds pin-bypass surface; re-pairing is rare and safe |
 | Traffic analysis | Padding costs throughput, the top priority |
-| Relay, BLE, Wi-Fi Direct; notification mirroring, SMS, SFTP | Not in v1; each needs its own model |
+| BLE, Wi-Fi Direct; notification mirroring, SMS, SFTP | Not in v1; each needs its own model |
 | Supply chain | Release process (cargo-deny, cargo-audit, reproducible builds) |
 | Attacks on locked, powered-off devices | OS disk encryption is the control |
 
