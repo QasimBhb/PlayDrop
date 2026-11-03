@@ -30,6 +30,7 @@ Versions: workspace `0.6.0`; `playdrop-ffi` keeps its own version, its API did n
 | Rust tests | 586 passed, 0 failed, 11 ignored (`dbus-run-session -- cargo test --workspace --no-fail-fast`, build dir on ext4); clippy and `fmt --check` clean; Windows check clean with a stub C compiler; Flatpak `check-sources` in step |
 | Android tests | 226 JUnit passed, 0 failed |
 | iOS | Only `MARKETING_VERSION` changed |
+| Release | v0.6.0 from `cee48dc` on 2026-11-02, five files plus checksums; Linux, Windows, iOS and Android CI green |
 | Phone | `throughput.md` 13.4: `mixed-5000` about half the time of 0.5.0, target of 0.8 missed, all sums verified |
 
 ### 1.1 What landed
