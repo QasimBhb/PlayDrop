@@ -737,7 +737,8 @@ async fn a_send_survives_a_placement_failure_on_the_receiver() {
     // Wait until the receiver reports every byte verified (its progress reading comes
     // once a second), so placement has run into the obstacle, then clear it. A fixed delay
     // or the sender's own byte counter raced slow runners (Defender on Windows): the
-    // obstacle went before the receiver tried to place anything. The sender keeps
+    // obstacle went before the receiver tried to place anything. Even 300 ms after that
+    // reading was too short on a Windows runner, so hold it for 3 s. The sender keeps
     // re-planning for at least 10 s without progress, far longer than this wait.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -753,7 +754,7 @@ async fn a_send_survives_a_placement_failure_on_the_receiver() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
     std::fs::remove_file(b.recv_dir.join("Batch")).unwrap();
     let summary = tokio::time::timeout(Duration::from_secs(30), handle.wait())
         .await
