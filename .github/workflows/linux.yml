@@ -57,6 +57,9 @@ env:
   CARGO_TERM_COLOR: always
   # Incremental builds only waste cache space on CI.
   CARGO_INCREMENTAL: "0"
+  # Full debug info for every test binary filled the runner's disk on 2026-11-03. Line tables
+  # still give file and line in a panic.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   linux:
