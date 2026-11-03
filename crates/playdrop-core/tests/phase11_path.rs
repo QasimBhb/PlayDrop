@@ -2589,15 +2589,26 @@ async fn a_merged_address_that_wins_a_dial_is_a_path_move() {
     s.cuttable[0].set_flowing(false);
     s.cuttable[0].cut();
     let short = s.b_id.to_hex()[..8].to_owned();
-    until("it carries the peer", || {
-        s.a.host.is_online(&s.b_id)
-            && s.a
-                .host
-                .path_reports()
+    // Failed once on a Windows runner, so a failure says what it was waiting on.
+    let started = tokio::time::Instant::now();
+    loop {
+        let online = s.a.host.is_online(&s.b_id);
+        let reports = s.a.host.path_reports();
+        if online
+            && reports
                 .iter()
                 .any(|r| r.peer == short && r.chosen == Some(s.fast.addr))
-    })
-    .await;
+        {
+            break;
+        }
+        assert!(
+            started.elapsed() < WAIT,
+            "fast is {}, online {online}, reports {reports:?}, fast accepted {}",
+            s.fast.addr,
+            s.fast.accepted()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let pin =
         s.a.host
             .peers()
