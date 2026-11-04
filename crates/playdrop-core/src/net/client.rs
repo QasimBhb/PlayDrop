@@ -80,6 +80,19 @@ impl From<DialError> for crate::Error {
 
 type TlsIo = tokio_rustls::client::TlsStream<TcpStream>;
 
+/// A connection's address as an event or a report shows it. With reach in the build a reach
+/// connection's is masked (SR-40); otherwise this is the address.
+#[cfg(feature = "iroh")]
+pub(crate) fn shown_addr(addr: SocketAddr) -> SocketAddr {
+    crate::reach::masked_addr(addr)
+}
+
+/// A connection's address as an event or a report shows it.
+#[cfg(not(feature = "iroh"))]
+pub(crate) fn shown_addr(addr: SocketAddr) -> SocketAddr {
+    addr
+}
+
 /// How long after a dial starts the other candidates may still finish TLS and be held
 /// for a path check (protocol.md 3.5). *Choice:* 1.5 s lets the first six candidates
 /// (250 ms apart, 3.2) start and finish a LAN handshake, which takes tens of
@@ -176,13 +189,13 @@ impl Drop for Alternatives {
     }
 }
 
-struct Established {
+struct Established<S> {
     remote: SocketAddr,
     local: Option<SocketAddr>,
     peer: PeerIdentity,
     exporter: [u8; EXPORTER_LEN],
     send: h2::client::SendRequest<Bytes>,
-    conn: h2::client::Connection<ActivityIo<TlsIo>, Bytes>,
+    conn: h2::client::Connection<ActivityIo<S>, Bytes>,
     bytes_read: Arc<AtomicU64>,
 }
 
@@ -396,9 +409,59 @@ async fn attempt(addr: SocketAddr, opts: &DialOptions) -> Result<HeldTls, String
     })
 }
 
+/// TLS with the expected SPKI and HTTP/2 over a stream that is not a TCP socket (protocol.md
+/// 12): the same handshakes and the same driver as [`attempt`] and [`HeldTls::finish`]. `remote`
+/// is the connection's address as the rest of the host sees it, `quic` what runs underneath.
+#[cfg(feature = "iroh")]
+pub(crate) async fn establish_over<IO>(
+    io: IO,
+    remote: SocketAddr,
+    quic: iroh::endpoint::WeakConnectionHandle,
+    opts: &DialOptions,
+) -> Result<Arc<Connection>, String>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let (stream, peer) = tls::connect(
+        Arc::clone(&opts.config),
+        opts.expected_spki,
+        remote.ip(),
+        io,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let exporter = tls::exporter(stream.get_ref().1).map_err(|e| e.to_string())?;
+    let bytes_read = Arc::new(AtomicU64::new(0));
+    let (send, conn) = tokio::time::timeout(
+        opts.limits.handshake_timeout,
+        client_builder(&opts.limits)
+            .handshake::<_, Bytes>(ActivityIo::new(stream, Arc::clone(&bytes_read))),
+    )
+    .await
+    .map_err(|_| "HTTP/2 handshake timed out".to_owned())?
+    .map_err(|e| format!("HTTP/2 handshake: {e}"))?;
+    let connection = spawn_driver(
+        Established {
+            remote,
+            local: None,
+            peer,
+            exporter,
+            send,
+            conn,
+            bytes_read,
+        },
+        &opts.limits,
+    );
+    connection.set_reach_quic(quic);
+    Ok(connection)
+}
+
 /// Wraps the winner in a [`Connection`] and drives it on its own task until it ends or a
 /// close is requested.
-fn spawn_driver(est: Established, limits: &Limits) -> Arc<Connection> {
+fn spawn_driver<S>(est: Established<S>, limits: &Limits) -> Arc<Connection>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let Established {
         remote,
         local,

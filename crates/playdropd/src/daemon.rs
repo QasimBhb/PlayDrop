@@ -98,6 +98,15 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         persisted,
         effective: effective.clone(),
         bind_ip: IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        #[cfg(feature = "iroh")]
+        reach: {
+            let reach = args.reach_config()?;
+            // SR-39: where reach is turned on, plainly, and without the URL (SR-40).
+            if reach.is_some() {
+                tracing::info!("{}", playdrop_core::reach::RELAY_NOTICE);
+            }
+            reach
+        },
         lock: lock_flag,
         notifier,
         autostart: locations.clone(),
@@ -325,6 +334,9 @@ pub struct Options {
     pub effective: Settings,
     /// Listening address (`::` in production, loopback in tests).
     pub bind_ip: IpAddr,
+    /// Reach across networks (protocol.md 12), from the command line only.
+    #[cfg(feature = "iroh")]
+    pub reach: Option<playdrop_core::reach::ReachConfig>,
     /// Lock state the core consults (SR-6).
     pub lock: Arc<LockFlag>,
     /// Notifications.
@@ -355,6 +367,8 @@ struct SettingsState {
 struct Shared {
     data_dir: PathBuf,
     bind_ip: IpAddr,
+    #[cfg(feature = "iroh")]
+    reach: Option<playdrop_core::reach::ReachConfig>,
     lock: Arc<LockFlag>,
     notifier: Arc<Notifier>,
     autostart: Option<Locations>,
@@ -408,6 +422,8 @@ impl Daemon {
         let shared = Arc::new(Shared {
             data_dir: opts.data_dir,
             bind_ip: opts.bind_ip,
+            #[cfg(feature = "iroh")]
+            reach: opts.reach,
             lock: opts.lock,
             notifier,
             autostart: opts.autostart,
@@ -558,6 +574,10 @@ impl Shared {
         let mut c = HostConfig::new(&self.data_dir, &s.receive_dir, &s.device_name);
         c.port = s.port;
         c.bind_ip = self.bind_ip;
+        #[cfg(feature = "iroh")]
+        {
+            c.reach.clone_from(&self.reach);
+        }
         c.discovery = s.discovery;
         c.lock_state = Box::new((*self.lock).clone());
         c.accepts_input = self.input_support.supported;
@@ -1261,6 +1281,16 @@ impl Shared {
                         .map_or(r.short_id.as_str(), |p| p.label.as_str());
                     r.summary_line(label, now)
                 }));
+                // A reach endpoint dropped because another device holds it (T46).
+                #[cfg(feature = "iroh")]
+                summary.extend(host.reach_notes());
+                // Peers across networks, in plain words (SR-39).
+                #[cfg(feature = "iroh")]
+                summary.extend(
+                    host.reach_paths()
+                        .iter()
+                        .map(playdrop_core::reach::ReachPath::status_line),
+                );
                 Ok(IpcOk::Diagnostics(DiagnosticsReport {
                     core,
                     port,
@@ -1275,6 +1305,35 @@ impl Shared {
                 let id = resolve(&host, &peer)?;
                 done(host.set_grants(&id, grants).await)
             }
+            #[cfg(feature = "iroh")]
+            Request::SetRemoteGrant { peer, on } => {
+                // A grant nothing can use reads as if reach were on (SR-39, anti-pattern 18).
+                if on && host.reach_endpoint_id().is_none() {
+                    return Err(err(
+                        ErrorCode::InvalidState,
+                        playdrop_core::reach::NO_RELAY_NOTICE,
+                    ));
+                }
+                let id = resolve(&host, &peer)?;
+                done(host.set_remote_grant(&id, on).await)
+            }
+            #[cfg(not(feature = "iroh"))]
+            Request::SetRemoteGrant { .. } => Err(err(
+                ErrorCode::InvalidState,
+                "this build has no reach across networks",
+            )),
+            #[cfg(feature = "iroh")]
+            Request::ReachPaths => Ok(IpcOk::ReachPaths(
+                host.reach_paths()
+                    .iter()
+                    .map(|p| playdrop_ipc::ReachPathLine {
+                        short_id: p.short_id.clone(),
+                        line: p.status_line(),
+                    })
+                    .collect(),
+            )),
+            #[cfg(not(feature = "iroh"))]
+            Request::ReachPaths => Ok(IpcOk::ReachPaths(Vec::new())),
             Request::SetLabel { peer, label } => {
                 let id = resolve(&host, &peer)?;
                 let r = host.set_label(&id, label).await;
@@ -1628,6 +1687,8 @@ mod tests {
             persisted: s.clone(),
             effective: s.clone(),
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            #[cfg(feature = "iroh")]
+            reach: None,
             lock: Arc::new(LockFlag::new()),
             notifier: Notifier::new(false, s.receive_dir),
             autostart: Some(Locations {
@@ -1849,6 +1910,22 @@ mod tests {
         assert_eq!(e.code, ErrorCode::Forbidden);
         assert_eq!(e.message, LOCKED_MESSAGE);
         d.shared.lock.set_locked(false);
+
+        // SR-39: no relay named, so the remote grant says so instead of seeming to work.
+        #[cfg(feature = "iroh")]
+        {
+            let e = call(
+                &h,
+                Request::SetRemoteGrant {
+                    peer: "anyone".into(),
+                    on: true,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidState);
+            assert!(e.message.contains("--reach-relay"), "{}", e.message);
+        }
 
         let mut stop = d.shutdown_requested();
         assert!(matches!(call(&h, Request::Shutdown).await, Ok(IpcOk::Done)));

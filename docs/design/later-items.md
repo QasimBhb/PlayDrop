@@ -10,7 +10,7 @@ starts with USB-tether path choice (`docs/phases/phase-10-daily-speed.md` sectio
 
 | # | Item | Size | Needs the user | Verdict |
 |---|---|---|---|---|
-| 1 | iroh for cross-network reach | large | a second network to prove it for real | build next (as a flagged spike) |
+| 1 | iroh for cross-network reach | large | a second network to prove it for real | spike built in Phase 12, off in every release (`docs/design/iroh-reach.md`); real network, phone and relay choice owed |
 | 2 | iOS Local Push Connectivity | medium | Apple entitlement grant, paid team | research only |
 | 3 | Wi-Fi Aware | large | a second Aware phone | research only |
 | 4 | libcosmic panel applet | small to medium | nothing | build later |

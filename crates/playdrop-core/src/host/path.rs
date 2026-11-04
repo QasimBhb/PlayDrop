@@ -50,6 +50,19 @@ use crate::net::{
 use crate::session::types::PresenceState;
 use crate::tls;
 
+/// An address for an info line or a report. A reach connection's is synthetic, a stable tag of
+/// its Endpoint ID, and stays out of both (SR-40).
+#[cfg(feature = "iroh")]
+fn log_addr(addr: SocketAddr) -> String {
+    crate::reach::display_addr(addr)
+}
+
+/// An address for an info line or a report.
+#[cfg(not(feature = "iroh"))]
+fn log_addr(addr: SocketAddr) -> String {
+    addr.to_string()
+}
+
 /// Default of [`PathTiming::recheck_every`].
 pub const RECHECK_EVERY: Duration = Duration::from_secs(60);
 
@@ -179,7 +192,7 @@ impl PathReport {
     pub fn summary_line(&self, label: &str, now: u64) -> String {
         let chosen = self
             .chosen
-            .map_or_else(|| "not connected".to_owned(), |a| a.to_string());
+            .map_or_else(|| "not connected".to_owned(), log_addr);
         let mut line = format!("note: path to {label}: {chosen}");
         if let (Some(outcome), Some(at)) = (self.outcome, self.checked_at) {
             let probes: Vec<String> = self
@@ -779,6 +792,114 @@ fn limits_allow(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) -> bool {
     true
 }
 
+/// What a re-check may dial: pinned last-known and verified advert addresses only (SR-1,
+/// protocol.md 3.2).
+fn known_addresses(inner: &Inner, pin: &crate::pin_store::Pin, why: Trigger) -> Vec<SocketAddr> {
+    let mut addrs = pin.last_known.clone();
+    if let Some(r) = lock(&inner.reach).get(&pin.device_id) {
+        for a in &r.discovered {
+            if !addrs.contains(a) {
+                addrs.push(*a);
+            }
+        }
+    }
+    if let Trigger::Advert(addr) = why {
+        if !addrs.contains(&addr) {
+            addrs.push(addr);
+        }
+    }
+    addrs
+}
+
+/// A session on an inbound reach connection, with nothing dialled by this host: dials the known
+/// LAN addresses under the usual limits, and the first that answers takes the session, which
+/// moves as protocol.md 3.3 says because a LAN path beats a reach connection. There is no
+/// connection in use to measure against (12).
+#[cfg(feature = "iroh")]
+fn leave_inbound_reach(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) {
+    let on_reach = inner
+        .registry
+        .session(&peer)
+        .is_some_and(|s| crate::reach::is_reach_addr(s.conn.remote_addr()));
+    if !on_reach || !limits_allow(inner, peer, why) {
+        return;
+    }
+    if should_save_power(inner, peer) {
+        note_saving_power(inner, peer);
+        return;
+    }
+    if busy(inner, peer) {
+        defer(inner, peer);
+        return;
+    }
+    let Some(pin) = inner.pins.get(&peer) else {
+        return;
+    };
+    let addrs = canonical_unique(&known_addresses(inner, &pin, why));
+    if addrs.is_empty() || !begin(inner, peer, &addrs) {
+        return;
+    }
+    let opts = DialOptions::new(
+        tls::build_client_config(&inner.identity, pin.spki_hash),
+        Some(pin.spki_hash),
+    );
+    let i2 = Arc::clone(inner);
+    inner.spawn(async move {
+        let gate = dial_lock(&i2, peer);
+        let _held = gate.lock().await;
+        let conn = match crate::net::dial(&addrs, &opts).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(peer = %short(&peer), error = %e, "no LAN path yet");
+                end(&i2, peer, PathOutcome::NoAlternative, Vec::new());
+                return;
+            }
+        };
+        watch_connection(&i2, &conn);
+        if !i2.pins.contains(&peer) {
+            conn.close(CloseReason::Unpaired);
+            end(&i2, peer, PathOutcome::Failed, Vec::new());
+            return;
+        }
+        // The dial can have taken 5 s. Right before the first request, the point of no return
+        // at the peer, as in `switch` (3.5).
+        if busy(&i2, peer) {
+            conn.close(CloseReason::Duplicate);
+            end(&i2, peer, PathOutcome::Busy, Vec::new());
+            defer(&i2, peer);
+            return;
+        }
+        if let Some(old) = i2.registry.attach(&conn).replaced {
+            close_if_silent(&i2, old);
+        }
+        let settled = super::connect::try_open_session(&i2, &conn);
+        let _ = tokio::time::timeout(SESSION_MOVE_TIMEOUT, settled).await;
+        let addr = conn.remote_addr();
+        record_chosen(&i2, peer, addr);
+        if let Err(e) = i2
+            .pins
+            .update(move |s| s.push_last_known(&peer, addr))
+            .await
+        {
+            tracing::debug!(error = %e, "last-known address not stored");
+        }
+        // Moved only if the session is now on it: the attempt can have been refused or timed out.
+        let moved = i2
+            .registry
+            .session(&peer)
+            .is_some_and(|s| s.conn.id() == conn.id());
+        if !moved {
+            note_failed_switch(&i2, peer);
+        }
+        let outcome = if moved {
+            PathOutcome::Switched
+        } else {
+            PathOutcome::Failed
+        };
+        end(&i2, peer, outcome, Vec::new());
+    });
+}
+
 /// Re-checks the paths of `peer` if it is online over a connection we dialled and the
 /// limits allow (protocol.md 3.5).
 fn recheck(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) {
@@ -789,6 +910,10 @@ fn recheck(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) {
         return;
     }
     let Some(current) = inner.registry.outbound(&peer) else {
+        // Our session came in over reach and this host dialled nothing, so 3.5's dialler rule
+        // would leave it on the slow path; any answer on the LAN moves it (protocol.md 12).
+        #[cfg(feature = "iroh")]
+        leave_inbound_reach(inner, peer, why);
         return;
     };
     let in_use = canonical_addr(current.remote_addr());
@@ -811,20 +936,7 @@ fn recheck(inner: &Arc<Inner>, peer: DeviceId, why: Trigger) {
     let Some(pin) = inner.pins.get(&peer) else {
         return;
     };
-    // Pinned last-known and verified advert addresses only (SR-1, protocol.md 3.2).
-    let mut addrs = pin.last_known.clone();
-    if let Some(r) = lock(&inner.reach).get(&peer) {
-        for a in &r.discovered {
-            if !addrs.contains(a) {
-                addrs.push(*a);
-            }
-        }
-    }
-    if let Trigger::Advert(addr) = why {
-        if !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-    }
+    let addrs = known_addresses(inner, &pin, why);
     // Canonical, so a stored mapped form neither dials the address in use again nor makes the
     // back-off take one address for two. Addresses on a path already measured would only take
     // the held slots from one that is not, check after check (protocol.md 3.5). With nothing
@@ -995,33 +1107,44 @@ async fn check(inner: &Arc<Inner>, peer: DeviceId, current: &Arc<Connection>, he
         current_peer_id = peer;
         true
     };
-    let current_rate = match probe_in_use_noting(current, PROBE_BYTES, on_head).await {
-        InUseProbe::Rate(r) => {
-            probes.push(report(addr, true, Some(r), None));
-            if let Some(key) = PathKey::new(current_peer_id, own_id(inner, current, current).await)
-            {
-                measured.push((key, addr));
+    // A reach connection counts as 0 MiB/s and is not probed, so any LAN candidate that
+    // answers and measures wins (protocol.md 12).
+    #[cfg(feature = "iroh")]
+    let on_reach = crate::reach::is_reach_addr(addr);
+    #[cfg(not(feature = "iroh"))]
+    let on_reach = false;
+    let current_rate = if on_reach {
+        0.0
+    } else {
+        match probe_in_use_noting(current, PROBE_BYTES, on_head).await {
+            InUseProbe::Rate(r) => {
+                probes.push(report(addr, true, Some(r), None));
+                if let Some(key) =
+                    PathKey::new(current_peer_id, own_id(inner, current, current).await)
+                {
+                    measured.push((key, addr));
+                }
+                r
             }
-            r
-        }
-        InUseProbe::Dead(e) => {
-            // Any alternative that measures wins, on this radio too: a connection can die
-            // while its radio lives on (a roam, a new address), so a dead one merges nothing.
-            probes.push(report(addr, true, None, Some(e)));
-            0.0
-        }
-        InUseProbe::Unsupported => {
-            // A peer from before 3.5: the alternatives never reach HTTP/2, so it never
-            // sees them and the connection in use is left alone.
-            drop(held);
-            tracing::debug!(peer = %short(&peer), "peer has no probe endpoint; path kept");
-            return end(inner, peer, PathOutcome::Unsupported, Vec::new());
-        }
-        InUseProbe::Unmeasured(e) => {
-            // It answers PINGs but not probes: a passing stall, not a dead path.
-            drop(held);
-            probes.push(report(addr, true, None, Some(e)));
-            return end(inner, peer, PathOutcome::Failed, probes);
+            InUseProbe::Dead(e) => {
+                // Any alternative that measures wins, on this radio too: a connection can die
+                // while its radio lives on (a roam, a new address), so a dead one merges nothing.
+                probes.push(report(addr, true, None, Some(e)));
+                0.0
+            }
+            InUseProbe::Unsupported => {
+                // A peer from before 3.5: the alternatives never reach HTTP/2, so it never
+                // sees them and the connection in use is left alone.
+                drop(held);
+                tracing::debug!(peer = %short(&peer), "peer has no probe endpoint; path kept");
+                return end(inner, peer, PathOutcome::Unsupported, Vec::new());
+            }
+            InUseProbe::Unmeasured(e) => {
+                // It answers PINGs but not probes: a passing stall, not a dead path.
+                drop(held);
+                probes.push(report(addr, true, None, Some(e)));
+                return end(inner, peer, PathOutcome::Failed, probes);
+            }
         }
     };
     if !inner.pins.contains(&peer) {
@@ -1076,8 +1199,8 @@ fn after_switch(
         Ok(()) => {
             tracing::info!(
                 peer = %short(&peer),
-                from = %current.remote_addr(),
-                to = %new.remote_addr(),
+                from = %log_addr(current.remote_addr()),
+                to = %log_addr(new.remote_addr()),
                 "moved to a faster path"
             );
             end(inner, peer, PathOutcome::Switched, probes);
@@ -1178,10 +1301,15 @@ async fn switch(
         if busy(inner, peer) {
             return Err(SwitchError::Busy);
         }
-        let moving = inner
-            .registry
-            .session(&peer)
-            .filter(|s| s.conn.id() == old.id());
+        let moving = inner.registry.session(&peer).filter(|s| {
+            // A session on a reach connection the peer dialled moves to a LAN path too; 3.3
+            // lets it, as a LAN path beats a reach connection (protocol.md 12).
+            #[cfg(feature = "iroh")]
+            if crate::reach::is_reach_addr(s.conn.remote_addr()) {
+                return true;
+            }
+            s.conn.id() == old.id()
+        });
         // Point of no return for the peer: it retires `old` at our first request on `new`.
         // `old` stays usable until that request is answered; new requests wait on the dial
         // lock, and the peer still answers any that were already on their way (3.5).
@@ -1306,7 +1434,9 @@ pub(crate) fn reports(inner: &Inner) -> Vec<PathReport> {
             Some(PathReport {
                 peer: short(&id),
                 short_id: id.short_id(),
-                chosen: live.or_else(|| st.and_then(|s| s.chosen)),
+                chosen: live
+                    .or_else(|| st.and_then(|s| s.chosen))
+                    .map(crate::net::client::shown_addr),
                 outcome: st.and_then(|s| s.outcome),
                 checked_at: st.and_then(|s| s.checked_at),
                 probes: st.map(|s| s.probes.clone()).unwrap_or_default(),

@@ -831,3 +831,10 @@ The app was force-stopped mid-send, relaunched after 4 s, and the send carried o
 The duplicates are `s0330 (1).bin` and `s0331 (1).bin`, with the same bytes as their originals, inside
 the limit of 4 per kill in 13.6. The bench's `verify.sh` printed `comm` order warnings for
 `small-1000`, so its counts were rechecked by name and hash, which agreed.
+
+### 14.3 Path choice with USB tethering and Wi-Fi both on
+
+Not run. It needs someone at the phone to turn tethering on, and the phase did not wait for that.
+Still only proxies on one machine (section 13). The one real-phone result from this phase is the
+merging line on Wi-Fi: `192.168.86.74:42187 same path as [fe80::9c08:4fff:feab:823e%3]:42187, not
+measured`, at 43.5 MiB/s, on a review build.

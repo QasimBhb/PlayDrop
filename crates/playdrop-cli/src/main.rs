@@ -56,6 +56,10 @@ enum Command {
     Send(daemon::SendArgs),
     /// List paired devices: Short ID, label, online state, last seen, last address.
     Peers(daemon::JsonArgs),
+    /// Give a paired device the `remote` grant, or take it back: reach across networks through
+    /// the relay the daemon was started with (`--reach-relay`).
+    #[cfg(feature = "iroh")]
+    Remote(daemon::RemoteArgs),
     /// Show the daemon's identity, address, version and settings.
     Status(daemon::JsonArgs),
     /// List running transfers and those that finished in the last 10 minutes.
@@ -108,7 +112,8 @@ enum Command {
     ///   cancel <id>                   cancel a transfer in either direction
     ///   transfers                     list running and recent transfers
     ///   grants <peer> [+g|-g]...      show or change grants (files, clipboardIn,
-    ///                                 clipboardOut, input, media, find)
+    ///                                 clipboardOut, input, media, find; remote in a build with
+    ///                                 reach across networks)
     ///   ping <peer> [message]         ping a peer
     ///   clip <peer> <text>            push clipboard text
     ///   unpair <peer>                 unpair a peer
@@ -128,6 +133,10 @@ enum Command {
 
 /// Options of `playdrop host`.
 #[derive(Debug, clap::Args)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent command line switches"
+)]
 pub struct HostArgs {
     /// Identity, pins and transfer state (default: the platform data folder).
     #[arg(long)]
@@ -153,11 +162,33 @@ pub struct HostArgs {
     /// Turn off mDNS and the beacon; rely on last-known addresses and manual pairing.
     #[arg(long)]
     no_discovery: bool,
+    /// Reach paired devices across networks through this relay, for those you give the `remote`
+    /// grant (`grants <peer> +remote`); give it on both devices, while they can see each other
+    /// on a LAN. The relay can see which devices connect, when, and how much data moves, though
+    /// not the contents. The device's endpoint ID stays the same until its key changes.
+    #[cfg(feature = "iroh")]
+    #[arg(long, value_name = "URL")]
+    reach_relay: Option<String>,
+    /// With --reach-relay: also allow a direct path across networks. Faster, but anyone who has
+    /// this device's endpoint ID, paired or not, can then make it send small UDP packets to an
+    /// address they name, which also tells them this device's address.
+    #[cfg(feature = "iroh")]
+    #[arg(long, requires = "reach_relay")]
+    reach_direct: bool,
+    /// With --reach-relay: PEM file of a private CA to trust for the relay's certificate.
+    #[cfg(feature = "iroh")]
+    #[arg(long, value_name = "FILE", requires = "reach_relay")]
+    reach_relay_ca: Option<PathBuf>,
 }
 
 fn init_logging() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("playdrop_core=warn"));
+    // SR-40: iroh names the relay at info level.
+    #[cfg(feature = "iroh")]
+    let filter = tracing_subscriber::EnvFilter::new(playdrop_core::reach::quiet_log_filter(
+        &filter.to_string(),
+    ));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
@@ -173,6 +204,8 @@ async fn main() -> ExitCode {
         Command::Bench(args) => return standalone(bench::run(args).await),
         Command::Send(a) => daemon::DaemonCommand::Send(a),
         Command::Peers(a) => daemon::DaemonCommand::Peers(a),
+        #[cfg(feature = "iroh")]
+        Command::Remote(a) => daemon::DaemonCommand::Remote(a),
         Command::Status(a) => daemon::DaemonCommand::Status(a),
         Command::Transfers(a) => daemon::DaemonCommand::Transfers(a),
         Command::Cancel(a) => daemon::DaemonCommand::Cancel(a),
@@ -208,6 +241,21 @@ mod tests {
     #[test]
     fn clap_definition_is_consistent() {
         Cli::command().debug_assert();
+    }
+
+    /// SR-39: the help text of `--reach-relay` says plainly what the relay can see.
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn reach_relay_help_says_what_the_relay_sees() {
+        let mut command = Cli::command();
+        let host = command.find_subcommand_mut("host").unwrap();
+        let help = host.render_long_help().to_string();
+        assert!(help.contains("--reach-relay"), "{help}");
+        assert!(help.contains("relay can see which devices"), "{help}");
+        // Direct is asked for by name, and its help says what it exposes (T45).
+        assert!(help.contains("--reach-direct"), "{help}");
+        assert!(help.contains("small UDP packets"), "{help}");
+        assert!(!help.contains("--reach-relay-only"), "{help}");
     }
 
     #[test]

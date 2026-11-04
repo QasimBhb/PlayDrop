@@ -8,6 +8,36 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.7.0] - 2026-11-03
+
+### Changed
+
+- A phone or computer that answers on several addresses over one radio now counts as one connection
+  when PlayDrop picks the fastest path. A check used to measure each address, up to 4 MiB each, to
+  learn nothing. Both devices need 0.7.0 for this; with an older device it measures as before. On a
+  Galaxy A54 the second address was set aside without being measured.
+- Default builds move to rustls 0.23.46.
+
+### Added, off in every download
+
+- An experiment in reaching a device on another network, through a relay you run yourself. It is
+  behind a build option that no release file turns on, so what you download contains none of it.
+  It has been tested on one computer with simulated networks, not on a phone or a real carrier
+  network. See `docs/design/iroh-reach.md`.
+
+### Tested
+
+- Sending a 1 GiB file to a phone is no slower than in 0.5.0: 42.6 MiB/s for both on a Galaxy A54.
+  This answers the mixed result listed under 0.6.0.
+- Force-stopping the Android app in the middle of a send on 0.6.0: the send carried on by itself
+  and every file arrived correct, for both 1,000 small files and a 1 GiB file. The 1,000-file run
+  left 2 duplicates, inside the limit of 4.
+
+### Known limits
+
+- Choosing between USB tethering and Wi-Fi has still been tested with simulated links, not on a
+  real phone with both turned on.
+
 ## [0.6.0] - 2026-11-02
 
 ### Added

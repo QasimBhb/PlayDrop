@@ -98,6 +98,8 @@ pub struct Server {
     path_probe: bool,
     not_in_use_timeout: Duration,
     interfaces: Arc<dyn InterfaceLookup>,
+    #[cfg(feature = "iroh")]
+    reach: Option<ReachAccept>,
 }
 
 /// The listening socket before it is bound, as [`ListenerSetup::before_bind`] sees it.
@@ -176,6 +178,8 @@ impl Server {
             path_probe: true,
             not_in_use_timeout: NOT_IN_USE_TIMEOUT,
             interfaces: Arc::new(SystemInterfaceLookup),
+            #[cfg(feature = "iroh")]
+            reach: None,
         })
     }
 
@@ -206,6 +210,19 @@ impl Server {
         self
     }
 
+    /// Also serves reach streams (protocol.md 12), under the same limits as TCP connections.
+    /// `tls` must refuse unpaired clients, whatever the "Add device" window says (SR-36).
+    #[cfg(feature = "iroh")]
+    #[must_use]
+    pub(crate) fn with_reach(
+        mut self,
+        incoming: tokio::sync::mpsc::Receiver<crate::reach::transport::ReachIncoming>,
+        tls: TlsAcceptor,
+    ) -> Self {
+        self.reach = Some(ReachAccept { incoming, tls });
+        self
+    }
+
     /// The bound address (the real port when bound to port 0).
     pub fn local_addr(&self) -> SocketAddr {
         self.local
@@ -230,6 +247,28 @@ impl Server {
         let unused = UnusedBook::default();
         let limits = Arc::new(self.limits);
         let mut conns = tokio::task::JoinSet::new();
+        // Reach streams get the same counters and the same serving path (SR-38). They take
+        // their own task, so the TCP loop below is the same with the feature on or off.
+        #[cfg(feature = "iroh")]
+        if let Some(reach) = self.reach {
+            let ctx = ConnCtx {
+                tls: reach.tls.clone(),
+                router: Arc::clone(&router),
+                limits: Arc::clone(&limits),
+                unpaired: unpaired.clone(),
+                shutdown: shutdown.clone(),
+                path_probe: self.path_probe,
+                not_in_use_timeout: self.not_in_use_timeout,
+                unused: unused.clone(),
+                interfaces: Arc::clone(&self.interfaces),
+            };
+            conns.spawn(serve_reach(
+                reach.incoming,
+                counter.clone(),
+                gate.clone(),
+                ctx,
+            ));
+        }
         loop {
             let accepted = tokio::select! {
                 biased;
@@ -279,6 +318,66 @@ impl Server {
     }
 }
 
+/// What [`Server::with_reach`] was given.
+#[cfg(feature = "iroh")]
+struct ReachAccept {
+    incoming: tokio::sync::mpsc::Receiver<crate::reach::transport::ReachIncoming>,
+    tls: TlsAcceptor,
+}
+
+#[cfg(feature = "iroh")]
+impl fmt::Debug for ReachAccept {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReachAccept").finish_non_exhaustive()
+    }
+}
+
+/// Serves reach streams until the server stops. The synthetic address of a stream makes the
+/// per-address limit per-peer (SR-38); ending this task ends every stream it serves.
+#[cfg(feature = "iroh")]
+async fn serve_reach(
+    mut incoming: tokio::sync::mpsc::Receiver<crate::reach::transport::ReachIncoming>,
+    counter: ConnectionCounter,
+    gate: HandshakeGate,
+    ctx: ConnCtx,
+) {
+    let mut conns = tokio::task::JoinSet::new();
+    loop {
+        let next = tokio::select! {
+            Some(_) = conns.join_next(), if !conns.is_empty() => continue,
+            next = incoming.recv() => next,
+        };
+        let Some(stream) = next else { break };
+        let permit = match counter.try_acquire(stream.remote.ip()) {
+            Ok(p) => p,
+            Err(why) => {
+                tracing::debug!(%why, "reach connection refused by limits");
+                continue;
+            }
+        };
+        let Some(hs) = gate.try_acquire() else {
+            tracing::debug!("too many handshakes in progress; reach connection dropped");
+            continue;
+        };
+        let ctx = ctx.clone();
+        conns.spawn(async move {
+            let _permit = permit;
+            let crate::reach::transport::ReachIncoming {
+                io,
+                remote,
+                admit,
+                quic,
+            } = stream;
+            // SR-36: the device behind this key must be one this Endpoint ID was stored for.
+            let admit = move |peer: &tls::PeerIdentity| admit(&peer.device_id);
+            let opened = move |conn: &Arc<Connection>| conn.set_reach_quic(quic);
+            serve_stream(io, remote, None, hs, ctx, admit, opened).await;
+        });
+    }
+    conns.shutdown().await;
+}
+
+#[derive(Clone)]
 struct ConnCtx {
     tls: TlsAcceptor,
     router: Arc<dyn Router>,
@@ -348,15 +447,34 @@ async fn serve_connection(
     tcp: TcpStream,
     remote: SocketAddr,
     handshake_permit: tokio::sync::OwnedSemaphorePermit,
-    mut ctx: ConnCtx,
+    ctx: ConnCtx,
 ) {
     tune_socket(&tcp);
     let local = tcp.local_addr().ok();
+    serve_stream(tcp, remote, local, handshake_permit, ctx, |_| true, |_| {}).await;
+}
+
+/// TLS, HTTP/2 and the connection's requests, over whatever carries the bytes. `admit` is asked
+/// about the device TLS authenticated; a TCP connection admits any. `opened` sees the connection
+/// before anything else can.
+async fn serve_stream<IO, A, O>(
+    io: IO,
+    remote: SocketAddr,
+    local: Option<SocketAddr>,
+    handshake_permit: tokio::sync::OwnedSemaphorePermit,
+    mut ctx: ConnCtx,
+    admit: A,
+    opened: O,
+) where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send,
+    A: FnOnce(&tls::PeerIdentity) -> bool,
+    O: FnOnce(&Arc<Connection>),
+{
     let accepted = tls::accept(
         Arc::clone(&ctx.tls.config),
         ctx.tls.pins.as_ref(),
         &ctx.tls.window,
-        tcp,
+        io,
     )
     .await;
     let (stream, peer) = match accepted {
@@ -367,6 +485,10 @@ async fn serve_connection(
             return;
         }
     };
+    if !admit(&peer) {
+        tracing::debug!(peer = %short(&peer.device_id), "device not admitted on this path");
+        return;
+    }
     let unpaired_permit = if peer.trust == PeerTrust::Unpaired {
         if let Ok(p) = ctx.unpaired.try_acquire(remote.ip()) {
             Some(p)
@@ -411,6 +533,7 @@ async fn serve_connection(
         ctx.limits.max_resets_per_second,
         bytes_read,
     );
+    opened(&conn);
     tracing::debug!(peer = %short(&conn.device_id()), trusted = conn.is_trusted(), "inbound connection");
     accept_requests(&mut h2conn, &conn, &mut ctx).await;
     drop(h2conn);

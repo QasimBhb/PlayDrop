@@ -114,6 +114,17 @@ pub enum Request {
         /// New grants.
         grants: Grants,
     },
+    /// Turn a peer's `remote` grant on or off (protocol.md 12). Only a local UI may do this
+    /// (SR-14). A daemon built without reach answers `invalid_state`.
+    SetRemoteGrant {
+        /// Peer query.
+        peer: String,
+        /// The new state.
+        on: bool,
+    },
+    /// Peers currently reached across networks, with the line that says so (SR-39). Empty from a
+    /// daemon built without reach.
+    ReachPaths,
     /// Change the local label of a peer (SR-8).
     SetLabel {
         /// Peer query.
@@ -272,6 +283,8 @@ impl Request {
             Self::Diagnose => "diagnose",
             Self::Connect { .. } => "connect",
             Self::SetGrants { .. } => "set_grants",
+            Self::SetRemoteGrant { .. } => "set_remote_grant",
+            Self::ReachPaths => "reach_paths",
             Self::SetLabel { .. } => "set_label",
             Self::Unpair { .. } => "unpair",
             Self::OpenAddDeviceWindow => "open_add_device_window",
@@ -421,6 +434,15 @@ pub struct Status {
     pub input_from: Vec<String>,
 }
 
+/// A peer reached across networks, for [`Request::ReachPaths`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachPathLine {
+    /// Short ID of the peer.
+    pub short_id: String,
+    /// What to print: which path, and that it is the slow one. No URL and no Endpoint ID (SR-40).
+    pub line: String,
+}
+
 /// What a port probe found, the daemon's part of [`Request::Diagnose`].
 ///
 /// The daemon cannot see a firewall from inside; it dials its own port on loopback and on
@@ -495,6 +517,8 @@ pub enum Ok {
     Transfers(Vec<TransferSnapshot>),
     /// [`Request::Diagnose`].
     Diagnostics(DiagnosticsReport),
+    /// [`Request::ReachPaths`].
+    ReachPaths(Vec<ReachPathLine>),
     /// [`Request::AddDeviceList`].
     AddDeviceList(Vec<AddDeviceCandidate>),
     /// [`Request::ShowQr`]: the one-use URI. Never log it (SR-32).

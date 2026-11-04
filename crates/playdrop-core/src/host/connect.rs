@@ -15,7 +15,10 @@ use super::{lock, path, session, Inner};
 use crate::discovery::{DiscoveryEvent, Via};
 use crate::identity::DeviceId;
 use crate::net::connection::{short, Heard, REPLACED_PING_DEADLINE};
-use crate::net::{canonical_addr, dial_with_alternatives, CloseReason, Connection, DialOptions};
+use crate::net::{
+    canonical_addr, dial_with_alternatives, Alternatives, CloseReason, Connection, DialOptions,
+};
+use crate::pin_store::Pin;
 use crate::tls;
 use crate::{Error, Result};
 
@@ -81,6 +84,9 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
         }
     }
     let guard = dial_lock(inner, peer);
+    #[cfg(feature = "iroh")]
+    let held = guard.lock().await;
+    #[cfg(not(feature = "iroh"))]
     let _held = guard.lock().await;
     if let Some(c) = inner.registry.outbound(&peer) {
         return Ok(c);
@@ -97,6 +103,15 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
         }
     }
     if addrs.is_empty() {
+        // No LAN candidate at all (protocol.md 12). The lock goes first: a LAN dial must not
+        // wait for a reach dial, and that dial takes the lock itself to adopt what it got.
+        #[cfg(feature = "iroh")]
+        {
+            drop(held);
+            if let Some(conn) = super::reach_link::dial_after_lan(inner, &pin).await {
+                return Ok(conn);
+            }
+        }
         record_failure(inner, peer, path, "no address known yet".into());
         return Err(Error::NotFound);
     }
@@ -107,10 +122,32 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
     let (conn, alternatives) = match dial_with_alternatives(&addrs, &opts, grace).await {
         Ok(c) => c,
         Err(e) => {
+            // Every LAN candidate failed, the one case reach is for (protocol.md 12). The lock
+            // goes first: a LAN dial must not wait for a reach dial, and that dial takes the
+            // lock itself to adopt what it got.
+            #[cfg(feature = "iroh")]
+            {
+                drop(held);
+                if let Some(conn) = super::reach_link::dial_after_lan(inner, &pin).await {
+                    return Ok(conn);
+                }
+            }
             record_failure(inner, peer, path, e.to_string());
             return Err(e.into());
         }
     };
+    adopt(inner, peer, &pin, conn, alternatives).await
+}
+
+/// A dial's winner becomes the peer's outbound connection: tracked, attached, its address stored
+/// and the session tried.
+pub(crate) async fn adopt(
+    inner: &Arc<Inner>,
+    peer: DeviceId,
+    pin: &Pin,
+    conn: Arc<Connection>,
+    alternatives: Alternatives,
+) -> Result<Arc<Connection>> {
     tracing::debug!(peer = %short(&peer), addr = %conn.remote_addr(), "dialled");
     watch_connection(inner, &conn);
     // Unpaired while this dial ran: attaching would bring back a link for a forgotten
@@ -120,11 +157,35 @@ pub(crate) async fn outbound(inner: &Arc<Inner>, peer: DeviceId) -> Result<Arc<C
         conn.close(CloseReason::Unpaired);
         return Err(Error::NotPaired);
     }
+    // Revoked while this dial ran: a revoke sweeps what is tracked (SR-14, protocol.md 12).
+    #[cfg(feature = "iroh")]
+    if !super::reach_link::still_allowed(inner, &conn) {
+        conn.close(CloseReason::Dead);
+        return Err(Error::NotPaired);
+    }
+    // A reach connection takes no place another path already has (protocol.md 12): it was dialled
+    // without the lock, so a LAN path can have come up meanwhile.
+    #[cfg(feature = "iroh")]
+    if crate::reach::is_reach_addr(conn.remote_addr()) {
+        if let Some(already) = inner.registry.outbound_or_attach(&conn) {
+            tracing::debug!(peer = %short(&peer), "another path came up during the reach dial");
+            conn.close(CloseReason::Duplicate);
+            return Ok(already);
+        }
+    } else if let Some(old) = inner.registry.attach(&conn).replaced {
+        close_if_silent(inner, old);
+    }
+    #[cfg(not(feature = "iroh"))]
     if let Some(old) = inner.registry.attach(&conn).replaced {
         close_if_silent(inner, old);
     }
     let addr = conn.remote_addr();
-    if pin.last_known.first() != Some(&addr) {
+    // A reach connection's address is synthetic: never stored, never dialled (protocol.md 12).
+    #[cfg(feature = "iroh")]
+    let store_addr = !crate::reach::is_reach_addr(addr);
+    #[cfg(not(feature = "iroh"))]
+    let store_addr = true;
+    if store_addr && pin.last_known.first() != Some(&addr) {
         if let Err(e) = inner
             .pins
             .update(move |s| s.push_last_known(&peer, addr))
@@ -158,7 +219,7 @@ const SESSION_SETTLE: Duration = Duration::from_secs(10);
 /// only sends [`path::keep`], so the peer counts the connection in use (3.5). The
 /// receiver fires once the attempt settled: the session was placed, refused or timed
 /// out, or the keep request was answered (a path check waits for it, 3.5).
-fn try_open_session(
+pub(crate) fn try_open_session(
     inner: &Arc<Inner>,
     conn: &Arc<Connection>,
 ) -> tokio::sync::oneshot::Receiver<()> {

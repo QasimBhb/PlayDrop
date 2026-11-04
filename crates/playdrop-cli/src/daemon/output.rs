@@ -32,6 +32,52 @@ pub fn json<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|e| format!("{{\"error\":\"{e}\"}}"))
 }
 
+/// `playdrop peers --json` with the line of each peer on the slow path under `reach` (SR-39). The
+/// answer's shape is otherwise the plain one.
+#[cfg(feature = "iroh")]
+pub fn peers_json_with_reach<T: Serialize>(
+    answer: &T,
+    paths: &[playdrop_ipc::ReachPathLine],
+) -> String {
+    fn add(value: &mut serde_json::Value, paths: &[playdrop_ipc::ReachPathLine]) {
+        match value {
+            serde_json::Value::Array(items) => items.iter_mut().for_each(|i| add(i, paths)),
+            serde_json::Value::Object(map) => {
+                let line = map
+                    .get("short_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| paths.iter().find(|p| p.short_id == id))
+                    .map(|p| p.line.clone());
+                match line {
+                    Some(l) => {
+                        map.insert("reach".to_owned(), serde_json::Value::String(l));
+                    }
+                    None => map.values_mut().for_each(|v| add(v, paths)),
+                }
+            }
+            _ => {}
+        }
+    }
+    let Ok(mut value) = serde_json::to_value(answer) else {
+        return json(answer);
+    };
+    add(&mut value, paths);
+    value.to_string()
+}
+
+/// What `playdrop remote` prints: the state, and with the grant on what that means (SR-39).
+#[cfg(feature = "iroh")]
+pub fn remote_grant(label: &str, on: bool) -> String {
+    if on {
+        format!(
+            "{label} has the remote grant\n{}\n",
+            playdrop_core::reach::RELAY_NOTICE
+        )
+    } else {
+        format!("{label} no longer has the remote grant\n")
+    }
+}
+
 /// Byte count with a binary unit, one decimal above bytes.
 // Display only: precision lost converting u64 to f64 is far below the one decimal shown.
 #[allow(clippy::cast_precision_loss)]
@@ -800,5 +846,50 @@ mod tests {
         let snap = json(&snapshot(TransferStatus::Complete));
         assert!(!snap.contains('\n'));
         assert!(snap.contains(r#""state":"complete""#));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn the_grant_says_what_the_relay_sees() {
+        let on = remote_grant("Laptop", true);
+        assert!(on.contains("Laptop has the remote grant"), "{on}");
+        assert!(
+            on.contains("relay you named can see which devices connect"),
+            "{on}"
+        );
+        assert!(!remote_grant("Laptop", false).contains("relay"));
+    }
+
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn peers_json_names_who_is_on_the_slow_path() {
+        fn strip(v: &mut serde_json::Value) {
+            match v {
+                serde_json::Value::Object(m) => {
+                    m.remove("reach");
+                    m.values_mut().for_each(strip);
+                }
+                serde_json::Value::Array(a) => a.iter_mut().for_each(strip),
+                _ => {}
+            }
+        }
+        let answer = playdrop_ipc::Ok::Peers(vec![
+            peer("aaaa-bbbb-cccc-dddd", "Far", true),
+            peer("eeee-ffff-gggg-hhhh", "Near", true),
+        ]);
+        let paths = [playdrop_ipc::ReachPathLine {
+            short_id: "aaaa-bbbb-cccc-dddd".into(),
+            line: "note: Far is on the relay".into(),
+        }];
+        let v: serde_json::Value =
+            serde_json::from_str(&peers_json_with_reach(&answer, &paths)).unwrap();
+        let text = v.to_string();
+        assert!(text.contains("note: Far is on the relay"), "{text}");
+        assert_eq!(text.matches("\"reach\"").count(), 1, "{text}");
+        // The rest of the answer is what plain JSON has.
+        let plain: serde_json::Value = serde_json::from_str(&json(&answer)).unwrap();
+        let mut stripped = v.clone();
+        strip(&mut stripped);
+        assert_eq!(stripped, plain);
     }
 }

@@ -45,6 +45,11 @@ struct Capture {
     /// Only targets that start with `playdrop`: the SAS is a bare six-digit number, so it
     /// is looked for here and not among dependency lines full of window sizes and counts.
     core: Arc<Mutex<Vec<u8>>>,
+    /// What a host's log shows: every target but the ones its log setup turns off (SR-40). A
+    /// target turned off also takes its spans with it, which is why this is a layer of its own
+    /// and not a search through the every-target log.
+    #[cfg(feature = "iroh-test")]
+    shipped: Arc<Mutex<Vec<u8>>>,
     level: ReloadHandle,
 }
 
@@ -96,6 +101,26 @@ fn capture() -> &'static Capture {
         let core = Arc::new(Mutex::new(Vec::new()));
         let b2 = Arc::clone(&buf);
         let c2 = Arc::clone(&core);
+        #[cfg(feature = "iroh-test")]
+        let shipped = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(feature = "iroh-test")]
+        let shipped_layer = {
+            let s2 = Arc::clone(&shipped);
+            let mut targets =
+                tracing_subscriber::filter::Targets::new().with_default(LevelFilter::TRACE);
+            for t in playdrop_core::reach::QUIET_LOG_TARGETS {
+                targets = targets.with_target(*t, LevelFilter::OFF);
+            }
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || BufWriter(Arc::clone(&s2)))
+                .with_ansi(false)
+                .without_time()
+                .with_target(true)
+                .with_level(true)
+                .with_filter(targets)
+        };
+        #[cfg(not(feature = "iroh-test"))]
+        let shipped_layer = tracing_subscriber::layer::Identity::new();
         tracing_subscriber::registry()
             .with(filter)
             .with(
@@ -118,9 +143,16 @@ fn capture() -> &'static Capture {
                             .with_target("playdrop", tracing::Level::TRACE),
                     ),
             )
+            .with(shipped_layer)
             .try_init()
             .expect("the SR-32 test owns the global subscriber");
-        Capture { buf, core, level }
+        Capture {
+            buf,
+            core,
+            #[cfg(feature = "iroh-test")]
+            shipped,
+            level,
+        }
     })
 }
 
@@ -721,6 +753,8 @@ async fn sr32_no_secret_reaches_the_logs_or_the_diagnostics_export() {
         leaks.extend(c.leaks(name, diag));
         leaks.extend(c.standalone_leaks(name, diag));
     }
+    #[cfg(feature = "iroh-test")]
+    reach_stays_out_of_info_logs_and_reports(cap, root.path()).await;
     println!(
         "SR-32 canary: {} log bytes, {} canaries, {} standalone tokens, {} leaks",
         captured.len(),
@@ -729,4 +763,145 @@ async fn sr32_no_secret_reaches_the_logs_or_the_diagnostics_export() {
         leaks.len()
     );
     assert!(leaks.is_empty(), "SR-32 leaks:\n{}", leaks.join("\n"));
+}
+
+/// SR-40: relay URLs and Endpoint IDs appear at debug level at most, and in no report. Two hosts
+/// reach each other through the in-process relay with the capture at INFO for every target, and
+/// all their reports are read too, through the log setup hosts use. Then, with iroh asked for at
+/// DEBUG, the ID is seen, so the search can see it.
+#[cfg(feature = "iroh-test")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scripted run, read top to bottom"
+)]
+async fn reach_stays_out_of_info_logs_and_reports(cap: &Capture, root: &Path) {
+    use playdrop_core::reach::{is_reach_addr, synthetic_addr, wire, ReachConfig};
+
+    let (_map, url, _server) = iroh::test_utils::run_relay_server().await.unwrap();
+    let url = url.to_string();
+    let reach = |url: &str| {
+        let mut r = ReachConfig::new(url);
+        r.insecure_relay_tls = true;
+        r.retry_every = Duration::from_millis(500);
+        r
+    };
+    let start = |name: &'static str, url: String| async move {
+        start_host_with(root, name, 0, move |cfg| cfg.reach = Some(reach(&url))).await
+    };
+    cap.set_level(LevelFilter::INFO);
+    let shipped_len = |cap: &Capture| cap.shipped.lock().unwrap().len();
+    let from = shipped_len(cap);
+
+    let mut d = start("delta", url.clone()).await;
+    let mut e = start("echo", url.clone()).await;
+    pair(&mut d, &mut e).await;
+    let (d_id, e_id) = (d.host.device_id(), e.host.device_id());
+    d.host.set_remote_grant(&e_id, true).await.unwrap();
+    e.host.set_remote_grant(&d_id, true).await.unwrap();
+    let started = std::time::Instant::now();
+    while d.host.reach_stored_for_test(&e_id).is_none()
+        || e.host.reach_stored_for_test(&d_id).is_none()
+    {
+        assert!(started.elapsed() < T, "reach values not exchanged");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let endpoints = [
+        d.host.reach_endpoint_id().unwrap(),
+        e.host.reach_endpoint_id().unwrap(),
+    ];
+    // New ports: the stored addresses are dead, the next session comes through the relay.
+    d.host.shutdown().await;
+    e.host.shutdown().await;
+    drop((d, e));
+    let mut d = start("delta", url.clone()).await;
+    let mut e = start("echo", url.clone()).await;
+    let online = d
+        .events
+        .wait_for(T, |ev| matches!(ev, HostEvent::PeerOnline { .. }))
+        .await;
+    let HostEvent::PeerOnline { addr, .. } = online else {
+        unreachable!()
+    };
+    assert!(is_reach_addr(addr), "the session came through the relay");
+    e.events
+        .wait_for(T, |ev| matches!(ev, HostEvent::PeerOnline { .. }))
+        .await;
+    assert!(d.host.send_clipboard(&e_id, "reach canary", false).unwrap());
+    e.events
+        .wait_for(T, |ev| matches!(ev, HostEvent::Clipboard { .. }))
+        .await;
+
+    // Everything a host reports.
+    let mut reports = String::new();
+    for h in [&d, &e] {
+        reports.push_str(&serde_json::to_string(&h.host.diagnose()).unwrap());
+        reports.push_str(&serde_json::to_string(&h.host.peers()).unwrap());
+        for r in h.host.path_reports() {
+            reports.push_str(&r.summary_line("peer", 0));
+        }
+        for p in h.host.reach_paths() {
+            assert!(p.status_line().contains("relay"));
+            reports.push_str(&p.status_line());
+        }
+    }
+    // The relay server is someone else's program in real use: its own lines do not count.
+    let log: String = {
+        let shipped = cap.shipped.lock().unwrap();
+        String::from_utf8_lossy(&shipped[from..]).into_owned()
+    }
+    .lines()
+    .filter(|l| !l.contains("iroh_relay::server") && !l.contains("iroh_relay::http"))
+    .collect::<Vec<_>>()
+    .join("\n");
+
+    let host_port = url
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_owned();
+    let mut needles = vec![("relay URL", url.clone()), ("relay address", host_port)];
+    for hex in &endpoints {
+        needles.push(("Endpoint ID", hex.clone()));
+        let id = wire::parse_endpoint(hex).unwrap();
+        needles.push(("short Endpoint ID", id.fmt_short().to_string()));
+        needles.push(("synthetic address", synthetic_addr(&id).ip().to_string()));
+    }
+    let mut leaks = Vec::new();
+    for (what, needle) in &needles {
+        if let Some(i) = log.find(needle.as_str()) {
+            leaks.push(format!(
+                "{what} in the INFO log: {}",
+                context(&log, i, needle.len())
+            ));
+        }
+        // The peers list holds no endpoint; a report must not name the relay's address either.
+        if let Some(i) = reports.find(needle.as_str()) {
+            leaks.push(format!(
+                "{what} in a report: {}",
+                context(&reports, i, needle.len())
+            ));
+        }
+    }
+    assert!(leaks.is_empty(), "SR-40 leaks:\n{}", leaks.join("\n"));
+
+    // Positive control, in the every-target log: at DEBUG the short ID does get logged there, so
+    // the search above could find it.
+    cap.set_level(LevelFilter::DEBUG);
+    let debug_from = cap.offset();
+    d.host.shutdown().await;
+    drop(d);
+    let d = start("delta", url.clone()).await;
+    d.host.network_changed();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let debug_log = cap.slice(debug_from, cap.offset());
+    cap.set_level(LevelFilter::TRACE);
+    let short = wire::parse_endpoint(&endpoints[0])
+        .unwrap()
+        .fmt_short()
+        .to_string();
+    assert!(
+        debug_log.contains(&short),
+        "at DEBUG the endpoint is logged: the matcher works"
+    );
+    d.host.shutdown().await;
+    e.host.shutdown().await;
 }

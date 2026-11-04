@@ -815,4 +815,35 @@ mod tests {
         let mut r = FrameReader::new(b);
         assert!(matches!(r.read_frame().await, Err(FrameError::Truncated)));
     }
+
+    /// protocol.md 12: a `reach` value of the wrong JSON type is a bad value, ignored, and not a
+    /// malformed frame that closes the connection. Everything else about the frame stays strict.
+    #[cfg(feature = "iroh")]
+    #[test]
+    fn a_reach_frame_of_wrong_types_parses_and_its_values_fail() {
+        let mut dec = InboundDecoder::new();
+        for (seq, body) in [
+            (1, r#""endpoint":5,"relay":[]"#),
+            (2, r#""endpoint":{"a":1},"relay":true"#),
+            (3, r#""endpoint":"x""#),
+        ] {
+            let json = format!(r#"{{"t":"reach","v":1,"seq":{seq},{body}}}"#);
+            let item = dec.accept_payload(json.as_bytes()).expect(&json);
+            let Inbound::Frame(env) = item else {
+                panic!("{json}: {item:?}")
+            };
+            let Frame::Reach(r) = env.frame else {
+                panic!("{json}")
+            };
+            assert!(
+                crate::reach::wire::parse_values(r.endpoint.as_deref(), r.relay.as_deref())
+                    .is_err(),
+                "{json}"
+            );
+        }
+        assert!(
+            dec.accept_payload(br#"{"t":"reach","v":1}"#).is_err(),
+            "no seq stays an error"
+        );
+    }
 }

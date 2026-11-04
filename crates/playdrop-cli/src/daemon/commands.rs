@@ -21,10 +21,42 @@ pub async fn peers(args: JsonArgs) -> Result<(), Failure> {
         return Err(unexpected("peers", &answer));
     };
     if args.json {
+        // With the slow path named too (SR-39).
+        #[cfg(feature = "iroh")]
+        if let Answer::ReachPaths(paths) = ask(&client, Request::ReachPaths).await? {
+            println!("{}", output::peers_json_with_reach(&answer, &paths));
+            return Ok(());
+        }
         println!("{}", output::json(&answer));
     } else {
         print!("{}", output::peers(list, output::unix_now()));
+        // Anyone on the slow path says so, in plain words (SR-39).
+        #[cfg(feature = "iroh")]
+        if let Answer::ReachPaths(paths) = ask(&client, Request::ReachPaths).await? {
+            for p in paths {
+                println!("{}", p.line);
+            }
+        }
     }
+    Ok(())
+}
+
+/// `playdrop remote`.
+#[cfg(feature = "iroh")]
+pub async fn remote(args: super::RemoteArgs) -> Result<(), Failure> {
+    let client = connect().await?;
+    let peers = list_peers(&client).await?;
+    let peer = pick_peer(&peers, Some(&args.peer))?;
+    let on = args.state == "on";
+    ask(
+        &client,
+        Request::SetRemoteGrant {
+            peer: peer.device_id.clone(),
+            on,
+        },
+    )
+    .await?;
+    print!("{}", output::remote_grant(&peer.label, on));
     Ok(())
 }
 

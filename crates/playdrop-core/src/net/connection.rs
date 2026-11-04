@@ -222,6 +222,9 @@ pub struct Connection {
     probes: Mutex<super::probe::ProbeLimiter>,
     bytes_read: Arc<AtomicU64>,
     opened_at: Instant,
+    /// The QUIC connection under a reach connection (protocol.md 12), for the label of SR-39.
+    #[cfg(feature = "iroh")]
+    reach_quic: std::sync::OnceLock<iroh::endpoint::WeakConnectionHandle>,
 }
 
 impl fmt::Debug for Connection {
@@ -284,7 +287,23 @@ impl Connection {
             probes: Mutex::new(super::probe::ProbeLimiter::default()),
             bytes_read,
             opened_at: Instant::now(),
+            #[cfg(feature = "iroh")]
+            reach_quic: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Notes the QUIC connection under this one (protocol.md 12).
+    #[cfg(feature = "iroh")]
+    pub(crate) fn set_reach_quic(&self, quic: iroh::endpoint::WeakConnectionHandle) {
+        let _ = self.reach_quic.set(quic);
+    }
+
+    /// The QUIC connection under this one, while it lives.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn reach_quic(&self) -> Option<iroh::endpoint::Connection> {
+        self.reach_quic
+            .get()
+            .and_then(iroh::endpoint::WeakConnectionHandle::upgrade)
     }
 
     /// Process-unique connection number.

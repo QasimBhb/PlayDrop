@@ -111,3 +111,45 @@ jobs:
         # for an hour on 2026-10-14), so the step has its own limit.
         timeout-minutes: 25
         run: dbus-run-session -- cargo test --workspace --locked --no-fail-fast
+
+  reach:
+    # The iroh feature is off in every release artifact, so nothing else here compiles it and it
+    # could break unnoticed. Its tests use a relay inside the test process, on loopback; no
+    # public relay is contacted. bench/reach-netns.sh (gate R5) is run by hand.
+    name: Cross-network reach behind the iroh feature (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-reach
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config dbus
+
+      - name: Default builds do not contain iroh
+        # Gate R3. Saved to a file first so a cargo failure fails the step, not the search.
+        run: |
+          for crate in playdropd playdrop-cli; do
+            cargo tree -p "$crate" -e normal --locked --prefix none > tree.txt
+            if grep -q '^iroh' tree.txt; then
+              echo "$crate has iroh in a default build"
+              exit 1
+            fi
+          done
+
+      - name: Clippy with the feature
+        run: |
+          cargo clippy -p playdrop-core -p playdropd -p playdrop-cli --all-targets --locked \
+            --features playdrop-core/iroh-test,playdropd/iroh,playdrop-cli/iroh -- -D warnings
+
+      - name: Reach tests
+        timeout-minutes: 15
+        run: |
+          cargo test -p playdrop-core --locked --features iroh-test --test phase12_reach
+          cargo test -p playdrop-core --locked --features iroh-test --test sr32_canary

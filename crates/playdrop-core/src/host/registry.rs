@@ -103,6 +103,23 @@ impl Registry {
         Attached { other, replaced }
     }
 
+    /// Attaches a reach connection unless this peer has a live outbound connection, in one step,
+    /// and returns that connection if it does (protocol.md 12).
+    #[cfg(feature = "iroh")]
+    pub(crate) fn outbound_or_attach(&self, conn: &Arc<Connection>) -> Option<Arc<Connection>> {
+        let mut links = lock(&self.links);
+        let link = links.entry(conn.device_id()).or_default();
+        if let Some(live) = link
+            .outbound
+            .as_ref()
+            .filter(|c| !c.is_closed() && !c.is_draining())
+        {
+            return Some(Arc::clone(live));
+        }
+        link.outbound = Some(Arc::clone(conn));
+        None
+    }
+
     /// Forgets a closed connection. A session on it is left for its own reader to end, so
     /// the peer is reported offline exactly once.
     pub(crate) fn detach(&self, conn: &Connection) {
@@ -158,6 +175,20 @@ impl Registry {
         };
         if existing.conn.id() == conn.id() {
             return Placement::Reject;
+        }
+        // A LAN path beats a reach connection, whoever dialled either (protocol.md 12): the
+        // side that sees the LAN first may not be the lower Device ID.
+        #[cfg(feature = "iroh")]
+        {
+            let old_reach = crate::reach::is_reach_addr(existing.conn.remote_addr());
+            let new_reach = crate::reach::is_reach_addr(conn.remote_addr());
+            if old_reach != new_reach {
+                return if new_reach {
+                    Placement::Reject
+                } else {
+                    Placement::Replace
+                };
+            }
         }
         let old_pref = self.dialled_by_lower(&existing.conn);
         let new_pref = self.dialled_by_lower(conn);

@@ -131,6 +131,16 @@ Requests are independent and may be issued concurrently. Events are broadcast to
 connected client from the moment it connects; there is no replay. A UI that starts late
 rebuilds its view from `Status`, `Peers` and `Transfers` and then applies events.
 
+### 1.6 Reach across networks (spike, protocol.md 12)
+
+| Request | Fields | Answer | Notes |
+|---|---|---|---|
+| `set_remote_grant` | `peer`, `on` | `done` | The `remote` grant (SR-14, SR-35). Turning it on with no relay named, or on a daemon built without the `iroh` feature, answers `invalid_state` saying so. `playdrop remote <peer> on` prints what the relay can see (SR-39) |
+| `reach_paths` | none | `reach_paths`: list of `{short_id, line}` | Peers on the relay or a direct path across networks, with the line to print (SR-39). No URL and no Endpoint ID (SR-40). Empty from a daemon without the feature |
+
+These two are in every build, because `playdrop-ipc` has no `iroh` feature of its own. Nothing calls
+them unless the client was built with the feature. `Diagnose` adds the same lines to its summary.
+
 ## 2. Linux: D-Bus on the session bus (SR-26)
 
 - Well-known name `org.playdrop.PlayDrop.Daemon1`, object `/org/playdrop/PlayDrop/Daemon1`, interface

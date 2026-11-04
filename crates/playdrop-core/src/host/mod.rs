@@ -32,6 +32,8 @@ mod pairing;
 mod path;
 mod pins;
 pub mod platform;
+#[cfg(feature = "iroh")]
+mod reach_link;
 mod receive;
 mod registry;
 mod router;
@@ -67,6 +69,8 @@ pub use events::{
 pub use lock::{AlwaysUnlocked, LockFlag, LockState};
 pub use outbox::OutboxItem;
 pub use path::{PathOutcome, PathReport, PathTiming, ProbeReport};
+#[cfg(feature = "iroh-test")]
+pub use reach_link::ReachCounters;
 pub use send::{SendSource, TransferHandle, TransferSummary};
 pub use status::MediaState;
 pub use transfers::{TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISHED, KEEP_FOR};
@@ -193,6 +197,11 @@ pub struct HostConfig {
     /// default is the system's list. Rust only; tests supply their own, as loopback gets
     /// no id.
     pub path_interfaces: Arc<dyn InterfaceLookup>,
+    /// Reach across networks through the relay the user named (protocol.md 12). `None` (the
+    /// default) means no endpoint exists and nothing outside the LAN is contacted (SR-35).
+    /// Rust only, not exposed through `playdrop-ffi`.
+    #[cfg(feature = "iroh")]
+    pub reach: Option<crate::reach::ReachConfig>,
 }
 
 impl HostConfig {
@@ -222,6 +231,8 @@ impl HostConfig {
             path_choice: true,
             path_timing: PathTiming::default(),
             path_interfaces: Arc::new(SystemInterfaceLookup),
+            #[cfg(feature = "iroh")]
+            reach: None,
         }
     }
 
@@ -376,6 +387,15 @@ pub(crate) struct Inner {
     pub(crate) path_timing: PathTiming,
     /// [`HostConfig::path_interfaces`].
     pub(crate) path_interfaces: Arc<dyn InterfaceLookup>,
+    /// The endpoint, when a relay is named (protocol.md 12).
+    #[cfg(feature = "iroh")]
+    pub(crate) reach_link: Option<Arc<reach_link::ReachLink>>,
+    /// The `remote` grant and what peers said in `reach` frames.
+    #[cfg(feature = "iroh")]
+    pub(crate) reach_store: crate::reach::store::SharedStore,
+    /// Stored `reach` changes per peer per minute.
+    #[cfg(feature = "iroh")]
+    pub(crate) reach_changes: reach_link::ChangeLimit,
     pub(crate) clipboard_echo: Mutex<ClipboardEcho>,
     /// Unix seconds of the last hello or frame per paired peer, updated on every frame.
     /// The pin store holds the persisted copy (written at session start and end only, so
@@ -785,6 +805,10 @@ impl Host {
         let (events_tx, events_rx) = mpsc::channel(4096);
         let interfaces: Arc<dyn InterfaceSource> = Arc::from(config.interfaces);
         let local_id = *identity.device_id();
+        #[cfg(feature = "iroh")]
+        let reach_store = reach_link::open_store(&data_dir, config.secret_store.clone());
+        #[cfg(feature = "iroh")]
+        let reach_link = reach_link::start(&identity, config.reach.as_ref()).await?;
         let inner = Arc::new(Inner {
             local_id,
             local_addr,
@@ -818,6 +842,12 @@ impl Host {
             path_choice: config.path_choice,
             path_timing: config.path_timing,
             path_interfaces: config.path_interfaces,
+            #[cfg(feature = "iroh")]
+            reach_link,
+            #[cfg(feature = "iroh")]
+            reach_store,
+            #[cfg(feature = "iroh")]
+            reach_changes: reach_link::ChangeLimit::default(),
             clipboard_echo: Mutex::new(ClipboardEcho::default()),
             last_seen: Mutex::new(HashMap::new()),
             free_space: config.free_space,
@@ -859,6 +889,28 @@ impl Host {
         // sends (protocol.md 7.6).
         send_resume::load_persisted(&inner).await;
 
+        // Reach gets its own TLS configuration with an "Add device" window that never opens:
+        // pairing does not run on this path, whatever the window says (SR-36).
+        #[cfg(feature = "iroh")]
+        let server = match inner.reach_link.clone() {
+            Some(link) => {
+                let closed = Arc::new(AtomicBool::new(false));
+                let lookup: Arc<dyn tls::PinLookup> = inner.pins.lookup();
+                let reach_tls = TlsAcceptor {
+                    config: tls::build_server_config(
+                        &identity,
+                        Arc::clone(&lookup),
+                        Arc::clone(&closed),
+                    ),
+                    pins: lookup,
+                    window: closed,
+                };
+                let (tx, rx) = mpsc::channel(16);
+                inner.spawn(reach_link::accept_loop(Arc::clone(&inner), link, tx));
+                server.with_reach(rx, reach_tls)
+            }
+            None => server,
+        };
         let server_task = tokio::spawn(server.run(acceptor, router, inner.shutdown_rx()));
         *lock(&inner.server_task) = Some(server_task);
 
@@ -951,6 +1003,8 @@ impl Host {
         for c in inner.registry.all_connections() {
             let _ = tokio::time::timeout(Duration::from_millis(500), c.closed()).await;
         }
+        #[cfg(feature = "iroh")]
+        reach_link::shutdown(inner).await;
         // Every task is gone: what they queued for the incoming records lands now, before
         // a host restarted on the same folders reads them.
         inner.owner_io.close().await;
@@ -1428,6 +1482,8 @@ impl Host {
             d.network_changed();
         }
         self.inner.dial_nudge.notify_one();
+        #[cfg(feature = "iroh")]
+        reach_link::network_changed(&self.inner);
         path::on_network_changed(&self.inner);
     }
 
@@ -1449,6 +1505,93 @@ impl Host {
     #[doc(hidden)]
     pub fn path_entries_for_test(&self) -> usize {
         lock(&self.inner.paths).len()
+    }
+
+    /// Whether `peer` holds the `remote` grant (protocol.md 12). Default off (SR-35).
+    #[cfg(feature = "iroh")]
+    pub fn remote_grant(&self, peer: &DeviceId) -> bool {
+        self.inner
+            .pins
+            .get(peer)
+            .is_some_and(|p| self.inner.reach_store.read(|s| s.granted(&p)))
+    }
+
+    /// Turns the `remote` grant of `peer` on or off. Only the local UI may do this (SR-14).
+    /// Off closes its reach connections and tells it to forget this host's endpoint.
+    #[cfg(feature = "iroh")]
+    pub async fn set_remote_grant(&self, peer: &DeviceId, on: bool) -> Result<()> {
+        reach_link::set_grant(&self.inner, *peer, on).await
+    }
+
+    /// Every peer currently reached across networks and how (SR-39).
+    #[cfg(feature = "iroh")]
+    pub fn reach_paths(&self) -> Vec<crate::reach::ReachPath> {
+        reach_link::paths(&self.inner)
+    }
+
+    /// This host's Endpoint ID, 64 hex characters, if a relay is named. `None` means no endpoint
+    /// exists (SR-35). Never log it above debug level (SR-40).
+    #[cfg(feature = "iroh")]
+    pub fn reach_endpoint_id(&self) -> Option<String> {
+        self.inner
+            .reach_link
+            .as_ref()
+            .map(|l| crate::reach::wire::endpoint_hex(&l.id()))
+    }
+
+    /// Lines for diagnostics about what is wrong with reach (T46).
+    #[cfg(feature = "iroh")]
+    pub fn reach_notes(&self) -> Vec<String> {
+        reach_link::notes(&self.inner)
+    }
+
+    /// Tasks this host has running, for tests of what piles up.
+    #[doc(hidden)]
+    #[cfg(feature = "iroh-test")]
+    pub fn tasks_for_test(&self) -> usize {
+        Arc::strong_count(&self.inner.task_guard)
+    }
+
+    /// The endpoint and relay `peer` told this host, for tests. Never log them (SR-40).
+    #[doc(hidden)]
+    #[cfg(feature = "iroh-test")]
+    pub fn reach_stored_for_test(&self, peer: &DeviceId) -> Option<(String, String)> {
+        reach_link::stored(&self.inner, peer)
+    }
+
+    /// The link's counters, for tests.
+    #[doc(hidden)]
+    #[cfg(feature = "iroh-test")]
+    pub fn reach_counters_for_test(&self) -> reach_link::ReachCounters {
+        reach_link::counters(&self.inner)
+    }
+
+    /// Tries a second stream on the live connection to `peer`: true if the peer allowed one
+    /// (SR-38), for tests.
+    #[doc(hidden)]
+    #[cfg(feature = "iroh-test")]
+    pub async fn reach_second_stream_for_test(&self, peer: &DeviceId, wait: Duration) -> bool {
+        reach_link::try_second_stream(&self.inner, peer, wait).await
+    }
+
+    /// Sends a `reach` frame with these values, as a hostile peer would. For tests.
+    #[doc(hidden)]
+    #[cfg(feature = "iroh-test")]
+    pub fn reach_send_frame_for_test(
+        &self,
+        peer: &DeviceId,
+        endpoint: Option<String>,
+        relay: Option<String>,
+    ) -> bool {
+        reach_link::send_frame_for_test(&self.inner, peer, endpoint, relay)
+    }
+
+    /// Dials `endpoint` expecting the wrong device key. For tests; true if the dial failed in its
+    /// handshake.
+    #[doc(hidden)]
+    #[cfg(feature = "iroh-test")]
+    pub async fn reach_dial_wrong_key_for_test(&self, endpoint: &str) -> bool {
+        reach_link::dial_wrong_key_for_test(&self.inner, endpoint).await
     }
 
     /// Dials a paired peer now if no session is up, using its last-known addresses.

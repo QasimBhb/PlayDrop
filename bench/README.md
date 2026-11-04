@@ -10,6 +10,7 @@ downloaded or built tools under `/tmp/pd-bench-tools`.
 | `loopback.sh` | PlayDrop HTTP/2 and raw framing against iperf3 on 127.0.0.1. Protocol and crypto cost only, no radio. | `cargo build --release -p playdrop-cli`, iperf3 |
 | `iperf3-phone.sh` | The Wi-Fi ceiling: desktop to phone and phone to desktop, 1 and 4 streams. | adb, iperf3, an arm64 Android iperf3 (the script header says how to build it) |
 | `desktop-to-phone.sh` | PlayDrop end to end, desktop to phone, per dataset, then checks file count and sha256 of every file on the phone. Sends with `playdrop send --to <peer> --json`. | `playdropd` running and paired, `cargo build --release -p playdrop-cli`, adb, python3 |
+| `reach-netns.sh` | Gate R5 of `docs/design/iroh-reach.md`: two hosts behind NATs in network namespaces, relay MiB/s, direct MiB/s (`--reach-direct`), and an nft counter of who each host sent to. Rootless, data under `~/.cache/pd-p12/netns`. | `unshare`, ip, nft, nsenter, openssl, iroh-relay, a `playdrop` built with `--features iroh`; see the top of the script |
 | `incumbents.md` | Manual steps to time LocalSend and KDE Connect on the same datasets. | the user |
 
 ## Order of a full run

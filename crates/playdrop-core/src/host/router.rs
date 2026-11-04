@@ -30,6 +30,12 @@ impl Router for HostRouter {
         if conn.is_trusted() && !self.inner.pins.contains(&conn.device_id()) {
             conn.close(CloseReason::Unpaired);
         }
+        // The same gap for the `remote` grant: a revoke sweeps what is tracked, and this one
+        // was still in its handshake then (SR-14, protocol.md 12).
+        #[cfg(feature = "iroh")]
+        if !super::reach_link::still_allowed(&self.inner, conn) {
+            conn.close(CloseReason::Dead);
+        }
     }
 
     /// Counts for protocol.md 3.3 only from its first request other than a path probe

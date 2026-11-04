@@ -96,10 +96,15 @@ pub(crate) fn local_caps(inner: &Inner) -> Caps {
     if inner.accepts_input {
         incoming.extend_from_slice(INPUT_CAPS);
     }
-    Caps {
-        incoming,
-        outgoing: LOCAL_OUT.to_vec(),
+    #[allow(unused_mut, reason = "only the iroh feature adds to it")]
+    let mut outgoing = LOCAL_OUT.to_vec();
+    // Listed only with a relay named: no endpoint, nothing to tell or to hear (protocol.md 12).
+    #[cfg(feature = "iroh")]
+    if inner.reach_link.is_some() {
+        incoming.push(super::reach_link::capability());
+        outgoing.push(super::reach_link::capability());
     }
+    Caps { incoming, outgoing }
 }
 
 #[allow(
@@ -205,6 +210,12 @@ impl Session {
         crate::session::may_send(LOCAL_OUT, &lock(&self.state).peer_in, cap)
     }
 
+    /// True if the peer's `caps.in` lists `cap`, for a capability this build adds at run time.
+    #[cfg(feature = "iroh")]
+    pub(crate) fn peer_lists_in(&self, cap: &Capability) -> bool {
+        lock(&self.state).peer_in.contains(cap)
+    }
+
     /// The peer's `caps.in` as wire strings, for `PeerSummary::capabilities`.
     pub(crate) fn peer_caps_in(&self) -> Vec<String> {
         lock(&self.state)
@@ -278,17 +289,22 @@ impl Session {
     /// Ends the stream and then closes its connection, giving the last frames time to go
     /// out (protocol.md 5.4, 6.2: send the error or reject, then close).
     pub(crate) fn close_after_flush(&self, inner: &Arc<Inner>, reason: CloseReason) {
+        self.close_after(inner, reason, FLUSH_GRACE);
+    }
+
+    /// Ends the stream and closes its connection after `grace`.
+    fn close_after(&self, inner: &Arc<Inner>, reason: CloseReason, grace: Duration) {
         self.end();
         let conn = Arc::clone(&self.conn);
         inner.spawn(async move {
-            tokio::time::sleep(FLUSH_GRACE).await;
+            tokio::time::sleep(grace).await;
             conn.close(reason);
         });
     }
 
     /// Sends at most one `forbidden` or `not_paired` error per frame type per connection
     /// (protocol.md 5.3, section 11 SR-14 deviation).
-    fn refuse_once(&self, t: &str, code: ErrorCode, re: u64) {
+    pub(crate) fn refuse_once(&self, t: &str, code: ErrorCode, re: u64) {
         let first = lock(&self.state).forbidden_sent.insert(t.to_owned());
         if first {
             let message = match code {
@@ -581,7 +597,11 @@ async fn handle_frame(
         return Ok(());
     }
     let hex = peer.to_hex();
+    #[cfg(feature = "iroh")]
+    let seq = env.seq;
     match env.frame {
+        #[cfg(feature = "iroh")]
+        Frame::Reach(r) => super::reach_link::on_frame(inner, sess, seq, r).await,
         Frame::Capabilities(CapabilitiesFrame { caps }) => {
             lock(&sess.state).peer_in = caps.incoming;
         }
@@ -736,6 +756,14 @@ fn on_hello(
 /// keep-alive and sends our announce key (protocol.md 8.2: at every session start).
 pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHello) {
     let peer = sess.peer();
+    // Revoked after this reach connection came up: no session, so no online report, no outbox and
+    // no resumed sends (SR-14). The peer hears it at its next session on a LAN (`told`).
+    #[cfg(feature = "iroh")]
+    if !super::reach_link::still_allowed(inner, &sess.conn) {
+        tracing::debug!(peer = %short(&peer), "session on a reach connection with no grant refused");
+        sess.conn.close(CloseReason::Dead);
+        return;
+    }
     let (placement, old) = inner.registry.install(sess);
     tracing::debug!(peer = %short(&peer), session = sess.id, conn = sess.conn.id(), ?placement, "session placed");
     if matches!(placement, Placement::Reject) {
@@ -765,7 +793,7 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
             peer: peer.to_hex(),
             short_id: peer.short_id(),
             name: v.name.clone(),
-            addr: sess.conn.remote_addr(),
+            addr: crate::net::client::shown_addr(sess.conn.remote_addr()),
         });
     }
     if let Some(old) = old {
@@ -798,6 +826,8 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
     outbox::notify(inner, peer);
     // Sends that gave up while the peer was away resume now (protocol.md 7.6).
     send_resume::resume_for_peer(inner, peer);
+    #[cfg(feature = "iroh")]
+    super::reach_link::on_session_placed(inner, sess);
 }
 
 /// Sends `accepted` again for every receive from this peer still running. Harmless to a
@@ -868,6 +898,8 @@ pub(crate) async fn unpair(inner: &Arc<Inner>, peer: DeviceId, notify: bool) -> 
     lock(&inner.status).forget(&peer);
     // A device paired again starts fresh: no tried addresses, no back-off.
     lock(&inner.paths).remove(&peer);
+    #[cfg(feature = "iroh")]
+    super::reach_link::forget(inner, peer).await;
     for s in inner.registry.sessions() {
         if s.peer() != peer {
             s.send_raw(announce_key_frame(inner), None);

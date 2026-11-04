@@ -57,6 +57,19 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
     // Windows free space, DPAPI sealing and the exclusive port, as in the daemon
     // (SR-20, SR-28, SR-31).
     playdrop_platform::apply_hooks(&mut cfg);
+    #[cfg(feature = "iroh")]
+    let reach_on = args.reach_relay.is_some();
+    #[cfg(feature = "iroh")]
+    if let Some(url) = args.reach_relay {
+        let mut c = playdrop_core::reach::ReachConfig::new(url);
+        c.direct = args.reach_direct;
+        if let Some(path) = &args.reach_relay_ca {
+            let pem = std::fs::read_to_string(path)
+                .with_context(|| format!("reading {}", path.display()))?;
+            c.add_ca_pem(&pem).context("--reach-relay-ca")?;
+        }
+        cfg.reach = Some(c);
+    }
     let (host, mut events) = match Host::start(cfg).await {
         Ok(v) => v,
         Err(playdrop_core::Error::PortHeld { port }) => {
@@ -73,6 +86,11 @@ pub async fn run(args: HostArgs) -> anyhow::Result<()> {
         host.local_addr(),
         receive_dir.display()
     );
+    // SR-39: said where reach is turned on, without the URL (SR-40).
+    #[cfg(feature = "iroh")]
+    if reach_on {
+        println!("{}", playdrop_core::reach::RELAY_NOTICE);
+    }
     let printer = tokio::spawn(async move {
         while let Some(ev) = events.recv().await {
             print_event(&ev, json);
@@ -167,6 +185,15 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
                     if p.online { "online " } else { "offline" },
                     p.last_known
                 );
+            }
+            // Anyone on the slow path says so, in plain words (SR-39).
+            #[cfg(feature = "iroh")]
+            for p in host.reach_paths() {
+                println!("{}", p.status_line());
+            }
+            #[cfg(feature = "iroh")]
+            for note in host.reach_notes() {
+                println!("{note}");
             }
         }
         ("pair", 1) => {
@@ -283,6 +310,18 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
                     _ => bail!("use +grant or -grant"),
                 };
                 match name {
+                    // Kept apart from the rest (protocol.md 12, no field in `Grants`).
+                    #[cfg(feature = "iroh")]
+                    "remote" => {
+                        host.set_remote_grant(&id, on).await?;
+                        if on {
+                            // SR-39, where the grant is given.
+                            println!("{}", playdrop_core::reach::RELAY_NOTICE);
+                            if host.reach_endpoint_id().is_none() {
+                                println!("{}", playdrop_core::reach::NO_RELAY_NOTICE);
+                            }
+                        }
+                    }
                     "files" => g.files = on,
                     "clipboardIn" => g.clipboard_in = on,
                     "clipboardOut" => g.clipboard_out = on,
@@ -296,6 +335,8 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
                 host.set_grants(&id, g).await?;
             }
             println!("{g:?}");
+            #[cfg(feature = "iroh")]
+            println!("remote: {}", host.remote_grant(&id));
         }
         ("ping", n) if n >= 2 => {
             let id = peer(host, &w[1])?;
@@ -467,6 +508,8 @@ fn print_event(ev: &HostEvent, json: bool) {
             addr,
             ..
         } => {
+            #[cfg(feature = "iroh")]
+            let addr = playdrop_core::reach::display_addr(*addr);
             println!("online: {name} ({short_id}) at {addr}");
         }
         HostEvent::PeerOffline { short_id, .. } => println!("offline: {short_id}"),

@@ -812,6 +812,32 @@ pub struct ErrorFrame {
     pub message: Option<String>,
 }
 
+/// `reach`, protocol.md 12: the sender's endpoint and relay, or both null to take them back.
+/// What it carries is checked by [`crate::reach::wire`] before it is stored. Debug prints it,
+/// which is fine at the debug level SR-40 allows.
+#[cfg(feature = "iroh")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachFrame {
+    /// The sender's Endpoint ID, 64 lowercase hex characters.
+    #[serde(default, deserialize_with = "lenient_reach_value")]
+    pub endpoint: Option<String>,
+    /// The relay the sender named.
+    #[serde(default, deserialize_with = "lenient_reach_value")]
+    pub relay: Option<String>,
+}
+
+/// A `reach` value of any JSON type parses (protocol.md 12): a wrong type is one more bad value,
+/// ignored with the rest of them, and not a malformed frame that closes the connection. It reads
+/// as an empty string, which [`crate::reach::wire`] refuses.
+#[cfg(feature = "iroh")]
+fn lenient_reach_value<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Ok(match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s),
+        _ => Some(String::new()),
+    })
+}
+
 /// A session frame body, tagged on `t` (protocol.md 5.3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "snake_case")]
@@ -856,6 +882,9 @@ pub enum Frame {
     Unpair,
     /// 5.14
     Error(ErrorFrame),
+    /// 12
+    #[cfg(feature = "iroh")]
+    Reach(ReachFrame),
     /// A `t` this version does not know. Ignored by the receiver (protocol.md section 4);
     /// never encoded.
     #[serde(skip)]
@@ -918,6 +947,8 @@ pub const KNOWN_TYPES: &[&str] = &[
     "pair_reject",
     "unpair",
     "error",
+    #[cfg(feature = "iroh")]
+    "reach",
 ];
 
 impl Frame {
@@ -944,6 +975,8 @@ impl Frame {
             Frame::PairReject(_) => "pair_reject",
             Frame::Unpair => "unpair",
             Frame::Error(_) => "error",
+            #[cfg(feature = "iroh")]
+            Frame::Reach(_) => "reach",
             Frame::Unknown { t } => t,
         }
     }
@@ -1095,6 +1128,10 @@ pub(crate) mod tests {
         r#"{"t":"input","v":1,"kind":"pointer","op":"button","button":"left","action":"click"}"#,
         r#"{"t":"input","v":1,"kind":"key","key":"Enter","mods":["ctrl"],"action":"press"}"#,
         r#"{"t":"input","v":1,"kind":"presenter","action":"next"}"#,
+        #[cfg(feature = "iroh")]
+        r#"{"t":"reach","v":1,"endpoint":"aa","relay":"https://relay.example.org"}"#,
+        #[cfg(feature = "iroh")]
+        r#"{"t":"reach","v":1,"endpoint":null,"relay":null}"#,
         r#"{"t":"transfer","v":1,"id":"c1d2...f0","state":"accepted"}"#,
         r#"{"t":"transfer","v":1,"id":"c1d2...f0","state":"cancelled","reason":"user"}"#,
         r#"{"t":"error","v":1,"re":45,"code":"forbidden","message":"media control is off for this device"}"#,
@@ -1222,6 +1259,9 @@ pub(crate) mod tests {
             ("pair_reject", None, true),
             ("unpair", None, false),
             ("error", None, true),
+            // The `remote` grant is checked by the handler, as it is not in `Grants`.
+            #[cfg(feature = "iroh")]
+            ("reach", None, false),
         ];
         assert_eq!(expect.len(), KNOWN_TYPES.len());
         for (t, grant, unpaired) in expect {

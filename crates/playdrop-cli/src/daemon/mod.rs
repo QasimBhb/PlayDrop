@@ -139,6 +139,18 @@ pub struct ClipArgs {
     pub sensitive: bool,
 }
 
+/// Options of `playdrop remote`.
+#[cfg(feature = "iroh")]
+#[derive(Debug, clap::Args)]
+pub struct RemoteArgs {
+    /// Peer: Short ID prefix or label.
+    #[arg(value_name = "PEER")]
+    pub peer: String,
+    /// `on` or `off`.
+    #[arg(value_name = "on|off", value_parser = ["on", "off"])]
+    pub state: String,
+}
+
 /// Options of `playdrop ping`.
 #[derive(Debug, clap::Args)]
 pub struct PingArgs {
@@ -198,6 +210,9 @@ pub enum DaemonCommand {
     Send(SendArgs),
     /// `playdrop peers`.
     Peers(JsonArgs),
+    /// `playdrop remote`.
+    #[cfg(feature = "iroh")]
+    Remote(RemoteArgs),
     /// `playdrop status`.
     Status(JsonArgs),
     /// `playdrop transfers`.
@@ -219,6 +234,8 @@ pub async fn run(cmd: DaemonCommand) -> ExitCode {
     let result = match cmd {
         DaemonCommand::Send(a) => send::run(a).await,
         DaemonCommand::Peers(a) => commands::peers(a).await,
+        #[cfg(feature = "iroh")]
+        DaemonCommand::Remote(a) => commands::remote(a).await,
         DaemonCommand::Status(a) => commands::status(a).await,
         DaemonCommand::Transfers(a) => commands::transfers(a).await,
         DaemonCommand::Cancel(a) => commands::cancel(a).await,

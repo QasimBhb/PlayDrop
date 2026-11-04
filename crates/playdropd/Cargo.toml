@@ -26,6 +26,10 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 
+[features]
+# Reach across networks through iroh (docs/design/iroh-reach.md). Off in every release build.
+iroh = ["playdrop-core/iroh"]
+
 [dependencies]
 anyhow = "1.0.104"
 async-trait = "0.1.92"

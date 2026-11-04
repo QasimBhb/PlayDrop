@@ -14,6 +14,8 @@ pub mod host;
 pub mod identity;
 pub mod net;
 pub mod pin_store;
+#[cfg(feature = "iroh")]
+pub mod reach;
 pub mod session;
 pub mod tls;
 pub mod transfer;
