@@ -31,7 +31,7 @@ Versions: workspace `0.7.0`; `playdrop-ffi` keeps its own version, its API did n
 | Reach tests | `phase12_reach` 32 passed, `sr32_canary` 1 passed with `iroh-test`; core lib 304 with the feature; every test written in the review rounds shown failing with its fix removed, except where section 5 says otherwise |
 | Android, iOS | No code change. iOS `MARKETING_VERSION` only |
 | Release | v0.7.0 from `e8743a6` on 2026-11-03, five files plus checksums; Linux (with the new reach job), Windows, iOS and Android CI green |
-| Phone | `throughput.md` 14.1 and 14.2 done; **14.3 tethering not run**, see section 5 |
+| Phone | `throughput.md` 14.1, 14.2 and 14.3 done. Tethering run on 2026-11-04 on the released 0.7.0: a send stayed on Wi-Fi at 44.5 MiB/s, sum matches |
 
 ### 1.1 What landed
 
@@ -101,7 +101,7 @@ list. To gate them, that crate needs an `iroh` feature of its own.
   possession is required before reach leaves spike status.
 - A daemon refuses `remote on` with no relay named; `playdrop host` saves it and warns.
 - USB tethering was not waited for: the release condition was green CI, and the run needs someone at
-  the phone. Recorded as owed.
+  the phone. It ran the day after the release (`throughput.md` 14.3).
 
 ---
 
@@ -109,8 +109,9 @@ list. To gate them, that crate needs an `iroh` feature of its own.
 
 | Area | What | Phase |
 |---|---|---|
-| Phone | **Owed: path choice on a real phone with USB tethering and Wi-Fi both on.** One 256 MiB file, about 5 min, the user turns tethering on. Check `ss`, `ip route`, `playdrop diagnose`; record in `throughput.md` 14.3 | next |
-| Phone | The final one-radio build has not run on the phone; the proof line above is from review round 2. The tethering run covers it | next |
+| Phone | With tethering and Wi-Fi both on, desktop and phone chose different paths and each held its own connection (`throughput.md` 14.3). A send from the phone to the desktop was not run, so which one it uses is not known | next |
+| Phone | Path measurements sit close when Wi-Fi swings either side of USB (raw Wi-Fi 21.7 to 60.1 MiB/s, USB about 33). The choice is made when the connection opens and can be stale at send time; not measured how often | later |
+| Packaging | The `.deb` ships `playdropd` and `playdrop-desktop` but no `playdrop` CLI, while the README and `docs/guide/cli.md` tell people to run `playdrop send`. Ship it or say how to get it. The Flatpak manifest does not mention it either; the Windows installer was not checked | next |
 | Reach | Real carrier network, real guest Wi-Fi, a phone, and who runs the relay | when wanted |
 | Reach | Proof of possession in the `reach` frame (T46), required before leaving spike status | before enabling |
 | Reach | `playdropd --reach-relay`, `playdrop remote` and `playdrop peers` over IPC never run live; R5 uses `playdrop host`. Windows type-checked only | before enabling |
@@ -122,7 +123,8 @@ list. To gate them, that crate needs an `iroh` feature of its own.
 | Tests | A silent-cut resume took 8.54 s on Windows against 1.4 s here, cause not known; the Windows bound is now 30 s, so that test no longer catches a drain there | later |
 | Core | A peer moving an address to another interface leaves it set aside until the 160 min lapse | later |
 | Bench | `~/.cache/pd-p11/verify.sh` prints `comm` order warnings on `small-1000`; counts were rechecked by hand | later |
-| Phone | Left on version code 607; v0.7.0's 700 installs over it. `locksettings get-disabled` read false though no keyguard showed; if a lock appears, skip phone runs and record why | note |
+| Phone | On 0.7.0 (version code 700), signed with the debug key. The published APK uses the release key, so it will not install over this one, and removing the app first loses the pairing; sign a build with the debug key as in 14.3. `locksettings get-disabled` read false though no keyguard showed; if a lock appears, skip phone runs and record why | note |
+| Bench | Start a daemon outside `flock`, or with `flock -o`. A daemon started inside `flock` inherits the lock and holds it for as long as it runs, which blocked the next phone step for 5 min on 2026-11-04 | note |
 | Earlier phases | See `phase-11-path-choice.md` section 5 for rows not touched here: `mixed-5000` target of 0.8, slow rounds, SR-34, iOS App Group, Windows live items | later |
 
 ---
@@ -140,8 +142,8 @@ manifest field, then `zipalign -f -P 16 4` and `apksigner` with the debug key.
 
 ## 7. Phase 13 kickoff brief
 
-v0.7.0 is released. First clear the tethering row in section 5, which needs the user to turn tethering
-on; say the file count and time first. Then pick from `docs/design/later-items.md`: the libcosmic
+v0.7.0 is released and the tethering run is done (`throughput.md` 14.3). Fix the missing CLI in section
+5 first. Then pick from `docs/design/later-items.md`: the libcosmic
 panel applet and notification mirroring need nothing from the user but a wish for them, so ask only
 if the choice is genuinely theirs. Reach stays a spike until a real second network is on offer. Build
 with `CARGO_TARGET_DIR=$HOME/.cache/playdrop-target` (the repo's drive is NTFS through ntfs-3g).

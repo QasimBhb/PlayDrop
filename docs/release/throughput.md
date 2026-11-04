@@ -834,7 +834,41 @@ the limit of 4 per kill in 13.6. The bench's `verify.sh` printed `comm` order wa
 
 ### 14.3 Path choice with USB tethering and Wi-Fi both on
 
-Not run. It needs someone at the phone to turn tethering on, and the phase did not wait for that.
-Still only proxies on one machine (section 13). The one real-phone result from this phase is the
-merging line on Wi-Fi: `192.168.86.74:42187 same path as [fe80::9c08:4fff:feab:823e%3]:42187, not
-measured`, at 43.5 MiB/s, on a review build.
+Run on 2026-11-04 at 13:42, after the release. Released 0.7.0 at both ends: `playdropd` from the
+`.deb`, and the released APK signed again with the debug key because the phone held a debug-key build
+and Android refuses an update from another key. The `.deb` has no CLI, so `playdrop` was built from
+the same source. Wi-Fi 5 GHz, RSSI -53; USB through `usb0`; battery 28 C.
+
+**The transfer stayed on Wi-Fi.** One 256 MiB file took 6.1 s, including the offer: 270.9 MiB left the
+desktop on Wi-Fi and 0.4 MiB on USB, mean 44.5 MiB/s, sum matches. With tethering winning in 12.3, the
+same phone did 26 to 28 MiB/s. Wi-Fi was the better choice on this run.
+
+What the desktop measured when it dialled, from `playdrop diagnose`, once per daemon start:
+
+| Wi-Fi MiB/s | USB MiB/s | Decision | USB address measured |
+|---|---|---|---|
+| 38.9 | 34.1 | kept Wi-Fi | `10.162.165.123` |
+| 29.0 | 31.9 | kept Wi-Fi | `fe80::c4f0:f0ff:fe28:7d8d%140` |
+
+Neither reaches the 1.25 times needed to move, so the connection it already had stayed. The Wi-Fi
+link-local address was set aside on both runs: `[fe80::9c08:4fff:feab:823e%3]:42187 same path as
+192.168.86.74:42187, not measured`. That is the one-radio code on the released build. Each decision
+saw only one USB address, so merging two USB addresses was not exercised.
+
+Raw TCP (`iperf3`, 5 s, MiB/s), which shows why the measurements sit so close:
+
+| Path | To phone | From phone |
+|---|---|---|
+| USB | 32.7, 32.7 | 33.5, 33.7 |
+| Wi-Fi | 60.1, 21.7 | 38.2 (the other run failed: server still busy) |
+
+USB is steady and Wi-Fi swings either side of it. A choice made when the connection opens can be
+stale by the time a file is sent; this run does not show how often.
+
+**The phone chose differently.** It dials too, and logged `moved to a faster path` from the desktop's
+Wi-Fi link-local address to `10.162.165.93`. After a daemon restart it again held a connection over
+USB. So there were two connections at once: desktop to phone on Wi-Fi and phone to desktop on USB. The
+send used the first, and the second stayed idle.
+
+Not shown: a send from the phone to the desktop, which might use the USB connection. A move on the
+desktop side (both runs kept the path), and the phone's measured speeds, which it does not log.
