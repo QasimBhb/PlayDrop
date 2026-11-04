@@ -30,7 +30,7 @@ Versions: workspace `0.7.0`; `playdrop-ffi` keeps its own version, its API did n
 | Rust tests | 628 passed, 0 failed, 11 ignored (`dbus-run-session -- cargo test --workspace --locked --no-fail-fast`, build dir on ext4); clippy and `fmt --check` clean, default and with the feature; Windows check clean with a stub C compiler, default only on the final tree; Flatpak `check-sources` in step |
 | Reach tests | `phase12_reach` 32 passed, `sr32_canary` 1 passed with `iroh-test`; core lib 304 with the feature; every test written in the review rounds shown failing with its fix removed, except where section 5 says otherwise |
 | Android, iOS | No code change. iOS `MARKETING_VERSION` only |
-| Release | v0.7.0, recorded in the commit after this one |
+| Release | v0.7.0 from `e8743a6` on 2026-11-03, five files plus checksums; Linux (with the new reach job), Windows, iOS and Android CI green |
 | Phone | `throughput.md` 14.1 and 14.2 done; **14.3 tethering not run**, see section 5 |
 
 ### 1.1 What landed
