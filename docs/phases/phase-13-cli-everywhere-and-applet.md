@@ -36,7 +36,7 @@ its own version.
 | Rust tests | 633 passed, 0 failed, 11 ignored (`dbus-run-session -- cargo test --workspace --locked --no-fail-fast`, build dir on ext4); clippy and `fmt --check` clean; Flatpak `check-sources` in step (898 crates) |
 | Applet tests | 68 passed in `apps/cosmic-applet` (`cargo test --locked`), clippy and `fmt --check` clean there too |
 | Android, iOS | No code change. iOS `MARKETING_VERSION` only |
-| Release | Not yet: v0.8.0 is tagged once CI is green on all four platforms and a release dry run builds the six files |
+| Release | v0.8.0 from `381a1f5` on 2026-11-09, six files plus checksums; Linux (with the new applet job), Windows (with the installer test, 16 checks passed on its first run), iOS and Android CI green |
 | Phone | Not used |
 
 ### 1.1 What landed
@@ -158,6 +158,8 @@ No ffi change, no wire change, no IPC contract change. `playdrop-ipc` gained the
 | Flatpak | The daemon log in the sandbox said clipboard watching is not available on COSMIC ("use the Send clipboard button"). Not looked into; the `.deb` daemon watches the clipboard on the same desktop | next |
 | Windows | The installer's wizard pages, SmartScreen and the tray still need a person at a Windows machine. The silent path is covered by CI | when a machine is on offer |
 | Windows | If our folder was the only `PATH` entry, uninstall leaves an empty `Path` value. A hand-added copy of the folder with a trailing backslash is not recognised as ours | later |
+| Tests | `the_label_follows_the_connection_and_reports_are_masked` (`phase12_reach.rs`, iroh feature) timed out once on Linux CI at "alpha forgot" on `381a1f5`. The core was not touched this phase, it passed on the push before, on the rerun, and 3 of 3 here | watch |
+| CI | The first push failed Windows clippy: a function that is `async` with no `await` only on non-Linux. A local `cargo check` for the Windows target does not catch that; run `cargo clippy` with the stub C compiler for `x86_64-pc-windows-gnu` before a push that touches `cfg`-split code | note |
 | Phone | Still owed from Phase 12: a send from the phone to the desktop with tethering and Wi-Fi both on (`throughput.md` 14.3) | when the phone is tethered |
 | Earlier phases | See `phase-12-one-path-and-reach.md` section 5 for the reach rows and the rest | later |
 
@@ -177,7 +179,7 @@ No ffi change, no wire change, no IPC contract change. `playdrop-ipc` gained the
 
 ## 7. Phase 14 kickoff brief
 
-v0.8.0 ships the command line everywhere and the optional applet. First, with the user at the
+v0.8.0 is released with the command line everywhere and the optional applet. First, with the user at the
 screen for ten minutes: the applet checklist in section 5, row 1. Then look at why the sandboxed
 daemon reports no clipboard watching on COSMIC. After that pick from `docs/design/later-items.md`:
 notification mirroring only if the user asks for it; the IPC gaps in section 5 are small and help
