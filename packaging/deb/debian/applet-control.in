@@ -1,0 +1,19 @@
+Package: playdrop-cosmic-applet
+Version: @VERSION@
+Architecture: @ARCH@
+Maintainer: PlayDrop maintainers <playdrop@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Section: net
+Priority: optional
+Homepage: https://github.com/QasimBhb/PlayDrop
+Depends: libc6 (>= 2.39), libgcc-s1, libxkbcommon0, playdrop (= @VERSION@)
+Recommends: xdg-desktop-portal
+Enhances: cosmic-panel
+Description: PlayDrop panel applet for the COSMIC desktop
+ An optional entry for the COSMIC panel: paired devices with their battery,
+ one click to send the clipboard or files to a device, transfers in progress,
+ and a stop button while a device controls this desktop.
+ .
+ It talks to the PlayDrop background service over D-Bus and never opens a
+ network connection itself. After installing, add it to a panel in COSMIC
+ Settings under Desktop, Panel, Applets.

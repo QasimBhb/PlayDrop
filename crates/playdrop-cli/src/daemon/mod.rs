@@ -294,10 +294,28 @@ fn pick_peer<'a>(peers: &'a [PeerSummary], to: Option<&str>) -> Result<&'a PeerS
     })
 }
 
+/// What a Flatpak user must type for the sandboxed `playdrop` to see a file outside the
+/// folders the sandbox shares (packaging/flatpak/README.md, "The command line").
+const FLATPAK_FORWARDING_HINT: &str = "playdrop runs inside the Flatpak sandbox and sees only \
+     the files handed to it; put the paths between @@ marks and add --file-forwarding: \
+     flatpak run --file-forwarding --command=playdrop org.playdrop.PlayDrop send @@ <PATH>... @@";
+
+/// Whether this process runs inside a Flatpak sandbox, which marks itself with this file.
+fn in_flatpak() -> bool {
+    cfg!(target_os = "linux") && std::path::Path::new("/.flatpak-info").exists()
+}
+
 /// Makes every path absolute before it leaves this process, and fails early with exit
 /// code 2 on one that does not exist. On Windows the daemon receives the paths as they are
 /// and runs in another folder, so a relative path would name the wrong file there.
 fn absolute_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Failure> {
+    absolute_paths_in(paths, in_flatpak())
+}
+
+/// [`absolute_paths`] with the sandbox answer passed in. Inside Flatpak a file that exists
+/// on the host is simply absent here, so "not found" gets the sentence that says how to
+/// hand the file over instead of leaving the user to guess.
+fn absolute_paths_in(paths: &[PathBuf], sandboxed: bool) -> Result<Vec<PathBuf>, Failure> {
     paths
         .iter()
         .map(|p| {
@@ -309,6 +327,12 @@ fn absolute_paths(paths: &[PathBuf]) -> Result<Vec<PathBuf>, Failure> {
                     Exit::Usage,
                     format!("{} is not a regular file or folder", p.display()),
                 )),
+                Err(e) if sandboxed && e.kind() == std::io::ErrorKind::NotFound => {
+                    Err(Failure::new(
+                        Exit::Usage,
+                        format!("{}: {e}\n{FLATPAK_FORWARDING_HINT}", p.display()),
+                    ))
+                }
                 Err(e) => Err(Failure::new(Exit::Usage, format!("{}: {e}", p.display()))),
             }
         })
@@ -360,7 +384,22 @@ mod tests {
         let got = absolute_paths(&[PathBuf::from("Cargo.toml"), PathBuf::from("src")])
             .expect("both exist");
         assert_eq!(got, vec![cwd.join("Cargo.toml"), cwd.join("src")]);
-        let f = absolute_paths(&[PathBuf::from("no-such-file-here")]).expect_err("missing");
+        let f =
+            absolute_paths_in(&[PathBuf::from("no-such-file-here")], false).expect_err("missing");
         assert_eq!(f.exit, Exit::Usage);
+        assert!(!f.message.contains("--file-forwarding"));
+    }
+
+    #[test]
+    fn a_missing_path_inside_flatpak_says_how_to_hand_the_file_over() {
+        let f =
+            absolute_paths_in(&[PathBuf::from("no-such-file-here")], true).expect_err("missing");
+        assert_eq!(f.exit, Exit::Usage);
+        assert!(f.message.starts_with("no-such-file-here: "));
+        assert!(f.message.contains(
+            "flatpak run --file-forwarding --command=playdrop org.playdrop.PlayDrop send @@"
+        ));
+        // A path that is there needs no hint, sandbox or not.
+        assert!(absolute_paths_in(&[PathBuf::from("Cargo.toml")], true).is_ok());
     }
 }

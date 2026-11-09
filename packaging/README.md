@@ -2,7 +2,8 @@
 
 Phase 2 task e. One folder per target, plus `linux/` with the desktop files that the deb and
 the Flatpak share. Nothing here touches the crates; every script builds the two binaries
-`playdropd` (daemon) and `playdrop-desktop` (window) from the workspace and lays them out.
+`playdropd` (daemon), `playdrop-desktop` (window) and `playdrop` (command line) from the workspace
+and lays them out.
 
 **`linux/`** holds the launcher (`org.playdrop.PlayDrop.desktop`), the XDG autostart entry
 for the daemon (`org.playdrop.Daemon.desktop`), the D-Bus activation file

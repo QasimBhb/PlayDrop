@@ -111,6 +111,22 @@ pub struct ClientOptions {
     pub bus_address: Option<String>,
 }
 
+/// Whether a connect may ask the bus to start the daemon (Linux D-Bus activation).
+///
+/// [`Client::connect`] and [`Client::connect_with`] use [`Activation::Allow`], which is how
+/// opening the window starts the daemon. A client that reconnects on its own, such as a panel
+/// applet, uses [`Activation::Never`] so it never starts a daemon the user quit or chose not
+/// to start at login. Windows has no activation; the value changes nothing there.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Activation {
+    /// Ask the bus to start the daemon when nobody owns its name.
+    #[default]
+    Allow,
+    /// Only connect to a daemon that is already running; otherwise
+    /// [`ConnectError::NotRunning`].
+    Never,
+}
+
 impl Default for ClientOptions {
     fn default() -> Self {
         Self {
@@ -128,8 +144,37 @@ impl Client {
 
     /// [`Client::connect`] with explicit options.
     pub async fn connect_with(options: ClientOptions) -> Result<Self, ConnectError> {
-        let inner = imp::Client::connect(options).await?;
+        Self::connect_with_activation(options, Activation::Allow).await
+    }
+
+    /// Connect only to a daemon that is already running: never asks the bus to start one.
+    /// Answers [`ConnectError::NotRunning`] when nobody owns the name.
+    pub async fn connect_without_activation() -> Result<Self, ConnectError> {
+        Self::connect_with_activation(ClientOptions::default(), Activation::Never).await
+    }
+
+    /// [`Client::connect_with`] with an explicit [`Activation`] choice.
+    pub async fn connect_with_activation(
+        options: ClientOptions,
+        activation: Activation,
+    ) -> Result<Self, ConnectError> {
+        #[cfg(target_os = "linux")]
+        let inner = imp::Client::connect(options, activation).await?;
+        #[cfg(not(target_os = "linux"))]
+        let inner = {
+            let _ = activation;
+            imp::Client::connect(options).await?
+        };
         Result::Ok(Self { inner })
+    }
+
+    /// Waits until some process owns the daemon's D-Bus name, without starting it. A thin
+    /// wrapper over [`DaemonWatch`] for one-off use: it opens a bus connection per call, so a
+    /// UI that waits repeatedly keeps one [`DaemonWatch`] instead.
+    ///
+    /// Linux only. Elsewhere it never resolves, so it can sit in a `select!` beside a poll.
+    pub async fn wait_for_daemon(options: &ClientOptions) -> Result<(), ConnectError> {
+        DaemonWatch::new(options).await?.appeared().await
     }
 
     /// The daemon's package version, as it reported on connect.
@@ -186,6 +231,58 @@ impl Client {
     }
 }
 
+/// Watches the session bus for the daemon's name gaining an owner, without ever starting the
+/// daemon, so a UI that is not connected learns at once that the daemon came up (a restart,
+/// or a start from the window, the CLI or `systemctl --user`).
+///
+/// It keeps one bus connection and one `NameOwnerChanged` subscription for its whole life,
+/// so it can be awaited again and again (between back-off polls) at no extra cost. The owner
+/// is not verified here: connect afterwards, which runs the SR-26 checks.
+///
+/// Linux only. Elsewhere [`DaemonWatch::new`] succeeds and [`DaemonWatch::appeared`] never
+/// resolves, so it can sit in a `select!` beside a poll.
+pub struct DaemonWatch {
+    #[cfg(target_os = "linux")]
+    inner: linux::Watch,
+}
+
+impl std::fmt::Debug for DaemonWatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DaemonWatch").finish_non_exhaustive()
+    }
+}
+
+impl DaemonWatch {
+    /// Connects to the session bus (or `options.bus_address`) and subscribes.
+    pub async fn new(options: &ClientOptions) -> Result<Self, ConnectError> {
+        #[cfg(target_os = "linux")]
+        {
+            Result::Ok(Self {
+                inner: linux::Watch::new(options).await?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = options;
+            Result::Ok(Self {})
+        }
+    }
+
+    /// Returns as soon as the daemon's name has an owner, at once when it already has one.
+    /// Changes that happened while nobody was waiting are not replayed: only the name's state
+    /// now and later counts. An error means the bus connection is gone; make a new watch.
+    pub async fn appeared(&mut self) -> Result<(), ConnectError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.appeared().await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::future::pending::<Result<(), ConnectError>>().await
+        }
+    }
+}
+
 /// Whether a Windows image path names `playdropd.exe` (SR-27). Pure, so it is tested on
 /// every platform.
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -208,6 +305,11 @@ mod tests {
         assert!(!is_daemon_image(r"C:\Temp\evil-playdropd.exe"));
         assert!(!is_daemon_image(r"C:\Temp\playdropd.exe.bak"));
         assert!(!is_daemon_image("playdropd.exe"));
+    }
+
+    #[test]
+    fn activation_defaults_to_allow_so_existing_callers_keep_starting_the_daemon() {
+        assert_eq!(Activation::default(), Activation::Allow);
     }
 
     #[test]

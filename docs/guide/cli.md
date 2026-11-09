@@ -4,6 +4,38 @@
 or a script. The commands below all talk to the running daemon (`playdropd`), so the daemon must
 be running. They show the same devices, pairings and transfers as the window.
 
+## Where the command comes from
+
+Every desktop download since 0.8.0 includes it.
+
+- **.deb:** `playdrop` is on your `PATH` after the install.
+- **Windows:** the installer puts `playdrop.exe` in `C:\Program Files\PlayDrop\bin` and, unless you
+  clear the "Add the playdrop command to PATH" box, adds that folder to `PATH`. Open a new terminal
+  after installing.
+- **Flatpak:** Flatpak does not put commands on your `PATH`, and the app only sees the files you
+  hand it. Add this to `~/.bashrc` or `~/.zshrc` once:
+
+  ```sh
+  playdrop() { flatpak run --file-forwarding --command=playdrop org.playdrop.PlayDrop "$@"; }
+  ```
+
+  Then every command below works as written, with one difference: put files and folders between
+  `@@` marks, so Flatpak passes them into the app.
+
+  ```sh
+  playdrop peers
+  playdrop send @@ ~/Pictures/trip @@ --to pixel
+  playdrop send @@ report.pdf notes.txt @@
+  playdrop outbox add @@ notes.txt @@ --to iphone
+  ```
+
+  Without the marks the command says the file does not exist and reminds you of them. Files in
+  `~/Downloads/PlayDrop` need no marks. Each marked file stays shared with PlayDrop until you
+  remove it (`flatpak documents org.playdrop.PlayDrop` lists them,
+  `flatpak document-unexport --doc-id <ID>` removes one). Whether that sharing lasts through a
+  restart of the computer has not been checked; if a stopped send cannot find its file after
+  one, send it again.
+
 ```
 playdrop send <PATH>... [--to <peer>] [--no-wait] [--json]
 playdrop peers [--json]

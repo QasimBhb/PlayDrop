@@ -1,6 +1,9 @@
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
+# apps/cosmic-applet is its own workspace with its own lock file: libcosmic comes from git
+# and pulls a large tree that must stay out of this Cargo.lock, the Flatpak crate list and
+# the Windows build.
+exclude = ["fuzz", "apps/cosmic-applet"]
 members = [
     "crates/playdrop-core",
     "crates/playdrop-cli",
@@ -13,7 +16,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/QasimBhb/PlayDrop"

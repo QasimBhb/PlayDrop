@@ -2,7 +2,8 @@
 # Build the PlayDrop .deb for Pop!_OS 24.04 and Ubuntu 24.04.
 #
 # Usage: packaging/deb/build-deb.sh [--no-build]
-#   --no-build   reuse target/release binaries instead of running cargo
+#   --no-build   reuse the release binaries already built (under CARGO_TARGET_DIR
+#                when it is set, otherwise target/) instead of running cargo
 #
 # Output: packaging/deb/dist/playdrop_<version>_<arch>.deb
 #
@@ -35,14 +36,19 @@ version="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version *= *"\(.*\)"/\1/p}
 [ -n "$version" ] || { echo "could not read the workspace version" >&2; exit 1; }
 arch="$(dpkg --print-architecture)"
 
+# Where cargo puts the binaries: CARGO_TARGET_DIR when set (this repo sits on a drive where
+# linking under target/ stalls, so local builds point it at ext4), otherwise target/.
+bindir="${CARGO_TARGET_DIR:-$repo/target}/release"
+
 if [ "$build" = 1 ]; then
     export PATH="$HOME/.cargo/bin:$PATH"
     cargo build --release --locked --manifest-path "$repo/Cargo.toml" \
-        -p playdropd -p playdrop-desktop
+        -p playdropd -p playdrop-desktop -p playdrop-cli
 fi
 
-for bin in playdropd playdrop-desktop; do
-    [ -x "$repo/target/release/$bin" ] || { echo "missing target/release/$bin" >&2; exit 1; }
+# playdrop is the command line from the playdrop-cli crate (docs/guide/cli.md).
+for bin in playdropd playdrop-desktop playdrop; do
+    [ -x "$bindir/$bin" ] || { echo "missing $bindir/$bin" >&2; exit 1; }
 done
 
 stage="$(mktemp -d)"
@@ -50,10 +56,12 @@ trap 'rm -rf "$stage"' EXIT
 root="$stage/playdrop_${version}_${arch}"
 
 # Binaries, stripped to keep the package small.
-install -Dm755 "$repo/target/release/playdropd"        "$root/usr/bin/playdropd"
-install -Dm755 "$repo/target/release/playdrop-desktop" "$root/usr/bin/playdrop-desktop"
+install -Dm755 "$bindir/playdropd"        "$root/usr/bin/playdropd"
+install -Dm755 "$bindir/playdrop-desktop" "$root/usr/bin/playdrop-desktop"
+install -Dm755 "$bindir/playdrop"         "$root/usr/bin/playdrop"
 if command -v strip >/dev/null; then
-    strip --strip-unneeded "$root/usr/bin/playdropd" "$root/usr/bin/playdrop-desktop"
+    strip --strip-unneeded "$root/usr/bin/playdropd" "$root/usr/bin/playdrop-desktop" \
+        "$root/usr/bin/playdrop"
 fi
 
 # Desktop integration, shared with the Flatpak.

@@ -2,11 +2,23 @@
 
 A classic Inno Setup installer (PLAN.md decision: classic first, MSIX only in Phase 7).
 
-**Status: built in CI, not yet run on a real machine.** `.github/workflows/windows.yml`
-builds, tests and lints the workspace on GitHub's `windows-latest` runner and compiles this
-installer (uploaded as the `windows-installer` artifact); `release.yml` reuses it for
-releases. Nobody has installed it on a Windows 11 machine yet; the checklist below lists
-what to confirm on the first real run.
+**Status: built and installed silently in CI, not yet run on a real machine.**
+`.github/workflows/windows.yml` builds, tests and lints the workspace on GitHub's
+`windows-latest` runner, compiles this installer (uploaded as the `windows-installer`
+artifact) and runs `test-installer.ps1` against it; `release.yml` reuses the job for
+releases. Nobody has clicked through it on a Windows 11 machine yet; the checklist below
+lists what to confirm on the first real run.
+
+## Installer test
+
+`test-installer.ps1` (elevated PowerShell, on a machine without PlayDrop: its last step
+uninstalls) installs silently and checks that the three programs are in place, `bin` is on the
+system `PATH` once, `playdrop --version` prints the release version, `playdrop status` exits 3
+with no daemon, both firewall rules name `playdropd.exe`, and the sign-in entry exists. It
+installs a second time to prove `PATH` does not grow, then uninstalls and checks that the
+folder, the `PATH` entry, the rules and the sign-in entry are gone. CI runs it on every
+installer build, so the items it covers are no longer in the checklist below as unknowns,
+only as things to see once with a person at the screen.
 
 ## Build
 
@@ -24,6 +36,10 @@ Output: `packaging\windows\dist\PlayDrop-<version>-x64-setup.exe`. The version c
 ## What the installer does
 
 - Installs `playdropd.exe` and `playdrop-desktop.exe` to `C:\Program Files\PlayDrop`.
+- Installs the command line, `playdrop.exe`, to `C:\Program Files\PlayDrop\bin` and adds that
+  folder to the system `PATH` (a checked task). It has its own folder so `PATH` gains one
+  command, not the daemon and the window. Installing again with the box cleared removes the
+  entry, an upgrade never adds it twice, and uninstall removes it.
 - Adds `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\PlayDrop` so the daemon starts at
   sign-in (a checked task; the value is removed on uninstall). The daemon uses the same
   value name when the user changes autostart in settings.

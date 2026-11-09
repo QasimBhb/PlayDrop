@@ -31,11 +31,12 @@ $Version = $versionMatch.Groups[1].Value
 if (-not $NoBuild) {
     & cargo build --release --locked --target $Target `
         --manifest-path (Join-Path $Repo 'Cargo.toml') `
-        -p playdropd -p playdrop-desktop
+        -p playdropd -p playdrop-desktop -p playdrop-cli
     if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
 }
 
-foreach ($exe in 'playdropd.exe', 'playdrop-desktop.exe') {
+# playdrop.exe is the command line from the playdrop-cli crate (docs/guide/cli.md).
+foreach ($exe in 'playdropd.exe', 'playdrop-desktop.exe', 'playdrop.exe') {
     if (-not (Test-Path (Join-Path $BinDir $exe))) { throw "Missing $BinDir\$exe" }
 }
 

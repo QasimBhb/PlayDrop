@@ -20,7 +20,8 @@ sudo apt install ./playdrop-<version>-linux-amd64.deb
 ```
 
 Use `apt`, not `dpkg -i`, so the packages PlayDrop needs come along. Then log out and in, or run
-`playdropd` once, to start the background service. It starts at login after that.
+`playdropd` once, to start the background service. It starts at login after that. The package
+also installs the `playdrop` command ([cli.md](cli.md)).
 
 **Flatpak** (`playdrop-<version>-linux-x86_64.flatpak`):
 
@@ -32,6 +33,20 @@ flatpak run org.playdrop.PlayDrop
 
 The bundle needs a runtime from Flathub, which is why the first command adds Flathub. A bundle
 installed from a file does not update itself. Install the next release's bundle the same way.
+The `playdrop` command is inside the bundle; [cli.md](cli.md) has the one line that makes it
+usable from your terminal.
+
+**COSMIC panel applet (optional).** On COSMIC you can add PlayDrop to the panel: devices with
+their battery, one click to send the clipboard or files, and transfers as they move. It needs
+the `.deb` above, at the same version, and is a second file,
+`playdrop-cosmic-applet-<version>-linux-amd64.deb`:
+
+```sh
+sudo apt install ./playdrop-cosmic-applet-<version>-linux-amd64.deb
+```
+
+Then open COSMIC Settings, go to Desktop, Panel, Applets, choose "Add applet" and pick PlayDrop.
+It does not work with the Flatpak. The tray icon keeps working either way.
 
 Pop!_OS 24.04 with COSMIC is the tested desktop. Ubuntu GNOME should work but has never been run.
 On GNOME, copying does not sync by itself (see [clipboard.md](clipboard.md)).
@@ -45,6 +60,8 @@ Run `playdrop-<version>-windows-x64-setup.exe`.
 - The installer is not code signed. Windows SmartScreen shows "Windows protected your PC".
   Click **More info**, then **Run anyway**.
 - The daemon starts when you sign in.
+- The `playdrop` command ([cli.md](cli.md)) is added to `PATH` unless you clear that box in the
+  installer. Open a new terminal to use it.
 
 Status: GitHub's Windows runner builds and tests the Windows version, but nobody has run it on a
 real Windows machine yet. Expect rough edges and please report them.

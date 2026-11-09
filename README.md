@@ -73,7 +73,8 @@ More in [docs/guide/pairing.md](docs/guide/pairing.md).
 
 ## Command line
 
-`playdrop` talks to the running daemon on Linux and Windows.
+`playdrop` talks to the running daemon on Linux and Windows. It comes with the `.deb`, the Flatpak
+and the Windows installer ([how to run it from each](docs/guide/cli.md#where-the-command-comes-from)).
 
 ```
 playdrop send <PATH>... [--to <peer>] [--no-wait] [--json]

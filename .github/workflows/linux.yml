@@ -31,6 +31,7 @@ on:
     paths:
       - "crates/**"
       - "apps/desktop/**"
+      - "apps/cosmic-applet/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -41,6 +42,7 @@ on:
     paths:
       - "crates/**"
       - "apps/desktop/**"
+      - "apps/cosmic-applet/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -153,3 +155,40 @@ jobs:
         run: |
           cargo test -p playdrop-core --locked --features iroh-test --test phase12_reach
           cargo test -p playdrop-core --locked --features iroh-test --test sr32_canary
+
+  cosmic-applet:
+    # The optional COSMIC panel applet is its own cargo workspace (apps/cosmic-applet) with a
+    # pinned libcosmic from git, so the job above never compiles it. It depends on
+    # playdrop-ipc and playdrop-core by path: a change there can break it, which is why this
+    # runs on the same pushes.
+    name: COSMIC panel applet (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: apps/cosmic-applet
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/cosmic-applet -> target"
+          key: linux-cosmic-applet
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev desktop-file-utils
+
+      - name: Validate the desktop file
+        run: desktop-file-validate data/org.playdrop.PlayDrop.CosmicApplet.desktop
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo test --locked

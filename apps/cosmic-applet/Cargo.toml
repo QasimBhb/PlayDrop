@@ -1,0 +1,74 @@
+[package]
+name = "playdrop-cosmic-applet"
+description = "PlayDrop panel applet for the COSMIC desktop: a thin client of playdropd over D-Bus"
+version = "0.8.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/QasimBhb/PlayDrop"
+publish = false
+
+[[bin]]
+name = "playdrop-cosmic-applet"
+path = "src/main.rs"
+
+# Its own workspace: libcosmic comes from git with a large tree and no stability promise, so it
+# stays out of the main Cargo.lock, the Flatpak crate list and the Windows build.
+[workspace]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+
+[dependencies]
+futures-util = "0.3.34"
+# Only for the payload types `playdrop-ipc` returns (`PeerSummary`, `TransferSnapshot`,
+# `HostEvent`); `playdrop-ipc` already links it and does not re-export them.
+playdrop-core = { path = "../../crates/playdrop-core" }
+playdrop-ipc = { path = "../../crates/playdrop-ipc" }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "sync", "time", "macros"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+wl-clipboard-rs = "0.9.4"
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["test-util"] }
+
+# Pinned to the revision cosmic-applets 1.9.0 (epoch-1.9.0, 82e7cd8) locks, so the applet
+# matches the installed panel. Same feature set as cosmic-applets, plus the portal file chooser
+# and the detached process spawner.
+[dependencies.libcosmic]
+git = "https://github.com/pop-os/libcosmic"
+rev = "03c8f93b294ad239ea935f6dd3c14a15acde8d0d"
+default-features = false
+features = [
+    "applet",
+    "applet-token",
+    "dbus-config",
+    "multi-window",
+    "process",
+    "tokio",
+    "wayland",
+    "winit",
+    "xdg-portal",
+]
+
+# Same patches as cosmic-applets 1.9.0, so the dependency tree resolves the same way.
+[patch."https://github.com/smithay/client-toolkit.git"]
+sctk = { package = "smithay-client-toolkit", version = "0.20.0" }
+
+[patch."https://github.com/pop-os/cosmic-protocols"]
+cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c0cff4d" }
+cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols//", rev = "c0cff4d" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

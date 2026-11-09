@@ -13,7 +13,7 @@ starts with USB-tether path choice (`docs/phases/phase-10-daily-speed.md` sectio
 | 1 | iroh for cross-network reach | large | a second network to prove it for real | spike built in Phase 12, off in every release (`docs/design/iroh-reach.md`); real network, phone and relay choice owed |
 | 2 | iOS Local Push Connectivity | medium | Apple entitlement grant, paid team | research only |
 | 3 | Wi-Fi Aware | large | a second Aware phone | research only |
-| 4 | libcosmic panel applet | small to medium | nothing | build later |
+| 4 | libcosmic panel applet | small to medium | nothing | built in Phase 13 (`apps/cosmic-applet`, optional `.deb`); a person has not yet looked at or clicked the open popup |
 | 5 | Notification mirroring (Android to desktop) | medium | the user wanting it | build later |
 | 6 | MSIX for Windows | medium | signing certificate, a Windows machine | drop (for now) |
 | 7 | iOS App Group for the share extension | small | paid Apple team | build later (blocked) |

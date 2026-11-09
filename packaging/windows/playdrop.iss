@@ -4,6 +4,10 @@
 ;
 ; What it does:
 ;   - installs playdropd.exe and playdrop-desktop.exe to Program Files\PlayDrop
+;   - installs the command line, playdrop.exe, to Program Files\PlayDrop\bin and
+;     (a checked task) adds that folder to the system PATH; uninstall takes the
+;     entry out again. The CLI has its own folder so PATH gains one command and
+;     not the daemon and the window too
 ;   - starts the daemon at login through HKCU\...\Run\PlayDrop
 ;   - Start Menu shortcut for the window
 ;   - a firewall rule scoped to playdropd.exe for TCP and UDP 42187 (SR-31),
@@ -22,6 +26,7 @@
 #define AppName "PlayDrop"
 #define DaemonExe "playdropd.exe"
 #define WindowExe "playdrop-desktop.exe"
+#define CliExe "playdrop.exe"
 #define Port "42187"
 #define RuleName "PlayDrop"
 
@@ -58,17 +63,22 @@ CloseApplications=no
 ; value itself on first run (crates/playdropd autostart), so the compiler
 ; warning about user areas is silenced on purpose.
 UsedUserAreasWarning=no
+; The PATH task edits the system environment; this makes Setup tell running
+; programs (Explorer, so new terminals) that it changed.
+ChangesEnvironment=yes
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "autostart"; Description: "Start PlayDrop when I sign in (needed to receive while the window is closed)"; GroupDescription: "Background service:"
+Name: "addtopath"; Description: "Add the playdrop command to PATH (for terminals and scripts)"; GroupDescription: "Command line:"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
 Source: "{#BinDir}\{#DaemonExe}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#BinDir}\{#WindowExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinDir}\{#CliExe}"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\..\THIRD_PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -115,4 +125,89 @@ begin
   StopProcess('{#WindowExe}');
   StopProcess('{#DaemonExe}');
   Result := '';
+end;
+
+{ The system PATH. Setup runs as admin, so the machine-wide value is the one
+  every user's terminal sees. It is edited here and not in [Registry] so that
+  an upgrade never adds the folder twice and uninstall removes only our entry. }
+const
+  EnvKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
+
+{ Reads the raw, unexpanded PATH. False when the value exists but cannot be
+  read as a string: then it is left alone, never overwritten. }
+function ReadSystemPath(var Paths: String): Boolean;
+begin
+  Paths := '';
+  Result := RegQueryStringValue(HKLM, EnvKey, 'Path', Paths)
+    or not RegValueExists(HKLM, EnvKey, 'Path');
+end;
+
+{ 1-based index of Dir as a whole entry of Paths, or 0. Case is ignored. }
+function PathEntryPos(const Paths, Dir: String): Integer;
+begin
+  Result := Pos(';' + Uppercase(Dir) + ';', ';' + Uppercase(Paths) + ';');
+end;
+
+procedure AddToSystemPath(const Dir: String);
+var
+  Paths: String;
+begin
+  if not ReadSystemPath(Paths) then
+  begin
+    Log('PATH not readable as a string; left unchanged');
+    exit;
+  end;
+  if PathEntryPos(Paths, Dir) > 0 then
+    exit;
+  if (Paths <> '') and (Paths[Length(Paths)] <> ';') then
+    Paths := Paths + ';';
+  if not RegWriteExpandStringValue(HKLM, EnvKey, 'Path', Paths + Dir) then
+    Log('could not write PATH');
+end;
+
+procedure RemoveFromSystemPath(const Dir: String);
+var
+  Paths: String;
+  P: Integer;
+  Changed: Boolean;
+begin
+  if not ReadSystemPath(Paths) then
+    exit;
+  Changed := False;
+  P := PathEntryPos(Paths, Dir);
+  while P > 0 do
+  begin
+    { Take the entry and the separator after it; for the last entry, the
+      separator before it. }
+    if P + Length(Dir) <= Length(Paths) then
+      Delete(Paths, P, Length(Dir) + 1)
+    else if P > 1 then
+      Delete(Paths, P - 1, Length(Dir) + 1)
+    else
+      Delete(Paths, P, Length(Dir));
+    Changed := True;
+    P := PathEntryPos(Paths, Dir);
+  end;
+  if Changed then
+    if not RegWriteExpandStringValue(HKLM, EnvKey, 'Path', Paths) then
+      Log('could not write PATH');
+end;
+
+{ Installing with the task ticked adds the folder; installing again with it
+  cleared takes it back out, so the checkbox always matches the machine. }
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    if WizardIsTaskSelected('addtopath') then
+      AddToSystemPath(ExpandConstant('{app}\bin'))
+    else
+      RemoveFromSystemPath(ExpandConstant('{app}\bin'));
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RemoveFromSystemPath(ExpandConstant('{app}\bin'));
 end;

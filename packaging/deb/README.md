@@ -31,7 +31,7 @@ run `playdropd` once) to start the background service.
 
 | File | Installed to | Purpose |
 |---|---|---|
-| `playdropd`, `playdrop-desktop` | `/usr/bin/` | Daemon and window |
+| `playdropd`, `playdrop-desktop`, `playdrop` | `/usr/bin/` | Daemon, window and command line (`docs/guide/cli.md`) |
 | `org.playdrop.PlayDrop.desktop` | `/usr/share/applications/` | App launcher |
 | `org.playdrop.Daemon.desktop` | `/etc/xdg/autostart/` | Starts the daemon at login (default) |
 | `org.playdrop.PlayDrop.Daemon1.service` | `/usr/share/dbus-1/services/` | Starts the daemon when the window calls it |
@@ -46,6 +46,16 @@ autostart off) overrides the system one instead of adding a second starter.
 
 `postinst` only refreshes the desktop and icon caches. The package never changes firewall
 rules and never starts services on its own.
+
+## The COSMIC applet package
+
+`build-applet-deb.sh` builds a second, optional package, `playdrop-cosmic-applet`, from
+`apps/cosmic-applet` (its own cargo workspace with a pinned libcosmic). It installs
+`/usr/bin/playdrop-cosmic-applet` and
+`/usr/share/applications/org.playdrop.PlayDrop.CosmicApplet.desktop`, depends on `playdrop` at
+exactly the same version (which also supplies the panel icon), and changes nothing until the
+user adds the applet to a panel in COSMIC Settings. The script refuses to run when the applet's
+version differs from the workspace version.
 
 ## Autostart: pick one
 

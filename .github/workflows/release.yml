@@ -17,6 +17,7 @@
 #   playdrop-<ver>-android.apk                 signed with the PlayDrop release key
 #   playdrop-<ver>-linux-amd64.deb             Pop!_OS and Ubuntu 24.04
 #   playdrop-<ver>-linux-x86_64.flatpak        single-file Flatpak bundle
+#   playdrop-cosmic-applet-<ver>-linux-amd64.deb  optional COSMIC panel applet
 #   playdrop-<ver>-windows-x64-setup.exe       Inno Setup installer, not code signed
 #   playdrop-<ver>-ios-unsigned.ipa            for SideStore or AltStore, which re-sign it
 #   SHA256SUMS                                 sha256sum of every file above
@@ -136,12 +137,63 @@ jobs:
           deb="packaging/deb/dist/playdrop_${ver}_amd64.deb"
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
+          # The guides tell people to run `playdrop`, so a package without it, or with one
+          # that does not start, must not be published.
+          dpkg-deb -x "$deb" "$RUNNER_TEMP/deb-root"
+          for bin in playdropd playdrop-desktop playdrop; do
+            test -x "$RUNNER_TEMP/deb-root/usr/bin/$bin" || { echo "::error::the .deb lacks /usr/bin/$bin"; exit 1; }
+          done
+          got="$("$RUNNER_TEMP/deb-root/usr/bin/playdrop" --version)"
+          [ "$got" = "playdrop $ver" ] || { echo "::error::playdrop --version printed '$got'"; exit 1; }
           mkdir -p out
           cp "$deb" "out/playdrop-${ver}-linux-amd64.deb"
 
       - uses: actions/upload-artifact@v7
         with:
           name: linux-deb
+          path: out/*.deb
+          if-no-files-found: error
+
+  cosmic-applet-deb:
+    name: COSMIC applet package
+    needs: version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev desktop-file-utils
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "apps/cosmic-applet -> target"
+          key: release-cosmic-applet
+
+      - name: Validate the desktop file
+        run: desktop-file-validate apps/cosmic-applet/data/org.playdrop.PlayDrop.CosmicApplet.desktop
+
+      - name: Build the .deb
+        # Fails when the applet's own version was not bumped with the workspace.
+        run: bash packaging/deb/build-applet-deb.sh
+
+      - name: Inspect and rename
+        run: |
+          ver="${{ needs.version.outputs.version }}"
+          deb="packaging/deb/dist/playdrop-cosmic-applet_${ver}_amd64.deb"
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          dpkg-deb -x "$deb" "$RUNNER_TEMP/applet-root"
+          test -x "$RUNNER_TEMP/applet-root/usr/bin/playdrop-cosmic-applet"
+          mkdir -p out
+          cp "$deb" "out/playdrop-cosmic-applet-${ver}-linux-amd64.deb"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cosmic-applet-deb
           path: out/*.deb
           if-no-files-found: error
 
@@ -214,6 +266,10 @@ jobs:
             exit 1
           fi
           mkdir -p "$GITHUB_WORKSPACE/out"
+          # The command line ships in the bundle beside the daemon and the window.
+          for bin in playdropd playdrop-desktop playdrop; do
+            test -x "$B/build-dir/files/bin/$bin" || { echo "::error::the Flatpak lacks /app/bin/$bin"; exit 1; }
+          done
           flatpak build-bundle \
             --runtime-repo=https://dl.flathub.org/repo/flathub.flatpakrepo \
             "$B/repo" "$GITHUB_WORKSPACE/out/playdrop-$VERSION-linux-x86_64.flatpak" \
@@ -419,7 +475,7 @@ jobs:
 
   release:
     name: Publish the GitHub release
-    needs: [version, linux-deb, flatpak, android, windows, ios]
+    needs: [version, linux-deb, cosmic-applet-deb, flatpak, android, windows, ios]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
@@ -435,7 +491,7 @@ jobs:
         working-directory: dist
         run: |
           ls -la
-          test "$(ls | wc -l)" -eq 5
+          test "$(ls | wc -l)" -eq 6
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 

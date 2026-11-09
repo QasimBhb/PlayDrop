@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=PlayDrop
+Comment=Send the clipboard and files to your paired devices, and see transfers
+Type=Application
+Exec=playdrop-cosmic-applet
+Terminal=false
+Categories=Utility;
+Keywords=COSMIC;Applet;PlayDrop;Send;Files;Clipboard;Phone;
+Icon=org.playdrop.PlayDrop-symbolic
+StartupNotify=true
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicHoverPopup=Auto
+X-OverflowPriority=10

@@ -57,6 +57,26 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.8.0" date="2026-11-09" type="development">
+      <description>
+        <p>Phase 13: the playdrop command line now comes with the .deb, the Flatpak and the Windows installer, and an optional COSMIC panel applet shows devices and sends the clipboard or files from the panel.</p>
+      </description>
+    </release>
+    <release version="0.7.0" date="2026-11-03" type="development">
+      <description>
+        <p>Phase 12: a device that answers on several addresses over one radio counts as one connection when the fastest path is picked.</p>
+      </description>
+    </release>
+    <release version="0.6.0" date="2026-11-02" type="development">
+      <description>
+        <p>Phase 11: the faster connection is chosen when two devices can reach each other more than one way, and thousands of small files reach an Android phone in about half the time.</p>
+      </description>
+    </release>
+    <release version="0.5.0" date="2026-10-29" type="development">
+      <description>
+        <p>Phase 10: received files show up in the phone's Downloads sooner, and the Windows build protects its keys, its data folder and its port.</p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-10-28" type="development">
       <description>
         <p>Phase 9: a send that lost its device or its daemon resumes on its own, sharing the same files again continues the earlier transfer, and many small files reach an Android phone faster.</p>

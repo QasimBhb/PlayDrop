@@ -1,7 +1,7 @@
 # Flatpak manifest for PlayDrop. Build instructions: packaging/flatpak/README.md.
 #
-# One app holds both binaries, so the daemon (playdropd) and the window
-# (playdrop-desktop) run under the same app ID. The daemon's SR-26 check expects
+# One app holds all three binaries, so the daemon (playdropd), the window
+# (playdrop-desktop) and the command line (playdrop) run under the same app ID. The daemon's SR-26 check expects
 # callers whose /.flatpak-info names org.playdrop.PlayDrop.
 #
 # Runtime 25.08: freedesktop-sdk branches get about two years of updates, and
@@ -68,9 +68,13 @@ modules:
         RUSTFLAGS: --remap-path-prefix=/run/build/playdrop=.
     build-commands:
       - cargo --offline fetch --manifest-path Cargo.toml --verbose
-      - cargo --offline build --release --locked -p playdropd -p playdrop-desktop
+      - cargo --offline build --release --locked -p playdropd -p playdrop-desktop -p playdrop-cli
       - install -Dm755 target/release/playdropd -t /app/bin/
       - install -Dm755 target/release/playdrop-desktop -t /app/bin/
+      # The command line (docs/guide/cli.md). Flatpak puts no command on the host
+      # PATH, so it is run as `flatpak run --command=playdrop org.playdrop.PlayDrop`;
+      # sending files also needs --file-forwarding (packaging/flatpak/README.md).
+      - install -Dm755 target/release/playdrop -t /app/bin/
       - install -Dm644 packaging/linux/org.playdrop.PlayDrop.desktop -t /app/share/applications/
       - install -Dm644 packaging/linux/org.playdrop.PlayDrop.metainfo.xml -t /app/share/metainfo/
       - install -Dm644 packaging/linux/icons/hicolor/scalable/apps/org.playdrop.PlayDrop.svg

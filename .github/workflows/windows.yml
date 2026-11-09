@@ -1,9 +1,10 @@
 # Builds, tests and packages PlayDrop on GitHub's Windows runner, since there is no Windows
 # machine. What this proves: the workspace compiles and links with the MSVC toolchain, the
 # unit and loopback tests pass on Windows, clippy is clean for the Windows code paths, and
-# the Inno Setup installer compiles. What it cannot prove: anything that needs someone at
-# the screen (the tray, SendInput, GSMTC media, the firewall prompt, the installer's
-# behaviour on a real Windows 11 machine; see packaging/windows/README.md).
+# the Inno Setup installer compiles, installs silently, puts `playdrop` on PATH and uninstalls
+# cleanly (packaging/windows/test-installer.ps1). What it cannot prove: anything that needs
+# someone at the screen (the tray, SendInput, GSMTC media, the firewall prompt, the
+# installer's wizard on a real Windows 11 machine; see packaging/windows/README.md).
 #
 # playdrop-ffi is excluded everywhere below: it only targets Android and iOS, and it uses
 # std::os::fd to adopt file descriptors from the Android host, which does not exist on
@@ -115,9 +116,15 @@ jobs:
 
       - name: Release build and installer
         # build-windows.ps1 runs `cargo build --release --locked --target x86_64-pc-windows-msvc
-        # -p playdropd -p playdrop-desktop`, reads the version from [workspace.package] and
-        # compiles packaging/windows/playdrop.iss with ISCC.
+        # -p playdropd -p playdrop-desktop -p playdrop-cli`, reads the version from
+        # [workspace.package] and compiles packaging/windows/playdrop.iss with ISCC.
         run: packaging/windows/build-windows.ps1
+
+      - name: Install, check and uninstall on the runner
+        # A silent install as admin: the three programs land in Program Files, `playdrop` is
+        # on the system PATH and runs, the firewall rules name playdropd.exe, and uninstall
+        # takes all of it back out. A release run fails here too, before anything is published.
+        run: packaging/windows/test-installer.ps1
 
       - name: Name the installer for the release
         id: name

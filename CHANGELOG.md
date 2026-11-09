@@ -8,6 +8,38 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.8.0] - 2026-11-09
+
+### Added
+
+- The `playdrop` command line now comes with every desktop download. The guides told you to run
+  `playdrop send`, but the `.deb`, the Flatpak and the Windows installer did not contain it.
+  - `.deb`: `playdrop` is on your `PATH` after the install.
+  - Windows: the installer adds it to `PATH` unless you clear that box. Open a new terminal.
+  - Flatpak: run it with `flatpak run`, and put files between `@@` marks so the app can see
+    them. `docs/guide/cli.md` has the one line to add to your shell. A file the app cannot see
+    now fails with a sentence that says how to pass it.
+- An optional panel applet for the COSMIC desktop, as its own download
+  (`playdrop-cosmic-applet-<version>-linux-amd64.deb`). It shows your devices with their battery,
+  sends the clipboard or files to a device in one click, shows transfers as they move, and has a
+  stop button while a device controls the computer. The tray icon keeps working without it.
+
+### Tested
+
+- The Windows installer is now installed, checked and uninstalled on GitHub's Windows machine
+  for every build: the programs are in place, `playdrop` runs from `PATH`, the firewall rules are
+  limited to the PlayDrop service, and uninstall removes all of it. Nobody has clicked through it
+  on a real Windows PC yet.
+- The command line inside the Flatpak sent files and folders to another device with every
+  checksum matching, on Pop!_OS.
+
+### Known limits
+
+- The applet's open panel has been run on COSMIC 1.9 but not looked at or clicked by a person
+  yet. Its logic is covered by tests; its looks are not.
+- In the Flatpak, it has not been checked whether a file passed between `@@` marks stays
+  readable after the computer restarts. If a stopped send cannot find its file, send it again.
+
 ## [0.7.0] - 2026-11-03
 
 ### Changed
