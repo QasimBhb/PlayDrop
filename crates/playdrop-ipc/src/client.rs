@@ -263,7 +263,10 @@ impl DaemonWatch {
         }
         #[cfg(not(target_os = "linux"))]
         {
+            // Nothing to connect to here. The await keeps this an async function with the
+            // same signature on every platform.
             let _ = options;
+            std::future::ready(()).await;
             Result::Ok(Self {})
         }
     }
