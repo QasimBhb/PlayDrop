@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use super::events::{DeliveredFile, TransferDirection};
 use crate::identity::DeviceId;
+use crate::transfer::manifest::{validate_component, Manifest};
 
 /// Most finished snapshots kept.
 pub const KEEP_FINISHED: usize = 64;
@@ -28,6 +29,12 @@ pub const KEEP_FOR: Duration = Duration::from_mins(10);
 /// still find its outcome after a burst of other transfers ended at the same moment, or
 /// it cannot tell a finished send from a lost one.
 pub const KEEP_AT_LEAST: Duration = Duration::from_mins(1);
+
+/// Most entries [`TransferSnapshot::names`] carries. *Choice:* 3 top-level names is what a
+/// one-line row shows ("a.pdf, b.pdf, Photos"); every snapshot and every `transfers` answer
+/// carries them, so a 5,000-file send must not repeat 5,000 names. `file_count` keeps the
+/// full count.
+pub const TRANSFER_NAMES_MAX: usize = 3;
 
 /// Hard ceiling on finished snapshots, young or not, so a flood of tiny transfers cannot
 /// grow the book without bound.
@@ -86,6 +93,17 @@ pub struct TransferSnapshot {
     pub started_at: u64,
     /// Number of files in the manifest.
     pub file_count: usize,
+    /// What is being sent, for display: the top-level names in manifest order (a file
+    /// sent alone, or the folder a file sits in), each once, at most [`TRANSFER_NAMES_MAX`].
+    /// More may exist. On the receive side they come from the peer's manifest after its
+    /// SR-17 path check, the same check the offer prompt's names pass: untrusted text to
+    /// show, never a path. Missing from an older host reads as empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub names: Vec<String>,
+    /// True when the transfer has more top-level names than [`names`](Self::names) lists.
+    /// Missing from an older host reads as false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub names_more: bool,
     /// The sender's note while the transfer runs; the reason once it failed or was
     /// cancelled (SR-22 wording). Peer-supplied text: display only.
     pub note: Option<String>,
@@ -132,6 +150,8 @@ impl TransferSnapshot {
             files_done: 0,
             started_at: unix_now(),
             file_count,
+            names: Vec::new(),
+            names_more: false,
             note,
             saved: Vec::new(),
             folder: None,
@@ -139,6 +159,40 @@ impl TransferSnapshot {
             resumable: false,
         }
     }
+
+    /// The same snapshot with [`names`](Self::names) taken from `manifest`.
+    #[must_use]
+    pub(crate) fn with_names(mut self, manifest: &Manifest) -> Self {
+        // One past the cap tells whether any were left out.
+        let mut names = top_level_names(manifest, TRANSFER_NAMES_MAX + 1);
+        self.names_more = names.len() > TRANSFER_NAMES_MAX;
+        names.truncate(TRANSFER_NAMES_MAX);
+        self.names = names;
+        self
+    }
+}
+
+/// The first `max` distinct top-level names of a manifest: the first component of each file
+/// path, then of each empty folder, in manifest order. A component that fails the SR-17
+/// check is left out; a validated manifest has none, so this only guards a caller that skipped
+/// [`Manifest::validate`]. Each entry is compared with at most `max` kept names, and the walk
+/// stops once `max` are found.
+pub(crate) fn top_level_names(manifest: &Manifest, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let firsts = manifest
+        .files
+        .iter()
+        .filter_map(|f| f.path.first())
+        .chain(manifest.dirs.iter().filter_map(|d| d.first()));
+    for name in firsts {
+        if out.len() >= max {
+            break;
+        }
+        if validate_component(name).is_ok() && !out.iter().any(|n| n == name) {
+            out.push(name.clone());
+        }
+    }
+    out
 }
 
 fn unix_now() -> u64 {
@@ -591,6 +645,94 @@ mod tests {
         v.as_object_mut().unwrap().remove("folder");
         let back: TransferSnapshot = serde_json::from_value(v).unwrap();
         assert!(back.saved.is_empty() && back.folder.is_none());
+    }
+
+    fn manifest_of(files: &[&[&str]], dirs: &[&[&str]]) -> Manifest {
+        Manifest {
+            id: "ab".repeat(16),
+            chunk_size: 1 << 20,
+            total_bytes: 0,
+            note: None,
+            files: files
+                .iter()
+                .enumerate()
+                .map(|(i, p)| crate::transfer::manifest::FileEntry {
+                    fid: u32::try_from(i).unwrap(),
+                    path: p.iter().map(|c| (*c).to_owned()).collect(),
+                    size: 0,
+                    mtime: 0,
+                    mime: None,
+                    in_bundle: false,
+                })
+                .collect(),
+            dirs: dirs
+                .iter()
+                .map(|d| d.iter().map(|c| (*c).to_owned()).collect())
+                .collect(),
+            bundle: None,
+        }
+    }
+
+    /// Names are top-level, each once, in manifest order, capped, and never a component the
+    /// SR-17 check refuses (control and bidi characters, `..`).
+    #[test]
+    fn names_are_top_level_capped_and_checked() {
+        let m = manifest_of(
+            &[
+                &["Photos", "a.jpg"],
+                &["Photos", "b.jpg"],
+                &["notes.txt"],
+                &["evil\u{202E}gpj.exe"],
+                &[".."],
+                &["Music", "x.mp3"],
+                &["more.txt"],
+            ],
+            &[&["Empty"]],
+        );
+        assert_eq!(TRANSFER_NAMES_MAX, 3);
+        assert_eq!(
+            top_level_names(&m, TRANSFER_NAMES_MAX),
+            ["Photos", "notes.txt", "Music"]
+        );
+        // Four names (with `more.txt` and `Empty`): three listed, and more says so.
+        let s = snap(1).with_names(&m);
+        assert_eq!(s.names, ["Photos", "notes.txt", "Music"]);
+        assert!(s.names_more);
+        // Exactly three: all listed, nothing more.
+        let three = manifest_of(&[&["a"], &["b"], &["c", "x"]], &[]);
+        let s = snap(1).with_names(&three);
+        assert_eq!(s.names, ["a", "b", "c"]);
+        assert!(!s.names_more);
+        // Empty folders count after the files.
+        let m = manifest_of(&[&["a.txt"]], &[&["Empty"], &["Empty", "inner"]]);
+        assert_eq!(top_level_names(&m, TRANSFER_NAMES_MAX), ["a.txt", "Empty"]);
+        // 5,000 files in one folder: one name.
+        let many: Vec<Vec<String>> = (0..5000)
+            .map(|i| vec!["Big".to_owned(), format!("f{i}.bin")])
+            .collect();
+        let refs: Vec<Vec<&str>> = many
+            .iter()
+            .map(|p| p.iter().map(String::as_str).collect())
+            .collect();
+        let slices: Vec<&[&str]> = refs.iter().map(Vec::as_slice).collect();
+        let m = manifest_of(&slices, &[]);
+        let snap = snap(1).with_names(&m);
+        assert_eq!(snap.names, ["Big"]);
+    }
+
+    /// An older host's snapshot has no `names`; an empty list is not written.
+    #[test]
+    fn names_are_optional_on_the_wire() {
+        let s = snap(3);
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("\"names\""), "{json}");
+        assert!(!json.contains("names_more"), "{json}");
+        let mut v = serde_json::to_value(snap(3).with_names(&manifest_of(&[&["a"]], &[]))).unwrap();
+        assert_eq!(v["names"], serde_json::json!(["a"]));
+        v.as_object_mut().unwrap().remove("names");
+        let back: TransferSnapshot = serde_json::from_value(v).unwrap();
+        assert_eq!(back.names, Vec::<String>::new());
+        assert!(!back.names_more);
     }
 
     #[test]

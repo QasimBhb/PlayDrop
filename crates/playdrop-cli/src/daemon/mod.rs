@@ -17,8 +17,8 @@ mod send;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use playdrop_core::host::PeerSummary;
 use playdrop_ipc::client::{Client, ConnectError};
+use playdrop_ipc::types::PeerSummary;
 use playdrop_ipc::{ErrorCode, IpcError, Ok as Answer, Request};
 
 /// How a daemon command ended, as the process exit code says it.
@@ -123,9 +123,10 @@ pub struct SendArgs {
 
 /// Options of `playdrop clip`.
 #[derive(Debug, clap::Args)]
-#[command(group(clap::ArgGroup::new("source").required(true).args(["text", "stdin"])))]
+#[command(group(clap::ArgGroup::new("source").args(["text", "stdin"])))]
 pub struct ClipArgs {
-    /// The text to send.
+    /// The text to send. Without it (and without --stdin) the daemon sends what is on this
+    /// computer's clipboard now: text, or an image while clipboard images are on.
     pub text: Option<String>,
     /// Read the text from stdin instead (sent exactly as read, newlines included).
     #[arg(long)]
@@ -134,7 +135,8 @@ pub struct ClipArgs {
     #[arg(long, value_name = "PEER")]
     pub to: Option<String>,
     /// Mark the clip sensitive (a password), so the other side does not show or keep it
-    /// in history.
+    /// in history. The same when sending this computer's clipboard: the clip goes marked,
+    /// and a clip a password manager marked is allowed to go.
     #[arg(long)]
     pub sensitive: bool,
 }

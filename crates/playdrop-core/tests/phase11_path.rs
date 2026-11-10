@@ -3276,6 +3276,22 @@ async fn a_silent_new_session_ends_the_old_one_after_the_limit() {
     a.host.shutdown().await;
 }
 
+/// A clipboard image to one device that does not list `clipboard.image` (here a raw peer
+/// that lists nothing) is not sent and counted as unsupported, not an error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_clipboard_image_to_a_device_without_image_support_is_unsupported() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_root, a, b_id, _peer, _opts, _raw_id) = host_with_raw_peer().await;
+    let r = a
+        .host
+        .send_clipboard_image(&b_id, vec![7; 64], "image/png", true)
+        .unwrap();
+    assert!(r.sent_to.is_empty() && !r.skipped_echo, "{r:?}");
+    assert_eq!(r.skipped_unsupported, 1);
+    a.host.shutdown().await;
+}
+
 /// protocol.md 3.3: a host from before the rule ends the old stream as soon as it has
 /// `hello` on the new one. Nothing is lost and order holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -74,10 +74,11 @@ enum Command {
     ///   playdrop cancel 7f3a
     #[command(verbatim_doc_comment)]
     Cancel(daemon::CancelArgs),
-    /// Send text to a device's clipboard
+    /// Send text, or this computer's clipboard, to a device's clipboard
     ///
     ///   playdrop clip "see you at 6"
     ///   echo -n secret | playdrop clip --stdin --sensitive --to phone
+    ///   playdrop clip --to phone        (what is on the clipboard now)
     #[command(verbatim_doc_comment)]
     Clip(daemon::ClipArgs),
     /// Ping a device, with an optional message it shows.
@@ -275,13 +276,17 @@ mod tests {
     }
 
     #[test]
-    fn clip_needs_text_or_stdin_but_not_both() {
+    fn clip_takes_text_or_stdin_or_neither_but_not_both() {
         assert!(matches!(parse(&["clip", "hi"]), Ok(Command::Clip(_))));
         assert!(matches!(
             parse(&["clip", "--stdin", "--to", "x"]),
             Ok(Command::Clip(_))
         ));
-        assert!(parse(&["clip"]).is_err());
+        // Neither: send this computer's clipboard.
+        let Ok(Command::Clip(a)) = parse(&["clip", "--sensitive"]) else {
+            panic!("clip with no text did not parse");
+        };
+        assert!(a.text.is_none() && !a.stdin && a.sensitive);
         assert!(parse(&["clip", "hi", "--stdin"]).is_err());
     }
 

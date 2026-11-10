@@ -17,12 +17,12 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use futures_util::{Stream, StreamExt as _};
-use playdrop_core::host::{HostEvent, TransferDirection, TransferSnapshot, TransferStatus};
 use playdrop_ipc::client::Client;
+use playdrop_ipc::types::{HostEvent, TransferDirection, TransferSnapshot, TransferStatus};
 use playdrop_ipc::{DaemonEvent, Event, Ok as Answer, Request};
-use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
+use unicode_width::UnicodeWidthStr as _;
 
-use super::output::{self, Progress};
+use super::output::{self, truncate, Progress};
 use super::{absolute_paths, ask, connect, peers, pick_peer, unexpected, Exit, Failure, SendArgs};
 
 /// How many once-a-second list reads may miss a transfer the daemon never listed before
@@ -393,19 +393,6 @@ fn os_columns() -> Option<u16> {
     terminal_size::terminal_size_of(std::io::stderr()).map(|(terminal_size::Width(w), _)| w)
 }
 
-/// `line` cut to at most `width` display columns, never inside a character. A wide
-/// character that would cross the edge is dropped whole.
-fn truncate(line: &str, width: usize) -> &str {
-    let mut used = 0;
-    for (i, c) in line.char_indices() {
-        used += c.width().unwrap_or(0);
-        if used > width {
-            return &line[..i];
-        }
-    }
-    line
-}
-
 /// The progress line on stderr: redrawn in place on a terminal (at most ten times a
 /// second, cut to the terminal width so it never wraps), one line per second otherwise,
 /// so a log stays readable.
@@ -485,6 +472,8 @@ mod tests {
             files_done: 0,
             started_at: 0,
             file_count: 1,
+            names: Vec::new(),
+            names_more: false,
             note: note.map(str::to_owned),
             saved: Vec::new(),
             folder: None,

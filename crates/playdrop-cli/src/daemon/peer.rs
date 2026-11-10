@@ -4,7 +4,7 @@
 //! pick the only online device when `--to` is left out and list the choices when it
 //! cannot. The daemon then gets the full hex Device ID, which it resolves without doubt.
 
-use playdrop_core::host::PeerSummary;
+use playdrop_ipc::types::PeerSummary;
 
 /// Why a peer query did not name exactly one device.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +109,7 @@ pub fn resolve<'a>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use playdrop_core::pin_store::Grants;
+    use playdrop_ipc::types::Grants;
 
     pub(crate) fn peer(short_id: &str, label: &str, online: bool) -> PeerSummary {
         PeerSummary {
@@ -123,6 +123,7 @@ pub(crate) mod tests {
             last_seen: None,
             removed_by_peer: false,
             capabilities: Vec::new(),
+            battery: None,
         }
     }
 

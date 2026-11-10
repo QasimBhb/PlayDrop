@@ -72,9 +72,15 @@ Keep the icon if the PlayDrop package installed it too.
   it to appear on the session bus (started at login, from the window, the command line or
   `systemctl --user`) and connects at once. Only "Start PlayDrop" starts it: through D-Bus
   activation when the service file is installed, otherwise by running `playdropd`.
-- "Send clipboard" reads the clipboard through the Wayland data-control protocol, like the
-  daemon. Text only, at most 1 MiB. A clip marked by a password manager asks first ("Send"
-  or "Cancel") and is sent marked sensitive, so the phone keeps it out of its history.
+- "Send clipboard" asks the daemon to read the clipboard itself and send it, so text and
+  images both work. A clip marked by a password manager is held back and the popup asks first
+  ("Send" or "Cancel"); on "Send" the daemon sends it marked sensitive, so the phone keeps it
+  out of its history. With an older daemon that does not know the request, or one that cannot
+  read the clipboard on this session, the applet reads the text itself through the Wayland
+  data-control protocol (text only, at most 1 MiB) with the same ask-first rule.
+- Devices show their battery as soon as the list loads (the daemon reports it with each
+  device). Transfer rows show what is being moved ("notes.txt", "Photos (50 files)", "a.pdf
+  and Photos"); names are cut to fit and come from the other device, so they are only shown.
 - "Send files..." and "Send folder..." use the desktop's file chooser. Only files on this
   computer can be sent; anything else chosen is left out and the popup says so.
 - Every request to the daemon gives up after 15 seconds and says so, so a stuck daemon never

@@ -45,7 +45,10 @@ transfer to a phone over Wi-Fi and checking the result has not been done yet.
 ## Auto-accept
 
 When you pair, the other device gets permission to send you files without a question. A
-notification then tells you what arrived, with Open and Show in folder.
+notification then tells you what arrived, with Open and Show in folder. On Windows the
+notification has no buttons yet: they are still being tested and are off unless the daemon is
+started with the environment variable `PLAYDROP_TOAST_BUTTONS=1`. Open the file from the
+PlayDrop window or the receive folder instead.
 
 - Auto-accept belongs to one paired device. It is never based on a name, an address or a network.
 - Turn it off per device in that device's settings. Then each send waits for your answer.

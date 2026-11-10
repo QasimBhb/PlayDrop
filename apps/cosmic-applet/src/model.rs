@@ -10,9 +10,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 
-use playdrop_core::host::TransferStatus;
-use playdrop_core::host::{HostEvent, PeerSummary, TransferDirection, TransferSnapshot};
-use playdrop_ipc::{ClipSkip, DaemonEvent, Event, Status};
+use playdrop_ipc::types::{
+    HostEvent, PeerSummary, TransferDirection, TransferSnapshot, TransferStatus, TRANSFER_NAMES_MAX,
+};
+use playdrop_ipc::{
+    ClipSkip, ConsentToken, DaemonEvent, ErrorCode, Event, IpcError, Ok as Answer, Request, Status,
+};
 
 /// Most finished transfers the popup lists.
 pub const SHOW_FINISHED: usize = 4;
@@ -101,7 +104,20 @@ pub struct Device {
 }
 
 impl Device {
-    fn from_summary(p: &PeerSummary, battery: Option<(u8, bool)>) -> Self {
+    fn from_summary(p: &PeerSummary, battery: Option<(u8, bool)>, authoritative: bool) -> Self {
+        // A daemon that reports battery in `peers` (see `answer_has_battery`) is
+        // authoritative: its answer is taken as is, so a missing report clears a stale level
+        // left by missed offline and online events. An older daemon sends none, so what an
+        // event told us stays.
+        let from_answer = p
+            .battery
+            .filter(|_| p.online)
+            .map(|b| (b.level.min(100), b.charging));
+        let battery = if authoritative {
+            from_answer
+        } else {
+            from_answer.or(battery)
+        };
         Self {
             device_id: p.device_id.clone(),
             short_id: p.short_id.clone(),
@@ -144,6 +160,11 @@ pub struct Transfer {
     pub file_count: usize,
     /// Display name when one file is involved and its name is known.
     pub name: Option<String>,
+    /// The daemon left out top-level names beyond `names`.
+    pub names_more: bool,
+    /// Top-level names the daemon lists (at most [`TRANSFER_NAMES_MAX`]); empty from an
+    /// older daemon. Peer-supplied on a receive: display only.
+    pub names: Vec<String>,
     /// Failure or cancel reason.
     pub reason: Option<String>,
     /// Unix seconds the transfer started or was first seen.
@@ -165,6 +186,8 @@ impl Transfer {
             total: s.total,
             file_count: s.file_count,
             name: single_name(s.file_count, s.saved.first()),
+            names: s.names.clone(),
+            names_more: s.names_more,
             reason: if finished && s.state != TransferStatus::Complete {
                 s.note.clone()
             } else {
@@ -185,6 +208,112 @@ fn single_name(file_count: usize, path: Option<&std::path::PathBuf>) -> Option<S
     }
     path.and_then(|p| p.file_name())
         .map(|n| n.to_string_lossy().into_owned())
+}
+
+/// Whether a daemon of this package version reports battery in its `peers` answer, so that
+/// an answer without it means "none known". 0.9.0 and later do; an older or unparseable
+/// version does not (keep what events told us).
+pub fn answer_has_battery(version: &str) -> bool {
+    let mut parts = version.split(['.', '-', '+']);
+    let mut next = || parts.next().and_then(|p| p.parse::<u64>().ok());
+    match (next(), next()) {
+        (Some(major), Some(minor)) => (major, minor) >= (0, 9),
+        _ => false,
+    }
+}
+
+/// The first `TRANSFER_NAMES_MAX + 1` distinct top-level names of manifest paths
+/// (`Photos/a.jpg` gives `Photos`); the extra one tells whether names were left out.
+fn offer_names<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for path in paths {
+        let top = path.split('/').next().unwrap_or(path);
+        if !top.is_empty() && !names.iter().any(|n| n == top) {
+            names.push(top.to_owned());
+            if names.len() > TRANSFER_NAMES_MAX {
+                break;
+            }
+        }
+    }
+    names
+}
+
+/// Longest one name is shown, in characters.
+const NAME_SHOWN: usize = 28;
+/// Longest the whole "what" part of a transfer title is shown, in characters.
+const WHAT_SHOWN: usize = 56;
+
+/// Zero-width, soft-hyphen, joiner and bidi control characters: they take no room but can
+/// reorder or hide text.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}'
+            | '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{180E}' | '\u{2060}'..='\u{2064}'
+    )
+}
+
+/// `text` on one line and at most `max` characters: invisible characters are dropped, control characters (a newline in a
+/// peer-supplied name) become spaces, and a longer text ends in `...`.
+pub fn elide(text: &str, max: usize) -> String {
+    let clean: String = text
+        .chars()
+        .filter(|c| !is_invisible(*c))
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    if clean.chars().count() <= max {
+        return clean;
+    }
+    let keep = max.saturating_sub(3);
+    let mut out: String = clean.chars().take(keep).collect();
+    out.push_str("...");
+    out
+}
+
+/// A count with thousands separators ("5,001").
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What a transfer row says is being moved, from the daemon's top-level `names`: "a",
+/// "a and b" or "a, b and c". When more is moved than the names say (`names_more`, or
+/// `file_count` above the names shown) the file count follows: "Photos (50 files)",
+/// "a and Photos (5,001 files)", "a, b, c and more (10 files)". Empty `names` gives `None`
+/// and the caller falls back to the count-only wording.
+fn names_text(names: &[String], names_more: bool, file_count: usize) -> Option<String> {
+    let shown: Vec<String> = names.iter().map(|n| elide(n, NAME_SHOWN)).collect();
+    let mut text = match shown.as_slice() {
+        [] => return None,
+        [one] => one.clone(),
+        [a, b] if !names_more => format!("{a} and {b}"),
+        [init @ .., last] if !names_more => format!("{} and {last}", init.join(", ")),
+        all => format!("{} and more", all.join(", ")),
+    };
+    // The count is appended after the names are cut to what is left of the budget, so a
+    // long name never pushes it out of the title.
+    let suffix = if file_count > 1 && (names_more || file_count > names.len()) {
+        format!(" ({} files)", grouped(file_count))
+    } else {
+        String::new()
+    };
+    let room = WHAT_SHOWN.saturating_sub(suffix.chars().count());
+    text = elide(&text, room);
+    text.push_str(&suffix);
+    Some(text)
 }
 
 /// A stable order for directions (the core type has no `Ord`).
@@ -466,6 +595,14 @@ impl Model {
     }
 
     fn replace_peers(&mut self, peers: &[PeerSummary]) {
+        let authoritative = match &self.daemon {
+            DaemonState::Running { version } => answer_has_battery(version),
+            DaemonState::Connecting
+            | DaemonState::Starting
+            | DaemonState::NotReady
+            | DaemonState::NotRunning
+            | DaemonState::Failed(_) => false,
+        };
         let old = std::mem::take(&mut self.devices);
         for p in peers {
             // Battery only arrives as events; keep what we heard while the device stays
@@ -474,8 +611,10 @@ impl Model {
                 .get(&p.device_id)
                 .filter(|_| p.online)
                 .and_then(|d| d.battery);
-            self.devices
-                .insert(p.device_id.clone(), Device::from_summary(p, battery));
+            self.devices.insert(
+                p.device_id.clone(),
+                Device::from_summary(p, battery, authoritative),
+            );
         }
         self.busy.retain(|(id, _)| self.devices.contains_key(id));
         if let Some(d) = &self.confirm_sensitive {
@@ -508,6 +647,10 @@ impl Model {
                         t.updated_at = prev.updated_at;
                     }
                     t.name = t.name.or(prev.name);
+                    if t.names.is_empty() {
+                        t.names = prev.names;
+                        t.names_more = prev.names_more;
+                    }
                     t
                 }
                 None => Transfer::from_snapshot(s, now),
@@ -607,6 +750,8 @@ impl Model {
         Transfer {
             short_id: self.short_id_of(&peer),
             name,
+            names: Vec::new(),
+            names_more: false,
             id,
             peer,
             direction,
@@ -667,6 +812,13 @@ impl Model {
                 t.name = (file_count == 1)
                     .then(|| files.first().map(|f| manifest_basename(&f.path)))
                     .flatten();
+                // One file keeps its own name (even inside a folder); several get theirs.
+                if file_count != 1 {
+                    let mut names = offer_names(files.iter().map(|f| f.path.as_str()));
+                    t.names_more = names.len() > TRANSFER_NAMES_MAX;
+                    names.truncate(TRANSFER_NAMES_MAX);
+                    t.names = names;
+                }
                 self.transfers.insert((id, TransferDirection::Receive), t);
                 Refresh::NONE
             }
@@ -1094,10 +1246,17 @@ impl Model {
             .map(|d| d.label.clone())
             .or_else(|| (!t.short_id.is_empty()).then(|| t.short_id.clone()))
             .unwrap_or_else(|| "a device".to_owned());
-        let what = match (&t.name, t.file_count) {
-            (Some(n), _) => n.clone(),
-            (None, 0) => "files".to_owned(),
-            (None, n) => format!("{n} {}", plural(n, "file", "files")),
+        // A single file whose own name is known keeps it: `names` would say its folder.
+        let own = (t.file_count <= 1).then_some(t.name.as_ref()).flatten();
+        let what = match own {
+            Some(n) => elide(n, WHAT_SHOWN),
+            None => names_text(&t.names, t.names_more, t.file_count).unwrap_or_else(|| {
+                match (&t.name, t.file_count) {
+                    (Some(n), _) => elide(n, WHAT_SHOWN),
+                    (None, 0) => "files".to_owned(),
+                    (None, n) => format!("{n} {}", plural(n, "file", "files")),
+                }
+            }),
         };
         let title = match t.direction {
             TransferDirection::Send => format!("{what} to {who}"),
@@ -1181,6 +1340,67 @@ pub fn clipboard_outcome(label: &str, sent: bool, skipped: Option<ClipSkip>, ech
         .or(echo.then_some(ClipSkip::Echo))
         .map_or("the daemon sent nothing", ClipSkip::reason);
     format!("Clipboard not sent: {reason}.")
+}
+
+/// What the daemon-side "send my clipboard" ended with, for the applet to act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalClip {
+    /// Settled: the sentence for the popup (sent, or why nothing was).
+    Done(String),
+    /// A password manager marked the clip and the user has not agreed yet (SR-24): ask, then
+    /// send again with the consent.
+    /// Carries the daemon's one-use consent token for the exact clip it refused, when it
+    /// sent one (never logged).
+    NeedsConfirm(Option<ConsentToken>),
+    /// The daemon cannot do this here (an older daemon, or no clipboard access on its
+    /// session): the applet reads the clipboard text itself, as before.
+    Fallback,
+}
+
+/// The first request for "Send clipboard": the daemon reads the clipboard itself, for one
+/// device. `allow_sensitive` is only true after the user said yes to a password-manager clip.
+pub fn local_clip_request(
+    device_id: &str,
+    allow_sensitive: bool,
+    consent: Option<ConsentToken>,
+) -> Request {
+    Request::SendLocalClipboard {
+        peer: Some(device_id.to_owned()),
+        allow_sensitive,
+        consent,
+    }
+}
+
+/// Sorts the answer to [`local_clip_request`]. `BadRequest` is an older daemon that does not
+/// know the request; `InvalidState` is a daemon that cannot read the clipboard on this
+/// session, or is still starting: both fall back. Any other error is the outcome.
+pub fn local_clip_result(label: &str, result: Result<Answer, IpcError>) -> LocalClip {
+    match result {
+        Ok(Answer::ClipboardPushed {
+            sent_to,
+            skipped_echo,
+            skipped,
+            consent,
+        }) => {
+            if skipped == Some(ClipSkip::Sensitive) && sent_to.is_empty() {
+                LocalClip::NeedsConfirm(consent)
+            } else {
+                LocalClip::Done(clipboard_outcome(
+                    label,
+                    !sent_to.is_empty(),
+                    skipped,
+                    skipped_echo,
+                ))
+            }
+        }
+        Ok(_) => {
+            LocalClip::Done("Clipboard not sent: the daemon gave an unexpected answer.".to_owned())
+        }
+        Err(e) if matches!(e.code, ErrorCode::BadRequest | ErrorCode::InvalidState) => {
+            LocalClip::Fallback
+        }
+        Err(e) => LocalClip::Done(format!("Clipboard not sent: {}", e.message)),
+    }
 }
 
 /// Which panel icon to draw.

@@ -10,6 +10,15 @@ pub(super) const NO_DATA_CONTROL: &str = "this desktop does not expose clipboard
      background apps; use the Send clipboard button in the window";
 
 #[cfg(target_os = "linux")]
+/// The Flatpak on COSMIC. The compositor has both data-control protocols but offers them only
+/// to clients without a sandbox security context (`cosmic-comp` `src/state.rs`,
+/// `client_not_sandboxed`), and Flatpak's Wayland socket always carries one. The same daemon
+/// from the `.deb` on the same desktop gets the protocol.
+pub(super) const SANDBOXED_ON_COSMIC: &str = "COSMIC does not let sandboxed (Flatpak) apps watch \
+     or set the clipboard; install the .deb package for automatic clipboard sync, or use the \
+     Send clipboard button in the window";
+
+#[cfg(target_os = "linux")]
 /// X11 sessions (Pop!_OS and Ubuntu default to Wayland; X11 is out of scope for v1).
 pub(super) const X11: &str = "X11 sessions are not supported for clipboard sync in this version";
 

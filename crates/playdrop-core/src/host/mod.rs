@@ -72,8 +72,10 @@ pub use path::{PathOutcome, PathReport, PathTiming, ProbeReport};
 #[cfg(feature = "iroh-test")]
 pub use reach_link::ReachCounters;
 pub use send::{SendSource, TransferHandle, TransferSummary};
-pub use status::MediaState;
-pub use transfers::{TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISHED, KEEP_FOR};
+pub use status::{MediaState, PeerBattery};
+pub use transfers::{
+    TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISHED, KEEP_FOR, TRANSFER_NAMES_MAX,
+};
 
 use crate::discovery::{BeaconSchedule, DialLimiter, Discovery, DiscoveryConfig, InterfaceSource};
 use crate::identity::{DeviceId, DeviceIdentity};
@@ -300,6 +302,12 @@ pub struct PeerSummary {
     /// capability here (PLAN.md anti-pattern 18: hide what cannot work, with the reason).
     #[serde(default)]
     pub capabilities: Vec<String>,
+    /// The peer's last `battery` frame (protocol.md 5.8) while online; `None` offline, before
+    /// its first frame of a session, or from a peer that does not send one (a desktop without
+    /// a battery). Clears when the peer goes offline. Missing from an older host reads as
+    /// `None`; a UI then waits for `HostEvent::Battery` as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery: Option<PeerBattery>,
 }
 
 /// A device seen in "Add device" mode (protocol.md 8.3 rule 1): listed, never dialled
@@ -1031,25 +1039,29 @@ impl Host {
         let store = self.inner.pins.read();
         store
             .iter()
-            .map(|p| PeerSummary {
-                device_id: p.device_id.to_hex(),
-                short_id: p.device_id.short_id(),
-                label: p.label.clone(),
-                online: self.inner.registry.session(&p.device_id).is_some(),
-                grants: p.grants,
-                last_known: p.last_known.clone(),
-                paired_at: p.paired_at,
-                last_seen: lock(&self.inner.last_seen)
-                    .get(&p.device_id)
-                    .copied()
-                    .max(p.last_seen),
-                removed_by_peer: p.removed_by_peer,
-                capabilities: self
-                    .inner
-                    .registry
-                    .session(&p.device_id)
-                    .map(|s| s.peer_caps_in())
-                    .unwrap_or_default(),
+            .map(|p| {
+                let session = self.inner.registry.session(&p.device_id);
+                PeerSummary {
+                    device_id: p.device_id.to_hex(),
+                    short_id: p.device_id.short_id(),
+                    label: p.label.clone(),
+                    online: session.is_some(),
+                    grants: p.grants,
+                    last_known: p.last_known.clone(),
+                    paired_at: p.paired_at,
+                    last_seen: lock(&self.inner.last_seen)
+                        .get(&p.device_id)
+                        .copied()
+                        .max(p.last_seen),
+                    removed_by_peer: p.removed_by_peer,
+                    capabilities: session
+                        .as_ref()
+                        .map(|s| s.peer_caps_in())
+                        .unwrap_or_default(),
+                    // Only while a session is up: a value from the last session is not news.
+                    battery: session
+                        .and_then(|_| lock(&self.inner.status).peer_battery(&p.device_id)),
+                }
             })
             .collect()
     }
@@ -1285,7 +1297,9 @@ impl Host {
         check_clipboard_size(text)?;
         let hash = crate::session::types::clipboard_text_hash(text);
         let body = ClipBody::of(text);
-        Ok(self.push_clip(&hash, |s| body.frame_for(&self.inner, s, &hash, sensitive)))
+        Ok(self.push_clip(&hash, None, |s| {
+            body.frame_for(&self.inner, s, &hash, sensitive)
+        }))
     }
 
     /// Pushes a clipboard image (at most 16 MiB) to every online peer with the
@@ -1294,6 +1308,41 @@ impl Host {
     /// capability are counted in [`ClipboardPush::skipped_unsupported`].
     pub fn push_clipboard_image(
         &self,
+        bytes: Vec<u8>,
+        mime: &str,
+        sensitive: bool,
+    ) -> Result<ClipboardPush> {
+        self.image_clip(None, bytes, mime, sensitive)
+    }
+
+    /// Sends a clipboard image (at most 16 MiB) to one peer, as a blob it fetches and verifies
+    /// (protocol.md 5.7, 5.15): the image counterpart of [`Host::send_clipboard`], with the same
+    /// errors for an unpaired peer, a missing `clipboardOut` grant and a peer with no session.
+    /// The answer says whether it went: `sent_to` holds the peer, or `skipped_echo` is set (same
+    /// echo rule as text), or `skipped_unsupported` is 1 (the peer lacks `clipboard.image` or
+    /// `blobs`). Not in the frozen `UniFFI` surface (`docs/core-api.md` section 14); the
+    /// desktop daemon uses it.
+    pub fn send_clipboard_image(
+        &self,
+        peer: &DeviceId,
+        bytes: Vec<u8>,
+        mime: &str,
+        sensitive: bool,
+    ) -> Result<ClipboardPush> {
+        let pin = self.inner.pins.get(peer).ok_or(Error::NotPaired)?;
+        if !pin.grants.clipboard_out {
+            return Err(Error::Forbidden("clipboardOut grant is off"));
+        }
+        if self.inner.registry.session(peer).is_none() {
+            return Err(Error::NotFound);
+        }
+        self.image_clip(Some(*peer), bytes, mime, sensitive)
+    }
+
+    /// [`Host::push_clipboard_image`] to every eligible peer, or to `only`.
+    fn image_clip(
+        &self,
+        only: Option<DeviceId>,
         bytes: Vec<u8>,
         mime: &str,
         sensitive: bool,
@@ -1307,7 +1356,7 @@ impl Host {
         let hash = blobs::blob_id(&bytes);
         let bytes = bytes::Bytes::from(bytes);
         let inner = &self.inner;
-        Ok(self.push_clip(&hash, |s| {
+        Ok(self.push_clip(&hash, only, |s| {
             if !(s.peer_accepts(&Capability::ClipboardImage) && s.peer_accepts(&Capability::Blobs))
             {
                 return None;
@@ -1328,8 +1377,9 @@ impl Host {
         }))
     }
 
-    /// The fan-out shared by text and image pushes (protocol.md 5.7 echo rule).
-    fn push_clip<F>(&self, hash: &str, mut frame_for: F) -> ClipboardPush
+    /// The fan-out shared by text and image pushes (protocol.md 5.7 echo rule), to every
+    /// paired peer or to `only`.
+    fn push_clip<F>(&self, hash: &str, only: Option<DeviceId>, mut frame_for: F) -> ClipboardPush
     where
         F: FnMut(&session::Session) -> Option<Frame>,
     {
@@ -1343,6 +1393,7 @@ impl Host {
             .pins
             .read()
             .iter()
+            .filter(|p| only.is_none_or(|o| o == p.device_id))
             .map(|p| (p.device_id, p.grants.clipboard_out))
             .collect();
         for (id, granted) in targets {

@@ -7,7 +7,8 @@ How it works depends on what the operating system allows.
 
 | Device | How the clipboard moves |
 |---|---|
-| Pop!_OS COSMIC | Automatic. Copying sends to your paired phones within a moment. |
+| Pop!_OS COSMIC, `.deb` | Automatic. Copying sends to your paired phones within a moment. |
+| Pop!_OS COSMIC, Flatpak | By button: the window has a send button. COSMIC keeps the clipboard away from sandboxed apps, so the Flatpak can neither watch it nor put a clip from your phone on it. Install the `.deb` for automatic sync. |
 | Windows | Automatic (written and tested by CI only, not yet run by a person). |
 | Ubuntu GNOME | By button: the window has a send button. GNOME gives no way to watch the clipboard. |
 | Android | Notification action. Tap **Send clipboard** in the PlayDrop notification. Android 10 and newer stop background apps from reading the clipboard, so this tap is how you send. |

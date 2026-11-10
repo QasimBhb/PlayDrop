@@ -507,6 +507,7 @@ fn on_end(inner: &Arc<Inner>, sess: &Arc<Session>) {
     if inner.registry.uninstall(sess) {
         let id = sess.peer();
         input::on_session_end(inner, id);
+        lock(&inner.status).peer_offline(&id);
         inner.persist_last_seen(id);
         inner.emit(HostEvent::PeerOffline {
             peer: id.to_hex(),
@@ -640,6 +641,10 @@ async fn handle_frame(
             });
         }
         Frame::Battery(b) => {
+            // Only for a pinned peer: nothing may bring back what unpair cleared.
+            if inner.pins.contains(&peer) {
+                lock(&inner.status).note_peer_battery(peer, (&b).into());
+            }
             path::note_peer_battery(inner, peer, b.low && !b.charging);
             inner.emit(HostEvent::Battery {
                 peer: hex,
@@ -816,6 +821,7 @@ pub(crate) fn activate(inner: &Arc<Inner>, sess: &Arc<Session>, v: &ValidatedHel
     // it repeats what it has right after its `hello` (5.8, 5.10). A moved one keeps it.
     if matches!(placement, Placement::Install) {
         path::on_session_placed(inner, peer);
+        lock(&inner.status).peer_offline(&peer);
     }
     sess.send_raw(announce_key_frame(inner), None);
     // A decision made while no session was up never reached the sender, which only waits

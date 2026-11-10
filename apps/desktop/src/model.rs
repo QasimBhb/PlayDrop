@@ -10,15 +10,14 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use playdrop_core::host::{
-    AddDeviceCandidate, Diagnostics, DiscoveryPath, HostEvent, MdnsStatus, MediaState,
-    MulticastStatus, PairingPromptKind, PeerDiagnostic, PeerSummary, TransferDirection,
+use playdrop_ipc::types::{
+    AddDeviceCandidate, Diagnostics, DiscoveryPath, Grants, HostEvent, MdnsStatus, MediaAction,
+    MediaState, MulticastStatus, PairingPromptKind, PeerDiagnostic, PeerSummary, TransferDirection,
     TransferSnapshot, TransferStatus,
 };
-use playdrop_core::pin_store::Grants;
-use playdrop_core::session::types::MediaAction;
 use playdrop_ipc::{
-    ClipSkip, DaemonEvent, DiagnosticsReport, Event, FirewallHint, PortProbe, Settings, Status,
+    ClipSkip, ConsentToken, DaemonEvent, DiagnosticsReport, Event, FirewallHint, PortProbe,
+    Settings, Status,
 };
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -53,7 +52,8 @@ pub struct PeerView {
     /// drops, so a phone in Doze reads "Asleep" rather than "Offline" (protocol.md 5.10:
     /// after `asleep` the peer expects a drop).
     pub presence: Option<String>,
-    /// Last battery report: level, charging.
+    /// Last battery report: level, charging. From the `peers` answer while online (a daemon
+    /// newer than 0.8.0), else from the last `battery` event; kept after the device drops.
     pub battery: Option<(u8, bool)>,
     /// When pairing completed, Unix seconds.
     pub paired_at: u64,
@@ -80,7 +80,7 @@ impl PeerView {
             label: p.label,
             online: p.online,
             presence: None,
-            battery: None,
+            battery: p.battery.map(|b| (b.level, b.charging)),
             paired_at: p.paired_at,
             grants: p.grants,
             note: None,
@@ -113,8 +113,15 @@ pub struct TransferView {
     pub file_count: usize,
     /// Files finished so far; 0 from an older daemon.
     pub files_done: usize,
-    /// First offered names, for the offer prompt.
+    /// Names to show: the first offered paths (from the offer event), or the top-level
+    /// names from the daemon's snapshot (`names_top_level`, at most three). Peer-supplied on
+    /// the receive side: display only.
     pub names: Vec<String>,
+    /// `names` are the snapshot's top-level names (a folder counts once), not file paths,
+    /// so "and N more" cannot be worked out from `file_count`.
+    pub names_top_level: bool,
+    /// With `names_top_level`: the daemon left some names out.
+    pub names_more: bool,
     /// Sender's note, or the failure reason once failed.
     pub note: Option<String>,
     /// Receive side: final paths, from `TransferComplete` or, for a window opened after
@@ -140,7 +147,9 @@ impl TransferView {
             bytes_per_sec: s.bytes_per_sec,
             file_count: s.file_count,
             files_done: s.files_done,
-            names: Vec::new(),
+            names_top_level: !s.names.is_empty(),
+            names_more: s.names_more,
+            names: s.names,
             note: s.note,
             saved: s.saved,
             elapsed_ms: None,
@@ -161,6 +170,8 @@ impl TransferView {
             file_count: 0,
             files_done: 0,
             names: Vec::new(),
+            names_top_level: false,
+            names_more: false,
             note: None,
             saved: Vec::new(),
             elapsed_ms: None,
@@ -286,7 +297,11 @@ impl Store {
             .map(|p| {
                 let mut v = PeerView::from_summary(p, now);
                 if let Some(o) = old.iter().find(|o| o.device_id == v.device_id) {
-                    v.battery = o.battery;
+                    // The answer's battery is current; without one (offline, or an older
+                    // daemon) the last one an event told us stays.
+                    if v.battery.is_none() {
+                        v.battery = o.battery;
+                    }
                     if v.online && v.grants.media {
                         v.media.clone_from(&o.media);
                     }
@@ -322,7 +337,13 @@ impl Store {
                     .iter()
                     .find(|o| o.id == v.id && o.direction == v.direction)
                 {
-                    v.names.clone_from(&o.names);
+                    // Offered paths say more than top-level names; a snapshot's names fill in
+                    // for a window that opened after the offer, or for a send.
+                    if !o.names.is_empty() && (v.names.is_empty() || !o.names_top_level) {
+                        v.names.clone_from(&o.names);
+                        v.names_top_level = o.names_top_level;
+                        v.names_more = o.names_more;
+                    }
                     if v.saved.is_empty() {
                         v.saved.clone_from(&o.saved);
                     }
@@ -629,6 +650,8 @@ impl Store {
                         t.file_count = file_count;
                         t.total = total_bytes;
                         t.names = names;
+                        t.names_top_level = false;
+                        t.names_more = false;
                         t.note = note;
                     });
                 changes.push(Change::Notice(
@@ -883,6 +906,110 @@ fn count_files(n: usize) -> String {
 /// "Clipboard not sent: <reason>", with the daemon's own wording of the reason.
 pub fn clipboard_skipped_text(skip: ClipSkip) -> String {
     format!("Clipboard not sent: {}", skip.reason())
+}
+
+/// What the window does with the daemon's answer to `send_local_clipboard`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalClipOutcome {
+    /// Show this notice; `true` marks it as an error.
+    Notice(String, bool),
+    /// The daemon cannot do it: an older daemon (`bad_request`) or a session where it
+    /// cannot read the clipboard (`invalid_state`, GNOME). Send the text the window read
+    /// itself, as before.
+    Fallback,
+    /// A password manager marked the clip (SR-24): ask, and send again with consent and this
+    /// token, which binds the consent to that clip.
+    AskConsent(ConsentToken),
+    /// Anything else: report the answer as a failure.
+    Report,
+}
+
+/// Sorts the answer to `send_local_clipboard` into what the window does next. `consented`:
+/// the request carried the user's yes to a marked clip. Then the window never falls back to
+/// sending its own text, which would go unmarked: an older daemon or one that cannot read the
+/// clipboard (or is still starting) gets a "try again" instead.
+pub fn local_clip_outcome(
+    r: &Result<playdrop_ipc::Ok, playdrop_ipc::IpcError>,
+    consented: bool,
+) -> LocalClipOutcome {
+    use playdrop_ipc::{ErrorCode, Ok};
+    match r {
+        Result::Ok(Ok::ClipboardPushed {
+            sent_to,
+            skipped,
+            consent,
+            ..
+        }) => match skipped {
+            None if consented && !sent_to.is_empty() => LocalClipOutcome::Notice(
+                format!(
+                    "{}, marked secret so it stays out of the device's clipboard history",
+                    clipboard_sent_text(sent_to.len())
+                ),
+                false,
+            ),
+            None => {
+                LocalClipOutcome::Notice(clipboard_sent_text(sent_to.len()), sent_to.is_empty())
+            }
+            Some(ClipSkip::Echo) => LocalClipOutcome::Notice(
+                "That clip was just synced; nothing new to send.".to_owned(),
+                false,
+            ),
+            Some(ClipSkip::Sensitive) => match consent {
+                Some(token) => LocalClipOutcome::AskConsent(token.clone()),
+                // A sensitive refusal without a token cannot be answered: say so.
+                None => LocalClipOutcome::Notice(clipboard_skipped_text(ClipSkip::Sensitive), true),
+            },
+            Some(skip) => LocalClipOutcome::Notice(clipboard_skipped_text(*skip), true),
+        },
+        Result::Err(e) if matches!(e.code, ErrorCode::BadRequest | ErrorCode::InvalidState) => {
+            if consented {
+                LocalClipOutcome::Notice(CONSENT_LOST_NOTICE.to_owned(), true)
+            } else {
+                LocalClipOutcome::Fallback
+            }
+        }
+        _ => LocalClipOutcome::Report,
+    }
+}
+
+/// The notice that asks for SR-24 consent: the user agrees by pressing the button again while
+/// it is shown.
+pub const SENSITIVE_CLIP_NOTICE: &str = "A password manager marked this clip as secret, so it \
+     was not sent. Press Send clipboard again while this message is shown to send it anyway; \
+     the device keeps it out of its clipboard history.";
+
+/// A consented send the daemon could not take (it is starting, or cannot read the clipboard).
+pub const CONSENT_LOST_NOTICE: &str =
+    "The clipboard was not sent: PlayDrop could not send it as secret just now. Try again.";
+
+/// Peer-supplied text cleaned for display: zero-width and bidi marks dropped, line and
+/// paragraph separators and control characters turned into a space. Display only; the
+/// core's SR-17 check already refused the worst, this keeps a row from being reordered or
+/// hiding characters.
+pub fn clean_display_name(name: &str) -> String {
+    name.chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{00AD}'
+                    | '\u{034F}'
+                    | '\u{061C}'
+                    | '\u{180E}'
+                    | '\u{200B}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{2060}'..='\u{2064}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{FEFF}'
+            )
+        })
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// "Clipboard sent to 2 devices" or the reason nothing was sent.
@@ -1234,10 +1361,17 @@ pub fn transfer_row(t: &TransferView, peer_name: &str) -> TransferRow {
     };
     if !t.names.is_empty() {
         files.push_str(": ");
-        files.push_str(&t.names.join(", "));
-        let more = t.file_count.saturating_sub(t.names.len());
-        if more > 0 {
-            let _ = write!(files, " and {more} more");
+        let shown: Vec<String> = t.names.iter().map(|n| clean_display_name(n)).collect();
+        files.push_str(&shown.join(", "));
+        if t.names_top_level {
+            if t.names_more {
+                files.push_str(" and more");
+            }
+        } else {
+            let more = t.file_count.saturating_sub(t.names.len());
+            if more > 0 {
+                let _ = write!(files, " and {more} more");
+            }
         }
     }
     let (state, status) = match t.state {
@@ -1491,8 +1625,7 @@ fn section(title: &str, lines: Vec<String>, ok: bool) -> DiagSection {
 #[allow(unknown_lints, clippy::assert_is_empty)]
 mod tests {
     use super::*;
-    use playdrop_core::host::{OfferedFile, Secret};
-    use playdrop_core::session::types::MediaAction;
+    use playdrop_ipc::types::{OfferedFile, PeerBattery, Secret};
     use slint::Model;
 
     fn peer(id: &str, online: bool) -> PeerSummary {
@@ -1507,6 +1640,7 @@ mod tests {
             last_seen: None,
             removed_by_peer: false,
             capabilities: Vec::new(),
+            battery: None,
         }
     }
 
@@ -2255,6 +2389,180 @@ mod tests {
     }
 
     #[test]
+    fn local_clip_answers_pick_the_next_step() {
+        use playdrop_ipc::{ErrorCode, IpcError, Ok};
+        let pushed = |sent: usize, skipped: Option<ClipSkip>| {
+            Result::Ok(Ok::ClipboardPushed {
+                sent_to: vec!["ab".into(); sent],
+                skipped_echo: skipped == Some(ClipSkip::Echo),
+                skipped,
+                consent: (skipped == Some(ClipSkip::Sensitive)).then(|| ConsentToken::new("t0k")),
+            })
+        };
+        assert_eq!(
+            local_clip_outcome(&pushed(1, None), false),
+            LocalClipOutcome::Notice("Clipboard sent to 1 device".into(), false)
+        );
+        assert_eq!(
+            local_clip_outcome(&pushed(0, Some(ClipSkip::Sensitive)), false),
+            LocalClipOutcome::AskConsent(ConsentToken::new("t0k"))
+        );
+        // No token to answer with: only a notice.
+        assert!(matches!(
+            local_clip_outcome(
+                &Result::Ok(Ok::ClipboardPushed {
+                    sent_to: vec![],
+                    skipped_echo: false,
+                    skipped: Some(ClipSkip::Sensitive),
+                    consent: None,
+                }),
+                false
+            ),
+            LocalClipOutcome::Notice(_, true)
+        ));
+        assert_eq!(
+            local_clip_outcome(&pushed(0, Some(ClipSkip::Empty)), false),
+            LocalClipOutcome::Notice("Clipboard not sent: the clipboard is empty".into(), true)
+        );
+        assert!(matches!(
+            local_clip_outcome(&pushed(0, Some(ClipSkip::Echo)), false),
+            LocalClipOutcome::Notice(_, false)
+        ));
+        // An older daemon, and a session where the daemon cannot read the clipboard: the
+        // window sends the text it read itself, as before.
+        for code in [ErrorCode::BadRequest, ErrorCode::InvalidState] {
+            assert_eq!(
+                local_clip_outcome(&Err(IpcError::new(code, "x")), false),
+                LocalClipOutcome::Fallback
+            );
+            // Never after the user agreed to a marked clip: that text would go unmarked.
+            assert_eq!(
+                local_clip_outcome(&Err(IpcError::new(code, "x")), true),
+                LocalClipOutcome::Notice(CONSENT_LOST_NOTICE.into(), true)
+            );
+        }
+        assert_eq!(
+            local_clip_outcome(&Err(IpcError::new(ErrorCode::Offline, "x")), false),
+            LocalClipOutcome::Report
+        );
+        // A consented send that went says so, and never "was not sent".
+        let LocalClipOutcome::Notice(text, error) = local_clip_outcome(&pushed(1, None), true)
+        else {
+            panic!("notice");
+        };
+        assert!(
+            !error && text.starts_with("Clipboard sent to 1 device"),
+            "{text}"
+        );
+        assert!(!text.contains("not sent"), "{text}");
+        // Debug of the outcome never shows the token.
+        let shown = format!(
+            "{:?}",
+            LocalClipOutcome::AskConsent(ConsentToken::new("secret-token"))
+        );
+        assert!(!shown.contains("secret-token"), "{shown}");
+    }
+
+    #[test]
+    fn display_names_lose_invisible_and_reordering_marks() {
+        assert_eq!(clean_display_name("plain.txt"), "plain.txt");
+        assert_eq!(clean_display_name("evil\u{202E}gpj.exe"), "evilgpj.exe");
+        assert_eq!(
+            clean_display_name("a\u{200B}b\u{FEFF}c\u{00AD}d\u{2066}e\u{2069}"),
+            "abcde"
+        );
+        assert_eq!(
+            clean_display_name("one\u{2028}two\u{2029}three"),
+            "one two three"
+        );
+        assert_eq!(clean_display_name("tab\there\u{7}"), "tab here ");
+        assert_eq!(clean_display_name("日本語 ok"), "日本語 ok");
+        // Rows use it.
+        let mut t = TransferView::blank("t", "aa", TransferDirection::Receive);
+        t.names = vec!["x\u{202E}y".into()];
+        t.names_top_level = true;
+        assert!(transfer_row(&t, "Phone").files.ends_with(": xy"));
+    }
+
+    /// A window that opens mid-transfer names it from the snapshot; offered paths, which say
+    /// more, are kept over a later snapshot's top-level names.
+    #[test]
+    fn snapshot_names_fill_rows_and_offer_names_win() {
+        let snap = |id: &str, names: &[&str], file_count: usize| -> TransferSnapshot {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "peer": "aa", "short_id": "K3QD", "direction": "send",
+                "state": "active", "bytes": 0, "total": 2048, "bytes_per_sec": 0,
+                "started_at": 1, "file_count": file_count, "note": null, "names": names
+            }))
+            .expect("snapshot")
+        };
+        let mut s = Store::default();
+        s.set_peers(vec![peer("aa", true)], 0);
+        let mut four = snap("t3", &["a.txt", "b.txt", "Music"], 12);
+        four.names_more = true;
+        s.set_transfers(vec![
+            snap("t1", &["Photos"], 5000),
+            snap("t2", &["a.txt", "b.txt", "Music"], 9),
+            four,
+        ]);
+        let row = transfer_row(&s.transfers[0], "Phone");
+        assert_eq!(row.files, "5000 files, 2.0 KiB: Photos");
+        // Exactly three names: no "and more".
+        let row = transfer_row(&s.transfers[1], "Phone");
+        assert_eq!(row.files, "9 files, 2.0 KiB: a.txt, b.txt, Music");
+        // Some left out: said.
+        let row = transfer_row(&s.transfers[2], "Phone");
+        assert_eq!(row.files, "12 files, 2.0 KiB: a.txt, b.txt, Music and more");
+        // An older daemon sends no names: the count alone, as before.
+        let mut old = snap("t9", &[], 2);
+        old.names.clear();
+        s.set_transfers(vec![old]);
+        assert_eq!(
+            transfer_row(&s.transfers[0], "Phone").files,
+            "2 files, 2.0 KiB"
+        );
+
+        // An offer's paths stay when a refetch brings top-level names.
+        s.apply(
+            Event::Host(HostEvent::TransferOffer {
+                id: "t4".into(),
+                peer: "aa".into(),
+                short_id: "K3QD".into(),
+                files: vec![OfferedFile {
+                    path: "Docs/a.pdf".into(),
+                    size: 10,
+                }],
+                file_count: 1,
+                total_bytes: 10,
+                note: None,
+            }),
+            0,
+        );
+        let mut t4 = snap("t4", &["Docs"], 1);
+        t4.direction = TransferDirection::Receive;
+        s.set_transfers(vec![t4]);
+        assert_eq!(s.transfers[0].names, ["Docs/a.pdf"]);
+        assert!(!s.transfers[0].names_top_level);
+    }
+
+    /// The `peers` answer's battery shows at once; without one the last event's stays.
+    #[test]
+    fn battery_comes_from_the_peers_answer() {
+        let mut s = Store::default();
+        let mut p = peer("aa", true);
+        p.battery = Some(PeerBattery {
+            level: 57,
+            charging: false,
+            low: false,
+        });
+        s.set_peers(vec![p], 0);
+        assert_eq!(device_row(&s.peers[0], 0).battery, "57%");
+        // A refetch from an older daemon (no battery) keeps it.
+        s.set_peers(vec![peer("aa", true)], 1);
+        assert_eq!(s.peers[0].battery, Some((57, false)));
+    }
+
+    #[test]
     fn a_failed_send_kept_for_resume_offers_forget() {
         let snap = |direction: &str, state: &str, resumable: bool| -> TransferSnapshot {
             serde_json::from_value(serde_json::json!({
@@ -2468,7 +2776,7 @@ mod tests {
 
     #[test]
     fn diagnostics_sections() {
-        use playdrop_core::host::{DialFailure, InterfaceInfo};
+        use playdrop_ipc::types::{DialFailure, InterfaceInfo};
         use playdrop_ipc::AddrProbe;
         let report = DiagnosticsReport {
             core: Diagnostics {

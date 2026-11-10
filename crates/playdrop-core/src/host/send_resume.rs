@@ -419,7 +419,8 @@ fn waiting_snapshot(inner: &Inner, rec: &SendRecord) -> TransferSnapshot {
         rec.manifest.total_bytes,
         rec.manifest.files.len(),
         None,
-    );
+    )
+    .with_names(&rec.manifest);
     snap.started_at = rec.created_ms / 1000;
     let reason = rec
         .failure

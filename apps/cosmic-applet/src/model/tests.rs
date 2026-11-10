@@ -3,9 +3,8 @@
 
 use std::path::PathBuf;
 
-use playdrop_core::host::{FileRoot, OfferedFile};
-use playdrop_core::pin_store::Grants;
-use playdrop_ipc::Settings;
+use playdrop_ipc::types::{FileRoot, Grants, OfferedFile, PeerBattery};
+use playdrop_ipc::{ConsentToken, Settings};
 
 use super::*;
 
@@ -31,6 +30,7 @@ fn peer(n: u8, label: &str, online: bool) -> PeerSummary {
         } else {
             Vec::new()
         },
+        battery: None,
     }
 }
 
@@ -72,6 +72,8 @@ fn snapshot(tid: &str, n: u8, dir: TransferDirection, state: TransferStatus) -> 
         files_done: 0,
         started_at: NOW - 10,
         file_count: 3,
+        names: Vec::new(),
+        names_more: false,
         note: None,
         saved: Vec::new(),
         folder: None,
@@ -1229,4 +1231,368 @@ fn no_question_is_asked_for_a_device_that_cannot_receive() {
     assert_eq!(m.confirm_sensitive(), None);
     m.set_confirm_sensitive(Some(&id(9)));
     assert_eq!(m.confirm_sensitive(), None);
+}
+
+// ---- battery from the answer, the daemon-side clipboard, transfer names ------------------
+
+fn with_battery(mut p: PeerSummary, level: u8, charging: bool) -> PeerSummary {
+    p.battery = Some(PeerBattery {
+        level,
+        charging,
+        low: false,
+    });
+    p
+}
+
+#[test]
+fn battery_is_seeded_from_the_peers_answer() {
+    let m = connected(vec![with_battery(peer(1, "Phone", true), 64, true)], vec![]);
+    assert_eq!(view(&m).devices[0].detail, "Online, battery 64% (charging)");
+    // A later answer replaces it, and a level over 100 is clamped.
+    let mut m = m;
+    m.apply(
+        Input::Peers(vec![with_battery(peer(1, "Phone", true), 200, false)]),
+        NOW,
+    );
+    assert_eq!(view(&m).devices[0].detail, "Online, battery 100%");
+}
+
+#[test]
+fn an_answer_without_battery_behaves_as_before() {
+    // An older daemon (or a device that has not reported): nothing shown at first...
+    let mut m = connected(vec![peer(1, "Phone", true)], vec![]);
+    assert_eq!(view(&m).devices[0].detail, "Online");
+    // ...an event is kept across a refresh that carries none...
+    m.apply(
+        host(HostEvent::Battery {
+            peer: id(1),
+            level: 55,
+            charging: false,
+            low: false,
+        }),
+        NOW,
+    );
+    m.apply(Input::Peers(vec![peer(1, "Phone", true)]), NOW);
+    assert_eq!(view(&m).devices[0].detail, "Online, battery 55%");
+    // ...and an offline device never shows one, whatever the answer carries.
+    m.apply(
+        Input::Peers(vec![with_battery(peer(1, "Phone", false), 90, false)]),
+        NOW,
+    );
+    assert_eq!(view(&m).devices[0].detail, "Offline");
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn pushed(sent_to: Vec<String>, skipped: Option<ClipSkip>) -> Result<Answer, IpcError> {
+    Ok(Answer::ClipboardPushed {
+        sent_to,
+        skipped_echo: skipped == Some(ClipSkip::Echo),
+        skipped,
+        consent: None,
+    })
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn refused(token: Option<&str>) -> Result<Answer, IpcError> {
+    Ok(Answer::ClipboardPushed {
+        sent_to: Vec::new(),
+        skipped_echo: false,
+        skipped: Some(ClipSkip::Sensitive),
+        consent: token.map(ConsentToken::new),
+    })
+}
+
+#[test]
+fn send_clipboard_asks_the_daemon_to_read_it_first() {
+    assert_eq!(
+        local_clip_request(&id(1), false, None),
+        Request::SendLocalClipboard {
+            peer: Some(id(1)),
+            allow_sensitive: false,
+            consent: None,
+        }
+    );
+}
+
+#[test]
+fn a_held_back_password_clip_asks_and_the_resend_carries_the_consent_and_token() {
+    let token = "ab".repeat(16);
+    assert_eq!(
+        local_clip_result("Phone", refused(Some(&token))),
+        LocalClip::NeedsConfirm(Some(ConsentToken::new(token.clone())))
+    );
+    // The question is the existing one, and it is dropped with the device.
+    let mut m = connected(vec![peer(1, "Phone", true)], vec![]);
+    m.set_confirm_sensitive(Some(&id(1)));
+    let row = &view(&m).devices[0];
+    assert_eq!(
+        row.confirm.as_deref(),
+        Some("This clip came from a password manager. Send it to Phone?")
+    );
+    // "Send" asks again with the consent and the token from the refusal.
+    assert_eq!(
+        local_clip_request(&id(1), true, Some(ConsentToken::new(token))),
+        Request::SendLocalClipboard {
+            peer: Some(id(1)),
+            allow_sensitive: true,
+            consent: Some(ConsentToken::new("ab".repeat(16))),
+        }
+    );
+    assert_eq!(
+        local_clip_result("Phone", pushed(vec![id(1)], None)),
+        LocalClip::Done("Clipboard sent to Phone.".into())
+    );
+}
+
+#[test]
+fn a_second_refusal_asks_again_with_the_new_token() {
+    // The clipboard changed between the question and the answer: not an error, not a send.
+    assert_eq!(
+        local_clip_result("Phone", refused(Some("cd".repeat(16).as_str()))),
+        LocalClip::NeedsConfirm(Some(ConsentToken::new("cd".repeat(16))))
+    );
+}
+
+#[test]
+fn a_refusal_without_a_token_still_asks_and_resends_without_one() {
+    assert_eq!(
+        local_clip_result("Phone", refused(None)),
+        LocalClip::NeedsConfirm(None)
+    );
+    assert_eq!(
+        local_clip_request(&id(1), true, None),
+        Request::SendLocalClipboard {
+            peer: Some(id(1)),
+            allow_sensitive: true,
+            consent: None,
+        }
+    );
+}
+
+#[test]
+fn other_skips_show_their_reason_sentence() {
+    assert_eq!(
+        local_clip_result("Phone", pushed(vec![], Some(ClipSkip::Empty))),
+        LocalClip::Done("Clipboard not sent: the clipboard is empty.".into())
+    );
+    assert_eq!(
+        local_clip_result("Phone", pushed(vec![], Some(ClipSkip::Unsupported))),
+        LocalClip::Done(
+            "Clipboard not sent: the connected devices cannot receive this kind of clip.".into()
+        )
+    );
+    assert_eq!(
+        local_clip_result("Phone", pushed(vec![], Some(ClipSkip::Echo))),
+        LocalClip::Done("Clipboard not sent: it matches the last clip sent or received.".into())
+    );
+}
+
+#[test]
+fn an_older_daemon_or_an_unreadable_clipboard_falls_back_to_reading_it_here() {
+    for code in [ErrorCode::BadRequest, ErrorCode::InvalidState] {
+        assert_eq!(
+            local_clip_result("Phone", Err(IpcError::new(code, "x"))),
+            LocalClip::Fallback
+        );
+    }
+    // Any other failure is the outcome, not a reason to read the clipboard again.
+    assert_eq!(
+        local_clip_result("Phone", Err(IpcError::new(ErrorCode::Internal, "boom"))),
+        LocalClip::Done("Clipboard not sent: boom".into())
+    );
+}
+
+fn named(tid: &str, names: &[&str], file_count: usize) -> TransferSnapshot {
+    let mut s = snapshot(tid, 1, TransferDirection::Send, TransferStatus::Active);
+    s.names = names.iter().map(|n| (*n).to_owned()).collect();
+    s.names_more = false;
+    s.file_count = file_count;
+    s
+}
+
+#[test]
+fn transfer_rows_show_the_names_the_daemon_lists() {
+    let m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &["notes.txt"], 1)],
+    );
+    assert_eq!(view(&m).transfers[0].title, "notes.txt to Phone");
+    let m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &["Photos"], 50)],
+    );
+    assert_eq!(view(&m).transfers[0].title, "Photos (50 files) to Phone");
+    let m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &["a.pdf", "Photos"], 9)],
+    );
+    assert_eq!(
+        view(&m).transfers[0].title,
+        "a.pdf and Photos (9 files) to Phone"
+    );
+    // Exactly the files named: no count.
+    let m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &["a.pdf", "b.pdf", "c.pdf"], 3)],
+    );
+    assert_eq!(
+        view(&m).transfers[0].title,
+        "a.pdf, b.pdf and c.pdf to Phone"
+    );
+    // Names left out: say so.
+    let mut s = named("t1", &["a.pdf", "b.pdf", "c.pdf"], 10);
+    s.names_more = true;
+    let m = connected(vec![peer(1, "Phone", true)], vec![s]);
+    assert_eq!(
+        view(&m).transfers[0].title,
+        "a.pdf, b.pdf, c.pdf and more (10 files) to Phone"
+    );
+    let m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &["a.pdf", "Photos"], 5001)],
+    );
+    assert_eq!(
+        view(&m).transfers[0].title,
+        "a.pdf and Photos (5,001 files) to Phone"
+    );
+}
+
+#[test]
+fn long_and_odd_names_stay_on_one_short_line() {
+    let long = "x".repeat(200);
+    let m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &[&long, "line\nbreak\u{202e}.txt", &long], 3)],
+    );
+    let title = view(&m).transfers[0].title.clone();
+    assert!(title.ends_with(" to Phone"), "{title}");
+    assert!(!title.chars().any(char::is_control), "{title:?}");
+    assert!(
+        title.chars().count() <= WHAT_SHOWN + " to Phone".len(),
+        "{title}"
+    );
+    assert!(title.contains("..."), "{title}");
+    assert_eq!(elide("abcdef", 6), "abcdef");
+    assert_eq!(elide("abcdefg", 6), "abc...");
+    assert_eq!(elide("a\tb", 6), "a b");
+    // Characters, not bytes: no cut inside a multi-byte letter.
+    assert_eq!(elide("ééééééé", 6), "ééé...");
+}
+
+#[test]
+fn rows_without_names_keep_the_count_wording() {
+    let m = connected(vec![peer(1, "Phone", true)], vec![named("t1", &[], 3)]);
+    assert_eq!(view(&m).transfers[0].title, "3 files to Phone");
+}
+
+#[test]
+fn names_survive_a_refresh_that_lacks_them_and_an_offer_names_its_top_level() {
+    let mut m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &["Photos"], 50)],
+    );
+    m.apply(Input::Transfers(vec![named("t1", &[], 50)]), NOW);
+    assert_eq!(view(&m).transfers[0].title, "Photos (50 files) to Phone");
+    let file = |p: &str| OfferedFile {
+        path: p.to_owned(),
+        size: 1,
+    };
+    m.apply(
+        host(HostEvent::TransferOffer {
+            id: "r1".into(),
+            peer: id(1),
+            short_id: "S1".into(),
+            files: vec![file("Trip/a.jpg"), file("Trip/b.jpg"), file("todo.txt")],
+            file_count: 3,
+            total_bytes: 3,
+            note: None,
+        }),
+        NOW,
+    );
+    let row = view(&m)
+        .transfers
+        .into_iter()
+        .find(|t| t.id == "r1")
+        .expect("offer row");
+    assert_eq!(row.title, "Trip and todo.txt (3 files) from Phone");
+}
+
+#[test]
+fn a_single_file_in_a_folder_keeps_its_own_name_across_a_refresh() {
+    let mut m = connected(vec![peer(1, "Phone", true)], vec![]);
+    m.note_sent("t1", &[PathBuf::from("/home/me/Photos/a.jpg")]);
+    let mut s = named("t1", &["Photos"], 1);
+    s.names = vec!["Photos".into()];
+    m.apply(Input::Transfers(vec![s.clone()]), NOW);
+    assert_eq!(view(&m).transfers[0].title, "a.jpg to Phone");
+    m.apply(Input::Transfers(vec![s]), NOW);
+    assert_eq!(view(&m).transfers[0].title, "a.jpg to Phone");
+}
+
+#[test]
+fn battery_from_a_new_daemon_is_authoritative_and_from_an_old_one_is_not() {
+    assert!(!answer_has_battery("0.8.0"));
+    assert!(answer_has_battery("0.9.0"));
+    assert!(answer_has_battery("0.10.0"));
+    assert!(answer_has_battery("1.0.0"));
+    assert!(!answer_has_battery("garbage"));
+    assert!(!answer_has_battery(""));
+    for (version, want) in [("0.9.0", "Online"), ("0.8.0", "Online, battery 55%")] {
+        let mut st = status(&[]);
+        st.daemon_version = version.into();
+        let mut m = Model::new();
+        m.apply(
+            Input::Connected {
+                status: st,
+                peers: vec![peer(1, "Phone", true)],
+                transfers: vec![],
+            },
+            NOW,
+        );
+        m.apply(
+            host(HostEvent::Battery {
+                peer: id(1),
+                level: 55,
+                charging: false,
+                low: false,
+            }),
+            NOW,
+        );
+        // A refresh without a report (missed offline and online events).
+        m.apply(Input::Peers(vec![peer(1, "Phone", true)]), NOW);
+        assert_eq!(view(&m).devices[0].detail, want);
+    }
+}
+
+#[test]
+fn invisible_and_bidi_characters_are_dropped_before_measuring() {
+    assert_eq!(elide("a\u{200B}b\u{202E}c\u{FEFF}d\u{2066}e", 5), "abcde");
+    // They do not use up the budget.
+    assert_eq!(elide("\u{200B}\u{200B}abcdef", 6), "abcdef");
+}
+
+#[test]
+fn the_count_is_never_cut_off_by_long_names() {
+    let a = "a".repeat(40);
+    let b = "b".repeat(40);
+    let m = connected(
+        vec![peer(1, "Phone", true)],
+        vec![named("t1", &[&a, &b], 5001)],
+    );
+    let title = view(&m).transfers[0].title.clone();
+    assert!(title.ends_with(" (5,001 files) to Phone"), "{title}");
+    assert!(title.contains("..."), "{title}");
+    assert!(
+        title.chars().count() <= WHAT_SHOWN + " to Phone".len(),
+        "{title}"
+    );
+}
+
+#[test]
+fn more_invisible_characters_go_and_line_separators_become_spaces() {
+    assert_eq!(
+        elide("a\u{AD}b\u{34F}c\u{61C}d\u{180E}e\u{2060}f\u{2064}g", 20),
+        "abcdefg"
+    );
+    assert_eq!(elide("a\u{2028}b\u{2029}c", 20), "a b c");
 }

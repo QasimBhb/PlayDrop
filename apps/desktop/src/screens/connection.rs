@@ -9,6 +9,10 @@ use super::{with, Controller};
 use crate::ipc::ConnectFailure;
 use crate::{daemon, App, ConnPhase, ConnState};
 
+/// How long a daemon that announced its shutdown may take before the window stops waiting
+/// for its connection to close and checks the bus itself.
+const STOPPING_PATIENCE: Duration = Duration::from_secs(15);
+
 /// After "Start", how often to try connecting.
 const START_RETRY_EVERY: Duration = Duration::from_secs(1);
 /// After "Start", how many tries before giving up (10 s).
@@ -90,6 +94,31 @@ pub(super) fn on_disconnected(c: &Controller) {
         ConnPhase::Connecting,
         "The connection to the daemon was lost. Reconnecting...",
     );
+    forget_daemon_state(c);
+    // Never `connect` here: on Linux that asks the bus to start the daemon, which would undo
+    // a crash report at best and the user's "Quit" at worst.
+    c.ipc.follow();
+}
+
+/// The daemon said it is shutting down (the user chose Quit, or the session is ending). It
+/// still owns its name for a moment, so "Start" is not offered yet: a start now would find
+/// the old daemon, exit, and leave the user to click again. Once this daemon is really gone
+/// the connection bridge reports "not running", which shows the button, and it picks up the
+/// next daemon by itself.
+pub(super) fn on_shutting_down(c: &Controller) {
+    c.ipc.disconnect();
+    set_phase(c, ConnPhase::Connecting, "PlayDrop is stopping...");
+    forget_daemon_state(c);
+    // A daemon that hangs while stopping never ends its event stream, and this screen has no
+    // button. After a while look for ourselves: that either finds the daemon still there or
+    // ends in "not running" or an error, each of which has a way on.
+    c.stopping_timer
+        .start(TimerMode::SingleShot, STOPPING_PATIENCE, || {
+            with(|c| c.ipc.follow());
+        });
+}
+
+fn forget_daemon_state(c: &Controller) {
     if let Some(app) = c.app() {
         let p = app.global::<crate::PairingState>();
         p.set_prompt_visible(false);
@@ -97,5 +126,4 @@ pub(super) fn on_disconnected(c: &Controller) {
     // The daemon is gone; whatever sessions it had are no longer ours to show.
     c.store.borrow_mut().clear_input_sessions();
     super::refresh_input_banner(c);
-    c.ipc.connect();
 }

@@ -23,8 +23,8 @@ use std::io::Write as _;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use playdrop_core::host::{HostEvent, TransferDirection};
 use playdrop_ipc::client::Client;
+use playdrop_ipc::types::{HostEvent, TransferDirection};
 use playdrop_ipc::{Event, Ok};
 
 /// Size of the file sent: big enough to take more than one chunk.

@@ -826,15 +826,18 @@ fn begin(
         {
             let mut book = lock(&job.inner.transfers);
             book.forget_finished(&job.id, TransferDirection::Send);
-            book.begin(TransferSnapshot::new(
-                &job.id,
-                &job.peer,
-                TransferDirection::Send,
-                TransferStatus::Offered,
-                job.manifest.total_bytes,
-                job.manifest.files.len(),
-                job.manifest.note.clone(),
-            ));
+            book.begin(
+                TransferSnapshot::new(
+                    &job.id,
+                    &job.peer,
+                    TransferDirection::Send,
+                    TransferStatus::Offered,
+                    job.manifest.total_bytes,
+                    job.manifest.files.len(),
+                    job.manifest.note.clone(),
+                )
+                .with_names(&job.manifest),
+            );
         }
         job.persist().await;
         let inner = Arc::clone(&job.inner);

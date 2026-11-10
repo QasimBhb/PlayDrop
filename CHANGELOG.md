@@ -8,6 +8,59 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.9.0] - 2026-11-10
+
+### Fixed
+
+- Quit now stays quit on Linux. With the PlayDrop window open, choosing Quit in the tray stopped
+  the background service and the window started it again within a moment. The window now waits
+  for the service and offers Start; it reconnects by itself when the service is started again
+  from the panel applet, the command line or the window.
+- The Flatpak on COSMIC now says why the clipboard does not sync by itself. COSMIC keeps the
+  clipboard away from sandboxed apps, so the Flatpak can neither watch it nor put a clip from
+  your phone on it. Install the `.deb` on COSMIC for automatic sync; in the Flatpak the Send
+  clipboard button still works.
+- Windows: the Start Menu shortcut now carries the app's ID. Without it Windows may have dropped
+  every PlayDrop notification. Not yet confirmed on a real PC.
+
+### Added
+
+- A device's battery shows as soon as the window, the panel applet or `playdrop peers` opens,
+  instead of up to a minute later.
+- Send clipboard from the panel applet now sends images as well as text. The service reads the
+  clipboard itself, and `playdrop clip` with no text sends what is on the clipboard.
+- Transfers show what is being sent ("Photos", "notes.txt and more") in the window, the applet
+  and `playdrop transfers`, also when you open them in the middle of a transfer.
+- Windows: the tray menu lists your devices with their state and battery, and "Stop remote
+  input" appears while a phone controls the computer, as on Linux.
+
+### Changed
+
+- A clip that a password manager marked as secret is still held back until you agree. Your
+  agreement now covers only that clip: if the clipboard changed in between, PlayDrop asks again.
+  A clip you agree to send always arrives marked as secret, so the other device keeps it out of
+  its clipboard history.
+
+### Added, off unless you turn it on
+
+- Windows: "Open" and "Show in folder" buttons on the "file received" notification. Nobody has
+  clicked one on a real PC yet, so they are off. Start the service with
+  `PLAYDROP_TOAST_BUTTONS=1` to try them.
+
+### Tested
+
+- The panel applet was looked at and clicked through by a person on COSMIC 1.9: the icon with
+  the service stopped and running, Start, pairing a phone, sending the clipboard, a file and a
+  folder, the battery, and Quit followed by Start.
+
+### Known limits
+
+- The Windows tray lines, notifications and their buttons are built and tested by GitHub's
+  Windows machine but have not been used by a person on a real Windows PC.
+- The applet's question before sending a password-manager clip was not tried by a person.
+- When the computer drops off the network without saying goodbye, a phone can keep showing it
+  as online for up to 12 minutes.
+
 ## [0.8.0] - 2026-11-09
 
 ### Added

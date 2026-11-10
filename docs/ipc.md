@@ -141,6 +141,68 @@ rebuilds its view from `Status`, `Peers` and `Transfers` and then applies events
 These two are in every build, because `playdrop-ipc` has no `iroh` feature of its own. Nothing calls
 them unless the client was built with the feature. `Diagnose` adds the same lines to its summary.
 
+### 1.7 Battery, the local clipboard and transfer names, added in 0.9.0
+
+`IPC_VERSION` stays 1 (additions only). Each new field has a serde default both ways: a new
+client reads an older daemon's answer, and an older client ignores the new fields.
+
+| Request, field or value | Meaning |
+|---|---|
+| `battery` on a `PeerSummary` (`peers` answer) | `{"level": 0-100, "charging": bool, "low": bool}`, the peer's last `battery` frame (protocol.md 5.8). Present only while the peer is online and after it sent one this session; it clears when the peer goes offline or is unpaired. Absent from an older daemon: wait for the `battery` host event as before |
+| `names` on a transfer snapshot (`transfers` answer) | What is being sent, for display: the top-level names in manifest order (a file sent alone, or the folder a file sits in), each once, at most 3 (`TRANSFER_NAMES_MAX`); `file_count` is still the full count. A folder of 5,000 files is one name. On the receive side the names come from the peer's manifest after the SR-17 path check the offer prompt's names pass: untrusted text to show, never a path. Absent (empty) from an older daemon |
+| `names_more` on a transfer snapshot | `true` only when the transfer has more top-level names than `names` lists (exactly 3 names reads `false`). Absent means `false`, also from an older daemon |
+| `send_local_clipboard` `{peer?, allow_sensitive, consent?}` | The daemon reads this computer's clipboard through its own backend (text, or a PNG image while `clipboard_images` is on) and sends it to `peer`, or with no `peer` to every online device with `clipboardOut` (like `push_clipboard`). `allow_sensitive` defaults to false, `consent` to none. Answers `clipboard_pushed`. For a `peer`, an unknown or offline device is `not_found`, `ambiguous` or `offline`, and a device whose `clipboardOut` grant is off is `forbidden`, all before the clipboard is read |
+| `clipboard_pushed.skipped: "sensitive"` with `consent` | `send_local_clipboard` only: a password manager marked the clip and the request did not carry a consent the daemon accepts (SR-24). Nothing was sent. `consent` is a one-use token (32 hex characters, 128 random bits, not derived from the clip). Ask the user, then send again with `allow_sensitive: true` and that `consent`. Rules below |
+| `clipboard_pushed.consent` | Present only with `skipped: "sensitive"`. Absent from an older daemon and on every other answer. Never log it |
+| `clipboard_pushed.skipped: "empty"` | `send_local_clipboard` only: the clipboard holds nothing the daemon sends (no text, and no image or images are off) |
+| `invalid_state` answer to `send_local_clipboard` | This session cannot read the clipboard from the background (GNOME, the Flatpak on COSMIC); `message` is the same sentence `Settings` gives for clipboard watching. A client that can read the clipboard itself then sends the text with `send_clipboard` or `push_clipboard` |
+| `internal` answer to `send_local_clipboard` | Reading failed, or the clip is over its cap (text 1 MiB, images 16 MiB); `message` names the cause, never the content |
+
+SR-24 rules for `send_local_clipboard`, in order:
+
+1. A send with `allow_sensitive: true` always goes marked sensitive, whether or not the clip
+   carried a password manager's mark (a manager that sets no mark is a known residual). So
+   `playdrop clip --sensitive` with no text marks the clip just as it does with text.
+2. A clip without the mark and `allow_sensitive: false` goes unmarked, as before.
+3. A marked clip with `allow_sensitive: false` is refused with `skipped: "sensitive"` and a
+   new `consent` token.
+4. A marked clip with `allow_sensitive: true` and no `consent` goes, marked. That is the CLI,
+   where typing `--sensitive` is the consent.
+5. A marked clip with `allow_sensitive: true` and a `consent` goes, marked, only if the token
+   is the one the daemon remembers, has not been used, is younger than 60 s, and the clip read
+   now has the same digest as the one refused. Otherwise the answer is `skipped: "sensitive"`
+   again, with a new token for the clip the clipboard holds now (it changed, or the token is
+   stale): ask again.
+6. A `consent` sent with `allow_sensitive: true` is used up by that request whatever happens,
+   also when the clipboard now holds an unmarked clip (which then goes, marked, by rule 1).
+   With `allow_sensitive: false` a `consent` is ignored.
+
+The daemon keeps one remembered refusal, in memory only: one clipboard means only the latest
+refusal can match it, so a newer refusal replaces the older one and a client holding the older
+token is asked again. The digest is BLAKE3 over the clip's kind (text, or image plus its MIME
+type) and then its content, so a text and an image never share one; it never leaves the daemon
+and is never logged. In Rust the token is `playdrop_ipc::ConsentToken`, a plain JSON string on
+the wire whose `Debug` prints `ConsentToken(..)`, so a logged request or answer never shows it.
+
+A client that sent a `consent` (the user agreed to a marked clip) must not fall back to sending
+text it read itself when the answer is `bad_request` or `invalid_state`: that text would go
+unmarked. It says the clip was not sent and lets the user try again.
+
+An older daemon cannot decode `send_local_clipboard` and answers `bad_request`. A client that
+uses the request treats `bad_request` like `invalid_state`: it falls back to reading the
+clipboard itself. An older client that receives `sensitive` or `empty` decodes it as `other`
+(section 1.4); it never does in practice, since only the new request produces them. The
+daemon logs no clip content for this request (SR-32): the clipboard module logs kind, length
+and a short hash at debug, as for every read.
+
+`playdrop-ipc` re-exports every `playdrop-core` type the contract carries in
+`playdrop_ipc::types` (`PeerSummary`, `PeerBattery`, `TransferSnapshot`, `TransferStatus`,
+`TransferDirection`, `HostEvent` and what its variants carry, `Grants`, `MediaAction`, the
+`Input` frame types, the diagnostics types, `OfferedFile`, `FileRoot`, `DeliveredFile`,
+`Secret`, `Base64Bytes`, `OFFER_FILES_MAX`, `TRANSFER_NAMES_MAX`), so a client needs no
+`playdrop-core` import for the shapes. They are the core's own types: no conversion, no wire
+change.
+
 ## 2. Linux: D-Bus on the session bus (SR-26)
 
 - Well-known name `org.playdrop.PlayDrop.Daemon1`, object `/org/playdrop/PlayDrop/Daemon1`, interface
@@ -227,7 +289,9 @@ Transports log request `op` names and error codes only. They never log request b
 - Presence and battery: the daemon sets `locked` or `active` presence from the lock watcher
   and reads this computer's battery every 10 s (pushing on change or every 60 s; a desktop
   without a battery sends nothing). Peers' `presence` and `battery` arrive as host events;
-  the window keeps a peer that sent `asleep` shown as "Asleep" after it drops.
+  the window keeps a peer that sent `asleep` shown as "Asleep" after it drops. After 0.8.0
+  the `peers` answer also carries each online peer's last battery (section 1.7), so a UI
+  that starts late shows it at once.
 - `find` from a peer rings: a critical, resident notification with the `phone-incoming-call`
   sound, shown again every 3 s until the peer stops, the user dismisses it, or 60 s pass
   (one reminder toast on Windows).

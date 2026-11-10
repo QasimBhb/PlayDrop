@@ -2,8 +2,9 @@
 
 use std::io::Read as _;
 
-use playdrop_core::host::{TransferSnapshot, TransferStatus};
-use playdrop_ipc::{ClipSkip, Ok as Answer, Request};
+use playdrop_ipc::client::Client;
+use playdrop_ipc::types::{PeerSummary, TransferSnapshot, TransferStatus};
+use playdrop_ipc::{ClipSkip, ErrorCode, IpcError, Ok as Answer, Request};
 
 use super::{
     absolute_paths, ask, connect, output, peers as list_peers, pick_peer, unexpected, CancelArgs,
@@ -178,14 +179,19 @@ pub async fn diagnose(args: JsonArgs) -> Result<(), Failure> {
 /// `playdrop clip`.
 pub async fn clip(args: ClipArgs) -> Result<(), Failure> {
     let text = if args.stdin {
-        read_clip(std::io::stdin().lock())?
+        Some(read_clip(std::io::stdin().lock())?)
     } else {
-        args.text.unwrap_or_default()
+        args.text
     };
-    check_clip(&text)?;
+    if let Some(text) = &text {
+        check_clip(text)?;
+    }
     let client = connect().await?;
     let peers = list_peers(&client).await?;
     let peer = pick_peer(&peers, args.to.as_deref())?;
+    let Some(text) = text else {
+        return clip_local(&client, peer, args.sensitive).await;
+    };
     let answer = ask(
         &client,
         Request::SendClipboard {
@@ -211,6 +217,66 @@ pub async fn clip(args: ClipArgs) -> Result<(), Failure> {
         other => return Err(unexpected("send_clipboard", &other)),
     }
     Ok(())
+}
+
+/// `playdrop clip` with no text: the daemon reads its own clipboard and sends it
+/// (`send_local_clipboard`). `allow_sensitive` is `--sensitive`: without it a clip a password
+/// manager marked is refused and the message says how to send it anyway (SR-24).
+async fn clip_local(
+    client: &Client,
+    peer: &PeerSummary,
+    allow_sensitive: bool,
+) -> Result<(), Failure> {
+    // Typing `--sensitive` is the consent, so no token is needed (`docs/ipc.md` 1.7).
+    let request = Request::SendLocalClipboard {
+        peer: Some(peer.device_id.clone()),
+        allow_sensitive,
+        consent: None,
+    };
+    match client.request(request).await {
+        Ok(Answer::ClipboardPushed { sent_to, .. }) if !sent_to.is_empty() => {
+            println!("clipboard sent to {}", peer.label);
+            Ok(())
+        }
+        Ok(Answer::ClipboardPushed { skipped, .. }) => {
+            // This request is new, so its daemon always gives a reason.
+            match skipped.unwrap_or(ClipSkip::Other) {
+                ClipSkip::Echo => {
+                    println!(
+                        "{}",
+                        output::local_clip_not_sent(&peer.label, ClipSkip::Echo)
+                    );
+                    Ok(())
+                }
+                other => Err(Failure::new(
+                    Exit::Failed,
+                    output::local_clip_not_sent(&peer.label, other),
+                )),
+            }
+        }
+        Ok(other) => Err(unexpected("send_local_clipboard", &other)),
+        Err(e) => Err(local_clip_refused(e)),
+    }
+}
+
+/// What `playdrop clip` with no text says when the daemon refused. An older daemon does not
+/// know the request (`bad_request`), and a session where it cannot read the clipboard answers
+/// `invalid_state` with the reason; this command cannot read the clipboard itself, so both
+/// point at the text forms instead.
+fn local_clip_refused(e: IpcError) -> Failure {
+    const HINT: &str = "give the text, or pipe it in with --stdin";
+    match e.code {
+        ErrorCode::BadRequest => Failure::new(
+            Exit::Failed,
+            format!(
+                "this daemon cannot send its own clipboard (it is older than this command); {HINT}"
+            ),
+        ),
+        ErrorCode::InvalidState => {
+            Failure::new(Exit::Failed, format!("not sent: {}; {HINT}", e.message))
+        }
+        _ => Failure::from(e),
+    }
 }
 
 /// Why a clip was not sent, from the daemon's answer. An older daemon sends only
@@ -371,6 +437,24 @@ mod tests {
     #[test]
     fn a_missing_reason_from_an_older_daemon_reads_as_echo() {
         assert_eq!(clip_reason(None), ClipSkip::Echo);
+        // `clip` with no text: an older daemon and an unreadable clipboard both point at
+        // the text forms; anything else keeps its usual exit code.
+        let old = local_clip_refused(IpcError::new(ErrorCode::BadRequest, "unknown op"));
+        assert_eq!(old.exit, Exit::Failed);
+        assert!(old.message.contains("--stdin"), "{}", old.message);
+        let gnome = local_clip_refused(IpcError::new(
+            ErrorCode::InvalidState,
+            "this desktop does not expose clipboard changes to background apps",
+        ));
+        assert!(
+            gnome.message.starts_with("not sent: this desktop"),
+            "{}",
+            gnome.message
+        );
+        assert_eq!(
+            local_clip_refused(IpcError::new(ErrorCode::NotFound, "no such device")).exit,
+            Exit::Usage
+        );
         assert_eq!(clip_reason(Some(ClipSkip::NoPeers)), ClipSkip::NoPeers);
         assert_eq!(
             clip_reason(Some(ClipSkip::Unsupported)),

@@ -10,8 +10,9 @@
 # where PlayDrop is installed and in use: the last step uninstalls it.
 #
 # What it proves: the three programs land where the guides say, `playdrop` is on the system
-# PATH and runs, the firewall rules are scoped to playdropd.exe (SR-31), and uninstall
-# removes the files, the PATH entry, the rules and the sign-in entry. What it cannot prove:
+# PATH and runs, the firewall rules are scoped to playdropd.exe (SR-31), the Start Menu
+# shortcut carries the AppUserModelID the daemon's toasts use, and uninstall removes the
+# files, the PATH entry, the rules, the shortcut and the sign-in entry. What it cannot prove:
 # anything that needs a person at the screen (the wizard pages, SmartScreen, the tray).
 
 [CmdletBinding()]
@@ -40,6 +41,9 @@ $Bin = Join-Path $App 'bin'
 $Cli = Join-Path $Bin 'playdrop.exe'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $Log = Join-Path ([System.IO.Path]::GetTempPath()) 'playdrop-install.log'
+# The all-users Start Menu (an admin install), and the toast ID from crates/playdropd/src/notify.rs.
+$Shortcut = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'PlayDrop\PlayDrop.lnk'
+$Aumid = 'org.playdrop.PlayDrop'
 
 $script:Failures = @()
 function Check([string]$What, [bool]$Ok) {
@@ -71,6 +75,18 @@ function Get-CliExit([string[]]$Arguments) {
     $ErrorActionPreference = 'Continue'
     & $Cli @Arguments 2>&1 | Out-Null
     return $LASTEXITCODE
+}
+
+# The System.AppUserModel.ID property of a shortcut, read through the Shell, or '' when the
+# shortcut or the property is missing.
+function Get-ShortcutAumid([string]$Path) {
+    if (-not (Test-Path $Path)) { return '' }
+    $shell = New-Object -ComObject Shell.Application
+    $item = $shell.NameSpace((Split-Path $Path)).ParseName((Split-Path $Path -Leaf))
+    if (-not $item) { return '' }
+    $id = $item.ExtendedProperty('System.AppUserModel.ID')
+    if ($null -eq $id) { return '' }
+    return [string]$id
 }
 
 function Test-RunValue {
@@ -110,6 +126,9 @@ $daemonPath = [regex]::Escape((Join-Path $App 'playdropd.exe'))
 Check 'two firewall rules are scoped to playdropd.exe' `
     ([regex]::Matches($rules, $daemonPath, 'IgnoreCase').Count -eq 2)
 Check 'the sign-in entry is set' (Test-RunValue)
+Check 'the Start Menu shortcut exists' (Test-Path $Shortcut)
+$shownAumid = Get-ShortcutAumid $Shortcut
+Check "the Start Menu shortcut carries AppUserModelID $Aumid (got '$shownAumid')" ($shownAumid -eq $Aumid)
 
 # A second install over the first must not add the PATH entry twice.
 $again = Start-Process -FilePath $Installer -Wait -PassThru `
@@ -134,6 +153,7 @@ Check 'the program folder is gone' (-not (Test-Path $App))
 Check 'bin is off the system PATH' (-not (Test-OnSystemPath $Bin))
 Check 'the firewall rules are gone' ((Get-FirewallRules) -eq '')
 Check 'the sign-in entry is gone' (-not (Test-RunValue))
+Check 'the Start Menu shortcut is gone' (-not (Test-Path $Shortcut))
 
 if ($script:Failures.Count -gt 0) {
     if (Test-Path $Log) { Get-Content $Log -Tail 60 }

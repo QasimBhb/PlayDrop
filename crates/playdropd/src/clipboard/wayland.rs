@@ -34,7 +34,7 @@ use wl_clipboard_rs::utils::{
 };
 use wl_clipboard_rs::{copy, watch};
 
-use super::unsupported::{unsupported, NO_DATA_CONTROL, X11};
+use super::unsupported::{unsupported, NO_DATA_CONTROL, SANDBOXED_ON_COSMIC, X11};
 use super::{short_hash, ClipContent, ClipboardSupport, LocalClip};
 use super::{IMAGE_MIME, MAX_IMAGE_BYTES, MAX_SYNC_BYTES};
 
@@ -72,6 +72,20 @@ fn session_kind(
     }
 }
 
+/// Why no data-control manager was offered. A sandboxed client on COSMIC is refused by the
+/// compositor's policy, which a different package fixes; everywhere else the desktop has no
+/// such protocol at all. `current_desktop` is `XDG_CURRENT_DESKTOP`, a colon-separated list.
+fn missing_protocol_reason(sandboxed: bool, current_desktop: Option<&OsStr>) -> &'static str {
+    let cosmic = current_desktop
+        .and_then(OsStr::to_str)
+        .is_some_and(|d| d.split(':').any(|part| part.eq_ignore_ascii_case("COSMIC")));
+    if sandboxed && cosmic {
+        SANDBOXED_ON_COSMIC
+    } else {
+        NO_DATA_CONTROL
+    }
+}
+
 pub(super) fn probe() -> ClipboardSupport {
     let session = session_kind(
         std::env::var_os("WAYLAND_DISPLAY").as_deref(),
@@ -94,7 +108,10 @@ pub(super) fn probe() -> ClipboardSupport {
             backend: BACKEND,
             reason: None,
         },
-        Err(PrimarySelectionCheckError::MissingProtocol) => unsupported(NO_DATA_CONTROL),
+        Err(PrimarySelectionCheckError::MissingProtocol) => unsupported(missing_protocol_reason(
+            std::path::Path::new("/.flatpak-info").exists(),
+            std::env::var_os("XDG_CURRENT_DESKTOP").as_deref(),
+        )),
         Err(PrimarySelectionCheckError::NoSeats) => {
             unsupported("the compositor reports no input seat, so there is no clipboard to watch")
         }
@@ -470,6 +487,24 @@ mod tests {
 
     fn types(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_sandboxed_daemon_on_cosmic_is_told_which_package_syncs() {
+        let cosmic = Some(OsStr::new("COSMIC"));
+        assert_eq!(missing_protocol_reason(true, cosmic), SANDBOXED_ON_COSMIC);
+        assert_eq!(
+            missing_protocol_reason(true, Some(OsStr::new("pop:cosmic"))),
+            SANDBOXED_ON_COSMIC
+        );
+        // Outside a sandbox COSMIC offers the protocol, so a miss there is the generic case.
+        assert_eq!(missing_protocol_reason(false, cosmic), NO_DATA_CONTROL);
+        // GNOME has no data-control for anyone: the package does not matter.
+        assert_eq!(
+            missing_protocol_reason(true, Some(OsStr::new("ubuntu:GNOME"))),
+            NO_DATA_CONTROL
+        );
+        assert_eq!(missing_protocol_reason(true, None), NO_DATA_CONTROL);
     }
 
     #[test]

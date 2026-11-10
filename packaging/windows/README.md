@@ -14,9 +14,10 @@ lists what to confirm on the first real run.
 `test-installer.ps1` (elevated PowerShell, on a machine without PlayDrop: its last step
 uninstalls) installs silently and checks that the three programs are in place, `bin` is on the
 system `PATH` once, `playdrop --version` prints the release version, `playdrop status` exits 3
-with no daemon, both firewall rules name `playdropd.exe`, and the sign-in entry exists. It
-installs a second time to prove `PATH` does not grow, then uninstalls and checks that the
-folder, the `PATH` entry, the rules and the sign-in entry are gone. CI runs it on every
+with no daemon, both firewall rules name `playdropd.exe`, the sign-in entry exists, and the
+Start Menu shortcut carries the AppUserModelID `org.playdrop.PlayDrop`. It installs a second
+time to prove `PATH` does not grow, then uninstalls and checks that the folder, the `PATH`
+entry, the rules, the sign-in entry and the shortcut are gone. CI runs it on every
 installer build, so the items it covers are no longer in the checklist below as unknowns,
 only as things to see once with a person at the screen.
 
@@ -43,7 +44,11 @@ Output: `packaging\windows\dist\PlayDrop-<version>-x64-setup.exe`. The version c
 - Adds `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\PlayDrop` so the daemon starts at
   sign-in (a checked task; the value is removed on uninstall). The daemon uses the same
   value name when the user changes autostart in settings.
-- Start Menu shortcut for the window, optional desktop shortcut.
+- Start Menu shortcut for the window, optional desktop shortcut. The Start Menu shortcut
+  carries the AppUserModelID `org.playdrop.PlayDrop`, the ID the daemon shows its toasts
+  under: Windows finds a classic app's toast identity through such a shortcut. Nothing else
+  is registered for toasts (no COM activator, no CLSID): the experimental toast buttons
+  (`PLAYDROP_TOAST_BUTTONS=1`) reach the running daemon in-process.
 - Adds two inbound firewall rules named `PlayDrop`, both limited to `playdropd.exe`: TCP
   42187 for transfers and UDP 42187 for discovery. They are program-scoped, never a bare
   port rule (SR-31), so another program cannot use the opening.

@@ -32,6 +32,7 @@ mod autostart;
 mod battery;
 mod cli;
 mod clipboard;
+mod consent;
 mod control;
 mod daemon;
 mod input;

@@ -17,7 +17,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use playdrop_ipc::{IpcError, Ok, Request};
+use playdrop_ipc::{ConsentToken, IpcError, Ok, Request};
 use slint::{ComponentHandle, Timer, TimerMode, VecModel};
 
 use crate::ipc::{Ipc, IpcMsg};
@@ -31,6 +31,9 @@ const DIAGNOSTICS_PAGE: i32 = 4;
 
 /// How long a notice stays before it clears itself.
 const NOTICE_FOR: Duration = Duration::from_secs(6);
+/// How long the notice that asks to send a marked clip stays: time to read it and press
+/// again, well inside the daemon's 60 s token lifetime (SR-24).
+const CONSENT_NOTICE_FOR: Duration = Duration::from_secs(30);
 /// How often relative times ("5 min ago") are refreshed.
 const CLOCK_TICK: Duration = Duration::from_secs(30);
 
@@ -50,6 +53,13 @@ pub struct Controller {
     /// "Start" retries.
     start_timer: Timer,
     start_attempts: Cell<u32>,
+    /// Bounds the wait for a daemon that said it is shutting down to really go.
+    stopping_timer: Timer,
+    /// The device and consent token behind the notice that asks to send a marked clip
+    /// (SR-24). Set only by [`Controller::ask_consent`] and cleared whenever that notice is
+    /// replaced, times out or is dismissed, so a press counts as consent only while the
+    /// question is on screen.
+    consent: RefCell<Option<(String, ConsentToken)>>,
 }
 
 thread_local! {
@@ -78,6 +88,8 @@ pub fn install(app: &App, ipc: Arc<Ipc>) {
         add_deadline: Cell::new(None),
         start_timer: Timer::default(),
         start_attempts: Cell::new(0),
+        stopping_timer: Timer::default(),
+        consent: RefCell::new(None),
     });
     CONTROLLER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&c)));
 
@@ -212,27 +224,47 @@ impl Controller {
                 Change::Lock => pairing::refresh_lock(self),
                 Change::InputSessions => refresh_input_banner(self),
                 Change::Refetch(what) => self.load(what),
-                Change::ShuttingDown => {
-                    self.ipc.disconnect();
-                    connection::on_disconnected(self);
-                }
+                Change::ShuttingDown => connection::on_shutting_down(self),
             }
         }
     }
 
     /// Shows a one-line notice that clears itself.
     pub fn notice(&self, text: &str, error: bool) {
+        self.show_notice(text, error, NOTICE_FOR);
+    }
+
+    /// Shows a notice for `for_`. Any notice replaces the consent question, so the token
+    /// behind that question goes with it.
+    fn show_notice(&self, text: &str, error: bool, for_: Duration) {
+        self.consent.borrow_mut().take();
         let Some(app) = self.app() else { return };
         let n = app.global::<NoticeState>();
         n.set_text(text.into());
         n.set_error(error);
-        self.notice_timer
-            .start(TimerMode::SingleShot, NOTICE_FOR, || {
-                with(Controller::clear_notice);
-            });
+        self.notice_timer.start(TimerMode::SingleShot, for_, || {
+            with(Controller::clear_notice);
+        });
+    }
+
+    /// Asks whether to send a marked clip to `peer` (SR-24) and holds `token` for exactly as
+    /// long as the question is shown.
+    pub fn ask_consent(&self, peer: String, token: ConsentToken) {
+        self.show_notice(model::SENSITIVE_CLIP_NOTICE, true, CONSENT_NOTICE_FOR);
+        *self.consent.borrow_mut() = Some((peer, token));
+    }
+
+    /// The consent token, once, if the question for `peer` is on screen: this press is the
+    /// user's yes. Any other press drops it.
+    pub fn take_consent(&self, peer: &str) -> Option<ConsentToken> {
+        self.consent
+            .borrow_mut()
+            .take()
+            .and_then(|(p, token)| (p == peer).then_some(token))
     }
 
     fn clear_notice(&self) {
+        self.consent.borrow_mut().take();
         self.notice_timer.stop();
         if let Some(app) = self.app() {
             app.global::<NoticeState>().set_text("".into());

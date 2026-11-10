@@ -240,6 +240,39 @@ pub fn read_current(images: bool) -> anyhow::Result<Option<LocalClip>> {
     Ok(clip)
 }
 
+/// What one manual read of the clipboard found ([`read_for_send`]).
+#[derive(Debug)]
+pub enum ClipRead {
+    /// A clip to send. `sensitive` carries the password-manager mark (SR-24).
+    Clip(LocalClip),
+    /// Nothing we send: no text, and no image (or images are off).
+    Empty,
+    /// This session cannot read the clipboard at all (GNOME, the Flatpak on COSMIC): the
+    /// [`ClipboardSupport::reason`] sentence.
+    Unreadable(String),
+    /// The read failed, or the clip is over its cap. The message names the cause, never the
+    /// content (SR-32).
+    Failed(String),
+}
+
+/// How the daemon reads the clipboard for a manual send: [`read_for_send`] in a real run, a
+/// stand-in in tests.
+pub type ClipReader = fn(bool) -> ClipRead;
+
+/// [`read_current`] sorted into the answers a manual send gives: unreadable (with the reason
+/// sentence), empty, failed, or a clip. Blocking, like [`read_current`].
+pub fn read_for_send(images: bool) -> ClipRead {
+    let support = support();
+    if !support.supported {
+        return ClipRead::Unreadable(unsupported::error(&support).to_string());
+    }
+    match read_current(images) {
+        Ok(Some(clip)) => ClipRead::Clip(clip),
+        Ok(None) => ClipRead::Empty,
+        Err(e) => ClipRead::Failed(e.to_string()),
+    }
+}
+
 /// Writes `text` to the clipboard. With `sensitive`, also writes the password-manager marks so
 /// clipboard history, cloud upload and other watchers skip it (SR-24).
 ///

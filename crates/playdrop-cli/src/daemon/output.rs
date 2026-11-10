@@ -7,12 +7,13 @@
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use playdrop_core::host::{
-    MdnsStatus, MulticastStatus, OutboxItem, PeerSummary, TransferSnapshot, TransferStatus,
+use playdrop_ipc::types::{
+    MdnsStatus, MulticastStatus, OutboxItem, PeerBattery, PeerSummary, TransferDirection,
+    TransferSnapshot, TransferStatus,
 };
 use playdrop_ipc::{ClipSkip, DiagnosticsReport, PortProbe, Status};
 use serde::Serialize;
-use unicode_width::UnicodeWidthStr as _;
+use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
 const KIB: f64 = 1024.0;
 const MIB: f64 = 1024.0 * 1024.0;
@@ -143,6 +144,19 @@ pub fn table(header: &[&str], rows: &[Vec<String>]) -> String {
     out
 }
 
+/// `line` cut to at most `width` display columns, never inside a character. A wide
+/// character that would cross the edge is dropped whole.
+pub fn truncate(line: &str, width: usize) -> &str {
+    let mut used = 0;
+    for (i, c) in line.char_indices() {
+        used += c.width().unwrap_or(0);
+        if used > width {
+            return &line[..i];
+        }
+    }
+    line
+}
+
 /// `label: value` lines with the values in one column.
 fn key_values(rows: &[(&str, String)]) -> String {
     let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
@@ -192,6 +206,7 @@ pub fn peers(peers: &[PeerSummary], now: u64) -> String {
                 p.short_id.clone(),
                 p.label.clone(),
                 peer_state(p).to_owned(),
+                p.battery.map(battery_cell).unwrap_or_default(),
                 if p.online {
                     "now".to_owned()
                 } else {
@@ -205,9 +220,28 @@ pub fn peers(peers: &[PeerSummary], now: u64) -> String {
         })
         .collect();
     table(
-        &["SHORT ID", "LABEL", "STATE", "LAST SEEN", "ADDRESS"],
+        &[
+            "SHORT ID",
+            "LABEL",
+            "STATE",
+            "BATTERY",
+            "LAST SEEN",
+            "ADDRESS",
+        ],
         &rows,
     )
+}
+
+/// The BATTERY column: `64%`, `64% charging` or `12% low`. Empty when the peer is offline or
+/// has not reported one (a desktop without a battery, or an older daemon).
+fn battery_cell(b: PeerBattery) -> String {
+    if b.charging {
+        format!("{}% charging", b.level)
+    } else if b.low {
+        format!("{}% low", b.level)
+    } else {
+        format!("{}%", b.level)
+    }
 }
 
 /// The label of a hex Device ID, or its Short ID when the peer is gone.
@@ -289,10 +323,10 @@ pub fn state_name(s: TransferStatus) -> &'static str {
     }
 }
 
-fn direction_name(d: playdrop_core::host::TransferDirection) -> &'static str {
+fn direction_name(d: TransferDirection) -> &'static str {
     match d {
-        playdrop_core::host::TransferDirection::Send => "send",
-        playdrop_core::host::TransferDirection::Receive => "receive",
+        TransferDirection::Send => "send",
+        TransferDirection::Receive => "receive",
     }
 }
 
@@ -311,6 +345,7 @@ pub fn transfers(list: &[TransferSnapshot], peers: &[PeerSummary], now: u64) -> 
                 state_column(t),
                 format!("{} of {}", size(t.bytes), size(t.total)),
                 files_column(t),
+                names_column(t),
                 ago(now, Some(t.started_at)),
                 t.note.clone().unwrap_or_default(),
             ]
@@ -318,10 +353,28 @@ pub fn transfers(list: &[TransferSnapshot], peers: &[PeerSummary], now: u64) -> 
         .collect();
     table(
         &[
-            "ID", "DIR", "PEER", "STATE", "BYTES", "FILES", "STARTED", "NOTE",
+            "ID", "DIR", "PEER", "STATE", "BYTES", "FILES", "NAMES", "STARTED", "NOTE",
         ],
         &rows,
     )
+}
+
+/// Widest the NAMES column gets, in display columns, so one long file name does not push the
+/// rest of the table off the screen.
+const NAMES_WIDTH: usize = 40;
+
+/// The NAMES column: the transfer's top-level names, comma separated, with `and more` when
+/// the daemon left some out, cut to [`NAMES_WIDTH`] with `...`. Empty from an older daemon.
+/// The receive side's names come from the other device: shown, never used as paths.
+fn names_column(t: &TransferSnapshot) -> String {
+    let mut all = t.names.join(", ");
+    if t.names_more {
+        all.push_str(" and more");
+    }
+    if all.width() <= NAMES_WIDTH {
+        return all;
+    }
+    format!("{}...", truncate(&all, NAMES_WIDTH - 3))
 }
 
 /// The STATE column: a failed send that is kept for resume says so, since `failed` alone
@@ -592,6 +645,19 @@ pub fn clip_not_sent(to: &str, skip: ClipSkip) -> String {
     }
 }
 
+/// What `playdrop clip` with no text says when the daemon sent nothing to `to`.
+pub fn local_clip_not_sent(to: &str, skip: ClipSkip) -> String {
+    match skip {
+        ClipSkip::Echo => format!("not sent: {}", ClipSkip::Echo.reason()),
+        ClipSkip::Empty => "not sent: the clipboard is empty".to_owned(),
+        ClipSkip::Sensitive => format!(
+            "not sent to {to}: a password manager marked it as secret; add --sensitive to send \
+             it anyway, marked (the device keeps it out of its clipboard history)"
+        ),
+        other => clip_not_sent(to, other),
+    }
+}
+
 /// The closing line of a successful `playdrop send`.
 #[allow(clippy::cast_precision_loss)]
 pub fn sent_line(t: &TransferSnapshot, to: &str, wall_secs: f64) -> String {
@@ -614,7 +680,6 @@ pub fn sent_line(t: &TransferSnapshot, to: &str, wall_secs: f64) -> String {
 mod tests {
     use super::*;
     use crate::daemon::peer::tests::peer;
-    use playdrop_core::host::TransferDirection;
 
     #[test]
     fn sizes_pick_a_unit() {
@@ -708,6 +773,8 @@ mod tests {
             files_done: 0,
             started_at: 990,
             file_count: 3,
+            names: vec!["report.pdf".into(), "Photos".into()],
+            names_more: false,
             note: None,
             saved: Vec::new(),
             folder: None,
@@ -728,11 +795,69 @@ mod tests {
             "active",
             "512.0 KiB of 1.0 MiB",
             "3",
+            "report.pdf, Photos",
             "10 s ago",
         ] {
             assert!(row.contains(want), "{want} missing from {row}");
         }
         assert!(transfers(&[], &peers, 0).starts_with("no transfers"));
+    }
+
+    #[test]
+    fn local_clip_skips_say_what_to_do() {
+        assert!(local_clip_not_sent("Phone", ClipSkip::Sensitive).contains("--sensitive"));
+        assert_eq!(
+            local_clip_not_sent("Phone", ClipSkip::Empty),
+            "not sent: the clipboard is empty"
+        );
+        // The echo rule is global, so the line names no device.
+        assert_eq!(
+            local_clip_not_sent("Phone", ClipSkip::Echo),
+            "not sent: it matches the last clip sent or received"
+        );
+        assert_eq!(
+            local_clip_not_sent("Phone", ClipSkip::NoPeers),
+            clip_not_sent("Phone", ClipSkip::NoPeers)
+        );
+    }
+
+    #[test]
+    fn names_are_cut_to_a_column_and_absent_names_are_blank() {
+        let mut t = snapshot(TransferStatus::Active);
+        t.names = vec!["a".repeat(30), "b".repeat(30), "c".into()];
+        let cell = names_column(&t);
+        assert_eq!(cell.width(), NAMES_WIDTH);
+        assert!(cell.ends_with("..."), "{cell}");
+        // An older daemon sends no names.
+        t.names.clear();
+        assert_eq!(names_column(&t), "");
+        // Names left out are said; exactly the full list is not.
+        t.names = vec!["a".into(), "b".into(), "c".into()];
+        assert_eq!(names_column(&t), "a, b, c");
+        t.names_more = true;
+        assert_eq!(names_column(&t), "a, b, c and more");
+    }
+
+    #[test]
+    fn peers_table_shows_the_battery_from_the_answer() {
+        let mut phone = peer("q3pn-42by-v2iw-elcy", "Phone", true);
+        phone.battery = Some(PeerBattery {
+            level: 64,
+            charging: true,
+            low: false,
+        });
+        let mut tablet = peer("pgry-2xha-ncda-zdim", "Tablet", true);
+        tablet.battery = Some(PeerBattery {
+            level: 9,
+            charging: false,
+            low: true,
+        });
+        let out = peers(&[phone, tablet, peer("2g5l", "Laptop", true)], 1_000);
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(lines[0].contains("BATTERY"));
+        assert!(lines[1].contains("64% charging"), "{out}");
+        assert!(lines[2].contains("9% low"), "{out}");
+        assert!(!lines[3].contains('%'), "{out}");
     }
 
     #[test]

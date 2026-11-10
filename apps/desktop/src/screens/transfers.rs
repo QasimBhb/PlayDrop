@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use playdrop_core::host::{TransferDirection, TransferStatus};
+use playdrop_ipc::types::{TransferDirection, TransferStatus};
 use playdrop_ipc::Request;
 use slint::{ComponentHandle, Model, ModelRc};
 

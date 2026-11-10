@@ -9,7 +9,9 @@
 ;     entry out again. The CLI has its own folder so PATH gains one command and
 ;     not the daemon and the window too
 ;   - starts the daemon at login through HKCU\...\Run\PlayDrop
-;   - Start Menu shortcut for the window
+;   - Start Menu shortcut for the window, carrying the AppUserModelID
+;     org.playdrop.PlayDrop that the daemon's toasts name (Windows identifies a
+;     classic app's toasts through a Start Menu shortcut with that ID)
 ;   - a firewall rule scoped to playdropd.exe for TCP and UDP 42187 (SR-31),
 ;     never a bare port rule
 ;   - stops the daemon before upgrading or uninstalling, and removes the rule
@@ -29,6 +31,7 @@
 #define CliExe "playdrop.exe"
 #define Port "42187"
 #define RuleName "PlayDrop"
+#define AppUserModelID "org.playdrop.PlayDrop"
 
 [Setup]
 ; Never change AppId: upgrades and uninstall find the old install through it.
@@ -83,7 +86,10 @@ Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignor
 Source: "..\..\THIRD_PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\{#AppName}"; Filename: "{app}\{#WindowExe}"; WorkingDir: "{app}"
+; The AppUserModelID must match AUMID in crates/playdropd/src/notify.rs: toasts are
+; shown under it, and Windows looks it up on a Start Menu shortcut. No COM activator or
+; CLSID is registered: toast buttons reach the running daemon in-process.
+Name: "{group}\{#AppName}"; Filename: "{app}\{#WindowExe}"; WorkingDir: "{app}"; AppUserModelID: "{#AppUserModelID}"
 Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#WindowExe}"; WorkingDir: "{app}"; Tasks: desktopicon
 

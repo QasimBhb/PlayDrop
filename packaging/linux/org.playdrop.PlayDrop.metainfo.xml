@@ -57,6 +57,11 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.9.0" date="2026-11-10" type="development">
+      <description>
+        <p>Phase 14: Quit stays quit while the window is open, a device's battery and the names of files in a transfer show at once, the panel applet sends clipboard images, and the Windows tray lists your devices.</p>
+      </description>
+    </release>
     <release version="0.8.0" date="2026-11-09" type="development">
       <description>
         <p>Phase 13: the playdrop command line now comes with the .deb, the Flatpak and the Windows installer, and an optional COSMIC panel applet shows devices and sends the clipboard or files from the panel.</p>

@@ -738,6 +738,7 @@ fn snapshot_of(peer: &DeviceId, manifest: &Manifest, status: TransferStatus) -> 
         manifest.files.len(),
         manifest.note.clone(),
     )
+    .with_names(manifest)
 }
 
 /// Accepts a manifest into staging and records its owner (protocol.md 7.3, SR-13). If the

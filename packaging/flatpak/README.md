@@ -88,7 +88,7 @@ The `finish-args` list is fixed. Each entry has a comment in the manifest.
 | Permission | Why |
 |---|---|
 | `--share=network` | LAN discovery and transfers on port 42187 |
-| `--share=ipc`, `--socket=wayland`, `--socket=fallback-x11`, `--device=dri` | The Slint window, and Wayland clipboard sync |
+| `--share=ipc`, `--socket=wayland`, `--socket=fallback-x11`, `--device=dri` | The Slint window, and Wayland clipboard sync where the compositor allows it (not COSMIC, see below) |
 | `--talk-name=org.kde.StatusNotifierWatcher` | Tray icon |
 | `--talk-name=org.freedesktop.Notifications` | Notifications |
 | `--system-talk-name=org.freedesktop.login1` | Suspend and resume signals (system bus) |
@@ -162,6 +162,25 @@ so the deb's approach does not carry over:
   file ID becomes a bus name that the shell activates through `org.freedesktop.Application`.
   It requires the window to implement that interface, which it does not, so the launcher
   uses a plain `Exec=`.
+
+## Clipboard on COSMIC
+
+The sandboxed daemon cannot watch or set the clipboard on COSMIC, and says so in its settings
+and its log. The cause is the compositor's policy, not a missing permission: `cosmic-comp`
+offers `ext-data-control-v1` and `zwlr-data-control-v1` only to clients that pass
+`client_not_sandboxed` (`src/state.rs`, checked at commit `ec674cd`, the build installed on
+2026-11-10), and Flatpak's `--socket=wayland` always attaches a security context. COSMIC's
+portal has no Clipboard interface either.
+
+Measured on 2026-11-10 with the daemon's own clipboard round-trip test run inside a sandbox on
+`org.freedesktop.Platform//26.08`: with `--socket=wayland` the probe reports no data-control;
+with the compositor's real socket bound in (`--nosocket=wayland
+--filesystem=xdg-run/wayland-1`) the round trip passes. That second form is deliberately not
+used: it hands the app every privileged protocol COSMIC keeps from sandboxes (screen capture,
+virtual keyboard, layer shell), the socket name differs per machine, and Flatpak clears
+`WAYLAND_DISPLAY` without the socket permission, so the daemon would need a hook whose only
+purpose is to step around the sandbox. The answer on COSMIC is the `.deb`. In the Flatpak the
+window's "Send clipboard" button still works, because a focused window may read the clipboard.
 
 ## What has been verified
 

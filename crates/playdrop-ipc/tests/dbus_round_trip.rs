@@ -12,25 +12,52 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use playdrop_core::host::{Base64Bytes, HostEvent, OutboxItem, Secret};
 use playdrop_ipc::client::{Client, ClientOptions, ConnectError};
 use playdrop_ipc::server::{ServeError, Server, ServerOptions};
+use playdrop_ipc::types::{Base64Bytes, HostEvent, OutboxItem, Secret};
 use playdrop_ipc::{
-    DaemonEvent, ErrorCode, Event, IpcError, Ok, Request, RequestHandler, Response, Settings,
-    Status, DBUS_INTERFACE, DBUS_NAME, DBUS_PATH, IPC_VERSION,
+    ClipSkip, ConsentToken, DaemonEvent, ErrorCode, Event, IpcError, Ok, Request, RequestHandler,
+    Response, Settings, Status, DBUS_INTERFACE, DBUS_NAME, DBUS_PATH, IPC_VERSION,
 };
 use tokio::sync::broadcast;
 
 /// A private bus, killed on drop.
+///
+/// It runs on its own minimal config with no service directory at all. `dbus-daemon
+/// --session` would read the system's session config, which lists the standard service
+/// directories: where the `PlayDrop` `.deb` is installed, a connect that allows activation
+/// would then start the real `/usr/bin/playdropd` against the user's real config.
 struct Bus {
     child: Child,
     address: String,
+    _dir: tempfile::TempDir,
 }
+
+/// A session-type bus config that allows everything and can activate nothing.
+const BUS_CONFIG: &str = r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:tmpdir=/tmp</listen>
+  <policy context="default">
+    <allow send_destination="*" eavesdrop="true"/>
+    <allow eavesdrop="true"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>
+"#;
 
 impl Bus {
     fn start() -> Option<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("pd-ipc-rt-bus")
+            .tempdir_in("/tmp")
+            .expect("temp dir");
+        let config = dir.path().join("bus.conf");
+        std::fs::write(&config, BUS_CONFIG).expect("bus config");
         let mut child = match Command::new("dbus-daemon")
-            .args(["--session", "--nofork", "--print-address"])
+            .arg(format!("--config-file={}", config.display()))
+            .args(["--nofork", "--print-address"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
@@ -48,7 +75,11 @@ impl Bus {
             .expect("read bus address");
         let address = line.trim().to_owned();
         assert!(!address.is_empty(), "dbus-daemon printed no address");
-        Some(Self { child, address })
+        Some(Self {
+            child,
+            address,
+            _dir: dir,
+        })
     }
 }
 
@@ -107,10 +138,32 @@ fn handler() -> Arc<dyn RequestHandler> {
             Request::PullOutbox { peer } => Response::Ok(Ok::OutboxPulled { ids: vec![peer] }),
             Request::SendFiles { peer, paths } => echo("send_files", peer, &paths),
             Request::QueueOutbox { peer, paths } => echo("queue_outbox", peer, &paths),
+            // Refuses until the consent token comes back, then sends.
+            Request::SendLocalClipboard {
+                peer,
+                allow_sensitive,
+                consent,
+            } => {
+                let agreed =
+                    allow_sensitive && consent.as_ref().map(ConsentToken::as_str) == Some(TOKEN);
+                Response::Ok(Ok::ClipboardPushed {
+                    sent_to: if agreed {
+                        peer.into_iter().collect()
+                    } else {
+                        vec![]
+                    },
+                    skipped_echo: false,
+                    skipped: (!agreed).then_some(ClipSkip::Sensitive),
+                    consent: (!agreed).then(|| ConsentToken::new(TOKEN)),
+                })
+            }
             _ => Response::err(ErrorCode::InvalidState, "not in this test"),
         }
     })
 }
+
+/// The consent token the test handler hands out.
+const TOKEN: &str = "0123456789abcdef0123456789abcdef";
 
 fn echo(op: &str, peer: String, paths: &[PathBuf]) -> Response {
     let mut lines = vec![op.to_owned(), peer];
@@ -174,6 +227,7 @@ async fn dbus_round_trip() {
     assert_eq!(refused.code, ErrorCode::InvalidState);
 
     check_send_files(&client).await;
+    check_local_clipboard(&client).await;
     check_outbox(&client).await;
     check_raw_refusals(&bus).await;
     check_host_events(&client, &events).await;
@@ -207,6 +261,34 @@ async fn dbus_round_trip() {
         .await
         .expect("restart after shutdown");
     drop(restarted);
+}
+
+/// `send_local_clipboard` and its consent token cross the bus both ways.
+async fn check_local_clipboard(client: &Client) {
+    let ask = |consent: Option<&ConsentToken>| Request::SendLocalClipboard {
+        peer: Some("k3qd".into()),
+        allow_sensitive: consent.is_some(),
+        consent: consent.cloned(),
+    };
+    let refused = client.request(ask(None)).await.expect("answer");
+    let Ok::ClipboardPushed {
+        skipped: Some(ClipSkip::Sensitive),
+        consent: Some(token),
+        ..
+    } = refused
+    else {
+        panic!("expected a sensitive refusal, got {refused:?}");
+    };
+    let sent = client.request(ask(Some(&token))).await.expect("answer");
+    assert_eq!(
+        sent,
+        Ok::ClipboardPushed {
+            sent_to: vec!["k3qd".into()],
+            skipped_echo: false,
+            skipped: None,
+            consent: None,
+        }
+    );
 }
 
 /// Files travel as descriptors and reach the handler as their real paths.

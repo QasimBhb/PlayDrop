@@ -33,8 +33,8 @@ use playdrop_core::session::types::PresenceState;
 use playdrop_core::Error as CoreError;
 use playdrop_ipc::server::{ServeError, Server};
 use playdrop_ipc::{
-    ClipSkip, DaemonEvent, DiagnosticsReport, ErrorCode, Event, IpcError, Ok as IpcOk, Request,
-    RequestHandler, Response, Status, IPC_VERSION,
+    ClipSkip, ConsentToken, DaemonEvent, DiagnosticsReport, ErrorCode, Event, IpcError,
+    Ok as IpcOk, Request, RequestHandler, Response, Status, IPC_VERSION,
 };
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 use tokio::task::JoinHandle;
@@ -42,7 +42,8 @@ use tokio::task::JoinHandle;
 use crate::autostart::{self, Locations};
 use crate::battery;
 use crate::cli::Args;
-use crate::clipboard::{self, ClipContent, LocalClip};
+use crate::clipboard::{self, ClipContent, ClipRead, ClipReader, LocalClip};
+use crate::consent::ConsentSlot;
 use crate::control::{self, InputRunners};
 use crate::input::InputSupport;
 use crate::media::{self, MediaSupport};
@@ -60,6 +61,10 @@ const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Local clips buffered between the watcher and the push.
 const CLIP_QUEUE: usize = 16;
+
+/// The refusal for a clipboard send to a device whose `clipboardOut` grant is off, worded as
+/// the core words it (SR-14).
+const CLIPBOARD_GRANT_OFF: &str = "clipboardOut grant is off";
 
 /// The message for SR-6 refusals (`docs/ipc.md` section 5).
 const LOCKED_MESSAGE: &str = "desktop is locked";
@@ -112,6 +117,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         autostart: locations.clone(),
         clipboard_supported: support.supported,
         watch_clipboard: true,
+        read_clip: clipboard::read_for_send,
         input_support,
         media_support,
     });
@@ -347,6 +353,9 @@ pub struct Options {
     pub clipboard_supported: bool,
     /// Start the clipboard watcher at all (false in tests).
     pub watch_clipboard: bool,
+    /// Reads the clipboard for a manual send (tray, `send_local_clipboard`):
+    /// [`clipboard::read_for_send`], or a stand-in in tests.
+    pub read_clip: ClipReader,
     /// What the input backend said at start (`accepts_input`, the window's toggle).
     pub input_support: InputSupport,
     /// What the media backend said at start.
@@ -374,6 +383,9 @@ struct Shared {
     autostart: Option<Locations>,
     clipboard_supported: bool,
     watch_clipboard: bool,
+    read_clip: ClipReader,
+    /// The last `send_local_clipboard` refusal of a marked clip, waiting for consent (SR-24).
+    consent: Mutex<ConsentSlot>,
     settings: Mutex<SettingsState>,
     host: RwLock<Option<Arc<Host>>>,
     drain: Mutex<Option<JoinHandle<()>>>,
@@ -429,6 +441,8 @@ impl Daemon {
             autostart: opts.autostart,
             clipboard_supported: opts.clipboard_supported,
             watch_clipboard: opts.watch_clipboard,
+            read_clip: opts.read_clip,
+            consent: Mutex::new(ConsentSlot::default()),
             settings: Mutex::new(SettingsState {
                 persisted: opts.persisted,
                 effective: opts.effective,
@@ -1113,23 +1127,17 @@ impl Shared {
     /// keeps it out of history) and a notification says so. *Choice*, documented for the
     /// window: the window's own send button is where a real prompt belongs.
     async fn send_clipboard_now(&self) {
-        let images = self.clipboard_images.load(Ordering::SeqCst);
-        let read = tokio::task::spawn_blocking(move || clipboard::read_current(images)).await;
-        let clip = match read {
-            Ok(Ok(Some(c))) => c,
-            Ok(Ok(None)) => {
+        let clip = match self.read_local_clip().await {
+            Some(ClipRead::Clip(c)) => c,
+            Some(ClipRead::Empty) => {
                 self.notifier.info("The clipboard is empty", "");
                 return;
             }
-            Ok(Err(e)) => {
-                self.notifier
-                    .info("Could not read the clipboard", e.to_string());
+            Some(ClipRead::Unreadable(why) | ClipRead::Failed(why)) => {
+                self.notifier.info("Could not read the clipboard", why);
                 return;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "clipboard read task failed");
-                return;
-            }
+            None => return,
         };
         let Some(host) = self.host() else { return };
         let sensitive = clip.sensitive;
@@ -1152,6 +1160,70 @@ impl Shared {
             },
             Err(e) => self.notifier.info("Clipboard not sent", e.to_string()),
         }
+    }
+
+    /// Reads the clipboard once for a manual send, off the event loop: text, or an image
+    /// while `clipboard_images` is on. `None` if the read task itself failed (logged).
+    async fn read_local_clip(&self) -> Option<ClipRead> {
+        let images = self.clipboard_images.load(Ordering::SeqCst);
+        let reader = self.read_clip;
+        match tokio::task::spawn_blocking(move || reader(images)).await {
+            Result::Ok(r) => Some(r),
+            Err(e) => {
+                tracing::warn!(error = %e, "clipboard read task failed");
+                None
+            }
+        }
+    }
+
+    /// `send_local_clipboard`: reads this computer's clipboard and sends it to `target`, or to
+    /// every online peer with `clipboardOut` (`docs/ipc.md` 1.7). SR-24: a password-manager
+    /// clip goes only with `allow_sensitive`, marked; SR-32: nothing about the content is
+    /// logged here (the clipboard module logs kind, length and a short hash at debug).
+    async fn send_local_clipboard(
+        &self,
+        host: &Host,
+        target: Option<DeviceId>,
+        allow_sensitive: bool,
+        consent: Option<ConsentToken>,
+    ) -> Result<IpcOk, IpcError> {
+        let clip = match self.read_local_clip().await {
+            Some(ClipRead::Clip(c)) => c,
+            Some(ClipRead::Empty) => return Ok(clip_answer(Vec::new(), Some(ClipSkip::Empty))),
+            Some(ClipRead::Unreadable(why)) => return Err(err(ErrorCode::InvalidState, why)),
+            Some(ClipRead::Failed(why)) => {
+                return Err(internal(format!("could not read the clipboard: {why}")))
+            }
+            None => return Err(internal("could not read the clipboard")),
+        };
+        let gated = lock_std(&self.consent).gate(
+            clip,
+            allow_sensitive,
+            consent.as_ref(),
+            std::time::Instant::now(),
+        );
+        let clip = match gated {
+            Result::Ok(c) => c,
+            Err(refused) => {
+                let mut answer = clip_answer(Vec::new(), Some(refused.skip));
+                if let IpcOk::ClipboardPushed { consent, .. } = &mut answer {
+                    *consent = Some(refused.consent);
+                }
+                return Ok(answer);
+            }
+        };
+        let p = match target {
+            Some(id) => send_one(host, &id, clip),
+            None => push(host, clip),
+        }
+        .map_err(map_core_error)?;
+        let sent_to: Vec<String> = p.sent_to.iter().map(DeviceId::to_hex).collect();
+        if !sent_to.is_empty() {
+            self.emit(DaemonEvent::ClipboardPushed {
+                sent_to: sent_to.clone(),
+            });
+        }
+        Ok(clip_answer(sent_to, clip_skip(&p)))
     }
 
     fn status(&self, host: &Host) -> Status {
@@ -1417,6 +1489,25 @@ impl Shared {
                 // refusal (no grant, offline, too large) is an error above.
                 Ok(clip_answer(sent_to, (!sent).then_some(ClipSkip::Echo)))
             }
+            Request::SendLocalClipboard {
+                peer,
+                allow_sensitive,
+                consent,
+            } => {
+                // An unknown or offline device, or one without the clipboard grant, is an
+                // error before the clipboard is read for nothing.
+                let target = peer
+                    .as_deref()
+                    .map(|q| resolve_online(&host, q))
+                    .transpose()?;
+                if let Some(id) = &target {
+                    if !host.grants(id).is_some_and(|g| g.clipboard_out) {
+                        return Err(err(ErrorCode::Forbidden, CLIPBOARD_GRANT_OFF));
+                    }
+                }
+                self.send_local_clipboard(&host, target, allow_sensitive, consent)
+                    .await
+            }
             Request::OpenReceived { path } => {
                 let dir = self.effective().receive_dir;
                 crate::open::open_received(&path, &dir)
@@ -1478,6 +1569,7 @@ fn clip_answer(sent_to: Vec<String>, skipped: Option<ClipSkip>) -> IpcOk {
         sent_to,
         skipped_echo: skipped == Some(ClipSkip::Echo),
         skipped,
+        consent: None,
     }
 }
 
@@ -1497,6 +1589,30 @@ fn push(host: &Host, clip: LocalClip) -> Result<playdrop_core::host::ClipboardPu
         ClipContent::Text(text) => host.push_clipboard(&text, clip.sensitive),
         ClipContent::Image { mime, bytes } => {
             host.push_clipboard_image(bytes, &mime, clip.sensitive)
+        }
+    }
+}
+
+/// Sends a local clip to one peer: text through `send_clipboard`, an image through
+/// `send_clipboard_image`. The answer has the same shape as [`push`]'s, so [`clip_skip`]
+/// reads both.
+fn send_one(
+    host: &Host,
+    peer: &DeviceId,
+    clip: LocalClip,
+) -> Result<playdrop_core::host::ClipboardPush, CoreError> {
+    match clip.content {
+        ClipContent::Text(text) => {
+            let sent = host.send_clipboard(peer, &text, clip.sensitive)?;
+            Result::Ok(playdrop_core::host::ClipboardPush {
+                sent_to: if sent { vec![*peer] } else { Vec::new() },
+                // `send_clipboard` has one "false" case: the echo rule.
+                skipped_echo: !sent,
+                ..playdrop_core::host::ClipboardPush::default()
+            })
+        }
+        ClipContent::Image { mime, bytes } => {
+            host.send_clipboard_image(peer, bytes, &mime, clip.sensitive)
         }
     }
 }
@@ -1650,6 +1766,245 @@ mod tests {
         );
     }
 
+    async fn send_local(
+        h: &Arc<dyn RequestHandler>,
+        peer: Option<&str>,
+        allow_sensitive: bool,
+        consent: Option<&ConsentToken>,
+    ) -> Result<IpcOk, IpcError> {
+        call(
+            h,
+            Request::SendLocalClipboard {
+                peer: peer.map(str::to_owned),
+                allow_sensitive,
+                consent: consent.cloned(),
+            },
+        )
+        .await
+    }
+
+    /// The consent token of a `sensitive` refusal.
+    fn consent_of(answer: Result<IpcOk, IpcError>) -> ConsentToken {
+        match answer {
+            Result::Ok(IpcOk::ClipboardPushed {
+                skipped: Some(ClipSkip::Sensitive),
+                consent: Some(token),
+                ..
+            }) => token,
+            other => panic!("expected a sensitive refusal, got {other:?}"),
+        }
+    }
+
+    /// Waits for the first item `pick` accepts.
+    async fn wait_for<T, R>(
+        mut next: impl FnMut() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<T>> + Send>>,
+        mut pick: impl FnMut(&T) -> Option<R>,
+    ) -> R {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Some(item) = next().await {
+                    if let Some(r) = pick(&item) {
+                        return r;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("event in time")
+    }
+
+    fn skipped(answer: Result<IpcOk, IpcError>) -> Option<ClipSkip> {
+        match answer {
+            Result::Ok(IpcOk::ClipboardPushed {
+                sent_to, skipped, ..
+            }) => {
+                assert_eq!(sent_to, Vec::<String>::new());
+                skipped
+            }
+            other => panic!("unexpected answer {other:?}"),
+        }
+    }
+
+    /// `send_local_clipboard` through the handler, with the clipboard stood in: a marked clip
+    /// is refused without consent and passes the gate with it; an empty clipboard and an
+    /// unreadable session each get their own answer; a device that is not paired is an error
+    /// before anything is read.
+    #[tokio::test]
+    async fn send_local_clipboard_answers() {
+        let secret: ClipReader = |_| ClipRead::Clip(LocalClip::text("hunter2", true));
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon_reading(tmp.path(), secret);
+        d.start_host().await.unwrap();
+        let h = d.handler();
+        let token = consent_of(send_local(&h, None, false, None).await);
+        assert_eq!(token.as_str().len(), 32);
+        // With consent it goes on to the push; with no paired device that is `no_peers`.
+        assert_eq!(
+            skipped(send_local(&h, None, true, Some(&token)).await),
+            Some(ClipSkip::NoPeers)
+        );
+        // The token is used up.
+        assert_ne!(
+            consent_of(send_local(&h, None, true, Some(&token)).await),
+            token
+        );
+        // Consent with no token (the CLI) goes on too.
+        assert_eq!(
+            skipped(send_local(&h, None, true, None).await),
+            Some(ClipSkip::NoPeers)
+        );
+        let e = send_local(&h, Some("nobody"), true, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
+        d.shutdown().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon_reading(tmp.path(), |_| ClipRead::Empty);
+        d.start_host().await.unwrap();
+        let h = d.handler();
+        assert_eq!(
+            skipped(send_local(&h, None, false, None).await),
+            Some(ClipSkip::Empty)
+        );
+        d.shutdown().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon(tmp.path());
+        d.start_host().await.unwrap();
+        let e = send_local(&d.handler(), None, false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidState);
+        assert_eq!(e.message, "no clipboard in tests");
+        d.shutdown().await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon_reading(tmp.path(), |_| {
+            ClipRead::Failed("clipboard text is larger than 1 MiB and is not synced".into())
+        });
+        d.start_host().await.unwrap();
+        let e = send_local(&d.handler(), None, false, None)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(e.message.contains("larger than 1 MiB"), "{}", e.message);
+        d.shutdown().await;
+    }
+
+    /// Reads of the stand-in clipboard in [`consented_local_clip_reaches_a_real_peer_marked`].
+    static SECRET_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counted_secret(_: bool) -> ClipRead {
+        SECRET_READS.fetch_add(1, Ordering::SeqCst);
+        ClipRead::Clip(LocalClip::text("hunter2", true))
+    }
+
+    /// The whole daemon path against a real paired host: a marked clip is refused with a
+    /// token, sent with it, and arrives marked; with the grant off the answer is `forbidden`
+    /// and the clipboard is not read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn consented_local_clip_reaches_a_real_peer_marked() {
+        use playdrop_core::host::HostConfig;
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon_reading(tmp.path(), counted_secret);
+        d.start_host().await.unwrap();
+        let h = d.handler();
+        let mut ui = d.events().subscribe();
+
+        let mut cfg = HostConfig::new(tmp.path().join("b-data"), tmp.path().join("b-in"), "bravo");
+        cfg.port = 0;
+        cfg.bind_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        cfg.discovery = false;
+        let (bravo, brx) = Host::start(cfg).await.unwrap();
+        let brx = Arc::new(tokio::sync::Mutex::new(brx));
+        let bravo_next = || {
+            let rx = Arc::clone(&brx);
+            Box::pin(async move { rx.lock().await.recv().await })
+                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<HostEvent>> + Send>>
+        };
+
+        // Pair through the daemon, as the window does.
+        bravo.open_add_device_window().unwrap();
+        call(
+            &h,
+            Request::PairWith {
+                addr: bravo.local_addr(),
+            },
+        )
+        .await
+        .unwrap();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(20), ui.recv())
+                .await
+                .expect("prompt in time");
+            if matches!(ev, Result::Ok(Event::Host(HostEvent::PairingPrompt { .. }))) {
+                break;
+            }
+        }
+        wait_for(bravo_next, |e: &HostEvent| {
+            matches!(e, HostEvent::PairingPrompt { .. }).then_some(())
+        })
+        .await;
+        call(&h, Request::PairingRespond { accept: true })
+            .await
+            .unwrap();
+        bravo.pairing_respond(true);
+        wait_for(bravo_next, |e: &HostEvent| {
+            matches!(e, HostEvent::PeerOnline { .. }).then_some(())
+        })
+        .await;
+        let alpha = d.shared.host().unwrap();
+        let id = bravo.device_id().to_hex();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while !alpha.is_online(&bravo.device_id()) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "alpha never saw bravo"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let token = consent_of(send_local(&h, Some(&id), false, None).await);
+        let Result::Ok(IpcOk::ClipboardPushed { sent_to, .. }) =
+            send_local(&h, Some(&id), true, Some(&token)).await
+        else {
+            panic!("consented send");
+        };
+        assert_eq!(sent_to, std::slice::from_ref(&id));
+        let (text, sensitive) = wait_for(bravo_next, |e: &HostEvent| match e {
+            HostEvent::Clipboard {
+                text, sensitive, ..
+            } => Some((text.0.clone(), *sensitive)),
+            _ => None,
+        })
+        .await;
+        assert_eq!(text.as_deref(), Some("hunter2"));
+        assert!(sensitive, "a consented clip must arrive marked (SR-24)");
+
+        // Grant off: refused before the clipboard is read.
+        let grants = Grants {
+            clipboard_out: false,
+            ..Grants::default()
+        };
+        call(
+            &h,
+            Request::SetGrants {
+                peer: id.clone(),
+                grants,
+            },
+        )
+        .await
+        .unwrap();
+        let reads = SECRET_READS.load(Ordering::SeqCst);
+        let e = send_local(&h, Some(&id), true, None).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Forbidden);
+        assert_eq!(SECRET_READS.load(Ordering::SeqCst), reads);
+
+        bravo.shutdown().await;
+        d.shutdown().await;
+    }
+
     #[test]
     fn clip_answer_derives_the_old_echo_flag() {
         for (skip, echo) in [
@@ -1657,6 +2012,8 @@ mod tests {
             (Some(ClipSkip::Echo), true),
             (Some(ClipSkip::NoPeers), false),
             (Some(ClipSkip::Unsupported), false),
+            (Some(ClipSkip::Sensitive), false),
+            (Some(ClipSkip::Empty), false),
         ] {
             let IpcOk::ClipboardPushed {
                 skipped_echo,
@@ -1671,6 +2028,13 @@ mod tests {
     }
 
     fn test_daemon(tmp: &std::path::Path) -> Daemon {
+        test_daemon_reading(tmp, |_| {
+            ClipRead::Unreadable("no clipboard in tests".into())
+        })
+    }
+
+    /// A test daemon whose manual clipboard reads return what `read_clip` gives.
+    fn test_daemon_reading(tmp: &std::path::Path, read_clip: ClipReader) -> Daemon {
         let s = Settings {
             receive_dir: tmp.join("in"),
             device_name: "smoke".into(),
@@ -1699,6 +2063,7 @@ mod tests {
             }),
             clipboard_supported: false,
             watch_clipboard: false,
+            read_clip,
             input_support: InputSupport {
                 supported: false,
                 backend: "none",
@@ -1976,6 +2341,7 @@ mod tests {
             last_seen: None,
             removed_by_peer: false,
             capabilities: vec![],
+            battery: None,
         };
         let peers = vec![
             p(&"ab".repeat(32), "k3qd-7f2m-xa9p-41bc", "Phone"),

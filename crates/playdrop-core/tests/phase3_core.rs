@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use common::{file_root, pair, start_host, start_host_with, temp_root, write_random_file};
 use playdrop_core::host::{
-    DeliverItem, HostEvent, ReceiveSink, ReceiveTarget, SendSource, SinkError, SourceOpener,
-    StreamSource, TransferDirection,
+    DeliverItem, HostEvent, PeerBattery, ReceiveSink, ReceiveTarget, SendSource, SinkError,
+    SourceOpener, StreamSource, TransferDirection,
 };
 
 const T: Duration = Duration::from_secs(30);
@@ -57,6 +57,52 @@ async fn long_clipboard_text_arrives_through_a_blob() {
     };
     assert_eq!(mime, "image/png");
     assert!(data.0 .0 == png, "image differs");
+
+    // An image to one device, marked sensitive (SR-24), arrives marked; the same image again
+    // is an echo and goes nowhere.
+    let png2 = vec![0x42u8; 4096];
+    let r = a
+        .host
+        .send_clipboard_image(&b.host.device_id(), png2.clone(), "image/png", true)
+        .unwrap();
+    assert_eq!(r.sent_to, [b.host.device_id()]);
+    // `wait_for` also searches events already seen, so match on the mark itself: the first
+    // image went unmarked.
+    let ev = b
+        .events
+        .wait_for(T, |e| {
+            matches!(
+                e,
+                HostEvent::ClipboardImage {
+                    sensitive: true,
+                    ..
+                }
+            )
+        })
+        .await;
+    let HostEvent::ClipboardImage { data, .. } = ev else {
+        unreachable!()
+    };
+    assert!(data.0 .0 == png2, "image differs");
+    let again = a
+        .host
+        .send_clipboard_image(&b.host.device_id(), png2, "image/png", true)
+        .unwrap();
+    assert!(again.sent_to.is_empty() && again.skipped_echo);
+    // With the clipboard grant off it is refused, like text.
+    let grants = playdrop_core::pin_store::Grants {
+        clipboard_out: false,
+        ..playdrop_core::pin_store::Grants::default()
+    };
+    a.host
+        .set_grants(&b.host.device_id(), grants)
+        .await
+        .unwrap();
+    let off = a
+        .host
+        .send_clipboard_image(&b.host.device_id(), vec![1; 16], "image/png", false)
+        .unwrap_err();
+    assert!(matches!(off, playdrop_core::Error::Forbidden(_)), "{off:?}");
     a.host.shutdown().await;
     b.host.shutdown().await;
 }
@@ -177,6 +223,10 @@ async fn staged_receiver_delivers_through_the_sink() {
     assert_eq!(left, [".playdrop-partial"]);
     let snap = b.host.transfers();
     assert_eq!(snap[0].delivered.len(), 4);
+    // A folder send is named by its folder on both sides, once, however many files it holds.
+    assert_eq!(snap[0].names, ["Album"]);
+    assert_eq!(snap[0].file_count, 4);
+    assert_eq!(a.host.transfers()[0].names, ["Album"]);
     a.host.shutdown().await;
     b.host.shutdown().await;
 }
@@ -391,6 +441,64 @@ async fn battery_is_sent_at_session_start() {
             )
         })
         .await;
+    // The `peers` answer carries the last battery while the peer is online, so a UI that
+    // connects now need not wait for the next frame.
+    let a_hex = a.host.device_id().to_hex();
+    let alpha = |b: &playdrop_core::host::Host| {
+        b.peers()
+            .into_iter()
+            .find(|p| p.device_id == a_hex)
+            .unwrap()
+    };
+    let p = alpha(&b.host);
+    assert!(p.online);
+    assert_eq!(
+        p.battery,
+        Some(PeerBattery {
+            level: 65,
+            charging: true,
+            low: false
+        })
+    );
+    // Offline, it is gone: an old reading is not shown as current.
+    let (a_id, a_port) = (a.host.device_id(), a.port);
+    a.host.shutdown().await;
+    drop(a);
+    b.events
+        .wait_for(T, |e| matches!(e, HostEvent::PeerOffline { .. }))
+        .await;
+    let p = alpha(&b.host);
+    assert!(!p.online);
+    assert_eq!(p.battery, None);
+    // Back on a new session that has sent no battery yet: still none, not the old 65 %.
+    let a = start_host(root.path(), "alpha", a_port).await;
+    let deadline = tokio::time::Instant::now() + T;
+    while !b.host.is_online(&a_id) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "alpha never came back"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(alpha(&b.host).battery, None);
+    // Its next frame shows again.
+    a.host.set_battery(30, false, true);
+    let deadline = tokio::time::Instant::now() + T;
+    while alpha(&b.host).battery.is_none() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "battery never arrived"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        alpha(&b.host).battery,
+        Some(PeerBattery {
+            level: 30,
+            charging: false,
+            low: true
+        })
+    );
     a.host.shutdown().await;
     b.host.shutdown().await;
 }

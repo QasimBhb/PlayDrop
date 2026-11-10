@@ -200,7 +200,37 @@ fn ping(c: &Controller, peer: &str) {
     );
 }
 
+/// "Send clipboard": the daemon reads its own clipboard (text or image, and it can see a
+/// password manager's mark, SR-24). Where it cannot, or it is older than this window, the text
+/// the window read itself goes as before, but never after the user agreed to a marked clip.
+/// A second press while the question about a marked clip is shown sends with its consent
+/// token (SR-24, `docs/ipc.md` 1.7); the daemon decides whether it still fits the clipboard.
 fn send_clipboard(c: &Controller, peer: &str, text: &str) {
+    let consent = c.take_consent(peer);
+    let consented = consent.is_some();
+    let peer = peer.to_owned();
+    let text = text.to_owned();
+    c.ipc().request(
+        Request::SendLocalClipboard {
+            peer: Some(peer.clone()),
+            allow_sensitive: consent.is_some(),
+            consent,
+        },
+        move |r| {
+            with(|c| match model::local_clip_outcome(&r, consented) {
+                model::LocalClipOutcome::Notice(msg, error) => c.notice(&msg, error),
+                model::LocalClipOutcome::Fallback => send_clipboard_text(c, &peer, &text),
+                // Also after a press with a token the daemon no longer takes (the clip
+                // changed, or a minute passed): ask again for what is there now.
+                model::LocalClipOutcome::AskConsent(token) => c.ask_consent(peer, token),
+                model::LocalClipOutcome::Report => c.report("Could not send the clipboard", r),
+            });
+        },
+    );
+}
+
+/// The window's own path: send the text it read from the clipboard.
+fn send_clipboard_text(c: &Controller, peer: &str, text: &str) {
     if text.is_empty() {
         c.notice("The clipboard is empty or does not hold text.", true);
         return;

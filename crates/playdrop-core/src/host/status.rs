@@ -26,6 +26,28 @@ pub(crate) const BATTERY_EVERY: Duration = Duration::from_secs(60);
 /// Media state frames per player: at most one per this period, 2 per second (5.9).
 pub(crate) const MEDIA_EVERY: Duration = Duration::from_millis(500);
 
+/// A peer's battery as it last reported it (protocol.md 5.8), on
+/// [`PeerSummary::battery`](super::PeerSummary::battery). Same fields as the `battery` frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerBattery {
+    /// Charge level, 0 to 100.
+    pub level: u8,
+    /// Charging now.
+    pub charging: bool,
+    /// Below the peer's low threshold.
+    pub low: bool,
+}
+
+impl From<&Battery> for PeerBattery {
+    fn from(b: &Battery) -> Self {
+        Self {
+            level: b.level.min(100),
+            charging: b.charging,
+            low: b.low,
+        }
+    }
+}
+
 /// A media player's state (protocol.md 5.9), as the host reports it and as
 /// `HostEvent::MediaState` carries a peer's. Position is a sample at `position_at_ms`
 /// (Unix ms) that the UI extrapolates while `playing`.
@@ -123,6 +145,9 @@ pub(crate) struct StatusState {
     /// The last state sent per player, so a peer that connects later learns what is
     /// playing now (5.9, Phase 5). A "gone" state (not playing, no actions) removes it.
     media_last: HashMap<String, MediaState>,
+    /// Each online peer's last `battery` frame (5.8), for `PeerSummary::battery`. Cleared
+    /// when the peer goes offline or is unpaired, so it never outlives the session.
+    peer_battery: HashMap<DeviceId, PeerBattery>,
 }
 
 impl StatusState {
@@ -221,6 +246,22 @@ impl StatusState {
     pub(crate) fn forget(&mut self, peer: &DeviceId) {
         self.battery_sent.remove(peer);
         self.battery_pending.remove(peer);
+        self.peer_battery.remove(peer);
+    }
+
+    /// Remembers the battery a peer just reported (5.8).
+    pub(crate) fn note_peer_battery(&mut self, peer: DeviceId, b: PeerBattery) {
+        self.peer_battery.insert(peer, b);
+    }
+
+    /// The peer's last reported battery, if it sent one since its session came up.
+    pub(crate) fn peer_battery(&self, peer: &DeviceId) -> Option<PeerBattery> {
+        self.peer_battery.get(peer).copied()
+    }
+
+    /// The peer went offline: what it said about its battery is no longer current.
+    pub(crate) fn peer_offline(&mut self, peer: &DeviceId) {
+        self.peer_battery.remove(peer);
     }
 }
 
@@ -478,5 +519,29 @@ mod tests {
         st.media_remember(&a);
         assert_eq!(st.media_current().len(), 1);
         assert_eq!(st.media_current()[0].player, "b");
+    }
+}
+
+#[cfg(test)]
+mod peer_battery_tests {
+    use super::*;
+
+    /// A peer's battery is gone once it goes offline or is unpaired.
+    #[test]
+    fn peer_battery_clears_on_offline_and_on_unpair() {
+        let id = DeviceId::from_spki_hash([3; 32]);
+        let b = PeerBattery {
+            level: 50,
+            charging: false,
+            low: false,
+        };
+        let mut st = StatusState::default();
+        st.note_peer_battery(id, b);
+        assert_eq!(st.peer_battery(&id), Some(b));
+        st.peer_offline(&id);
+        assert_eq!(st.peer_battery(&id), None);
+        st.note_peer_battery(id, b);
+        st.forget(&id);
+        assert_eq!(st.peer_battery(&id), None);
     }
 }

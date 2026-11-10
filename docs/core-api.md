@@ -369,3 +369,23 @@ hook called on the listening socket before it is bound, through which a Windows 
 `playdrop-ffi` does not expose it and builds its `HostConfig` through
 `HostConfig::new`/`with_sink`, so mobile hosts keep `None` and the ffi version does not
 change.
+
+## 14. 2026-11-10 note (Rust only, no `playdrop-ffi` change)
+
+Three additive changes for the desktop daemon's IPC (`docs/ipc.md` section 1.7). The ffi
+records are built field by field from the Rust types, so they ignore the new fields; the
+UniFFI surface and the ffi version (0.4.0) stay as they are, and Android and iOS see none of
+this yet.
+
+- `PeerSummary` gained `battery: Option<PeerBattery>` (`level`, `charging`, `low`, the
+  peer's last `battery` frame, protocol.md 5.8): set while the peer is online, cleared when
+  it goes offline or is unpaired. The ffi `PeerSummary` does not carry it; a mobile UI keeps
+  using `HostEvent::Battery`.
+- `TransferSnapshot` gained `names: Vec<String>`: the transfer's top-level names in manifest
+  order, each once, at most `TRANSFER_NAMES_MAX` (3). On the receive side they come from the
+  peer's manifest after its SR-17 check: display text only. With it, `names_more: bool`
+  (serde default false, not written when false) is true only when names were left out: the
+  core reads one name past the cap to tell. The ffi `TransferSnapshot` carries neither.
+- `Host::send_clipboard_image(peer, bytes, mime, sensitive) -> Result<ClipboardPush>`: the
+  one-device counterpart of `push_clipboard_image`, with the errors of `send_clipboard`. Not
+  bound by the ffi.

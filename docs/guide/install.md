@@ -49,7 +49,9 @@ Then open COSMIC Settings, go to Desktop, Panel, Applets, choose "Add applet" an
 It does not work with the Flatpak. The tray icon keeps working either way.
 
 Pop!_OS 24.04 with COSMIC is the tested desktop. Ubuntu GNOME should work but has never been run.
-On GNOME, copying does not sync by itself (see [clipboard.md](clipboard.md)).
+On GNOME, copying does not sync by itself (see [clipboard.md](clipboard.md)). On COSMIC the same
+is true of the Flatpak, because COSMIC hides the clipboard from sandboxed apps: choose the `.deb`
+there if you want the clipboard to sync without a click.
 
 ## Windows 10 and 11
 

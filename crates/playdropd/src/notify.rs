@@ -4,7 +4,8 @@
 //! - `Paired`: "Paired with <label> (<Short ID>)" (SR-8: a new pairing is never silent).
 //! - Receive-side `TransferComplete`: "Received <n> files from <label>" with "Open" and
 //!   "Show in folder" (both go through `open.rs`, so SR-23 and the receive folder rule
-//!   apply).
+//!   apply). On Windows the toast has these buttons only with `PLAYDROP_TOAST_BUTTONS=1`
+//!   (experimental, see `toast`); otherwise it shows without them.
 //! - `TransferFailed`: "Transfer failed: <reason>".
 //! - `Ping`: "Ping from <label>: <message>".
 //! - `Find` (PLAN.md "find"): a critical, resident "Find my device" with the freedesktop
@@ -29,6 +30,8 @@ use futures_util::future::BoxFuture;
 use playdrop_core::host::{HostEvent, TransferDirection};
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::Instant;
+
+mod toast;
 
 /// Most notifications at once that wait for an action click, each on a blocking thread.
 /// Beyond this, received-file notifications are shown without buttons rather than tying up
@@ -61,7 +64,7 @@ impl Action {
         }
     }
 
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "linux", windows)), allow(dead_code))]
     fn label(&self) -> &'static str {
         match self {
             Self::Open(_) => "Open",
@@ -610,11 +613,41 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use windows::core::HSTRING;
-    use windows::Data::Xml::Dom::XmlDocument;
-    use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+    use std::sync::LazyLock;
+    use std::time::Duration;
 
+    use tokio::sync::oneshot;
+    use windows::core::{IInspectable, Interface as _, Ref, HSTRING};
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::Foundation::TypedEventHandler;
+    use windows::UI::Notifications::{
+        ToastActivatedEventArgs, ToastDismissalReason, ToastDismissedEventArgs,
+        ToastFailedEventArgs, ToastNotification, ToastNotificationManager, ToastNotifier,
+    };
+
+    use super::toast::{self, Button, Pending, Token};
     use super::Note;
+
+    /// The longest a toast with buttons waits for a click. A toast that times out of view
+    /// moves to the notification centre and keeps waiting until this passes, in case a
+    /// click there still reaches this process. *Choice:* 5 minutes; the wait holds one of
+    /// the `MAX_ACTION_WAITERS` slots.
+    const BUTTON_WAIT: Duration = Duration::from_mins(5);
+
+    /// Toasts with buttons that may still be answered.
+    static PENDING: LazyLock<Pending<oneshot::Sender<Button>>> = LazyLock::new(Pending::default);
+
+    /// The experimental switch, read once.
+    static BUTTONS: LazyLock<bool> = LazyLock::new(|| {
+        let on = toast::switch_on(std::env::var_os(toast::SWITCH_ENV).as_deref());
+        if on {
+            tracing::info!(
+                "toast buttons on ({}=1, experimental): received toasts offer Open and Show in folder",
+                toast::SWITCH_ENV
+            );
+        }
+        on
+    });
 
     /// The `AppUserModelID` the installer's Start menu shortcut carries; toasts from an
     /// unregistered ID are dropped by Windows.
@@ -623,22 +656,19 @@ mod platform {
     /// One toast with the system reminder sound is the whole ring on Windows.
     pub(super) const RING_REPEATS: bool = false;
 
-    fn toast(note: &Note) -> windows::core::Result<()> {
-        let xml = format!(
-            "<toast{}><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual>{}</toast>",
-            if note.persistent { " scenario=\"reminder\"" } else { "" },
-            super::xml_escape(&note.summary),
-            super::xml_escape(&note.body),
-            if note.ring {
-                "<audio src=\"ms-winsoundevent:Notification.Reminder\"/>"
-            } else {
-                ""
-            }
-        );
+    fn notifier() -> windows::core::Result<ToastNotifier> {
+        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))
+    }
+
+    fn create(xml: &str) -> windows::core::Result<ToastNotification> {
         let doc = XmlDocument::new()?;
         doc.LoadXml(&HSTRING::from(xml))?;
-        let t = ToastNotification::CreateToastNotification(&doc)?;
-        ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))?.Show(&t)
+        ToastNotification::CreateToastNotification(&doc)
+    }
+
+    fn toast(note: &Note) -> windows::core::Result<()> {
+        let t = create(&super::toast_xml(note, None))?;
+        notifier()?.Show(&t)
     }
 
     /// Shows a toast. Replacing and closing by ID is not wired yet; returns no ID.
@@ -651,12 +681,114 @@ mod platform {
         None
     }
 
-    /// TODO(Phase 2 follow-up): toast buttons need a COM activator registered by the
-    /// installer; until then the toast shows without "Open" and "Show in folder".
+    /// Shows a toast with "Open" and "Show in folder" when the experimental switch is on
+    /// and waits for a click; returns the clicked action ID. With the switch off (the
+    /// default) the toast shows without buttons, as before.
     pub(super) async fn show_and_wait(mut note: Note) -> Option<String> {
-        note.actions.clear();
-        show(note, None).await;
-        None
+        if !*BUTTONS {
+            note.actions.clear();
+            show(note, None).await;
+            return None;
+        }
+        let token = match Token::random() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = %e, "no toast token; showing the toast without buttons");
+                note.actions.clear();
+                show(note, None).await;
+                return None;
+            }
+        };
+        let (answer, answered) = oneshot::channel();
+        PENDING.insert(token, answer);
+        let shown = tokio::task::spawn_blocking(move || show_with_buttons(&note, token)).await;
+        let shown = match shown {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                PENDING.remove(token);
+                tracing::debug!(error = %e, "toast not shown");
+                return None;
+            }
+            Err(e) => {
+                PENDING.remove(token);
+                tracing::debug!(error = %e, "toast task failed");
+                return None;
+            }
+        };
+        let chosen = tokio::time::timeout(BUTTON_WAIT, answered).await;
+        PENDING.remove(token);
+        shown.detach();
+        match chosen {
+            Ok(Ok(button)) => Some(button.id().to_owned()),
+            // Dismissed, failed, clicked elsewhere than a button, or the wait ran out.
+            _ => None,
+        }
+    }
+
+    /// A shown toast and its event registrations.
+    struct Shown {
+        toast: ToastNotification,
+        activated: i64,
+        dismissed: i64,
+        failed: i64,
+    }
+
+    impl Shown {
+        /// Removes the handlers: once the wait is over, nothing listens.
+        fn detach(self) {
+            let _ = self.toast.RemoveActivated(self.activated);
+            let _ = self.toast.RemoveDismissed(self.dismissed);
+            let _ = self.toast.RemoveFailed(self.failed);
+        }
+    }
+
+    /// Builds the toast with a button per action, wires its events to [`PENDING`] and shows
+    /// it. Windows raises the events in this process while it runs; the arguments are
+    /// resolved against [`PENDING`], never trusted as a path.
+    fn show_with_buttons(note: &Note, token: Token) -> windows::core::Result<Shown> {
+        let t = create(&super::toast_xml(note, Some(token)))?;
+        let activated = t.Activated(&TypedEventHandler::new(
+            move |_, args: Ref<IInspectable>| {
+                let arguments = args
+                    .as_ref()
+                    .and_then(|a| a.cast::<ToastActivatedEventArgs>().ok())
+                    .and_then(|a| a.Arguments().ok())
+                    .map(|h| h.to_string_lossy())
+                    .unwrap_or_default();
+                match PENDING.resolve(token, &arguments) {
+                    Ok((answer, button)) => {
+                        let _ = answer.send(button);
+                    }
+                    Err(e) => tracing::debug!(error = %e, "toast activation ignored"),
+                }
+                // Any activation of this toast ends its wait (a body click has no button).
+                PENDING.remove(token);
+                Ok(())
+            },
+        ))?;
+        let dismissed = t.Dismissed(&TypedEventHandler::new(
+            move |_, args: Ref<ToastDismissedEventArgs>| {
+                let reason = args.as_ref().and_then(|a| a.Reason().ok());
+                // Timed out of view: it sits in the notification centre, still clickable.
+                if reason != Some(ToastDismissalReason::TimedOut) {
+                    PENDING.remove(token);
+                }
+                Ok(())
+            },
+        ))?;
+        let failed = t.Failed(&TypedEventHandler::new(
+            move |_, _: Ref<ToastFailedEventArgs>| {
+                PENDING.remove(token);
+                Ok(())
+            },
+        ))?;
+        notifier()?.Show(&t)?;
+        Ok(Shown {
+            toast: t,
+            activated,
+            dismissed,
+            failed,
+        })
     }
 
     /// Toast dismissal is not observed without a COM activator; a ring ends on stop or
@@ -687,6 +819,45 @@ mod platform {
     }
 }
 
+/// The Windows toast XML for `note`. With `buttons`, each action becomes a button whose
+/// only argument is that token and the button name (`toast::arguments`); no path or file
+/// name goes into an argument.
+#[cfg(any(windows, test))]
+fn toast_xml(note: &Note, buttons: Option<toast::Token>) -> String {
+    use std::fmt::Write as _;
+    let actions = match buttons {
+        Some(token) if !note.actions.is_empty() => {
+            let mut out = String::from("<actions>");
+            for a in &note.actions {
+                let Some(button) = toast::Button::from_id(a.id()) else {
+                    continue;
+                };
+                let _ = write!(
+                    out,
+                    "<action content=\"{}\" arguments=\"{}\" activationType=\"foreground\"/>",
+                    xml_escape(a.label()),
+                    xml_escape(&toast::arguments(token, button)),
+                );
+            }
+            out.push_str("</actions>");
+            out
+        }
+        _ => String::new(),
+    };
+    format!(
+        "<toast{}><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual>{}{}</toast>",
+        if note.persistent { " scenario=\"reminder\"" } else { "" },
+        xml_escape(&note.summary),
+        xml_escape(&note.body),
+        if note.ring {
+            "<audio src=\"ms-winsoundevent:Notification.Reminder\"/>"
+        } else {
+            ""
+        },
+        actions,
+    )
+}
+
 /// Escapes text for an XML text node.
 #[cfg(any(windows, test))]
 fn xml_escape(s: &str) -> String {
@@ -711,6 +882,76 @@ mod tests {
     #[test]
     fn xml_is_escaped() {
         assert_eq!(xml_escape("a<b>&\"'"), "a&lt;b&gt;&amp;&quot;&apos;");
+    }
+
+    /// What `render` makes of one received file (built by hand so the test does not
+    /// depend on every `HostEvent` field).
+    fn received_note() -> Note {
+        let saved = PathBuf::from("C:\\Users\\me\\Downloads\\PlayDrop\\secret plan.exe");
+        Note {
+            summary: "Received 1 file from Phone".to_owned(),
+            body: "secret plan.exe".to_owned(),
+            actions: vec![Action::Open(saved.clone()), Action::ShowInFolder(saved)],
+            persistent: false,
+            ring: false,
+        }
+    }
+
+    #[test]
+    fn toast_xml_without_buttons_is_unchanged() {
+        let note = received_note();
+        assert_eq!(
+            toast_xml(&note, None),
+            "<toast><visual><binding template=\"ToastGeneric\"><text>Received 1 file from Phone</text>\
+             <text>secret plan.exe</text></binding></visual></toast>"
+        );
+    }
+
+    #[test]
+    fn toast_buttons_carry_only_the_token() {
+        let note = received_note();
+        let token = toast::Token::from_bytes([7; 16]);
+        let xml = toast_xml(&note, Some(token));
+        let open = toast::arguments(token, toast::Button::Open);
+        let show = toast::arguments(token, toast::Button::Show);
+        assert!(xml.ends_with(&format!(
+            "<actions><action content=\"Open\" arguments=\"{open}\" activationType=\"foreground\"/>\
+             <action content=\"Show in folder\" arguments=\"{show}\" activationType=\"foreground\"/>\
+             </actions></toast>"
+        )));
+        // The file name is in the body only, never in an argument.
+        let actions = &xml[xml.find("<actions>").expect("actions")..];
+        assert!(!actions.contains("secret") && !actions.contains("Users"));
+        // The full chain, as a click runs it: each argument the XML carries resolves for
+        // this toast to a button, and `Notifier::show` picks the note's action by that ID.
+        for (arg, expected) in [(&open, &note.actions[0]), (&show, &note.actions[1])] {
+            assert!(xml.contains(&format!("arguments=\"{arg}\"")));
+            let pending = toast::Pending::default();
+            pending.insert(token, ());
+            let ((), button) = pending.resolve(token, arg).expect("own toast resolves");
+            let chosen = note.actions.iter().find(|a| a.id() == button.id());
+            assert_eq!(chosen, Some(expected));
+        }
+        assert!(matches!(note.actions[0], Action::Open(_)));
+        assert!(matches!(note.actions[1], Action::ShowInFolder(_)));
+    }
+
+    #[test]
+    fn ring_toast_xml_without_buttons_is_unchanged() {
+        // Expected string written out from the toast format at HEAD (scenario and audio).
+        let note = ring_note();
+        assert_eq!(
+            toast_xml(&note, None),
+            "<toast scenario=\"reminder\"><visual><binding template=\"ToastGeneric\">\
+             <text>Find my device</text>\
+             <text>Phone is looking for this computer. Dismiss this to stop the ring.</text>\
+             </binding></visual><audio src=\"ms-winsoundevent:Notification.Reminder\"/></toast>"
+        );
+        // A ring note has no actions, so a token adds nothing either.
+        assert_eq!(
+            toast_xml(&note, Some(toast::Token::from_bytes([1; 16]))),
+            toast_xml(&note, None)
+        );
     }
 
     #[test]

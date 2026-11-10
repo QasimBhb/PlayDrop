@@ -1,10 +1,11 @@
-//! Reads the clipboard text once, for "Send clipboard".
+//! Reads the clipboard text once, as the fallback for "Send clipboard".
 //!
-//! The IPC has no "send your clipboard to this device" request (the tray's action reads the
-//! clipboard inside the daemon), so the applet reads it here through the Wayland data-control
-//! protocol, like the daemon does, and sends the text with `send_clipboard`. Same rules as the
-//! daemon: at most 1 MiB of text, and a clip that carries the password-manager hint goes out
-//! marked sensitive (SR-24). The text is never logged (SR-32).
+//! The applet first asks the daemon to read and send the clipboard (`send_local_clipboard`).
+//! Only when the daemon cannot (an older daemon, or no clipboard access on its session) does
+//! the applet read the text here through the Wayland data-control protocol, like the daemon
+//! does, and send it with `send_clipboard`. Same rules as the daemon: at most 1 MiB of text,
+//! and a clip that carries the password-manager hint goes out marked sensitive (SR-24). The
+//! text is never logged (SR-32).
 
 use std::io::Read;
 use std::time::Duration;

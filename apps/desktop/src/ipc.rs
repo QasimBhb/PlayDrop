@@ -5,10 +5,12 @@
 //! Events from the daemon take the same path, one closure per event.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use futures_util::StreamExt;
-use playdrop_ipc::client::{Client, ConnectError};
+use playdrop_ipc::client::{Client, ClientOptions, ConnectError};
 use playdrop_ipc::{ErrorCode, Event, IpcError, Ok, Request};
 use tokio::runtime::Handle;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
@@ -64,6 +66,75 @@ pub struct Ipc {
     rt: Handle,
     client: Mutex<Option<Arc<Client>>>,
     deliver: Deliver,
+    /// Held across one connect attempt and the install of its client, so [`Ipc::connect`]
+    /// and [`Ipc::follow`] never both bring up a connection (two event pumps would deliver
+    /// every event twice).
+    gate: tokio::sync::Mutex<()>,
+    /// Whether the [`Ipc::follow`] task is running; there is at most one.
+    following: AtomicBool,
+}
+
+/// While following: how long to wait before the next try when the daemon's name has an owner
+/// that does not answer yet (it is still starting), or when the bus watch itself failed.
+const FOLLOW_RETRY_EVERY: Duration = Duration::from_millis(500);
+/// While following: how long an owner that does not answer is retried before the failure is
+/// shown with "Try again". Measured on the clock from the first such failure, so a daemon
+/// that hangs (each attempt then lasts the whole [`CONNECT_TIMEOUT`]) cannot stretch it.
+const FOLLOW_PATIENCE: Duration = Duration::from_secs(15);
+
+/// What the follow loop does after one connect attempt that may not start the daemon.
+#[derive(Debug, PartialEq, Eq)]
+enum FollowStep {
+    /// Nobody owns the daemon's name: say so, then wait for the name to appear.
+    WaitForName,
+    /// An owner exists but did not answer: try again after [`FOLLOW_RETRY_EVERY`].
+    RetrySoon,
+    /// Stop and show the error (wrong version, unverified owner, or out of patience).
+    GiveUp,
+}
+
+/// Decides the next step from a failed attempt and how long an owner has gone unanswered
+/// (zero on the first such failure).
+fn follow_step(error: &ConnectError, unanswered_for: Duration) -> FollowStep {
+    match error {
+        ConnectError::NotRunning => FollowStep::WaitForName,
+        ConnectError::Transport(_) if unanswered_for < FOLLOW_PATIENCE => FollowStep::RetrySoon,
+        ConnectError::Transport(_) | ConnectError::Unverified(_) | ConnectError::Version { .. } => {
+            FollowStep::GiveUp
+        }
+    }
+}
+
+/// How [`Ipc::follow`] ended.
+enum Followed {
+    /// It connected; the caller pumps the events.
+    Connected(Arc<Client>, tokio_stream::wrappers::BroadcastStream<Event>),
+    /// [`Ipc::connect`] got there first.
+    ConnectedElsewhere,
+    /// It stopped after telling the window why.
+    Reported,
+}
+
+/// Whether [`Client::wait_for_daemon`] can ever resolve here. Only Linux has a bus name to
+/// watch; elsewhere the wait would park the follow task for good.
+const CAN_WATCH_FOR_DAEMON: bool = cfg!(target_os = "linux");
+
+/// Longest one connect attempt may take. The bus sets no deadline of its own, so a daemon
+/// that owns its name but never answers would otherwise hold the gate for ever and leave
+/// "Try again" and "Start" waiting behind it.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Runs one connect attempt under [`CONNECT_TIMEOUT`].
+async fn bounded(
+    attempt: impl std::future::Future<Output = Result<Client, ConnectError>>,
+) -> Result<Client, ConnectError> {
+    match tokio::time::timeout(CONNECT_TIMEOUT, attempt).await {
+        Result::Ok(outcome) => outcome,
+        Result::Err(_) => Err(ConnectError::Transport(format!(
+            "the daemon did not answer within {} seconds",
+            CONNECT_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 /// Runs `f` on the Slint thread. Fails only when the event loop has already quit, which
@@ -88,6 +159,8 @@ impl Ipc {
             rt,
             client: Mutex::new(None),
             deliver,
+            gate: tokio::sync::Mutex::new(()),
+            following: AtomicBool::new(false),
         })
     }
 
@@ -114,33 +187,137 @@ impl Ipc {
 
     /// Connects in the background and reports the outcome; on success also starts the
     /// event pump. Does nothing if already connected.
+    ///
+    /// On Linux this asks the session bus to start the daemon when it is not running, so
+    /// it is only for moments the user asked for the app: the window opening, "Start" and
+    /// "Try again". After the daemon went away use [`Ipc::follow`], or "Quit" would be
+    /// undone at once by the open window.
     pub fn connect(self: &Arc<Self>) {
         if self.is_connected() {
             return;
         }
         let this = Arc::clone(self);
         self.rt.spawn(async move {
-            let deliver = this.deliver;
-            match Client::connect().await {
+            let gate = this.gate.lock().await;
+            if this.is_connected() {
+                return;
+            }
+            match bounded(Client::connect()).await {
                 Result::Ok(client) => {
-                    let client = Arc::new(client);
-                    // Subscribe before announcing, so no event after `Connected` is missed.
-                    let events = client.events();
-                    this.set_current(Some(Arc::clone(&client)));
-                    post(move || deliver(IpcMsg::Connected));
+                    let (client, events) = this.install(client);
+                    drop(gate);
                     this.pump(events, &client).await;
                 }
                 Result::Err(e) => {
                     tracing::info!("connect to daemon failed: {e}");
-                    let failure = ConnectFailure::from(&e);
-                    post(move || deliver(IpcMsg::ConnectFailed(failure)));
+                    this.report_failure(&e);
+                    drop(gate);
                 }
             }
         });
     }
 
-    async fn pump(
+    /// Tells the window a connect attempt failed. Call with the gate held: posts to the
+    /// window run in order, so an outcome posted under the gate can never land after the
+    /// `Connected` of a later attempt and leave "not running" on screen over a live
+    /// connection.
+    fn report_failure(&self, error: &ConnectError) {
+        let deliver = self.deliver;
+        let failure = ConnectFailure::from(error);
+        post(move || deliver(IpcMsg::ConnectFailed(failure)));
+    }
+
+    /// Reconnects once a daemon is running again, without ever starting one. Used after the
+    /// connection was lost or the daemon said it is shutting down: a daemon the user quit
+    /// stays quit, and one that was restarted (by the user, the panel applet, the command
+    /// line or systemd after a crash) is picked up as soon as its name appears on the bus.
+    ///
+    /// Reports "not running" straight away when that is the case, so the window can offer
+    /// "Start". Does nothing if already connected or already following. On Windows there is
+    /// no name to watch (and a connect never starts anything there), so it makes one attempt
+    /// and reports it.
+    pub fn follow(self: &Arc<Self>) {
+        if self.is_connected() || self.following.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = Arc::clone(self);
+        self.rt.spawn(async move {
+            let outcome = this.follow_until_connected().await;
+            this.following.store(false, Ordering::SeqCst);
+            match outcome {
+                Followed::Connected(client, events) => this.pump(events, &client).await,
+                // That other connection may have been lost again before the flag above was
+                // cleared, in which case its request to follow was turned away. Ask again:
+                // it is a no-op while the connection is up.
+                Followed::ConnectedElsewhere => this.follow(),
+                Followed::Reported => {}
+            }
+        });
+    }
+
+    /// The follow loop.
+    async fn follow_until_connected(&self) -> Followed {
+        // When an owner of the name first failed to answer; cleared when the name is free.
+        let mut unanswered_since: Option<tokio::time::Instant> = None;
+        loop {
+            let gate = self.gate.lock().await;
+            if self.is_connected() {
+                return Followed::ConnectedElsewhere;
+            }
+            let attempt_started = tokio::time::Instant::now();
+            let error = match bounded(Client::connect_without_activation()).await {
+                Result::Ok(client) => {
+                    let (client, events) = self.install(client);
+                    return Followed::Connected(client, events);
+                }
+                Result::Err(e) => e,
+            };
+            let unanswered_for = unanswered_since.map_or(Duration::ZERO, |t| t.elapsed());
+            match follow_step(&error, unanswered_for) {
+                FollowStep::WaitForName => {
+                    unanswered_since = None;
+                    self.report_failure(&error);
+                    drop(gate);
+                    if !CAN_WATCH_FOR_DAEMON {
+                        return Followed::Reported;
+                    }
+                    if let Err(e) = Client::wait_for_daemon(&ClientOptions::default()).await {
+                        tracing::debug!("watching for the daemon failed: {e}");
+                        tokio::time::sleep(FOLLOW_RETRY_EVERY).await;
+                    }
+                }
+                FollowStep::RetrySoon => {
+                    drop(gate);
+                    // From the start of the attempt: one against a daemon that hangs lasts
+                    // the whole timeout, and that time counts.
+                    unanswered_since.get_or_insert(attempt_started);
+                    tokio::time::sleep(FOLLOW_RETRY_EVERY).await;
+                }
+                FollowStep::GiveUp => {
+                    tracing::info!("reconnect to daemon failed: {error}");
+                    self.report_failure(&error);
+                    return Followed::Reported;
+                }
+            }
+        }
+    }
+
+    /// Makes `client` the current connection and announces it. Call with the gate held.
+    fn install(
         &self,
+        client: Client,
+    ) -> (Arc<Client>, tokio_stream::wrappers::BroadcastStream<Event>) {
+        let deliver = self.deliver;
+        let client = Arc::new(client);
+        // Subscribe before announcing, so no event after `Connected` is missed.
+        let events = client.events();
+        self.set_current(Some(Arc::clone(&client)));
+        post(move || deliver(IpcMsg::Connected));
+        (client, events)
+    }
+
+    async fn pump(
+        self: &Arc<Self>,
         mut events: tokio_stream::wrappers::BroadcastStream<Event>,
         client: &Arc<Client>,
     ) {
@@ -160,10 +337,16 @@ impl Ipc {
             *slot = None;
             drop(slot);
             post(move || deliver(IpcMsg::Disconnected));
+        } else {
+            // The window let go first because the daemon said it is shutting down. Its
+            // stream has now really ended, so the name is free: wait for the next daemon.
+            drop(slot);
+            self.follow();
         }
     }
 
-    /// Forgets the connection (the daemon said it is shutting down).
+    /// Forgets the connection (the daemon said it is shutting down). When the daemon's event
+    /// stream then ends, [`Ipc::follow`] starts by itself.
     pub fn disconnect(&self) {
         self.set_current(None);
     }
@@ -200,5 +383,65 @@ impl Ipc {
             };
             post(move || done(result));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_daemon_is_waited_for_and_never_started() {
+        assert_eq!(
+            follow_step(&ConnectError::NotRunning, Duration::ZERO),
+            FollowStep::WaitForName
+        );
+        // However long it has been retrying: "not running" always goes back to waiting.
+        assert_eq!(
+            follow_step(&ConnectError::NotRunning, FOLLOW_PATIENCE * 2),
+            FollowStep::WaitForName
+        );
+    }
+
+    #[test]
+    fn a_starting_daemon_is_retried_for_a_bounded_time() {
+        let starting = ConnectError::Transport("no reply".to_owned());
+        assert_eq!(
+            follow_step(&starting, Duration::ZERO),
+            FollowStep::RetrySoon
+        );
+        assert_eq!(
+            follow_step(
+                &starting,
+                FOLLOW_PATIENCE.saturating_sub(Duration::from_millis(1))
+            ),
+            FollowStep::RetrySoon
+        );
+        assert_eq!(follow_step(&starting, FOLLOW_PATIENCE), FollowStep::GiveUp);
+        // One attempt against a daemon that hangs already uses most of the patience, so the
+        // window cannot sit without a button for minutes.
+        assert!(CONNECT_TIMEOUT + FOLLOW_RETRY_EVERY < FOLLOW_PATIENCE);
+        assert!(FOLLOW_PATIENCE < CONNECT_TIMEOUT * 2);
+    }
+
+    #[test]
+    fn a_wrong_daemon_is_reported_not_retried() {
+        assert_eq!(
+            follow_step(
+                &ConnectError::Unverified("other user".to_owned()),
+                Duration::ZERO
+            ),
+            FollowStep::GiveUp
+        );
+        assert_eq!(
+            follow_step(
+                &ConnectError::Version {
+                    daemon: 2,
+                    client: 1
+                },
+                Duration::ZERO
+            ),
+            FollowStep::GiveUp
+        );
     }
 }

@@ -42,7 +42,7 @@ playdrop peers [--json]
 playdrop status [--json]
 playdrop transfers [--json]
 playdrop cancel <ID>
-playdrop clip (<TEXT> | --stdin) [--to <peer>]
+playdrop clip [<TEXT> | --stdin] [--to <peer>] [--sensitive]
 playdrop ping [--to <peer>] [MESSAGE]
 playdrop outbox [--json]
 playdrop outbox add <PATH>... --to <peer>
@@ -70,11 +70,15 @@ playdrop send report.pdf notes.txt
 It waits for the transfer to finish and prints progress to standard error: bytes, rate and, for several files, how many are done (`1,204 of 5,000 files`). The line is cut to the width of your terminal. With `--no-wait` it
 starts the transfer and returns at once. Check on it with `playdrop transfers`.
 
-**`peers`** lists paired devices, whether each is online, and its short ID.
+**`peers`** lists paired devices, whether each is online, its short ID and, for a device that
+is online and reports one, its battery (`64%`, `64% charging` or `9% low`).
 
 **`status`** shows the daemon's state, the same as the window's status.
 
-**`transfers`** lists current and recent transfers with their progress. For a transfer of many
+**`transfers`** lists current and recent transfers with their progress. The NAMES column says
+what is being sent: up to three top-level names (a file, or the folder it is in), so a folder
+of 5,000 files reads as its folder's name. `and more` follows when there are more than
+three. For a transfer of many
 files that is moving, the FILES column shows how many are done, like `1204/5000`. A failed send
 that PlayDrop keeps so it can resume shows `failed (resumes)` in the STATE column; `--json`
 gives it as `"resumable": true`.
@@ -89,10 +93,19 @@ exits 0. An ID that matches no transfer exits 2.
 
 **`clip`** sends text to a device's clipboard. `playdrop clip "hello"` sends that text.
 `playdrop clip --stdin` reads the text from standard input, for example
-`pwd | playdrop clip --stdin`. The same grants apply as in the window: the device must accept
-clipboard text from you. When nothing is sent it says why: the text matches the last clip sent
-or received (exit code 0, nothing to do), nothing could receive it, or the device cannot take
-it (exit code 1 for both).
+`pwd | playdrop clip --stdin`. With neither, `playdrop clip --to phone` sends what is on this
+computer's clipboard now: text, or an image when clipboard images are on in Settings. The same
+grants apply as in the window: the device must accept clipboard text from you. When nothing is
+sent it says why: the clip matches the last clip sent or received (exit code 0, nothing to do),
+nothing could receive it, the device cannot take it, or the clipboard is empty (exit code 1).
+
+A clip a password manager marked as secret is not sent from the clipboard unless you add
+`--sensitive`: the command says so and exits 1. With `--sensitive` the clip always goes marked
+sensitive, whether or not a password manager marked it, so the device keeps it out of its
+clipboard history; with text or `--stdin`, `--sensitive` marks that text the same way. On a
+desktop where PlayDrop cannot read the clipboard in the background (GNOME, or the Flatpak on
+COSMIC), and with a daemon older than this command, `playdrop clip` without text says so and
+exits 1: give the text or use `--stdin` there.
 
 **`ping`** pings a device, which makes it show a notification. An optional message is shown with
 it.

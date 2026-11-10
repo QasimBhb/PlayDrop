@@ -13,11 +13,11 @@ starts with USB-tether path choice (`docs/phases/phase-10-daily-speed.md` sectio
 | 1 | iroh for cross-network reach | large | a second network to prove it for real | spike built in Phase 12, off in every release (`docs/design/iroh-reach.md`); real network, phone and relay choice owed |
 | 2 | iOS Local Push Connectivity | medium | Apple entitlement grant, paid team | research only |
 | 3 | Wi-Fi Aware | large | a second Aware phone | research only |
-| 4 | libcosmic panel applet | small to medium | nothing | built in Phase 13 (`apps/cosmic-applet`, optional `.deb`); a person has not yet looked at or clicked the open popup |
+| 4 | libcosmic panel applet | small to medium | nothing | built in Phase 13 (`apps/cosmic-applet`, optional `.deb`); looked at and clicked through by a person on 2026-11-10 (Phase 14) |
 | 5 | Notification mirroring (Android to desktop) | medium | the user wanting it | build later |
 | 6 | MSIX for Windows | medium | signing certificate, a Windows machine | drop (for now) |
 | 7 | iOS App Group for the share extension | small | paid Apple team | build later (blocked) |
-| 8 | Windows toast buttons and tray device lines | small | a Windows machine, a person at the screen | build later |
+| 8 | Windows toast buttons and tray device lines | small | a Windows machine, a person at the screen | built in Phase 14 (2026-11-10): tray lines on, toast buttons behind `PLAYDROP_TOAST_BUTTONS=1`; never run on a real Windows PC, checklist in `docs/phases/phase-14-applet-check-and-ipc-gaps.md` section 6 |
 
 Constraint for all of them: `PLAN.md` row 7 says each ships behind a feature flag until that
 platform's stack is stable.
@@ -261,3 +261,22 @@ and is not in this list.
 - Item 1: a decision between n0's public relays and a self-hosted relay, and a real non-LAN test
   (mobile data or a different Wi-Fi).
 - Item 5: the user saying they want it.
+
+## Update, 2026-11-10 (Phase 14)
+
+Item 8 was picked and built because every other open row was blocked on something an agent
+cannot supply: a paid Apple team (2, 7), a second Aware phone (3), a certificate (6), a relay
+reachable from a second network (1), or the user's wish (5, recorded as "not required"). Item 8
+needs a person only for the last step, the click. What was found while building it:
+
+- The claim in the old TODO, that toast buttons need a COM activator registered by the
+  installer, is wrong while the daemon runs: the in-process `Activated` event of
+  `ToastNotification` is enough. A COM activator is only needed for a click that must reach a
+  daemon that has exited; that case is left out.
+- The Start Menu shortcut never carried the AppUserModelID the toast code names, so Windows may
+  have dropped every toast since Phase 2. The installer now sets it and the installer test checks
+  it. Whether toasts now appear is the first thing to look at on a real PC.
+
+What is left of the list for an agent alone: nothing. The next phase either gets a Windows PC
+for the item 8 click-through, or takes work from outside this list (the handoff names candidates).
+

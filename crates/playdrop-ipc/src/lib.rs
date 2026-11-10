@@ -13,6 +13,9 @@
 //! - [`client`]: what a UI uses. Opens the transport, verifies the daemon's identity
 //!   (SR-26, SR-27), sends requests, streams events.
 //!
+//! - [`types`]: every `playdrop-core` type the contract carries, re-exported, so a client
+//!   needs no `playdrop-core` import of its own for them.
+//!
 //! Secrets (`Secret<T>` inside events) are serialised for the UI but never logged (SR-32).
 
 #![forbid(clippy::unwrap_used)]
@@ -20,6 +23,29 @@
 pub mod client;
 pub mod server;
 pub mod wire;
+
+/// The `playdrop-core` types that appear in the IPC contract, re-exported: what [`Request`],
+/// [`Ok`] and [`Event`] carry, and what those carry in turn. A client imports them from here
+/// (`use playdrop_ipc::types::{PeerSummary, TransferSnapshot};`) instead of depending on
+/// `playdrop-core` for the shapes. They are the core's own types, so values move between the
+/// daemon and a client with no conversion.
+///
+/// Only contract types are listed. Core items a client may use for other reasons (the reach
+/// notices, identity helpers) stay in `playdrop-core`.
+pub mod types {
+    pub use playdrop_core::host::{
+        AddDeviceCandidate, Base64Bytes, DeliveredFile, Diagnostics, DialFailure, DiscoveryPath,
+        FileRoot, HostEvent, InterfaceInfo, JoinFailure, MdnsStatus, MediaState, MulticastStatus,
+        OfferedFile, OutboxItem, PairingPromptKind, PeerBattery, PeerDiagnostic, PeerSummary,
+        Secret, TransferDirection, TransferSnapshot, TransferStatus, OFFER_FILES_MAX,
+        TRANSFER_NAMES_MAX,
+    };
+    pub use playdrop_core::pin_store::Grants;
+    pub use playdrop_core::session::types::{
+        ButtonAction, Input, KeyAction, KeyInput, MediaAction, Modifier, PointerButton,
+        PointerInput, PresenterAction, ScrollUnit, SessionOp,
+    };
+}
 
 #[cfg(target_os = "linux")]
 mod linux;
@@ -31,11 +57,12 @@ mod win;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use playdrop_core::host::{
-    AddDeviceCandidate, Diagnostics, HostEvent, OutboxItem, PeerSummary, TransferSnapshot,
-};
-use playdrop_core::pin_store::Grants;
 use serde::{Deserialize, Serialize};
+
+use crate::types::{
+    AddDeviceCandidate, Diagnostics, Grants, HostEvent, MediaAction, OutboxItem, PeerSummary,
+    TransferSnapshot,
+};
 
 /// IPC contract version. Bumped on any change a client could misread; the daemon refuses
 /// clients that ask for a different major version.
@@ -232,6 +259,37 @@ pub enum Request {
         /// SR-24 flag.
         sensitive: bool,
     },
+    /// Send what is on this computer's clipboard now: the daemon reads it through its own
+    /// backend (text, or a PNG image while `clipboard_images` is on) and pushes it, so a client
+    /// need not read the clipboard itself. Answers [`Ok::ClipboardPushed`].
+    ///
+    /// SR-24: a clip a password manager marked goes out only with `allow_sensitive`; without it
+    /// nothing is sent, `skipped` is [`ClipSkip::Sensitive`] and the answer carries a one-use
+    /// `consent` token for that clip. The client asks the user and sends again with
+    /// `allow_sensitive: true` and that token: the daemon sends only if the clipboard still
+    /// holds the clip that was refused (`docs/ipc.md` 1.7 has the full rules). With
+    /// `allow_sensitive: true` and no token (the CLI, where typing the command is the consent)
+    /// it sends whatever is there. A send with `allow_sensitive: true` always goes marked
+    /// sensitive, hint or no hint. An empty
+    /// clipboard answers `skipped` [`ClipSkip::Empty`]. A session where the daemon cannot read
+    /// the clipboard (GNOME, the Flatpak on COSMIC) answers [`ErrorCode::InvalidState`] with the
+    /// reason sentence; the client then reads the clipboard itself and uses
+    /// [`Request::SendClipboard`] or [`Request::PushClipboard`], as it does when an older daemon
+    /// answers [`ErrorCode::BadRequest`] to this request.
+    SendLocalClipboard {
+        /// Peer query, or `None` for every online peer with the `clipboardOut` grant (like
+        /// [`Request::PushClipboard`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<String>,
+        /// The user agreed to send a password-manager clip (SR-24). A send with it always
+        /// goes marked sensitive.
+        #[serde(default)]
+        allow_sensitive: bool,
+        /// The `consent` token from the refusal the user just answered: binds the consent to
+        /// the clip that was refused. Never log it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent: Option<ConsentToken>,
+    },
     /// Read the daemon settings.
     GetSettings,
     /// Change daemon settings. Fields left `None` keep their value. Changing `receive_dir`
@@ -263,7 +321,7 @@ pub enum Request {
         /// Player ID from the peer's `MediaState` event.
         player: String,
         /// What to do.
-        action: playdrop_core::session::types::MediaAction,
+        action: MediaAction,
         /// `seek`: absolute position in ms; `volume`: 0 to 100; otherwise `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         value: Option<u64>,
@@ -304,6 +362,7 @@ impl Request {
             Self::Ping { .. } => "ping",
             Self::PushClipboard { .. } => "push_clipboard",
             Self::SendClipboard { .. } => "send_clipboard",
+            Self::SendLocalClipboard { .. } => "send_local_clipboard",
             Self::GetSettings => "get_settings",
             Self::SetSettings(_) => "set_settings",
             Self::OpenReceived { .. } => "open_received",
@@ -540,7 +599,8 @@ pub enum Ok {
         /// Transfer IDs.
         ids: Vec<String>,
     },
-    /// [`Request::PushClipboard`] and [`Request::SendClipboard`].
+    /// [`Request::PushClipboard`], [`Request::SendClipboard`] and
+    /// [`Request::SendLocalClipboard`].
     ClipboardPushed {
         /// Hex Device IDs the clip was sent to.
         sent_to: Vec<String>,
@@ -551,6 +611,11 @@ pub enum Ok {
         /// reads as `None`: use `skipped_echo` then.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         skipped: Option<ClipSkip>,
+        /// With `skipped` [`ClipSkip::Sensitive`]: a one-use token (128 random bits, hex) to send
+        /// back in [`Request::SendLocalClipboard`] once the user agreed. Not derived from the
+        /// clip. `None` otherwise, and from an older daemon. Never log it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        consent: Option<ConsentToken>,
     },
     /// [`Request::GetSettings`] and [`Request::SetSettings`].
     Settings {
@@ -559,6 +624,34 @@ pub enum Ok {
         /// The host was restarted to apply them.
         restarted: bool,
     },
+}
+
+/// The one-use SR-24 consent token of [`Request::SendLocalClipboard`] and
+/// [`Ok::ClipboardPushed`]: 32 lowercase hex characters (128 random bits) on the wire, a plain
+/// JSON string. `Debug` never shows it, so a `{:?}` of a request, an answer or a client's own
+/// state cannot leak it into a log (SR-32).
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ConsentToken(String);
+
+impl ConsentToken {
+    /// Wraps a token the daemon made.
+    #[must_use]
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(token.into())
+    }
+
+    /// The token text, for comparing it with the one the daemon remembers.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ConsentToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConsentToken(..)")
+    }
 }
 
 /// Why a clipboard push sent nothing, in [`Ok::ClipboardPushed`]. Only reasons the host can
@@ -575,6 +668,12 @@ pub enum ClipSkip {
     /// Devices are connected but cannot take this clip (an image to a device without image
     /// support, or long text to one that cannot fetch it).
     Unsupported,
+    /// [`Request::SendLocalClipboard`] only: a password manager marked the clip and the
+    /// request did not carry `allow_sensitive` (SR-24). Ask the user, then send again with it.
+    Sensitive,
+    /// [`Request::SendLocalClipboard`] only: the clipboard holds nothing the daemon sends (no
+    /// text, and no image or images are off).
+    Empty,
     /// A reason added by a newer daemon.
     #[serde(other)]
     Other,
@@ -588,6 +687,8 @@ impl ClipSkip {
             Self::Echo => "it matches the last clip sent or received",
             Self::NoPeers => "no connected device has clipboard sharing turned on",
             Self::Unsupported => "the connected devices cannot receive this kind of clip",
+            Self::Sensitive => "a password manager marked it as secret",
+            Self::Empty => "the clipboard is empty",
             Self::Other => "the daemon gave a reason this version does not know",
         }
     }
@@ -801,11 +902,13 @@ mod tests {
                 sent_to: vec!["ab".into()],
                 skipped_echo: false,
                 skipped: None,
+                consent: None,
             },
             Ok::ClipboardPushed {
                 sent_to: vec![],
                 skipped_echo: false,
                 skipped: Some(ClipSkip::NoPeers),
+                consent: None,
             },
         ];
         for ok in oks {
@@ -823,6 +926,7 @@ mod tests {
             sent_to: vec![],
             skipped_echo: false,
             skipped: Some(ClipSkip::NoPeers),
+            consent: None,
         })
         .expect("serialise");
         assert!(json.contains(r#""skipped":"no_peers""#), "{json}");
@@ -845,6 +949,7 @@ mod tests {
             sent_to: vec!["ab".into()],
             skipped_echo: false,
             skipped: None,
+            consent: None,
         })
         .expect("serialise");
         assert!(!sent.contains("skipped\""), "{sent}");
@@ -858,7 +963,8 @@ mod tests {
             Ok::ClipboardPushed {
                 sent_to: vec![],
                 skipped_echo: true,
-                skipped: None
+                skipped: None,
+                consent: None,
             }
         );
     }
@@ -884,11 +990,263 @@ mod tests {
             Request::Outbox,
             Request::RemoveOutbox { id: "o1".into() },
             Request::PullOutbox { peer: "p".into() },
+            Request::SendLocalClipboard {
+                peer: None,
+                allow_sensitive: false,
+                consent: None,
+            },
         ];
         for r in requests {
             let value = serde_json::to_value(&r).expect("serialise");
             assert_eq!(value["op"], r.op());
         }
+    }
+
+    #[test]
+    fn send_local_clipboard_round_trips_and_defaults() {
+        for r in [
+            Request::SendLocalClipboard {
+                peer: Some("k3qd".into()),
+                allow_sensitive: true,
+                consent: None,
+            },
+            Request::SendLocalClipboard {
+                peer: None,
+                allow_sensitive: false,
+                consent: None,
+            },
+        ] {
+            let json = serde_json::to_string(&r).expect("serialise");
+            assert!(json.contains(r#""op":"send_local_clipboard""#), "{json}");
+            assert_eq!(serde_json::from_str::<Request>(&json).expect("parse"), r);
+        }
+        // Every peer is `peer` left out, and the SR-24 consent is off unless given.
+        let bare: Request =
+            serde_json::from_str(r#"{"op":"send_local_clipboard"}"#).expect("parse");
+        assert_eq!(
+            bare,
+            Request::SendLocalClipboard {
+                peer: None,
+                allow_sensitive: false,
+                consent: None
+            }
+        );
+        // An older daemon's contract has no such op: it cannot decode it and answers
+        // `bad_request`, which is the client's cue to read the clipboard itself.
+        assert!(serde_json::from_str::<Request>(r#"{"op":"send_local_clipbord"}"#).is_err());
+    }
+
+    #[test]
+    fn consent_token_travels_both_ways_and_is_optional() {
+        let r = Request::SendLocalClipboard {
+            peer: Some("k3qd".into()),
+            allow_sensitive: true,
+            consent: Some(ConsentToken::new("ab".repeat(16))),
+        };
+        let json = serde_json::to_string(&r).expect("json");
+        assert!(
+            json.contains(&format!(r#""consent":"{}""#, "ab".repeat(16))),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<Request>(&json).expect("parse"), r);
+        // No token: not written, and a request without the field (the CLI) reads as none.
+        let bare = Request::SendLocalClipboard {
+            peer: None,
+            allow_sensitive: true,
+            consent: None,
+        };
+        assert!(!serde_json::to_string(&bare)
+            .expect("json")
+            .contains("consent"));
+        assert_eq!(
+            serde_json::from_str::<Request>(
+                r#"{"op":"send_local_clipboard","allow_sensitive":true}"#
+            )
+            .expect("parse"),
+            bare
+        );
+        // The refusal carries it; an answer without it (any older daemon) reads as none.
+        let refused = Ok::ClipboardPushed {
+            sent_to: vec![],
+            skipped_echo: false,
+            skipped: Some(ClipSkip::Sensitive),
+            consent: Some(ConsentToken::new("cd".repeat(16))),
+        };
+        let json = serde_json::to_string(&refused).expect("json");
+        assert_eq!(serde_json::from_str::<Ok>(&json).expect("parse"), refused);
+        let old: Ok = serde_json::from_str(
+            r#"{"kind":"clipboard_pushed","data":{"sent_to":["ab"],"skipped_echo":false}}"#,
+        )
+        .expect("old");
+        assert!(matches!(old, Ok::ClipboardPushed { consent: None, .. }));
+    }
+
+    #[test]
+    fn debug_never_shows_the_consent_token() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let request = Request::SendLocalClipboard {
+            peer: Some("k3qd".into()),
+            allow_sensitive: true,
+            consent: Some(ConsentToken::new(token)),
+        };
+        let answer = Response::Ok(Ok::ClipboardPushed {
+            sent_to: vec![],
+            skipped_echo: false,
+            skipped: Some(ClipSkip::Sensitive),
+            consent: Some(ConsentToken::new(token)),
+        });
+        for shown in [format!("{request:?}"), format!("{answer:?}")] {
+            assert!(!shown.contains(token), "{shown}");
+            assert!(shown.contains("ConsentToken(..)"), "{shown}");
+        }
+        // The wire still carries it as a plain string.
+        let json = serde_json::to_string(&request).expect("json");
+        assert!(json.contains(&format!(r#""consent":"{token}""#)), "{json}");
+        let back: ConsentToken = serde_json::from_str(&format!("\"{token}\"")).expect("parse");
+        assert_eq!(back.as_str(), token);
+    }
+
+    #[test]
+    fn transfer_names_more_is_optional() {
+        let t: TransferSnapshot = serde_json::from_str(
+            r#"{"id":"t","peer":"ab","short_id":"k","direction":"send","state":"active",
+            "bytes":0,"total":0,"bytes_per_sec":0,"started_at":0,"file_count":9,"note":null,
+            "names":["a","b","c"],"names_more":true}"#,
+        )
+        .expect("parse");
+        assert!(t.names_more);
+        let json = serde_json::to_string(&TransferSnapshot {
+            names_more: false,
+            ..t
+        })
+        .expect("json");
+        assert!(!json.contains("names_more"), "{json}");
+    }
+
+    #[test]
+    fn new_clip_skips_are_snake_case_and_older_builds_read_them_as_other() {
+        // A 0.8.0 client's `ClipSkip` had no `sensitive`; its `#[serde(other)]` arm is what
+        // this build's `Other` is, so the same answer decodes there as `other`.
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum OldClipSkip {
+            Echo,
+            NoPeers,
+            Unsupported,
+            #[serde(other)]
+            Other,
+        }
+        for (skip, name) in [
+            (ClipSkip::Sensitive, "sensitive"),
+            (ClipSkip::Empty, "empty"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&skip).expect("json"),
+                format!("\"{name}\"")
+            );
+            let back: ClipSkip = serde_json::from_str(&format!("\"{name}\"")).expect("json");
+            assert_eq!(back, skip);
+            assert_ne!(skip.reason(), "");
+        }
+        let refused = Response::Ok(Ok::ClipboardPushed {
+            sent_to: vec![],
+            skipped_echo: false,
+            skipped: Some(ClipSkip::Sensitive),
+            consent: None,
+        });
+        let json = serde_json::to_string(&refused).expect("serialise");
+        assert!(json.contains(r#""skipped":"sensitive""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<OldClipSkip>("\"sensitive\"").expect("old"),
+            OldClipSkip::Other
+        );
+    }
+
+    #[test]
+    fn peers_and_transfers_from_an_older_daemon_decode() {
+        // 0.8.0 shapes: no `battery` on a peer, no `names` on a transfer.
+        let peers = r#"{"kind":"peers","data":[{"device_id":"ab","short_id":"k3qd",
+            "label":"Phone","online":true,"grants":{"files":true,"clipboardIn":true,
+            "clipboardOut":true,"input":false,"media":false,
+            "find":true},"last_known":[],"paired_at":1}]}"#;
+        let Ok::Peers(p) = serde_json::from_str::<Ok>(peers).expect("old peers") else {
+            panic!("peers");
+        };
+        assert_eq!(p[0].battery, None);
+        let transfers = r#"{"kind":"transfers","data":[{"id":"t1","peer":"ab",
+            "short_id":"k3qd","direction":"send","state":"active","bytes":1,"total":2,
+            "bytes_per_sec":0,"started_at":1,"file_count":5000,"note":null}]}"#;
+        let Ok::Transfers(t) = serde_json::from_str::<Ok>(transfers).expect("old transfers") else {
+            panic!("transfers");
+        };
+        assert_eq!(t[0].names, Vec::<String>::new());
+        assert_eq!(t[0].file_count, 5000);
+    }
+
+    #[test]
+    fn peers_and_transfers_round_trip_with_the_new_fields() {
+        use crate::types::{PeerBattery, TransferDirection, TransferStatus};
+        let peer = PeerSummary {
+            device_id: "ab".repeat(32),
+            short_id: "k3qd-7f2m-xa9p-41bc".into(),
+            label: "Phone".into(),
+            online: true,
+            grants: Grants::default(),
+            last_known: vec![],
+            paired_at: 1,
+            last_seen: Some(2),
+            removed_by_peer: false,
+            capabilities: vec!["battery".into()],
+            battery: Some(PeerBattery {
+                level: 41,
+                charging: true,
+                low: false,
+            }),
+        };
+        let json = serde_json::to_string(&Ok::Peers(vec![peer.clone()])).expect("json");
+        assert!(
+            json.contains(r#""battery":{"level":41,"charging":true,"low":false}"#),
+            "{json}"
+        );
+        let Ok::Peers(back) = serde_json::from_str::<Ok>(&json).expect("parse") else {
+            panic!("peers");
+        };
+        assert_eq!(back, vec![peer.clone()]);
+        // Offline peers carry no battery, and none is written.
+        let offline = PeerSummary {
+            online: false,
+            battery: None,
+            ..peer
+        };
+        let json = serde_json::to_string(&offline).expect("json");
+        assert!(!json.contains(r#""battery":"#), "{json}");
+
+        let snap = TransferSnapshot {
+            id: "t1".into(),
+            peer: "ab".repeat(32),
+            short_id: "k3qd".into(),
+            direction: TransferDirection::Receive,
+            state: TransferStatus::Active,
+            bytes: 1,
+            total: 2,
+            bytes_per_sec: 3,
+            files_done: 0,
+            started_at: 4,
+            file_count: 5000,
+            names: vec!["Photos".into(), "notes.txt".into()],
+            names_more: false,
+            note: None,
+            saved: vec![],
+            folder: None,
+            delivered: vec![],
+            resumable: false,
+        };
+        let json = serde_json::to_string(&Ok::Transfers(vec![snap.clone()])).expect("json");
+        assert!(json.contains(r#""names":["Photos","notes.txt"]"#), "{json}");
+        let Ok::Transfers(back) = serde_json::from_str::<Ok>(&json).expect("parse") else {
+            panic!("transfers");
+        };
+        assert_eq!(back, vec![snap]);
     }
 
     #[test]

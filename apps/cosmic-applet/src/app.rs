@@ -19,16 +19,16 @@ use cosmic::iced::{window, Alignment, Length, Subscription};
 use cosmic::surface;
 use cosmic::widget::{self, button, divider, icon, text};
 use cosmic::{Element, Task};
-use playdrop_core::host::{PeerSummary, TransferSnapshot};
-use playdrop_ipc::{Ok as Answer, Request, Status, MAX_SEND_ITEMS};
+use playdrop_ipc::types::{PeerSummary, TransferSnapshot};
+use playdrop_ipc::{ConsentToken, Ok as Answer, Request, Status, MAX_SEND_ITEMS};
 use tokio::sync::mpsc;
 
 use crate::clipboard::{self, Clip};
 use crate::daemon::{self, timed, Handle, Link, Wake};
 use crate::launch;
 use crate::model::{
-    clipboard_outcome, Action, Busy, DeviceRow, Input, Model, PanelIcon, Refresh, StartAction,
-    TransferRow, View, WindowAction,
+    clipboard_outcome, local_clip_request, local_clip_result, Action, Busy, DeviceRow, Input,
+    LocalClip, Model, PanelIcon, Refresh, StartAction, TransferRow, View, WindowAction,
 };
 
 /// The applet ID, also the desktop file's name.
@@ -58,7 +58,7 @@ pub struct Applet {
     daemon_found: bool,
     /// A password-manager clip waiting for "Send" or "Cancel", with its device (SR-24).
     /// Dropped when the popup closes.
-    pending_clip: Option<(String, Clip)>,
+    pending_clip: Option<(String, PendingClip)>,
     /// Bumped each time the popup opens or closes. A clipboard read carries the value from
     /// its click; a result from an earlier popup is dropped, so no clip outlives the popup
     /// it was read for.
@@ -95,6 +95,16 @@ pub enum FilesOutcome {
     Failed(String),
 }
 
+/// A password-manager clip waiting for the user's answer (SR-24).
+#[derive(Debug)]
+pub enum PendingClip {
+    /// The daemon holds it back; "Send" asks it again with the consent and this one-use
+    /// token from the refusal (never logged).
+    Daemon(Option<ConsentToken>),
+    /// The applet read it itself (older daemon); "Send" sends this text, marked sensitive.
+    Text(Clip),
+}
+
 /// What reading the clipboard for a send ended with.
 #[derive(Debug, Clone)]
 pub enum ClipRead {
@@ -102,6 +112,10 @@ pub enum ClipRead {
     Ready(Clip),
     /// A password manager marked it: ask first (SR-24).
     NeedsConfirm(Clip),
+    /// The daemon read and settled it: the sentence to show.
+    Sent(String),
+    /// The daemon holds back a password-manager clip: ask first (SR-24).
+    DaemonNeedsConfirm(Option<ConsentToken>),
     /// Could not read; worded for the user.
     Failed(String),
 }
@@ -176,6 +190,7 @@ async fn push_clip(
             sent_to,
             skipped_echo,
             skipped,
+            ..
         }) => clipboard_outcome(label, !sent_to.is_empty(), skipped, skipped_echo),
         Ok(_) => "Clipboard not sent: the daemon gave an unexpected answer.".to_owned(),
         Err(e) => {
@@ -183,6 +198,34 @@ async fn push_clip(
             format!("Clipboard not sent: {}", e.message)
         }
     }
+}
+
+/// What the resend after the user's consent ends with. A `Fallback` here is a failure, never
+/// a reason to read the clipboard text in the applet: the token is used up, and the applet's
+/// own read would send a clip the user did not agree to, unmarked.
+fn confirmed_read(local: LocalClip) -> ClipRead {
+    match local {
+        LocalClip::Done(outcome) => ClipRead::Sent(outcome),
+        LocalClip::NeedsConfirm(token) => ClipRead::DaemonNeedsConfirm(token),
+        LocalClip::Fallback => ClipRead::Failed(
+            "Clipboard not sent: the daemon could not read the clipboard. Try again.".to_owned(),
+        ),
+    }
+}
+
+/// Asks the daemon to read the clipboard and send it to `device`.
+async fn push_local_clip(
+    client: &playdrop_ipc::client::Client,
+    device: &str,
+    label: &str,
+    allow_sensitive: bool,
+    consent: Option<ConsentToken>,
+) -> LocalClip {
+    let result = timed(client.request(local_clip_request(device, allow_sensitive, consent))).await;
+    if let Err(e) = &result {
+        tracing::info!(code = %e.code, "daemon clipboard send refused");
+    }
+    local_clip_result(label, result)
 }
 
 impl Applet {
@@ -325,20 +368,59 @@ impl Applet {
     }
 
     fn send_clipboard(&mut self, device: String) -> Task<cosmic::Action<Message>> {
-        if self.client.is_none() {
+        let Some(Handle(client)) = self.client.clone() else {
             return Task::none();
-        }
+        };
         self.model.set_busy(&device, Busy::Clipboard, true);
         let generation = self.popup_gen;
+        let label = self.model.label_of(&device);
         cosmic::task::future(async move {
-            let read = match tokio::task::spawn_blocking(clipboard::read_text).await {
-                Ok(Ok(c)) if c.sensitive => ClipRead::NeedsConfirm(c),
-                Ok(Ok(c)) => ClipRead::Ready(c),
-                Ok(Err(e)) => ClipRead::Failed(e.message()),
-                Err(_) => ClipRead::Failed("Could not read the clipboard.".to_owned()),
+            // The daemon reads the clipboard itself (text and images); only when it cannot
+            // does the applet read the text.
+            let read = match push_local_clip(&client, &device, &label, false, None).await {
+                LocalClip::Done(outcome) => ClipRead::Sent(outcome),
+                LocalClip::NeedsConfirm(token) => ClipRead::DaemonNeedsConfirm(token),
+                LocalClip::Fallback => {
+                    match tokio::task::spawn_blocking(clipboard::read_text).await {
+                        Ok(Ok(c)) if c.sensitive => ClipRead::NeedsConfirm(c),
+                        Ok(Ok(c)) => ClipRead::Ready(c),
+                        Ok(Err(e)) => ClipRead::Failed(e.message()),
+                        Err(_) => ClipRead::Failed("Could not read the clipboard.".to_owned()),
+                    }
+                }
             };
             Message::ClipboardRead(device, generation, read)
         })
+    }
+
+    /// Sends again after the user agreed to a password-manager clip the daemon held back,
+    /// with the token from the refusal. If the clipboard changed meanwhile the daemon
+    /// refuses again with a new token and the question is asked again.
+    fn push_confirmed(
+        &mut self,
+        device: String,
+        token: Option<ConsentToken>,
+    ) -> Task<cosmic::Action<Message>> {
+        let Some(Handle(client)) = self.client.clone() else {
+            self.model.set_busy(&device, Busy::Clipboard, false);
+            return Task::none();
+        };
+        self.model.set_busy(&device, Busy::Clipboard, true);
+        let generation = self.popup_gen;
+        let label = self.model.label_of(&device);
+        cosmic::task::future(async move {
+            let read = confirmed_read(push_local_clip(&client, &device, &label, true, token).await);
+            Message::ClipboardRead(device, generation, read)
+        })
+    }
+
+    /// Shows the password-manager question for `device` and keeps `pending` until it is
+    /// answered.
+    fn ask_sensitive(&mut self, device: String, pending: PendingClip) {
+        self.model.set_confirm_sensitive(Some(&device));
+        self.pending_clip = Some((device, pending));
+        // The device may have gone while the clipboard was read.
+        self.sync_pending_clip();
     }
 
     fn push(&mut self, device: String, clip: Clip) -> Task<cosmic::Action<Message>> {
@@ -567,25 +649,32 @@ impl cosmic::Application for Applet {
             Message::ClipboardRead(device, generation, read) => {
                 self.model.set_busy(&device, Busy::Clipboard, false);
                 if self.popup.is_none() || generation != self.popup_gen {
-                    // Read for a popup that has closed since: drop it, clip and all.
+                    // For a popup that has closed since. On the fallback path this drops the
+                    // clip text with it. On the daemon path the clip was already sent (or
+                    // held back by the daemon), so only the notice or the question is dropped.
                     return Task::none();
                 }
                 match read {
                     ClipRead::Ready(clip) => return self.push(device, clip),
+                    ClipRead::Sent(outcome) => self.model.set_notice(outcome),
                     ClipRead::NeedsConfirm(clip) => {
-                        self.model.set_confirm_sensitive(Some(&device));
-                        self.pending_clip = Some((device, clip));
-                        // The device may have gone while the clipboard was read.
-                        self.sync_pending_clip();
+                        self.ask_sensitive(device, PendingClip::Text(clip));
+                    }
+                    ClipRead::DaemonNeedsConfirm(token) => {
+                        self.ask_sensitive(device, PendingClip::Daemon(token));
                     }
                     ClipRead::Failed(m) => self.model.set_notice(m),
                 }
             }
             Message::ConfirmSensitive => {
                 self.model.set_confirm_sensitive(None);
-                if let Some((device, clip)) = self.pending_clip.take() {
+                match self.pending_clip.take() {
                     // Sent marked sensitive, so the phone keeps it out of its history.
-                    return self.push(device, clip);
+                    Some((device, PendingClip::Text(clip))) => return self.push(device, clip),
+                    Some((device, PendingClip::Daemon(token))) => {
+                        return self.push_confirmed(device, token)
+                    }
+                    None => {}
                 }
             }
             Message::CancelSensitive => {
@@ -807,4 +896,57 @@ fn transfer_row(t: &TransferRow, gap: u16) -> Element<'static, Message> {
         col = col.push(widget::determinate_linear(p).width(Length::Fill));
     }
     padded_control(col).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "0123456789abcdef0123456789abcdef";
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn token() -> Option<ConsentToken> {
+        Some(ConsentToken::new(SECRET))
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_consent_token() {
+        let shown = [
+            format!("{:?}", PendingClip::Daemon(token())),
+            format!("{:?}", ClipRead::DaemonNeedsConfirm(token())),
+            format!("{:?}", LocalClip::NeedsConfirm(token())),
+            format!(
+                "{:?}",
+                Message::ClipboardRead("d".into(), 1, ClipRead::DaemonNeedsConfirm(token()))
+            ),
+        ];
+        for text in shown {
+            assert!(!text.contains(SECRET), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_fallback_after_consent_is_a_failure_not_a_text_read() {
+        assert!(matches!(
+            confirmed_read(LocalClip::Fallback),
+            ClipRead::Failed(m) if m.starts_with("Clipboard not sent")
+        ));
+        // Never the applet's own read paths.
+        assert!(!matches!(
+            confirmed_read(LocalClip::Fallback),
+            ClipRead::Ready(_) | ClipRead::NeedsConfirm(_)
+        ));
+    }
+
+    #[test]
+    fn a_second_refusal_after_consent_asks_again_with_the_new_token() {
+        assert!(matches!(
+            confirmed_read(LocalClip::NeedsConfirm(token())),
+            ClipRead::DaemonNeedsConfirm(Some(t)) if t == ConsentToken::new(SECRET)
+        ));
+        assert!(matches!(
+            confirmed_read(LocalClip::Done("x".into())),
+            ClipRead::Sent(_)
+        ));
+    }
 }
