@@ -154,8 +154,8 @@ What differs from the Xcode build, by design:
 - **No multicast entitlement**, on any team: it is not in xtool's list and Apple grants it
   per app anyway (section below). Discovery fails and Diagnostics says so; pair by address
   or QR code, and paired devices reconnect by their last-known address.
-- **No asset or string catalogs** (they need Xcode's compilers): a blank icon unless
-  `iconPath` in `xtool.yml` points at a PNG, and every string is its English source text.
+- **No asset or string catalogs** (they need Xcode's compilers): the icon comes from
+  `iconPath` in `xtool.yml` instead, and every string is its English source text.
   **No AppIntents metadata extraction**: the "Send Clipboard" Shortcut is not listed in the
   Shortcuts app. **No unit tests**: `PlayDropTests` is an Xcode test bundle; the
   Linux-runnable tests live in `Packages/PlayDropShared`.
@@ -207,9 +207,17 @@ doubt, the US BIS rules for 5D992). Distribution in France may need its own decl
 
 ## App icon
 
-`PlayDrop/Resources/Assets.xcassets/AppIcon.appiconset` has the single 1024 x 1024 slot
-but no image yet. Builds run with a blank icon; App Store upload is refused until a
-1024 x 1024 PNG without transparency is added to that slot.
+`PlayDrop/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png` fills the single
+1024 x 1024 slot: the Android launcher mark (white drop, play triangle) on its blue, with
+no transparency. Its source is `PlayDrop/Resources/AppIcon.svg`. Xcode takes it from the
+catalog; xtool cannot compile catalogs, so `xtool.yml` names the same PNG as `iconPath`.
+To render it again after editing the SVG (the first tool needs the librsvg pixbuf loader,
+the second drops the alpha channel Apple refuses):
+
+```sh
+gdk-pixbuf-thumbnailer -s 1024 PlayDrop/Resources/AppIcon.svg /tmp/icon.png
+ffmpeg -y -i /tmp/icon.png -pix_fmt rgb24 PlayDrop/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
+```
 
 ## Phase 4 gates (manual checklist)
 
@@ -335,7 +343,7 @@ when the first Xcode build or device run misbehaves.
   iOS 16 and later without the `com.apple.developer.device-information.user-assigned-device-name`
   entitlement, so peers see "iPhone" until the user sets a name in Settings.
 - **Multicast entitlement**: signing fails until Apple grants it (see above).
-- **App icon**: missing; builds work, App Store upload does not (see above).
+- **App icon**: in place since 2026-11-10 (see above); Apple has not reviewed it.
 - **XCFramework module map in a subfolder** (`Headers/PlayDropCoreFFI/module.modulemap`):
   chosen so it does not collide with other binary packages; if `import PlayDropCoreFFI`
   fails, check that Xcode found it there. The same applies to the unit tests, which reach

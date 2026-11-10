@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="18 18 72 72">
+  <!-- Source of the iPhone app icon: the Android launcher mark (white drop, play triangle)
+       on its blue, cropped to the middle 72 units because iOS draws the icon edge to edge.
+       Render to Assets.xcassets/AppIcon.appiconset/AppIcon.png at 1024x1024 with no alpha
+       (README "App icon"). -->
+  <path fill="#1E5BD8" d="M18 18h72v72h-72z"/>
+  <path fill="#FFFFFF" d="M54 26C54 26 34 49 34 62C34 73.05 42.95 82 54 82C65.05 82 74 73.05 74 62C74 49 54 26 54 26Z"/>
+  <path fill="#1E5BD8" d="M49 52L49 72L65 62Z"/>
+</svg>

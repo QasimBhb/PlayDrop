@@ -33,6 +33,7 @@ Before tagging, give the version's heading its release date in place of "Unrelea
   and `playdrop transfers`, also when you open them in the middle of a transfer.
 - Windows: the tray menu lists your devices with their state and battery, and "Stop remote
   input" appears while a phone controls the computer, as on Linux.
+- iPhone: the app has an icon (the same drop as on Android) instead of a blank tile.
 
 ### Changed
 

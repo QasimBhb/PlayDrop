@@ -11,6 +11,8 @@ bundleID: org.playdrop.ios
 product: PlayDrop
 infoPath: build/xtool/PlayDrop-Info.plist
 entitlementsPath: build/xtool/PlayDrop.entitlements
+# xtool cannot compile the asset catalog, so it is handed the catalog's icon image directly.
+iconPath: PlayDrop/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
 resources:
   - PlayDrop/Resources/PrivacyInfo.xcprivacy
 extensions:
