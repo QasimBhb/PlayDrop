@@ -252,29 +252,50 @@ struct Pump {
 
 impl Pump {
     /// Forwards until end of file, or until a cut, which hands both halves back.
-    #[allow(clippy::cast_precision_loss, reason = "test pacing")]
+    ///
+    /// A cut wins over everything else the pump may be doing: a read that is ready, the
+    /// flow and hold gates, a write, the pacing sleeps. It used to be seen only between
+    /// chunks, so a pump that picked up a chunk just as the test closed the gate and cut
+    /// sat at the gate for good, its half of the dialler's socket stayed open, and the
+    /// dialler never learnt the path had died (seen on Windows runners, where bytes were
+    /// still in flight at that moment more often than not).
     async fn run(
         mut self,
         mut r: OwnedReadHalf,
         mut w: OwnedWriteHalf,
     ) -> Option<(OwnedReadHalf, OwnedWriteHalf)> {
+        let (mut cut, born) = (self.cut.0.clone(), self.cut.1);
+        let was_cut = {
+            let forward = self.forward(&mut r, &mut w);
+            tokio::select! {
+                biased;
+                _ = cut.wait_for(|g| *g > born) => true,
+                () = forward => false,
+            }
+        };
+        if was_cut {
+            return Some((r, w));
+        }
+        let _ = w.shutdown().await;
+        None
+    }
+
+    /// The forwarding itself, until end of file or an error on either side.
+    #[allow(clippy::cast_precision_loss, reason = "test pacing")]
+    async fn forward(&mut self, r: &mut OwnedReadHalf, w: &mut OwnedWriteHalf) {
         let mut buf = vec![0u8; 16 * 1024];
         let mut next = tokio::time::Instant::now();
-        let (mut cut, born) = (self.cut.0.clone(), self.cut.1);
         loop {
-            let n = tokio::select! {
-                _ = cut.wait_for(|g| *g > born) => return Some((r, w)),
-                read = r.read(&mut buf) => match read {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                },
+            let n = match r.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
             };
             let _ = self.flow.wait_for(|f| *f).await;
             if let Some(hold) = &mut self.hold {
                 let _ = hold.wait_for(|h| *h).await;
             }
             if w.write_all(&buf[..n]).await.is_err() {
-                break;
+                return;
             }
             if let Some(StallCount {
                 returned,
@@ -300,8 +321,6 @@ impl Pump {
                 tokio::time::sleep_until(next).await;
             }
         }
-        let _ = w.shutdown().await;
-        None
     }
 }
 
