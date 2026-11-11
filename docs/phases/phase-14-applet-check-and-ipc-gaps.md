@@ -36,7 +36,7 @@ Versions: workspace `0.9.0`; `apps/cosmic-applet` `0.9.0`; `playdrop-ffi` keeps 
 | Built on | This Pop!_OS COSMIC machine, 2026-11-10, one session: two Opus builders (IPC, Windows), one Sonnet builder (applet), me on the Flatpak question and the window's reconnect, four independent Opus review passes |
 | Rust tests | 683 passed, 0 failed, 11 ignored (`dbus-run-session -- cargo test --workspace --locked --no-fail-fast`); clippy `-D warnings` on Linux and on `x86_64-pc-windows-gnu` with the stub C compiler; `fmt --check` clean; Flatpak `check-sources` in step (898 crates) |
 | Applet tests | 88 passed in `apps/cosmic-applet` (`cargo test --locked`), clippy and `fmt --check` clean |
-| Android, iOS | No code change. iOS `MARKETING_VERSION` only. The ffi is untouched |
+| Android, iOS | No code change. iOS `MARKETING_VERSION` and, added the same day, an app icon (below). The ffi is untouched |
 | Release | See the end of section 1.1 |
 | Phone | Paired and used by hand; no bench |
 
@@ -119,7 +119,24 @@ default session config, which includes `/usr/share/dbus-1/services`. With the `.
 that let the test start the real `/usr/bin/playdropd` against the real config (and fail at
 random). Its bus now has its own config with no service directory.
 
-**Release.** Not released at the time of this commit. v0.9.0 is tagged once CI is green on all four platforms; the note recording that is its own commit.
+**iPhone icon.** The user installed the app on an iPhone with xtool on 2026-11-10 (paired by QR,
+works) and found a blank home screen tile: the icon slot had never been filled. Commit `de8e130`
+adds `apps/ios/PlayDrop/Resources/AppIcon.svg` (the Android launcher mark) and its 1024 x 1024
+render in the asset catalog, and `xtool.yml` names the same PNG as `iconPath`. Xcode's asset
+compiler accepted it on CI; the user saw it on the phone.
+
+**The Windows path test.** `a_merged_address_that_wins_a_dial_is_a_path_move` failed on 3 of 4
+Windows runs that day (one CI run, two attempts of the release run), each time with the session
+still online on the cut address. The fault was in the test's proxy, not in the core: `Pump::run`
+looked for a cut only between chunks, so a pump that had just read a chunk when the test closed
+the gate and cut waited at the gate for good and its half of the dialler's socket never closed.
+Commit `6d56a53` makes a cut win over everything the pump does. Reviewed independently; green on
+Windows on the first run after it.
+
+**Release.** v0.9.0 released from GitHub Releases on 2026-11-11 from `6d56a53` (six files plus
+checksums), CI green on all four platforms. The tag was first pushed on `de8e130`, whose release
+run stopped at the Windows test above before anything was published; the user moved the tag to
+the fix.
 
 ---
 
@@ -190,6 +207,9 @@ docs/core-api.md (section 14, a dated note), docs/design/later-items.md
 | Core | A battery report can race a session teardown and be wiped until the next report (at most 60 s); a late report can leave one entry for a just-unpaired device until its next offline | low |
 | Clipboard | `wayland.rs` `read_current` reads the password-manager hint and the content in two round trips; a clip copied in between could be misjudged. Older than this phase, and the new request relies on it | low |
 | Tests | `the_label_follows_the_connection_and_reports_are_masked` (iroh feature) timed out once on CI in Phase 13 | watch |
+| Tests | The proxy in `phase11_path.rs` still does not see a cut while a new connection waits at a closed flow gate before its connect (near `flow.wait_for` in `Proxy::on`). No test hits it today | low |
+| Android | The always-on notification can be swiped away (Android 13 and newer) and opening the app does not bring it back; only Force stop and a fresh start did, on the A54 on 2026-11-10. Opening the app should post it again (`CoreHostImpl` skips the service start when the core already runs, and `Notifications.updateService` only fires on a state change) | 15 |
+| iOS | The icon is the Android mark at full bleed; Apple has not reviewed it and there are no dark or tinted variants | later |
 | Earlier phases | See `phase-13-cli-everywhere-and-applet.md` section 5 for the rest | later |
 
 ---
@@ -248,7 +268,8 @@ docs/core-api.md (section 14, a dated note), docs/design/later-items.md
 ## 8. Phase 15 kickoff brief
 
 v0.9.0 is released. The later-items list has nothing left that an agent can finish alone. In
-order of value: (1) if a Windows PC is on offer, the section 6 click-through, then turn toast
+order of value: (0) the small Android fix in section 5: opening the app must bring a swiped-away
+service notification back; (1) if a Windows PC is on offer, the section 6 click-through, then turn toast
 buttons on by default; (2) the stale "online" on the phone after an unclean drop (section 5),
 which is core work provable on this machine with the A54 and a firewall rule that drops the
 desktop's packets; (3) the two applet checks nobody tried. Reach stays a spike until a relay on a
