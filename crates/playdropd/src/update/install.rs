@@ -302,6 +302,9 @@ mod windows_shell {
 mod tests {
     use super::*;
 
+    // The paths are Unix ones, and only a Unix path starting with `/` is absolute: on
+    // Windows this failed the first CI run. The `.deb` path never runs there.
+    #[cfg(unix)]
     #[test]
     fn the_deb_command_is_pkexec_apt_get_with_absolute_files() {
         let files = [
