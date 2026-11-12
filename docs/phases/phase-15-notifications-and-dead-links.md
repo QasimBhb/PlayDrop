@@ -91,7 +91,7 @@ transient listener unbind asks for a rebind instead of being read as revoked acc
 `MainActivity` start guard above; the desktop keeps expired copies; the Windows exception to
 SR-42 is written down. Review 3 judged the watchdog sound.
 
-**Release.** See the end of this file's section 7 and `CLAUDE.md`.
+**Release.** v0.10.0 was tagged at `4168fe3` on 2026-11-12 and its release run passed first time: six files plus `SHA256SUMS` on GitHub Releases. The docs commit under the tag touched no code, so the platform workflows did not run again (path filters); their green runs at `40477b7` cover the same code.
 
 ---
 
