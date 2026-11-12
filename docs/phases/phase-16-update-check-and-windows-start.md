@@ -87,6 +87,8 @@ per minute) and the desktop notification for it. The desktop mirror table keeps 
 minutes over an absence and matches what the phone sends again
 (`crates/playdropd/src/notify/mirror.rs`, protocol 5.16).
 
+**Release.** v0.11.0 was tagged at `514cee2` on 2026-11-12 and its release run passed first time: six files plus `SHA256SUMS` and `SHA256SUMS.sig`. The user stored the Actions secret `PLAYDROP_UPDATE_SIGNING_KEY` (storing a secret is refused for the agent; the command is in `docs/release/distribution.md`). The published signature was fetched from the "latest" URLs and verified with `openssl` against `docs/release/playdrop-update.pub`.
+
 **Reviews.** No critical finding. Fixed from them, among others: a `.deb` update could remove the
 applet (`--no-remove`, probe at install time); the Windows daemon stayed in "installing" for
 ever when the installer was cancelled; a pre-release build would be offered an older release;
@@ -153,7 +155,6 @@ docs/{protocol,threat-model,core-api,ipc,product}.md, docs/guide/cli.md, CHANGEL
 
 | Area | What | Phase |
 |---|---|---|
-| Release | The Actions secret `PLAYDROP_UPDATE_SIGNING_KEY` must be set by the user (storing it was refused for the agent). The command is in `docs/release/distribution.md`. The release job stops before publishing without it | before the tag |
 | Update | Never run for real: `pkexec apt-get` (both start paths: autostart and the systemd unit, where polkit may find no agent), the exec restart, TLS to GitHub through `ureq`. First real proof is updating a 0.11.0 install to the next release | next release |
 | Update | Windows: `ShellExecuteExW`, UAC, a cancelled installer, over-the-shoulder elevation. Type-checked only | when a PC is on offer |
 | Update | Android and iOS still parse the "is this a release build" rule in app code; `update_check_available` exists in the bindings and should replace it | next |
