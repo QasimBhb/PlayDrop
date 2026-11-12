@@ -12,8 +12,8 @@ files. There is no account and no cloud: devices talk directly to each other on 
 nothing you send leaves it. The one request PlayDrop makes to the internet is an anonymous check
 for a newer release when you open it, at most once a day, which Settings can turn off.
 
-Licence: GPL-3.0-or-later. Version: 0.4.0; the latest release is
-[v0.4.0](https://github.com/QasimBhb/PlayDrop/releases/tag/v0.4.0). See [CHANGELOG.md](CHANGELOG.md).
+Licence: GPL-3.0-or-later. The latest release is on the
+[releases page](https://github.com/QasimBhb/PlayDrop/releases/latest). See [CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
