@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.playdrop.core.ClipboardPush
 
 /** Which devices a clip can go to, and what one push to the chosen ones reports. */
 class ClipPlanTest {
@@ -133,5 +134,49 @@ class ClipPlanTest {
     fun aDeviceThatRemovedThisPhoneIsReportedAsNotPaired() {
         val r = ClipPlan.results(listOf("aa"), { it }, mapOf("aa" to Blocked.REMOVED), null, null)
         assertEquals(listOf(DeviceResult.NotPaired("aa")), r)
+    }
+
+    /** The phone run: "Send clipboard" with two devices ticked; both got it. */
+    @Test
+    fun aClipDeliveredToBothIsReportedAsSentToBoth() {
+        val one = "3f0c9a7e5b2d4c18a6e1f0b7d9c3a5e2" + "7b4d1c8e6a2f9b0d3c5e7a1f4b6d8c0e"
+        val two = "a1b2c3d4e5f60718293a4b5c6d7e8f90" + "0f9e8d7c6b5a49382716f5e4d3c2b1a0"
+        val candidates = listOf(
+            Candidate(one, "test-one", "AAAA-1111", online = true, clipboardOut = true),
+            Candidate(two, "test-two", "BBBB-2222", online = true, clipboardOut = true),
+        )
+        val labels = mapOf(one to "test-one", two to "test-two")
+        fun send(chosen: List<String>): String {
+            val blocked = ClipPlan.blockedNow(chosen, candidates, SendKind.CLIPBOARD_TEXT)
+            val targets = ClipPlan.targets(chosen, blocked.filterValues { it == null }.keys)
+            assertEquals(chosen, targets)
+            // Exactly what push_clipboard_to returned: every target in sentTo, nothing skipped.
+            val real = ClipboardPush(
+                sentTo = targets,
+                skippedEcho = false,
+                skippedOffline = 0u,
+                skippedNoGrant = 0u,
+                skippedUnsupported = 0u,
+                skippedNotPaired = emptyList(),
+            )
+            val results = ClipPlan.results(chosen, labels::getValue, blocked, Pushed.of(real), null)
+            return SendReport.sentence(results, EnglishPhrases())
+        }
+        assertEquals("Sent to test-one and test-two.", send(listOf(one, two)))
+        assertEquals("Sent to test-one.", send(listOf(one)))
+    }
+
+    @Test
+    fun blockedNowKeepsEligibleDevicesApartFromMissingOnes() {
+        val chosen = listOf("aa", "dd", "zz")
+        val blocked = ClipPlan.blockedNow(chosen, listOf(laptop, away), SendKind.CLIPBOARD_TEXT)
+        // Eligible is null, not offline; a device no longer listed is not paired.
+        assertEquals(mapOf("aa" to null, "dd" to Blocked.OFFLINE, "zz" to Blocked.REMOVED), blocked)
+    }
+
+    @Test
+    fun theCoresAnswerIsReadFieldByField() {
+        val p = Pushed.of(ClipboardPush(listOf("aa"), true, 1u, 2u, 3u, listOf("zz")))
+        assertEquals(Pushed(setOf("aa"), echo = true, notPaired = setOf("zz"), skippedOffline = 1, skippedNoGrant = 2, skippedUnsupported = 3), p)
     }
 }

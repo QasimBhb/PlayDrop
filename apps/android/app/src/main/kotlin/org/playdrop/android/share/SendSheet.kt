@@ -89,9 +89,11 @@ internal class SendSheet(
     /**
      * Shows the sending card until it has been up for [CANCEL_WINDOW_MS] and [ready] is done
      * (every send started), or until Cancel. True when the person cancelled. Leaving the
-     * screen ends the wait without cancelling: the person already tapped "Send".
+     * screen ends the wait without cancelling: the person already tapped "Send". Once
+     * [finished] is done (every send ended) Cancel has nothing left to stop, so the card
+     * goes at once and the result is reported.
      */
-    suspend fun holdSending(title: String, ready: Deferred<Unit>): Boolean = coroutineScope {
+    suspend fun holdSending(title: String, ready: Deferred<Unit>, finished: Deferred<Unit>? = null): Boolean = coroutineScope {
         state = SheetState.Sending(title)
         val window = async {
             delay(windowMs)
@@ -101,6 +103,7 @@ internal class SendSheet(
             cancelled.onAwait { true }
             left.onAwait { false }
             window.onAwait { false }
+            finished?.onAwait { false }
         }
         window.cancel()
         wasCancelled

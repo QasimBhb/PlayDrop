@@ -102,24 +102,18 @@ internal object ShareSender {
         if (dialFirst) dial(chosen)
         val online = CoreHost.withHost { h -> CoreHost.peers.value.associate { it.deviceId to h.isOnline(it.deviceId) } }
         val candidates = CoreHost.peers.value.map { Candidate.of(it).copy(online = online[it.deviceId] == true) }
-        val blockedNow = chosen.associateWith { id -> candidates.firstOrNull { it.id == id }?.let(nowKind::blocked) ?: Blocked.OFFLINE }
-        val targets = ClipPlan.targets(chosen, candidates.filter { nowKind.blocked(it) == null }.map { it.id })
+        val blockedNow = ClipPlan.blockedNow(chosen, candidates, nowKind)
+        val targets = ClipPlan.targets(chosen, blockedNow.filterValues { it == null }.keys)
         var pushed: Pushed? = null
         var error: String? = null
         if (targets.isNotEmpty()) {
             try {
                 pushed = CoreHost.withHost { h ->
-                    val p = when (clip) {
-                        is Clip.Text -> h.pushClipboardTo(targets, clip.text, sensitive)
-                        is Clip.Image -> h.pushClipboardImageTo(targets, clip.bytes, clip.mime, sensitive)
-                    }
-                    Pushed(
-                        sentTo = p.sentTo.toSet(),
-                        echo = p.skippedEcho,
-                        notPaired = p.skippedNotPaired.toSet(),
-                        skippedOffline = p.skippedOffline.toInt(),
-                        skippedNoGrant = p.skippedNoGrant.toInt(),
-                        skippedUnsupported = p.skippedUnsupported.toInt(),
+                    Pushed.of(
+                        when (clip) {
+                            is Clip.Text -> h.pushClipboardTo(targets, clip.text, sensitive)
+                            is Clip.Image -> h.pushClipboardImageTo(targets, clip.bytes, clip.mime, sensitive)
+                        },
                     )
                 }
             } catch (e: Exception) {

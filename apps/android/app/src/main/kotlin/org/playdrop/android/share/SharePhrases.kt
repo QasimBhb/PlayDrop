@@ -3,9 +3,13 @@ package org.playdrop.android.share
 import android.content.Context
 import org.playdrop.android.R
 
-/** [Phrases] from string resources; only the "it went" sentence differs per kind of send. */
+/**
+ * [Phrases] from string resources; only the "it went" sentences differ per kind of send
+ * ([sentLine] for a send that went or is going, [deliveredLine] for files that all arrived).
+ */
 internal class SharePhrases private constructor(
     private val context: Context,
+    private val deliveredLine: (String) -> String = { names -> context.getString(R.string.share_report_sent, names) },
     private val sentLine: (String) -> String,
 ) : Phrases {
     private val res get() = context.resources
@@ -13,6 +17,12 @@ internal class SharePhrases private constructor(
     override val and: String get() = context.getString(R.string.share_and)
 
     override fun sent(names: String): String = sentLine(names)
+
+    override fun delivered(names: String): String = deliveredLine(names)
+
+    override fun stopped(names: String): String = context.getString(R.string.share_report_stopped, names)
+
+    override fun notSent(names: String): String = context.getString(R.string.share_report_not_sent, names)
 
     override fun waiting(names: String, count: Int): String = res.getQuantityString(R.plurals.share_report_waiting, count, names)
 
@@ -31,10 +41,12 @@ internal class SharePhrases private constructor(
     override fun failed(name: String, reason: String): String = context.getString(R.string.share_report_failed, name, reason)
 
     companion object {
-        /** Files: "Sending 3 items to A and B." */
-        fun files(context: Context, items: Int) = SharePhrases(context) { names ->
-            context.resources.getQuantityString(R.plurals.share_report_sending, items, items, names)
-        }
+        /** Files: "Sending 3 items to A and B.", or "Sent 3 items to A and B." once they arrived. */
+        fun files(context: Context, items: Int) = SharePhrases(
+            context,
+            deliveredLine = { names -> context.resources.getQuantityString(R.plurals.share_report_sent_items, items, items, names) },
+            sentLine = { names -> context.resources.getQuantityString(R.plurals.share_report_sending, items, items, names) },
+        )
 
         /** The phone's clipboard: "Sent to A and B." */
         fun clipboard(context: Context) = SharePhrases(context) { names -> context.getString(R.string.share_report_sent, names) }

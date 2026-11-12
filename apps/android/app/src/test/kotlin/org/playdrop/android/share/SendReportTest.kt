@@ -6,19 +6,7 @@ import org.junit.Test
 /** Device names in plain English and the one-line result of a send to several devices. */
 class SendReportTest {
     /** The English wording of strings_share.xml, for clips. */
-    private val english = object : Phrases {
-        override val and = "and"
-        override fun sent(names: String) = "Sent to $names."
-        override fun waiting(names: String, count: Int) =
-            "$names ${if (count == 1) "is" else "are"} offline. PlayDrop keeps trying for 10 minutes."
-        override fun offline(names: String, count: Int) = "$names ${if (count == 1) "is" else "are"} offline."
-        override fun clipboardOff(names: String) = "Clipboard to $names is off."
-        override fun noImages(names: String) = "$names cannot take copied images."
-        override fun alreadySent(names: String) = "Already sent to $names."
-        override fun notPaired(names: String, count: Int) = "$names ${if (count == 1) "is" else "are"} no longer paired."
-        override fun notTaken(names: String) = "$names did not take it."
-        override fun failed(name: String, reason: String) = "Could not send to $name: $reason"
-    }
+    private val english = EnglishPhrases()
 
     @Test
     fun joinsNames() {

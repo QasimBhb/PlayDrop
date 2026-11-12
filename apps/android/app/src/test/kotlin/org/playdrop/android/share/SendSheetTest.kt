@@ -4,6 +4,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -117,5 +118,17 @@ class SendSheetTest {
         assertFalse(held.isCompleted)
         ready.complete(Unit)
         assertFalse(held.await())
+    }
+
+    @Test
+    fun theSendingCardGoesOnceEverySendEnded() = runBlocking {
+        val s = SendSheet(onMakeDefault = {}, windowMs = 10_000)
+        val finished = CompletableDeferred<Unit>()
+        val held = async { s.holdSending("Sending to A and B", CompletableDeferred(), finished) }
+        yield()
+        assertFalse(held.isCompleted)
+        // Nothing is left to cancel: the card closes before its window, without a Cancel.
+        finished.complete(Unit)
+        assertFalse(withTimeout(1_000) { held.await() })
     }
 }

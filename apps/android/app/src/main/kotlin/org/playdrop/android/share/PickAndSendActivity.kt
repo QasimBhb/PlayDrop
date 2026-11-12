@@ -19,8 +19,10 @@ import org.playdrop.android.core.UriSource
 import org.playdrop.android.data.Settings
 
 /**
- * The "Send to <device>" or "Send files" notification action: opens the photo picker (or the document
- * picker where the photo picker is unavailable). With one usable paired device the picks go
+ * The "Send to <device>" or "Send files" notification action. "Send files"
+ * ([EXTRA_DOCUMENTS]) opens the document picker, which takes any kind of file and also
+ * offers photos; "Send to <device>" opens the photo picker (or the document picker where the
+ * photo picker is unavailable). With one usable paired device the picks go
  * to it (the pick is the confirmation, as before); with more than one the device chooser
  * follows, the same one as the share sheet's, and "Send" hands the sends to the process
  * scope ([ManySend]). Without a usable paired device it opens the app. The picked items are
@@ -78,7 +80,8 @@ class PickAndSendActivity : ComponentActivity() {
                 finish()
                 return@launch
             }
-            if (ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(this@PickAndSendActivity)) {
+            val documents = intent.getBooleanExtra(EXTRA_DOCUMENTS, false)
+            if (!documents && ActivityResultContracts.PickVisualMedia.isPhotoPickerAvailable(this@PickAndSendActivity)) {
                 pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
             } else {
                 pickDocuments.launch(arrayOf("*/*"))
@@ -159,7 +162,10 @@ class PickAndSendActivity : ComponentActivity() {
 
     private fun toast(text: String) = Toast.makeText(applicationContext, text, Toast.LENGTH_LONG).show()
 
-    private companion object {
-        const val KEY_PICKED = "picked"
+    companion object {
+        /** True for the "Send files" action: pick any file, not only photos and videos. */
+        const val EXTRA_DOCUMENTS = "org.playdrop.android.extra.DOCUMENTS"
+
+        private const val KEY_PICKED = "picked"
     }
 }

@@ -105,7 +105,7 @@ internal object Notifications {
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setContentIntent(openApp(context))
             .addAction(0, context.getString(R.string.action_send_clipboard), activity(context, ClipboardSendActivity::class.java, 11))
-            .addAction(0, sendLabel, activity(context, PickAndSendActivity::class.java, 12))
+            .addAction(0, sendLabel, pickAndSend(context, documents = sendToLabel == null))
             .build()
     }
 
@@ -492,6 +492,17 @@ internal object Notifications {
             ?: Intent().setPackage(context.packageName)
         launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         return PendingIntent.getActivity(context, 10, launch, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+    }
+
+    /**
+     * The file action. "Send files" ([documents]) opens the document picker, which takes any
+     * file and also offers photos; "Send to <device>" keeps the photo picker.
+     */
+    private fun pickAndSend(context: Context, documents: Boolean): PendingIntent {
+        val intent = Intent(context, PickAndSendActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .putExtra(PickAndSendActivity.EXTRA_DOCUMENTS, documents)
+        return PendingIntent.getActivity(context, 12, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
 
     private fun activity(context: Context, cls: Class<*>, requestCode: Int): PendingIntent {

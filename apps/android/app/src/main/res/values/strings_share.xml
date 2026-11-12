@@ -8,7 +8,10 @@
     <string name="share_choose_text">Send text to</string>
     <string name="share_choose_clipboard">Send clipboard to</string>
     <string name="share_select_all">Select all</string>
-    <string name="share_clear">Clear</string>
+    <!-- Spoken state of a tick box in the device chooser -->
+    <string name="share_state_ticked">Ticked</string>
+    <string name="share_state_not_ticked">Not ticked</string>
+    <string name="share_state_some_ticked">Some ticked</string>
     <string name="share_send">Send</string>
     <plurals name="share_send_to_devices">
         <item quantity="one">Send to %d device</item>
@@ -33,6 +36,12 @@
         <item quantity="other">Sending %1$d items to %2$s.</item>
     </plurals>
     <string name="share_report_sent">Sent to %1$s.</string>
+    <plurals name="share_report_sent_items">
+        <item quantity="one">Sent %1$d item to %2$s.</item>
+        <item quantity="other">Sent %1$d items to %2$s.</item>
+    </plurals>
+    <string name="share_report_stopped">Stopped sending to %1$s.</string>
+    <string name="share_report_not_sent">Not sent to %1$s.</string>
     <string name="share_report_copied">Copied to %1$s.</string>
     <plurals name="share_report_waiting">
         <item quantity="one">%1$s is offline. PlayDrop keeps trying for 10 minutes.</item>

@@ -7,6 +7,15 @@ internal sealed class DeviceResult {
     /** Sent (a clip) or started while the device was online (files). */
     data class Sent(override val label: String) : DeviceResult()
 
+    /** Files: every item arrived before the report. */
+    data class Delivered(override val label: String) : DeviceResult()
+
+    /** Files: Cancel stopped the send part way. */
+    data class Stopped(override val label: String) : DeviceResult()
+
+    /** Files: Cancel came before the send to this device started. */
+    data class NotSent(override val label: String) : DeviceResult()
+
     /** Files: started while the device was offline; the core keeps trying for 10 minutes. */
     data class Waiting(override val label: String) : DeviceResult()
 
@@ -52,6 +61,15 @@ internal interface Phrases {
     /** "Sent to A and B." for clips, "Sending 3 items to A and B." for files. */
     fun sent(names: String): String
 
+    /** Files that all arrived: "Sent 3 items to A and B." */
+    fun delivered(names: String): String
+
+    /** "Stopped sending to B." */
+    fun stopped(names: String): String
+
+    /** "Not sent to C." */
+    fun notSent(names: String): String
+
     /** Files to offline devices: "B is offline. PlayDrop keeps trying for 10 minutes." */
     fun waiting(names: String, count: Int): String
 
@@ -86,9 +104,12 @@ internal object SendReport {
     fun sentence(results: List<DeviceResult>, p: Phrases): String {
         fun names(of: List<DeviceResult>) = NameList.join(of.map { it.label }, p.and)
         val out = mutableListOf<String>()
+        results.filterIsInstance<DeviceResult.Delivered>().takeIf { it.isNotEmpty() }?.let { out += p.delivered(names(it)) }
         results.filterIsInstance<DeviceResult.Sent>().takeIf { it.isNotEmpty() }?.let { out += p.sent(names(it)) }
         results.filterIsInstance<DeviceResult.Waiting>().takeIf { it.isNotEmpty() }?.let { out += p.waiting(names(it), it.size) }
         results.filterIsInstance<DeviceResult.AlreadySent>().takeIf { it.isNotEmpty() }?.let { out += p.alreadySent(names(it)) }
+        results.filterIsInstance<DeviceResult.Stopped>().takeIf { it.isNotEmpty() }?.let { out += p.stopped(names(it)) }
+        results.filterIsInstance<DeviceResult.NotSent>().takeIf { it.isNotEmpty() }?.let { out += p.notSent(names(it)) }
         results.filterIsInstance<DeviceResult.Offline>().takeIf { it.isNotEmpty() }?.let { out += p.offline(names(it), it.size) }
         results.filterIsInstance<DeviceResult.ClipboardOff>().takeIf { it.isNotEmpty() }?.let { out += p.clipboardOff(names(it)) }
         results.filterIsInstance<DeviceResult.NoImages>().takeIf { it.isNotEmpty() }?.let { out += p.noImages(names(it)) }

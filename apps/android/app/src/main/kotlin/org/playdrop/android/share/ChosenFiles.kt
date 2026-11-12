@@ -2,6 +2,7 @@ package org.playdrop.android.share
 
 import android.content.Context
 import androidx.activity.ComponentActivity
+import kotlinx.coroutines.flow.mapNotNull
 import kotlinx.coroutines.launch
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
@@ -9,13 +10,17 @@ import org.playdrop.android.core.CoreHostImpl
 import org.playdrop.android.core.HostLog
 import org.playdrop.android.core.UriSource
 import org.playdrop.android.data.Settings
+import org.playdrop.core.HostEvent
+import org.playdrop.core.TransferDirection
+import org.playdrop.core.TransferFailure
 
 /**
  * Starts the sends of [prepared] to the [chosen] devices after "Send" in the chooser, in the
  * process scope ([ManySend]), and takes over the caller's reference to the items. Every
  * device after the first gets its own share of the items, prepared there and then (the
  * activity that holds the grant is normally still alive: the card stays up for at least
- * the cancel window). One toast names every device at the end, or says Cancelled.
+ * the cancel window). One toast names every device at the end and says truthfully what
+ * happened on each: sent, still sending, stopped by Cancel or never started.
  */
 internal fun startFileSends(
     context: Context,
@@ -51,6 +56,7 @@ internal fun startFileSends(
         },
         stop = { id -> CoreHost.withHost { it.cancelTransfer(id) } },
         release = { it.release() },
+        ends = CoreHost.events.mapNotNull(::sendEndOf),
         report = { r ->
             val text = when (r) {
                 ManySend.Report.Cancelled -> app.getString(R.string.toast_cancelled)
@@ -58,7 +64,8 @@ internal fun startFileSends(
                     HostLog.wNoDetail("share", "preparing the items for every device failed", r.error)
                     ShareSender.failedText(app, r.error)
                 }
-                is ManySend.Report.Done -> SendReport.sentence(fileResults(r.outcomes, chosen, wasOnline), SharePhrases.files(app, items))
+                is ManySend.Report.Done ->
+                    SendReport.sentence(fileResults(r, chosen, wasOnline), SharePhrases.files(app, items))
             }
             ShareSender.toast(app, text)
         },
@@ -67,26 +74,51 @@ internal fun startFileSends(
     return run
 }
 
-/** One result per device for a finished [ManySend] of files. */
-private fun fileResults(outcomes: List<FanOut.Outcome<Int>>, chosen: List<String>, wasOnline: Map<String, Boolean>): List<DeviceResult> =
-    outcomes.mapNotNull { o ->
-        val peer = chosen[o.target]
-        val label = CoreHost.labelOf(peer)
-        when (o) {
-            is FanOut.Outcome.Started -> if (wasOnline[peer] == true) DeviceResult.Sent(label) else DeviceResult.Waiting(label)
-            is FanOut.Outcome.Failed -> DeviceResult.Failed(label, ShareSender.reason(o.error))
-            is FanOut.Outcome.Skipped, is FanOut.Outcome.Stopped -> null
+/** The end of one of this device's sends, or null for any other event. */
+internal fun sendEndOf(ev: HostEvent): SendEnd? = when (ev) {
+    is HostEvent.TransferComplete ->
+        if (ev.direction == TransferDirection.SEND) SendEnd(ev.id, completed = true, byCancel = false, reason = "") else null
+    is HostEvent.TransferFailed ->
+        if (ev.direction == TransferDirection.SEND) {
+            SendEnd(ev.id, completed = false, byCancel = ev.code == TransferFailure.CANCELLED_BY_YOU, reason = ev.reason)
+        } else {
+            null
         }
-    }
+    else -> null
+}
 
 /**
- * Shows the sending card of [run] until its window is over and every send started, then
- * finishes the activity. Cancel stops every send. Leaving the screen ends the wait and the
+ * One result per device for a finished [ManySend] of files. After a Cancel a device that had
+ * already received everything is "already sent", one stopped part way "stopped" and one never
+ * started "not sent"; without a Cancel a finished send is "sent" and a running one "sending".
+ */
+internal fun fileResults(
+    done: ManySend.Report.Done,
+    chosen: List<String>,
+    wasOnline: Map<String, Boolean>,
+    label: (String) -> String = CoreHost::labelOf,
+    reason: (Exception) -> String = ShareSender::reason,
+): List<DeviceResult> = done.devices.map { d ->
+    val peer = chosen[d.target]
+    val name = label(peer)
+    when (d) {
+        is ManySend.Device.Completed -> if (done.cancelled) DeviceResult.AlreadySent(name) else DeviceResult.Delivered(name)
+        is ManySend.Device.Running -> if (wasOnline[peer] == true) DeviceResult.Sent(name) else DeviceResult.Waiting(name)
+        is ManySend.Device.Stopped -> DeviceResult.Stopped(name)
+        is ManySend.Device.NotStarted -> DeviceResult.NotSent(name)
+        is ManySend.Device.FailedToStart -> DeviceResult.Failed(name, reason(d.error))
+        is ManySend.Device.Failed -> DeviceResult.Failed(name, d.reason)
+    }
+}
+
+/**
+ * Shows the sending card of [run] until its window is over and every send started, or until
+ * every send ended (nothing left to cancel), then finishes the activity. Cancel stops every send. Leaving the screen ends the wait and the
  * sends go on. A rotation cancels this wait without deciding: the recreated activity shows
  * the card again ([ManySends.find]).
  */
 internal suspend fun ComponentActivity.holdSendingCard(sheet: SendSheet, run: ManySend<*>) {
-    if (sheet.holdSending(run.title, run.allStarted)) run.cancel() else run.keep()
+    if (sheet.holdSending(run.title, run.allStarted, run.allFinished)) run.cancel() else run.keep()
     finish()
 }
 

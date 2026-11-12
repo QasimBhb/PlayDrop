@@ -1,5 +1,7 @@
 package org.playdrop.android.share
 
+import org.playdrop.core.ClipboardPush
+
 /**
  * What the core reported for one clip push to a chosen set of devices
  * (`push_clipboard_to` or `push_clipboard_image_to`): one echo check covers the whole push,
@@ -33,6 +35,22 @@ internal data class Pushed(
             )
             return counted.singleOrNull()
         }
+
+    companion object {
+        /**
+         * The core's answer as the app reads it. `sentTo` lists by Device ID every device the
+         * clip went to (docs/core-api.md section 16); the skip counters only count, and
+         * `skippedNotPaired` lists the chosen IDs that are not paired.
+         */
+        fun of(p: ClipboardPush): Pushed = Pushed(
+            sentTo = p.sentTo.toSet(),
+            echo = p.skippedEcho,
+            notPaired = p.skippedNotPaired.toSet(),
+            skippedOffline = p.skippedOffline.toInt(),
+            skippedNoGrant = p.skippedNoGrant.toInt(),
+            skippedUnsupported = p.skippedUnsupported.toInt(),
+        )
+    }
 }
 
 /** Pure rules for clip sends to one or several devices. */
@@ -43,6 +61,20 @@ internal object ClipPlan {
      */
     fun targets(chosen: List<String>, eligibleNow: Collection<String>): List<String> =
         chosen.filter { it in eligibleNow }
+
+    /**
+     * Why each chosen device cannot take a clip of [kind] right now, by ID; null for a device
+     * that can. A chosen device missing from [candidates] is no longer paired.
+     *
+     * Kept apart from the null of "can take it": `blocked(c)` returns null for an eligible
+     * device, so folding a missing candidate in with `?:` would call every eligible device
+     * offline (the toast said "A and B are offline" for a clip both had received).
+     */
+    fun blockedNow(chosen: List<String>, candidates: List<Candidate>, kind: SendKind): Map<String, Blocked?> =
+        chosen.associateWith { id ->
+            val c = candidates.firstOrNull { it.id == id }
+            if (c == null) Blocked.REMOVED else kind.blocked(c)
+        }
 
     /**
      * One result per chosen device, in [chosen] order. [blockedNow] holds why a chosen device

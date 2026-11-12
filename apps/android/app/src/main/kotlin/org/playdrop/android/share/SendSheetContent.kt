@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -23,6 +24,8 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.selection.toggleable
+import androidx.compose.foundation.selection.triStateToggleable
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material3.Button
@@ -37,6 +40,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.TriStateCheckbox
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.dynamicDarkColorScheme
 import androidx.compose.material3.dynamicLightColorScheme
@@ -56,6 +60,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.unit.dp
 import org.playdrop.android.R
 
@@ -143,11 +151,7 @@ private fun ChooserCard(state: SheetState.Choose, sheet: SendSheet) {
                 style = MaterialTheme.typography.titleMedium,
                 modifier = Modifier.weight(1f),
             )
-            if (selection.canToggleAll) {
-                TextButton(onClick = sheet::toggleAll) {
-                    Text(stringResource(if (selection.allTicked) R.string.share_clear else R.string.share_select_all))
-                }
-            }
+            if (selection.canToggleAll) SelectAll(selection, sheet)
         }
         LazyColumn(Modifier.heightIn(max = 360.dp)) {
             items(selection.rows, key = { it.id }) { row ->
@@ -181,32 +185,82 @@ private fun chooserTitle(kind: SendKind, items: Int): String = when (kind) {
     SendKind.CLIPBOARD_TEXT, SendKind.CLIPBOARD_IMAGE -> stringResource(R.string.share_choose_clipboard)
 }
 
+/**
+ * "Select all": one tick box for every row that can be ticked, read out as a check box that
+ * is checked, not checked or partly checked. A tap ticks all of them, or clears them once all
+ * are ticked.
+ */
 @Composable
-private fun ChooserRowItem(row: ChooserRow, kind: SendKind, ticked: Boolean, sheet: SendSheet) {
+private fun SelectAll(selection: Selection, sheet: SendSheet) {
+    val state = when {
+        selection.allTicked -> ToggleableState.On
+        selection.ticked.isEmpty() -> ToggleableState.Off
+        else -> ToggleableState.Indeterminate
+    }
+    val description = tickState(state)
     Row(
         Modifier
-            .fillMaxWidth()
-            .clickable(enabled = row.selectable) { sheet.toggle(row.id) }
-            .padding(start = 8.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            .triStateToggleable(state = state, role = Role.Checkbox, onClick = sheet::toggleAll)
+            .semantics { stateDescription = description }
+            .padding(start = 12.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // The row is the click target, so the box itself takes no separate tap.
-        Checkbox(checked = ticked, onCheckedChange = null, enabled = row.selectable, modifier = Modifier.padding(12.dp))
-        Column(Modifier.weight(1f).alpha(if (row.selectable) 1f else 0.6f)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(row.label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f, fill = false))
-                if (row.isDefault) {
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        stringResource(R.string.share_default_marker),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                }
-            }
-            Text(rowDetail(row, kind), style = MaterialTheme.typography.bodySmall)
+        Text(stringResource(R.string.share_select_all), style = MaterialTheme.typography.labelLarge)
+        // The row is the toggle, so the box itself takes no separate tap.
+        TriStateCheckbox(state = state, onClick = null, modifier = Modifier.padding(12.dp))
+    }
+}
+
+/** The spoken state of a tick box. */
+@Composable
+private fun tickState(state: ToggleableState): String = stringResource(
+    when (state) {
+        ToggleableState.On -> R.string.share_state_ticked
+        ToggleableState.Off -> R.string.share_state_not_ticked
+        ToggleableState.Indeterminate -> R.string.share_state_some_ticked
+    },
+)
+
+@Composable
+private fun ChooserRowItem(row: ChooserRow, kind: SendKind, ticked: Boolean, sheet: SendSheet) {
+    val description = tickState(ToggleableState(ticked))
+    Row(
+        Modifier.fillMaxWidth().padding(start = 8.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        // The box and the names are one check box for accessibility services: checkable,
+        // checked or not, and greyed out with the row. The menu stays its own button.
+        Row(
+            Modifier
+                .weight(1f)
+                .toggleable(value = ticked, enabled = row.selectable, role = Role.Checkbox) { sheet.toggle(row.id) }
+                .semantics { stateDescription = description },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            ChooserRowBody(row, kind, ticked)
         }
         if (!row.isDefault) RowMenu(row, sheet)
+    }
+}
+
+/** The tick box, the name and the detail line of a chooser row. */
+@Composable
+private fun RowScope.ChooserRowBody(row: ChooserRow, kind: SendKind, ticked: Boolean) {
+    // The row is the toggle, so the box itself takes no separate tap.
+    Checkbox(checked = ticked, onCheckedChange = null, enabled = row.selectable, modifier = Modifier.padding(12.dp))
+    Column(Modifier.weight(1f).alpha(if (row.selectable) 1f else 0.6f)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(row.label, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.weight(1f, fill = false))
+            if (row.isDefault) {
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    stringResource(R.string.share_default_marker),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        Text(rowDetail(row, kind), style = MaterialTheme.typography.bodySmall)
     }
 }
 
