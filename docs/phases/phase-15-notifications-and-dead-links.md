@@ -210,7 +210,41 @@ sudo; freezing a test host needs none and answers the same question for the watc
 
 ## 8. Phase 16 kickoff brief
 
-v0.10.0 is the state of `main`. In order of value: (1) the mirroring follow-ups in section 5 that
+v0.10.0 is the state of `main`.
+
+**First item, asked for by the user on 2026-11-12: an update check inside PlayDrop.** On opening,
+at most once a day, each app asks GitHub Releases whether a newer version exists and offers
+"Update" or "Later". What "Update" can do: the `.deb` and Windows download, verify and install
+(system password prompt on Linux, the installer on Windows) and restart; Android downloads the
+APK and hands it to the system installer (`REQUEST_INSTALL_PACKAGES`); the Flatpak and the iPhone
+can only show a notice with a link. To settle in the design note before building: this is the
+first time PlayDrop contacts the internet, so it needs a Settings switch and a line in
+`docs/product.md` and the threat model (default on is the recommendation; the user has not
+answered on or off yet); the checksums file must be signed with a release key and anything that
+does not verify refused (Android's own signature check covers the APK); nothing about the user
+or the device goes in the request; today this laptop was updated by hand because `sudo` cannot
+prompt inside a session (`pkexec` can).
+
+**Second and third items, from the user's own use of the Android app (2026-11-12).**
+
+- *The device page has no way to send.* Tapping a paired computer shows Ping, Find, Remote
+  input, media and a long list of "Allow this device to" switches and the notification section,
+  but nothing to send a file, photo or video; today sending only starts from another app's Share
+  sheet (and the notification's pick-and-send, `share/PickAndSendActivity.kt`). Put send actions
+  at the top of the page (files, photos and videos through the system pickers, clipboard), and
+  move the permission switches and notification mirroring off the first screen (their own
+  "Permissions" page or collapsed sections) so they stop taking the room. Check the same gap on
+  iOS and in the desktop window.
+- *Sharing with more than one device paired never asks which.* `share/ShareActivity.kt` sends to
+  the default device after the 2 s cancel card (SR-29) and only shows a picker when no default
+  exists, and that first pick becomes the default for good. Wanted: with more than one paired
+  device, a chooser listing them, online first, with tick boxes, "Select all", and a send to
+  each ticked device; the default is pre-ticked so one tap still sends. With exactly one device
+  keep today's one-tap path (the user's complaint about LocalSend is taps per send). The cancel
+  window of SR-29 has to hold for every recipient. The core sends per peer, so this is one send
+  per ticked device from one prepared source; check `UriSource.prepare` can serve several.
+
+Then, in order of value: (1) the mirroring follow-ups in section 5 that
 need no one: no re-popup after a reconnect (send only what changed, or let the desktop keep its
 table across a reconnect), rate limits for `removed` and `dismiss`, announce the capability only
 where a handler exists; (2) look at mirrored notifications on real COSMIC and fix what shows;
