@@ -153,7 +153,7 @@ docs/design/later-items.md, README.md, CHANGELOG.md
 
 | Area | What | Phase |
 |---|---|---|
-| Applet | The password-manager question and Stop during remote input are still not tried by a person. A helper for the first: build a small program that offers text with the `x-kde-passwordManagerHint` type set to `secret` and stays in the foreground (the session's own was a scratch crate) | next time someone is at the screen |
+| Applet | Done on 2026-11-12 by the user on the installed 0.9.0: the password-manager clip was not synced by itself, Send clipboard asked first and Send delivered it; Stop on the "Remote input from" line ended a live trackpad session. Not pressed: Cancel on the question. Seen on the way: with the input grant off on the computer the phone's trackpad screen just closes with no reason shown | Cancel and the missing reason: later |
 | Mirroring | Not seen on a real COSMIC notification stack: section 7 used a stand-in service on a private bus. Look once after installing 0.10.0 | first use |
 | Mirroring | After a reconnect the phone sends its current notifications again, so up to 20 pop up again on the desktop | next |
 | Mirroring | `removed` and `dismiss` are not rate limited (only `posted` is) | next |
