@@ -11,6 +11,7 @@ import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.catch
@@ -36,6 +37,7 @@ internal object SettingsImpl {
     private val ONBOARDED = booleanPreferencesKey("onboarded")
     private val BATTERY_PROMPT_SHOWN = booleanPreferencesKey("battery_prompt_shown")
     private val TRACKPAD_SENSITIVITY = floatPreferencesKey("trackpad_sensitivity")
+    private val MIRROR_APPS = stringSetPreferencesKey("mirror_apps")
 
     /** Live settings; a read error logs and falls back to the defaults instead of crashing. */
     fun flow(context: Context): Flow<Settings.Values> =
@@ -66,6 +68,7 @@ internal object SettingsImpl {
             prefs[ONBOARDED] = after.onboarded
             prefs[BATTERY_PROMPT_SHOWN] = after.batteryPromptShown
             prefs[TRACKPAD_SENSITIVITY] = after.trackpadSensitivity
+            prefs[MIRROR_APPS] = after.mirrorApps
         }
     }
 
@@ -81,6 +84,8 @@ internal object SettingsImpl {
         trackpadSensitivity = prefs[TRACKPAD_SENSITIVITY]
             ?.takeIf { it in Settings.MIN_TRACKPAD_SENSITIVITY..Settings.MAX_TRACKPAD_SENSITIVITY }
             ?: Settings.DEFAULT_TRACKPAD_SENSITIVITY,
+        // Nothing is mirrored until the user picks apps (SR-41).
+        mirrorApps = prefs[MIRROR_APPS].orEmpty(),
     )
 
     /** The device model, e.g. "SM-A546B"; the core sanitises it further (SR-8). */

@@ -27,6 +27,7 @@ pub mod diagnostics;
 pub mod events;
 mod input;
 pub mod lock;
+mod notifications;
 mod outbox;
 mod pairing;
 mod path;
@@ -67,6 +68,7 @@ pub use events::{
     Secret, TransferDirection, OFFER_FILES_MAX,
 };
 pub use lock::{AlwaysUnlocked, LockFlag, LockState};
+pub use notifications::{MirroredNotification, NOTIFICATIONS_POSTED_PER_MINUTE};
 pub use outbox::OutboxItem;
 pub use path::{PathOutcome, PathReport, PathTiming, ProbeReport};
 #[cfg(feature = "iroh-test")]
@@ -1447,6 +1449,43 @@ impl Host {
         value: Option<u64>,
     ) -> Result<()> {
         status::send_media_command(&self.inner, peer, player, action, value)
+    }
+
+    /// Mirrors one notification to `peer` (protocol.md 5.16): `posted`, which shows a copy
+    /// or replaces the one with the same `key`. Needs this host's `notificationsOut` grant
+    /// for the peer ([`Error::Forbidden`], nothing sent), a session ([`Error::NotFound`])
+    /// and the peer's `notifications` capability ([`Error::Forbidden`]). `key` comes from
+    /// [`Host::notification_key`] ([`Error::BadRequest`] otherwise). `app`, `title` and
+    /// `text` are cut to 64 B, 256 B and 1 KiB at a character boundary. The caller filters
+    /// what may be mirrored at all (SR-41); nothing here is logged (SR-43).
+    pub fn send_notification(&self, peer: &DeviceId, n: MirroredNotification) -> Result<()> {
+        notifications::send_posted(&self.inner, peer, n)
+    }
+
+    /// Tells `peer` a mirrored notification went away (protocol.md 5.16 `removed`). Needs
+    /// no grant (it carries no content), so a phone that just turned `notificationsOut` off
+    /// can still clear the peer's copies (SR-42); otherwise the errors of
+    /// [`Host::send_notification`]. The peer acts on it only with its `notificationsIn`.
+    pub fn send_notification_removed(&self, peer: &DeviceId, key: String) -> Result<()> {
+        notifications::send_removed(&self.inner, peer, key)
+    }
+
+    /// Asks `peer` to dismiss the notification it mirrored under `key`, after the user
+    /// closed the copy here (protocol.md 5.16 `dismiss`). Needs this host's
+    /// `notificationsIn` grant for the peer ([`Error::Forbidden`]), a session
+    /// ([`Error::NotFound`]) and the peer's `notifications` capability; the peer acts on it
+    /// only with its `notificationsOut` grant for us.
+    pub fn send_notification_dismiss(&self, peer: &DeviceId, key: String) -> Result<()> {
+        notifications::send_dismiss(&self.inner, peer, key)
+    }
+
+    /// The opaque `key` for a platform notification key (protocol.md 5.16): the first 128
+    /// bits of BLAKE3 keyed by a per-process random salt over `raw`, as 32 lowercase hex
+    /// characters. The same `raw` gives the same key for the life of the process; the raw
+    /// key never leaves this device.
+    #[must_use]
+    pub fn notification_key(&self, raw: &str) -> String {
+        notifications::notification_key(raw)
     }
 
     /// Pushes a local player's state to every online peer with the `media` grant,

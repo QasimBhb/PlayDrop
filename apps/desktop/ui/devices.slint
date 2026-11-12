@@ -261,6 +261,14 @@ component DeviceCard inherits Card {
             }
 
             Toggle {
+                text: "Show this device's notifications";
+                checked: root.device.grant-notifications-in;
+                toggled(on) => {
+                    DevicesState.set-grant(root.device.id, "notifications_in", on);
+                }
+            }
+
+            Toggle {
                 text: "Control the pointer and keyboard (remote input)";
                 checked: root.device.grant-input;
                 // Turning it off stays possible even where it cannot be applied.

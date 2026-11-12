@@ -5,8 +5,8 @@
 use playdrop_core::host::HostEvent as CoreEvent;
 
 use crate::types::{
-    DeliveredFile, DiscoveryPath, FileRoot, InputEvent, MediaAction, MediaState, OfferedFile,
-    PairingPrompt, TransferDirection,
+    DeliveredFile, DiscoveryPath, FileRoot, InputEvent, MediaAction, MediaState,
+    MirroredNotification, OfferedFile, PairingPrompt, TransferDirection,
 };
 
 /// Everything the host tells the app. Peers are hex Device IDs.
@@ -209,6 +209,30 @@ pub enum HostEvent {
         peer: String,
         /// State.
         state: MediaState,
+    },
+    /// The peer mirrored a notification (protocol.md 5.16; ffi 0.5.0), with our
+    /// `notificationsIn` grant for it. A later one with the same `key` replaces the copy.
+    /// Never log it (SR-43).
+    NotificationPosted {
+        /// Hex Device ID.
+        peer: String,
+        /// The notification.
+        notification: MirroredNotification,
+    },
+    /// A notification the peer mirrored went away there: close the copy (ffi 0.5.0).
+    NotificationRemoved {
+        /// Hex Device ID.
+        peer: String,
+        /// Opaque key from `NotificationPosted`. Never log it (SR-43).
+        key: String,
+    },
+    /// The peer closed its copy of a notification we mirrored: dismiss the original. Only
+    /// with our `notificationsOut` grant for the peer (ffi 0.5.0).
+    NotificationDismiss {
+        /// Hex Device ID.
+        peer: String,
+        /// Opaque key we sent. Never log it (SR-43).
+        key: String,
     },
     /// A media command from the peer (it holds the `media` grant).
     MediaCommand {
@@ -464,6 +488,12 @@ impl From<CoreEvent> for HostEvent {
                 action: action.into(),
                 value,
             },
+            CoreEvent::NotificationPosted { peer, notification } => Self::NotificationPosted {
+                peer,
+                notification: notification.into(),
+            },
+            CoreEvent::NotificationRemoved { peer, key } => Self::NotificationRemoved { peer, key },
+            CoreEvent::NotificationDismiss { peer, key } => Self::NotificationDismiss { peer, key },
             CoreEvent::OutboxReady {
                 peer,
                 count,

@@ -27,7 +27,9 @@ import org.playdrop.android.BuildConfig
 import org.playdrop.android.data.Settings
 import org.playdrop.android.service.CoreService
 import org.playdrop.android.service.MulticastPolicy
+import org.playdrop.android.service.NotificationMirror
 import org.playdrop.android.service.Notifications
+import org.playdrop.android.service.ServiceStart
 import org.playdrop.core.AddDeviceCandidate
 import org.playdrop.core.DeviceType
 import org.playdrop.core.HostConfig
@@ -205,9 +207,13 @@ internal object CoreHostImpl {
         return withContext(Dispatchers.IO) { block(h) }
     }
 
-    /** Starts [CoreService] as a foreground service. */
-    fun ensureServiceRunning(context: Context) {
-        if (running.value) return
+    /**
+     * Starts [CoreService] as a foreground service. With [repost] it also starts a running
+     * service again, which posts its notification anew: Android 14 and newer let the user
+     * swipe that notification away, and opening the app must bring it back.
+     */
+    fun ensureServiceRunning(context: Context, repost: Boolean = false) {
+        if (!ServiceStart.needed(running.value, repost)) return
         ContextCompat.startForegroundService(context, Intent(context, CoreService::class.java))
     }
 
@@ -380,16 +386,25 @@ internal object CoreHostImpl {
     private suspend fun route(ev: HostEvent, landed: Boolean, ended: Boolean) {
         when (ev) {
             is HostEvent.Listening -> identity.value = OwnIdentity(ev.deviceId, ev.shortId, ev.addr)
-            is HostEvent.PeerOnline -> refreshPeers()
+            is HostEvent.PeerOnline -> {
+                refreshPeers()
+                // The desktop closed every mirrored copy when we went away: send the current set.
+                appContext?.let { NotificationMirror.resyncPeer(it, ev.peer) }
+            }
             is HostEvent.PeerOffline -> {
                 media.update { MediaPlayers.forget(it, ev.peer) }
+                NotificationMirror.peerGone(ev.peer)
                 refreshPeers()
             }
             is HostEvent.Unpaired -> {
                 media.update { MediaPlayers.forget(it, ev.peer) }
+                NotificationMirror.peerGone(ev.peer)
                 refreshPeers()
             }
-            is HostEvent.RemovedByPeer -> refreshPeers()
+            is HostEvent.RemovedByPeer -> {
+                NotificationMirror.peerGone(ev.peer)
+                refreshPeers()
+            }
             is HostEvent.MediaState -> media.update { MediaPlayers.apply(it, ev.peer, ev.state) }
             is HostEvent.Paired -> {
                 pairingPrompt.value = null

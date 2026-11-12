@@ -16,7 +16,10 @@ use tokio::sync::{mpsc, watch};
 use super::events::{HostEvent, Secret, TransferDirection};
 use super::registry::Placement;
 use super::transfers::TransferStatus;
-use super::{blobs, input, lock, outbox, pairing, path, receive, send, send_resume, status, Inner};
+use super::{
+    blobs, input, lock, notifications, outbox, pairing, path, receive, send, send_resume, status,
+    Inner,
+};
 use crate::identity::DeviceId;
 use crate::net::connection::short;
 use crate::net::server::SESSION_PATH;
@@ -51,6 +54,7 @@ pub(crate) const LOCAL_IN: &[Capability] = &[
     Capability::TransferBundle,
     Capability::Outbox,
     Capability::Blobs,
+    Capability::Notifications,
 ];
 
 /// The remote input capabilities (protocol.md 5.12).
@@ -75,6 +79,7 @@ pub(crate) const LOCAL_OUT: &[Capability] = &[
     Capability::TransferBundle,
     Capability::Outbox,
     Capability::Blobs,
+    Capability::Notifications,
     Capability::InputPointer,
     Capability::InputKey,
     Capability::InputPresenter,
@@ -126,6 +131,9 @@ struct State {
     /// The session this one replaced, still open until the peer has placed this one too
     /// ([`Session::end_replaced`]).
     replaced: Option<Arc<Session>>,
+    /// When the `posted` notification frames of the last minute arrived, oldest first
+    /// (protocol.md 5.16, SR-44).
+    notifications_posted: VecDeque<tokio::time::Instant>,
 }
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -300,6 +308,26 @@ impl Session {
             tokio::time::sleep(grace).await;
             conn.close(reason);
         });
+    }
+
+    /// Counts one `posted` notification frame against the per-connection limit (protocol.md
+    /// 5.16, SR-44): false once [`notifications::NOTIFICATIONS_POSTED_PER_MINUTE`] arrived
+    /// within the last 60 s. A dropped frame does not count.
+    pub(crate) fn allow_notification_posted(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut st = lock(&self.state);
+        let q = &mut st.notifications_posted;
+        while q
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
+        {
+            q.pop_front();
+        }
+        if q.len() >= notifications::NOTIFICATIONS_POSTED_PER_MINUTE {
+            return false;
+        }
+        q.push_back(now);
+        true
     }
 
     /// Sends at most one `forbidden` or `not_paired` error per frame type per connection
@@ -551,6 +579,8 @@ fn has_grant(grants: Grants, g: GrantKind) -> bool {
         GrantKind::Input => grants.input,
         GrantKind::Media => grants.media,
         GrantKind::Find => grants.find,
+        GrantKind::NotificationsIn => grants.notifications_in,
+        GrantKind::NotificationsOut => grants.notifications_out,
     }
 }
 
@@ -598,7 +628,6 @@ async fn handle_frame(
         return Ok(());
     }
     let hex = peer.to_hex();
-    #[cfg(feature = "iroh")]
     let seq = env.seq;
     match env.frame {
         #[cfg(feature = "iroh")]
@@ -677,6 +706,7 @@ async fn handle_frame(
             ids: o.ids,
         }),
         Frame::Input(i) => input::on_frame(inner, peer, i),
+        Frame::Notification(n) => notifications::on_frame(inner, sess, seq, n),
         Frame::Transfer(tf) => send::on_transfer_frame(inner, peer, &tf),
         Frame::PairRequest(_)
         | Frame::PairResponse(_)

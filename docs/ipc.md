@@ -203,6 +203,41 @@ and a short hash at debug, as for every read.
 `playdrop-core` import for the shapes. They are the core's own types: no conversion, no wire
 change.
 
+### 1.8 Notification mirroring grants, added in Phase 15
+
+`IPC_VERSION` stays 1 (additions only). Protocol.md 5.16, SR-41 to SR-44.
+
+| Request, field or value | Meaning |
+|---|---|
+| `grants.notificationsIn` (`peers` answer, `set_grants`) | Show the notifications this peer mirrors. Default `true`, also for devices paired before it existed. Set it with `set_grants` like every other grant. Turning it off closes every copy of that peer's notifications at once (SR-42) |
+| `grants.notificationsOut` (`peers` answer, `set_grants`) | Mirror this device's notifications to the peer. Default `false`, never turned on by pairing. Carried for completeness: a desktop has no notifications to mirror, so no desktop client offers it |
+| Host events `notification_posted`, `notification_removed`, `notification_dismiss` | Never sent to clients. The daemon shows and closes the desktop copies itself, and the D-Bus `Event` signal is a broadcast other programs on the session bus can match, so the app names, titles, text and keys stay in the daemon (SR-43) |
+
+Both grant fields have serde defaults both ways. An older daemon ignores them in `set_grants`
+and leaves them out of `peers`; a client then reads the defaults. An older client that sends
+`set_grants` with grants it read from a newer daemon drops both fields, so `notificationsIn`
+goes back to `true` and `notificationsOut` to `false`: a client that offers the toggle must be
+built against this version. `playdrop_ipc::types` also re-exports `MirroredNotification`.
+
+What the daemon does with a mirrored notification (section 5 has the rest of its behaviour):
+
+- `posted` shows a desktop notification "<app> - <device label>" with the title and the text,
+  and no buttons, only while the `notifications` setting is on and the grant is on when the
+  event is handled. A later `posted` with the same key replaces it (freedesktop
+  `replaces_id`); `removed` closes it.
+- At most 20 copies per device are shown; the 21st closes the oldest (SR-44).
+- Every copy of a device closes when it goes offline, is unpaired (by either side), or its
+  `notificationsIn` grant is turned off; every copy closes when the host restarts or stops,
+  or when the `notifications` setting is turned off (SR-42).
+- When the user dismisses a copy (freedesktop `NotificationClosed` reason 2), the daemon
+  sends `dismiss` to the phone. An expired copy, or one the daemon closed, does not.
+- Where the notification server reads the body as markup, the body is escaped, so text from
+  the phone shows as typed and cannot add links or images.
+- Windows shows a plain toast: no replace, no close and no dismiss-back yet (never run on a
+  real PC).
+- None of the content or keys is logged at any level, and none is in the `diagnose`
+  report (SR-43).
+
 ## 2. Linux: D-Bus on the session bus (SR-26)
 
 - Well-known name `org.playdrop.PlayDrop.Daemon1`, object `/org/playdrop/PlayDrop/Daemon1`, interface

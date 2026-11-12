@@ -467,6 +467,21 @@ impl Daemon {
             autostart_attempt: AtomicU64::new(0),
         });
         let weak = Arc::downgrade(&shared);
+        shared
+            .notifier
+            .set_mirror_dismiss(Arc::new(move |peer: &str, key: String| {
+                let Some(host) = weak.upgrade().and_then(|s| s.host()) else {
+                    return;
+                };
+                let Ok(id) = peer.parse::<DeviceId>() else {
+                    return;
+                };
+                // SR-43: the key is never logged, and no core error carries it.
+                if let Err(e) = host.send_notification_dismiss(&id, key) {
+                    tracing::debug!(peer = short_hex(peer), error = %e, "dismiss not sent to the phone");
+                }
+            }));
+        let weak = Arc::downgrade(&shared);
         shared.input_runners.set_ender(Box::new(move |_peer: &str| {
             if let Some(h) = weak.upgrade().and_then(|s| s.host()) {
                 // Ends every session, not just the peer's: a backend failure is global.
@@ -535,8 +550,22 @@ async fn drain(shared: Weak<Shared>, mut rx: mpsc::Receiver<HostEvent>) {
     while let Some(ev) = rx.recv().await {
         let Some(s) = shared.upgrade() else { return };
         s.on_host_event(&ev);
-        let _ = s.events.send(Event::Host(for_clients(ev)));
+        if goes_to_clients(&ev) {
+            let _ = s.events.send(Event::Host(for_clients(ev)));
+        }
     }
+}
+
+/// Mirrored notifications stay in the daemon: no UI shows them, and the D-Bus `Event`
+/// signal is a broadcast any process on the session bus can match, so their app names,
+/// titles, text and keys never go out over IPC (SR-43).
+fn goes_to_clients(ev: &HostEvent) -> bool {
+    !matches!(
+        ev,
+        HostEvent::NotificationPosted { .. }
+            | HostEvent::NotificationRemoved { .. }
+            | HostEvent::NotificationDismiss { .. }
+    )
 }
 
 /// Trims an event before it goes to UI clients. The daemon has already applied a clipboard
@@ -806,6 +835,8 @@ impl Shared {
     /// Stops the host and lets its drain hand over the last events. Caller holds
     /// `lifecycle`.
     async fn stop_host(&self) {
+        // No session survives the host, so no mirrored copy does either (SR-42).
+        self.notifier.mirror_close_all();
         let host = self
             .host
             .write()
@@ -852,6 +883,16 @@ impl Shared {
             .map_or_else(|| short_hex(peer).to_owned(), |p| p.label)
     }
 
+    /// Whether `peer` (hex Device ID) has the `notificationsIn` grant now.
+    fn notifications_in(&self, peer: &str) -> bool {
+        let Ok(id) = peer.parse::<DeviceId>() else {
+            return false;
+        };
+        self.host()
+            .and_then(|h| h.grants(&id))
+            .is_some_and(|g| g.notifications_in)
+    }
+
     /// Daemon-side reactions to a host event. Never blocks: slow work is spawned.
     fn on_host_event(self: &Arc<Self>, ev: &HostEvent) {
         self.notifier.host_event(ev, || match ev {
@@ -870,12 +911,27 @@ impl Shared {
             }
             HostEvent::Unpaired { peer, .. } => {
                 lock_std(&self.battery).remove(peer);
+                self.notifier.mirror_close_peer(peer);
                 self.tray_dirty.notify_one();
             }
-            HostEvent::PeerOnline { .. }
-            | HostEvent::PeerOffline { .. }
-            | HostEvent::Paired { .. }
-            | HostEvent::RemovedByPeer { .. } => self.tray_dirty.notify_one(),
+            HostEvent::PeerOffline { peer, .. } | HostEvent::RemovedByPeer { peer, .. } => {
+                self.notifier.mirror_close_peer(peer);
+                self.tray_dirty.notify_one();
+            }
+            HostEvent::PeerOnline { .. } | HostEvent::Paired { .. } => {
+                self.tray_dirty.notify_one();
+            }
+            HostEvent::NotificationPosted { peer, notification } => {
+                // The grant may have been turned off after the core let this frame through
+                // (SR-42): ask again.
+                if self.notifications_in(peer) {
+                    self.notifier
+                        .mirror_posted(peer, notification, || self.label_for(peer));
+                }
+            }
+            HostEvent::NotificationRemoved { peer, key } => {
+                self.notifier.mirror_removed(peer, key.clone());
+            }
             HostEvent::Input { peer, input } => {
                 // The core already checked grant, session, lock and rate (SR-25); the
                 // runner keeps the frames in order and owns the injector's life.
@@ -1375,7 +1431,12 @@ impl Shared {
             }
             Request::SetGrants { peer, grants } => {
                 let id = resolve(&host, &peer)?;
-                done(host.set_grants(&id, grants).await)
+                let r = host.set_grants(&id, grants).await;
+                if r.is_ok() && !grants.notifications_in {
+                    // SR-42: turning the grant off removes every copy at once.
+                    self.notifier.mirror_close_peer(&id.to_hex());
+                }
+                done(r)
             }
             #[cfg(feature = "iroh")]
             Request::SetRemoteGrant { peer, on } => {
@@ -1900,29 +1961,27 @@ mod tests {
         ClipRead::Clip(LocalClip::text("hunter2", true))
     }
 
-    /// The whole daemon path against a real paired host: a marked clip is refused with a
-    /// token, sent with it, and arrives marked; with the grant off the answer is `forbidden`
-    /// and the clipboard is not read.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn consented_local_clip_reaches_a_real_peer_marked() {
+    /// The next event of a test peer, as a boxed future for [`wait_for`].
+    type NextEvent = Box<
+        dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<HostEvent>> + Send>>,
+    >;
+
+    /// Starts a second host "bravo" on loopback and pairs it with the daemon through the
+    /// daemon's requests, as the window does. Returns it once both see each other online.
+    async fn pair_bravo(d: &Daemon, tmp: &std::path::Path) -> (Host, NextEvent) {
         use playdrop_core::host::HostConfig;
-        let tmp = tempfile::tempdir().unwrap();
-        let d = test_daemon_reading(tmp.path(), counted_secret);
-        d.start_host().await.unwrap();
         let h = d.handler();
         let mut ui = d.events().subscribe();
-
-        let mut cfg = HostConfig::new(tmp.path().join("b-data"), tmp.path().join("b-in"), "bravo");
+        let mut cfg = HostConfig::new(tmp.join("b-data"), tmp.join("b-in"), "bravo");
         cfg.port = 0;
         cfg.bind_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         cfg.discovery = false;
         let (bravo, brx) = Host::start(cfg).await.unwrap();
         let brx = Arc::new(tokio::sync::Mutex::new(brx));
-        let bravo_next = || {
+        let bravo_next: NextEvent = Box::new(move || {
             let rx = Arc::clone(&brx);
             Box::pin(async move { rx.lock().await.recv().await })
-                as std::pin::Pin<Box<dyn std::future::Future<Output = Option<HostEvent>> + Send>>
-        };
+        });
 
         // Pair through the daemon, as the window does.
         bravo.open_add_device_window().unwrap();
@@ -1942,7 +2001,7 @@ mod tests {
                 break;
             }
         }
-        wait_for(bravo_next, |e: &HostEvent| {
+        wait_for(&bravo_next, |e: &HostEvent| {
             matches!(e, HostEvent::PairingPrompt { .. }).then_some(())
         })
         .await;
@@ -1950,12 +2009,11 @@ mod tests {
             .await
             .unwrap();
         bravo.pairing_respond(true);
-        wait_for(bravo_next, |e: &HostEvent| {
+        wait_for(&bravo_next, |e: &HostEvent| {
             matches!(e, HostEvent::PeerOnline { .. }).then_some(())
         })
         .await;
         let alpha = d.shared.host().unwrap();
-        let id = bravo.device_id().to_hex();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
         while !alpha.is_online(&bravo.device_id()) {
             assert!(
@@ -1964,6 +2022,21 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        (bravo, bravo_next)
+    }
+
+    /// The whole daemon path against a real paired host: a marked clip is refused with a
+    /// token, sent with it, and arrives marked; with the grant off the answer is `forbidden`
+    /// and the clipboard is not read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn consented_local_clip_reaches_a_real_peer_marked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon_reading(tmp.path(), counted_secret);
+        d.start_host().await.unwrap();
+        let h = d.handler();
+
+        let (bravo, bravo_next) = pair_bravo(&d, tmp.path()).await;
+        let id = bravo.device_id().to_hex();
 
         let token = consent_of(send_local(&h, Some(&id), false, None).await);
         let Result::Ok(IpcOk::ClipboardPushed { sent_to, .. }) =
@@ -1972,7 +2045,7 @@ mod tests {
             panic!("consented send");
         };
         assert_eq!(sent_to, std::slice::from_ref(&id));
-        let (text, sensitive) = wait_for(bravo_next, |e: &HostEvent| match e {
+        let (text, sensitive) = wait_for(&bravo_next, |e: &HostEvent| match e {
             HostEvent::Clipboard {
                 text, sensitive, ..
             } => Some((text.0.clone(), *sensitive)),
@@ -2003,6 +2076,148 @@ mod tests {
 
         bravo.shutdown().await;
         d.shutdown().await;
+    }
+
+    /// Writes every log line into a shared buffer, for the SR-43 checks.
+    #[derive(Clone, Default)]
+    struct LogBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            lock_std(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A notification mirrored by a real paired host reaches the daemon, never leaves it
+    /// over IPC, is in no log line at any level and not in the diagnostics report (SR-43);
+    /// a user dismissal goes back to the phone as `dismiss`.
+    #[tokio::test]
+    async fn mirrored_notification_stays_out_of_logs_ipc_and_diagnostics() {
+        let logs = LogBuf::default();
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || sink.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon(tmp.path());
+        d.start_host().await.unwrap();
+        let h = d.handler();
+        let (bravo, bravo_next) = pair_bravo(&d, tmp.path()).await;
+        let mut ui = d.events().subscribe();
+        let alpha = d.shared.host().unwrap();
+        let alpha_id = alpha.device_id();
+        let id = bravo.device_id().to_hex();
+
+        // The phone side: its own UI turns `notificationsOut` on for the desktop.
+        let phone_grants = Grants {
+            notifications_out: true,
+            ..bravo.grants(&alpha_id).unwrap()
+        };
+        bravo.set_grants(&alpha_id, phone_grants).await.unwrap();
+        let key = bravo.notification_key("0|org.example.chat|7|canary-tag|0");
+        let canary = playdrop_core::host::MirroredNotification {
+            key: key.clone(),
+            app: "CanaryApp".into(),
+            title: "CanaryTitle".into(),
+            text: "CanaryText".into(),
+            when_ms: 1_762_900_000_000,
+        };
+        // Wait until the desktop has the phone's capabilities, then send.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while let Err(e) = bravo.send_notification(&alpha_id, canary.clone()) {
+            assert!(tokio::time::Instant::now() < deadline, "not sent: {e}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        bravo
+            .send_notification_removed(&alpha_id, key.clone())
+            .unwrap();
+        // A ping after them: once it reaches the UI, the notification frames were handled.
+        bravo.ping(&alpha_id, None).unwrap();
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(20), ui.recv())
+                .await
+                .expect("ping in time")
+                .expect("event");
+            let Event::Host(ev) = ev else { continue };
+            assert!(
+                goes_to_clients(&ev),
+                "a mirrored notification went over IPC"
+            );
+            if matches!(ev, HostEvent::Ping { .. }) {
+                break;
+            }
+        }
+
+        // The user closes the desktop copy: `dismiss` reaches the phone.
+        d.shared.notifier.dismiss_back(&id, key.clone());
+        let back = wait_for(&bravo_next, |e: &HostEvent| match e {
+            HostEvent::NotificationDismiss { key, .. } => Some(key.clone()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(back, key);
+
+        // Grant off on the desktop: saved, and the core drops what the phone sends next.
+        call(
+            &h,
+            Request::SetGrants {
+                peer: id.clone(),
+                grants: Grants {
+                    notifications_in: false,
+                    ..alpha.grants(&bravo.device_id()).unwrap()
+                },
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!d.shared.notifications_in(&id));
+
+        let Ok(IpcOk::Diagnostics(report)) = call(&h, Request::Diagnose).await else {
+            panic!("diagnose");
+        };
+        let report = serde_json::to_string(&report).unwrap();
+        bravo.shutdown().await;
+        d.shutdown().await;
+
+        let logs = String::from_utf8(lock_std(&logs.0).clone()).unwrap();
+        assert!(
+            logs.contains("TRACE") || logs.contains("DEBUG"),
+            "logs captured"
+        );
+        for secret in ["CanaryApp", "CanaryTitle", "CanaryText", "canary-tag", &key] {
+            assert!(!logs.contains(secret), "{secret} in the logs");
+            assert!(
+                !report.contains(secret),
+                "{secret} in the diagnostics report"
+            );
+        }
+    }
+
+    #[test]
+    fn only_mirrored_notifications_stay_in_the_daemon() {
+        let peer = "ab".repeat(32);
+        let key = "cd".repeat(16);
+        assert!(!goes_to_clients(&HostEvent::NotificationRemoved {
+            peer: peer.clone(),
+            key: key.clone(),
+        }));
+        assert!(!goes_to_clients(&HostEvent::NotificationDismiss {
+            peer: peer.clone(),
+            key,
+        }));
+        assert!(goes_to_clients(&HostEvent::Ping {
+            peer,
+            message: None,
+        }));
     }
 
     #[test]

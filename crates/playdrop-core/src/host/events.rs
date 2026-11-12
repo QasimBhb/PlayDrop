@@ -320,6 +320,32 @@ pub enum HostEvent {
         /// The player's state.
         state: MediaState,
     },
+    /// A peer mirrored a notification (protocol.md 5.16 `posted`), with this host's
+    /// `notificationsIn` grant for it. A later one with the same `key` replaces the copy.
+    /// Its content is never logged (SR-43).
+    NotificationPosted {
+        /// Device ID.
+        peer: String,
+        /// The notification.
+        notification: super::notifications::MirroredNotification,
+    },
+    /// A notification the peer mirrored went away on the peer (5.16 `removed`): close the
+    /// copy. Needs this host's `notificationsIn` grant. `key` is never logged (SR-43).
+    NotificationRemoved {
+        /// Device ID.
+        peer: String,
+        /// The opaque key from the `posted` event.
+        key: String,
+    },
+    /// The peer closed its copy of a notification this host mirrored (5.16 `dismiss`):
+    /// dismiss the original. Needs this host's `notificationsOut` grant for the peer.
+    /// `key` is never logged (SR-43).
+    NotificationDismiss {
+        /// Device ID.
+        peer: String,
+        /// The opaque key this host sent.
+        key: String,
+    },
     /// A peer asks this host to control one of its players (protocol.md 5.9), with the
     /// `media` grant.
     MediaCommand {
@@ -528,6 +554,24 @@ mod tests {
             HostEvent::InputSessionEnded {
                 peer: "ab".repeat(32),
                 reason: "the desktop is locked".into(),
+            },
+            HostEvent::NotificationPosted {
+                peer: "ab".repeat(32),
+                notification: super::super::notifications::MirroredNotification {
+                    key: "cd".repeat(16),
+                    app: "hunter2 app".into(),
+                    title: "hunter2 title".into(),
+                    text: "hunter2 text".into(),
+                    when_ms: 1_762_900_000_000,
+                },
+            },
+            HostEvent::NotificationRemoved {
+                peer: "ab".repeat(32),
+                key: "cd".repeat(16),
+            },
+            HostEvent::NotificationDismiss {
+                peer: "ab".repeat(32),
+                key: "cd".repeat(16),
             },
         ];
         for ev in events {

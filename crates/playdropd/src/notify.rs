@@ -16,6 +16,9 @@
 //! - `RemovedByPeer`: "<label> no longer has you paired".
 //! - Clipboard content is never shown in a notification, sensitive or not (SR-24); the
 //!   daemon only reports a clip it could not apply, without its text.
+//! - Notifications a phone mirrors (protocol.md 5.16): "<app> - <label>" with the title and
+//!   text, replaced, closed and dismissed back as `mirror` decides (SR-42 to SR-44). They
+//!   never carry buttons and are never logged (SR-43).
 //!
 //! Nothing here blocks the caller: every notification is shown on a blocking-pool thread,
 //! and an action click is handled in its own task.
@@ -23,15 +26,18 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
-use playdrop_core::host::{HostEvent, TransferDirection};
-use tokio::sync::{oneshot, Semaphore};
+use playdrop_core::host::{HostEvent, MirroredNotification, TransferDirection};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::Instant;
 
+pub mod mirror;
 mod toast;
+
+use mirror::{Cmd, Dismiss, DismissSlot, MirrorUi};
 
 /// Most notifications at once that wait for an action click, each on a blocking thread.
 /// Beyond this, received-file notifications are shown without buttons rather than tying up
@@ -279,6 +285,10 @@ pub struct Notifier {
     /// Source of [`Ring::generation`].
     ring_generation: AtomicU64,
     waiters: Arc<Semaphore>,
+    /// The mirror worker's queue, started at the first mirrored notification.
+    mirror: OnceLock<mpsc::UnboundedSender<Cmd>>,
+    /// Sends `dismiss` back to the phone; set by the daemon.
+    mirror_dismiss: DismissSlot,
 }
 
 impl std::fmt::Debug for Notifier {
@@ -299,12 +309,94 @@ impl Notifier {
             stop_notes: Arc::new(Mutex::new(HashMap::new())),
             ring_generation: AtomicU64::new(0),
             waiters: Arc::new(Semaphore::new(MAX_ACTION_WAITERS)),
+            mirror: OnceLock::new(),
+            mirror_dismiss: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Turns notifications on or off.
+    /// Turns notifications on or off. Off also closes every mirrored copy.
     pub fn set_enabled(&self, on: bool) {
         self.enabled.store(on, Ordering::SeqCst);
+        if !on {
+            self.mirror_close_all();
+        }
+    }
+
+    /// Sets what sends `dismiss` to a phone when the user closes a mirrored copy.
+    pub fn set_mirror_dismiss(&self, f: Dismiss) {
+        *lock(&self.mirror_dismiss) = Some(f);
+    }
+
+    /// Shows (or replaces) the copy of a notification `peer` mirrored, when notifications
+    /// are on. The caller has checked the `notificationsIn` grant. `label` is called only
+    /// when it is shown.
+    pub fn mirror_posted(
+        &self,
+        peer: &str,
+        n: &MirroredNotification,
+        label: impl FnOnce() -> String,
+    ) {
+        if !self.enabled() {
+            return;
+        }
+        let note = mirror::note(n, &label());
+        self.mirror_send(Cmd::Posted {
+            peer: peer.to_owned(),
+            note,
+            key: n.key.clone(),
+        });
+    }
+
+    /// Closes the copy of `(peer, key)`: the phone's notification went away.
+    pub fn mirror_removed(&self, peer: &str, key: String) {
+        if self.mirror.get().is_some() {
+            self.mirror_send(Cmd::Removed {
+                peer: peer.to_owned(),
+                key,
+            });
+        }
+    }
+
+    /// Closes every mirrored copy of `peer` (SR-42).
+    pub fn mirror_close_peer(&self, peer: &str) {
+        if self.mirror.get().is_some() {
+            self.mirror_send(Cmd::ClosePeer {
+                peer: peer.to_owned(),
+            });
+        }
+    }
+
+    /// Closes every mirrored copy.
+    pub fn mirror_close_all(&self) {
+        if self.mirror.get().is_some() {
+            self.mirror_send(Cmd::CloseAll);
+        }
+    }
+
+    /// What the mirror does when the user dismisses a copy: tells the phone.
+    #[cfg(test)]
+    pub fn dismiss_back(&self, peer: &str, key: String) {
+        let f = lock(&self.mirror_dismiss).clone();
+        if let Some(f) = f {
+            f(peer, key);
+        }
+    }
+
+    /// Queues a command for the mirror worker, starting it on first use.
+    fn mirror_send(&self, cmd: Cmd) {
+        let tx = self.mirror.get_or_init(|| {
+            let (tx, rx) = mpsc::unbounded_channel();
+            tokio::spawn(mirror::run(
+                PlatformMirror,
+                rx,
+                tx.downgrade(),
+                Arc::clone(&self.mirror_dismiss),
+            ));
+            tx
+        });
+        if tx.send(cmd).is_err() {
+            tracing::debug!("mirror worker gone; mirrored notification dropped");
+        }
     }
 
     /// The receive folder actions are confined to (it changes on a settings change).
@@ -453,6 +545,23 @@ impl RingUi for PlatformUi {
     }
 }
 
+/// The real notification server for mirrored copies.
+struct PlatformMirror;
+
+impl MirrorUi for PlatformMirror {
+    fn show(&self, note: Note, replaces: Option<u32>) -> BoxFuture<'static, Option<u32>> {
+        Box::pin(platform::show_mirrored(note, replaces))
+    }
+
+    fn close(&self, id: u32) -> BoxFuture<'static, ()> {
+        Box::pin(platform::close(id))
+    }
+
+    fn watch_closed(&self, tx: mpsc::UnboundedSender<Cmd>) {
+        platform::watch_closed(tx);
+    }
+}
+
 /// Shows `note` and shows it again every `timing.repeat` (where the platform replays the
 /// sound that way) until `stopped` fires, the user dismisses it, or `timing.limit` passes.
 /// Returns why it ended and the notification ID to replace.
@@ -510,8 +619,76 @@ mod platform {
         gen_blocking = false
     )]
     trait Notifications {
+        fn close_notification(&self, id: u32) -> zbus::Result<()>;
+
+        fn get_capabilities(&self) -> zbus::Result<Vec<String>>;
+
         #[zbus(signal)]
         fn notification_closed(&self, id: u32, reason: u32) -> zbus::Result<()>;
+    }
+
+    /// One session bus connection for the mirror's calls and its close watch.
+    static SESSION: tokio::sync::OnceCell<zbus::Connection> = tokio::sync::OnceCell::const_new();
+
+    async fn notifications() -> zbus::Result<NotificationsProxy<'static>> {
+        let conn = SESSION.get_or_try_init(zbus::Connection::session).await?;
+        NotificationsProxy::new(conn).await
+    }
+
+    /// Whether the server reads the body as markup, asked once.
+    static BODY_MARKUP: tokio::sync::OnceCell<bool> = tokio::sync::OnceCell::const_new();
+
+    /// Shows a mirrored copy. Its text comes from another device, so where the server
+    /// reads markup the body is escaped and shows as typed (no links or images).
+    pub(super) async fn show_mirrored(mut note: Note, replaces: Option<u32>) -> Option<u32> {
+        let markup = *BODY_MARKUP
+            .get_or_init(|| async {
+                match notifications().await {
+                    Ok(p) => p
+                        .get_capabilities()
+                        .await
+                        .is_ok_and(|c| c.iter().any(|c| c == "body-markup")),
+                    // Escaping is the safe guess when the server cannot be asked.
+                    Err(_) => true,
+                }
+            })
+            .await;
+        if markup {
+            note.body = super::markup_escape(&note.body);
+        }
+        show(note, replaces).await
+    }
+
+    /// Closes notification `id`.
+    pub(super) async fn close(id: u32) {
+        let r = async { notifications().await?.close_notification(id).await }.await;
+        if let Err(e) = r {
+            tracing::debug!(error = %e, "notification not closed");
+        }
+    }
+
+    /// Forwards every `NotificationClosed` signal to the mirror worker until it is gone.
+    pub(super) fn watch_closed(tx: tokio::sync::mpsc::UnboundedSender<super::Cmd>) {
+        tokio::spawn(async move {
+            let stream = async { notifications().await?.receive_notification_closed().await };
+            let mut stream = match stream.await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::debug!(error = %e, "notification close signal unavailable");
+                    return;
+                }
+            };
+            while let Some(signal) = stream.next().await {
+                let Ok(a) = signal.args() else { continue };
+                let cmd = super::Cmd::ServerClosed {
+                    id: a.id,
+                    reason: super::mirror::CloseReason::from_freedesktop(a.reason),
+                };
+                if tx.send(cmd).is_err() {
+                    return;
+                }
+            }
+        });
     }
 
     /// Completes when the notification server reports `id` closed (dismissed, expired or
@@ -796,6 +973,18 @@ mod platform {
     pub(super) async fn closed(_id: Option<u32>) {
         std::future::pending::<()>().await;
     }
+
+    /// A mirrored copy is a plain toast: no replace, close or dismiss-back yet.
+    pub(super) async fn show_mirrored(note: Note, replaces: Option<u32>) -> Option<u32> {
+        show(note, replaces).await
+    }
+
+    /// Toasts are not closed by ID yet.
+    #[allow(clippy::unused_async)]
+    pub(super) async fn close(_id: u32) {}
+
+    /// Toast dismissals are not observed (see [`closed`]).
+    pub(super) fn watch_closed(_tx: tokio::sync::mpsc::UnboundedSender<super::Cmd>) {}
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -817,6 +1006,16 @@ mod platform {
     pub(super) async fn show_and_wait(_note: Note) -> Option<String> {
         None
     }
+
+    #[allow(clippy::unused_async)]
+    pub(super) async fn show_mirrored(_note: Note, _replaces: Option<u32>) -> Option<u32> {
+        None
+    }
+
+    #[allow(clippy::unused_async)]
+    pub(super) async fn close(_id: u32) {}
+
+    pub(super) fn watch_closed(_tx: tokio::sync::mpsc::UnboundedSender<super::Cmd>) {}
 }
 
 /// The Windows toast XML for `note`. With `buttons`, each action becomes a button whose
@@ -858,6 +1057,21 @@ fn toast_xml(note: &Note, buttons: Option<toast::Token>) -> String {
     )
 }
 
+/// Escapes text for a freedesktop body that the server reads as markup.
+#[cfg(any(target_os = "linux", test))]
+fn markup_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Escapes text for an XML text node.
 #[cfg(any(windows, test))]
 fn xml_escape(s: &str) -> String {
@@ -882,6 +1096,14 @@ mod tests {
     #[test]
     fn xml_is_escaped() {
         assert_eq!(xml_escape("a<b>&\"'"), "a&lt;b&gt;&amp;&quot;&apos;");
+    }
+
+    #[test]
+    fn mirrored_markup_is_escaped() {
+        assert_eq!(
+            markup_escape("<a href=\"x\">hi</a> & 'q'"),
+            "&lt;a href=\"x\"&gt;hi&lt;/a&gt; &amp; 'q'"
+        );
     }
 
     /// What `render` makes of one received file (built by hand so the test does not

@@ -48,6 +48,7 @@ import org.playdrop.android.ui.help.CantFindRoute
 import org.playdrop.android.ui.help.HelpTopic
 import org.playdrop.android.ui.input.InputRoute
 import org.playdrop.android.ui.input.InputViewModel
+import org.playdrop.android.ui.mirror.MirrorAppsRoute
 import org.playdrop.android.ui.onboarding.OnboardingRoute
 import org.playdrop.android.ui.pairing.PairingDialog
 import org.playdrop.android.ui.settings.SettingsRoute
@@ -82,6 +83,9 @@ object Routes {
 
     /** Remote input for one device, with the hex Device ID as argument. */
     const val INPUT = "input/{${InputViewModel.ARG_ID}}"
+
+    /** The app picker for notification mirroring (one allow list for every device). */
+    const val MIRROR_APPS = "mirror-apps"
 
     /** The detail route for one device. */
     fun device(id: String) = "device/$id"
@@ -199,6 +203,7 @@ private fun MainScaffold(
                     onBack = { nav.popIfAt(Routes.DEVICE) },
                     onPairAgain = { nav.navigate(Routes.ADD_DEVICE) },
                     onOpenInput = { nav.navigate(Routes.input(id)) { launchSingleTop = true } },
+                    onChooseMirrorApps = { nav.navigate(Routes.MIRROR_APPS) { launchSingleTop = true } },
                     showMessage = show,
                 )
             }
@@ -207,6 +212,9 @@ private fun MainScaffold(
                 arguments = listOf(navArgument(InputViewModel.ARG_ID) { type = NavType.StringType }),
             ) {
                 InputRoute(onBack = { nav.popIfAt(Routes.INPUT) }, showMessage = show)
+            }
+            composable(Routes.MIRROR_APPS) {
+                MirrorAppsRoute(onBack = { nav.popIfAt(Routes.MIRROR_APPS) })
             }
             composable(Routes.ADD_DEVICE) {
                 AddDeviceRoute(

@@ -315,8 +315,15 @@ impl InboundDecoder {
                 v,
             });
         }
-        let frame: Frame =
-            serde_json::from_slice(payload).map_err(|e| FrameError::Malformed(e.to_string()))?;
+        let frame: Frame = serde_json::from_slice(payload).map_err(|e| {
+            // serde quotes the offending value; a notification's fields are never logged
+            // (SR-43), so its error names only the frame type.
+            if t == "notification" {
+                FrameError::Malformed("malformed notification frame".into())
+            } else {
+                FrameError::Malformed(e.to_string())
+            }
+        })?;
         frame
             .validate()
             .map_err(|e| FrameError::Malformed(e.into()))?;
@@ -653,6 +660,22 @@ mod tests {
                 got: 5
             })
         ));
+    }
+
+    #[test]
+    fn malformed_notification_error_never_quotes_the_value() {
+        // SR-43: serde would quote a wrongly typed string; the error must not carry it.
+        for bad in [
+            &br#"{"t":"notification","v":1,"seq":1,"op":"posted","key":"canary-key-7f3a","app":"canary-app-7f3a","title":"canary-title-7f3a","text":"x","when":"canary-when-7f3a"}"#[..],
+            &br#"{"t":"notification","v":1,"seq":1,"op":"canary-op-7f3a","key":"k"}"#[..],
+            &br#"{"t":"notification","v":1,"seq":1,"op":"removed","key":["canary-key-7f3a"]}"#[..],
+        ] {
+            let Err(FrameError::Malformed(msg)) = one(bad) else {
+                panic!("not malformed");
+            };
+            let shown = format!("{msg} {:?}", FrameError::Malformed(msg.clone()));
+            assert!(!shown.contains("canary"), "{shown}");
+        }
     }
 
     #[test]

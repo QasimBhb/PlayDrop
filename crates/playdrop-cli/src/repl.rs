@@ -328,6 +328,8 @@ async fn command(host: &Arc<Host>, w: &[String], json: bool) -> anyhow::Result<(
                     "input" => g.input = on,
                     "media" => g.media = on,
                     "find" => g.find = on,
+                    "notificationsIn" => g.notifications_in = on,
+                    "notificationsOut" => g.notifications_out = on,
                     other => bail!("unknown grant {other}"),
                 }
             }

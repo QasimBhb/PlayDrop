@@ -214,7 +214,8 @@ Phase 2 variants are unchanged except where noted. New variants:
 ## 6. Capabilities advertised by v1
 
 `in` and `out`: `ping`, `find`, `clipboard`, `clipboard.image`, `battery`, `media.state`,
-`media.control`, `presence`, `transfer`, `transfer.bundle`, `outbox`, `blobs`. `input.*` is
+`media.control`, `presence`, `transfer`, `transfer.bundle`, `outbox`, `blobs`, `notifications`
+(section 15). `input.*` is
 Phase 5. The `capabilities` frame is parsed but never sent in v1: per-peer toggles are grants.
 
 ## 7. Traits a host may supply
@@ -389,3 +390,43 @@ this yet.
 - `Host::send_clipboard_image(peer, bytes, mime, sensitive) -> Result<ClipboardPush>`: the
   one-device counterpart of `push_clipboard_image`, with the errors of `send_clipboard`. Not
   bound by the ffi.
+
+## 15. Phase 15 note: notification mirroring (`playdrop-ffi` 0.5.0, additive)
+
+Protocol.md 5.16, SR-41 to SR-44. Every change is additive; nothing existing changed.
+
+- `pin_store::Grants` gains `notifications_in: bool` (default `true`) and
+  `notifications_out: bool` (default `false`, never turned on by pairing). Both are
+  `#[serde(default)]`, so pin stores written before load with those values. `Grants` no
+  longer refuses unknown fields, and each new field is left out of the JSON while at its
+  default, so an older reader (a v0.9.0 applet, a downgraded daemon) fails only once the
+  user changed one of them.
+- `MirroredNotification { key: String, app: String, title: String, text: String, when_ms:
+  u64 }` in `playdrop_core::host`, serde as is, `Debug` redacted (SR-43). Also
+  `NOTIFICATIONS_POSTED_PER_MINUTE` (30).
+- `Host` methods:
+  - `send_notification(&self, peer: &DeviceId, n: MirroredNotification) -> Result<()>`:
+    `posted`. Needs this host's `notifications_out` grant for the peer (`Forbidden`, nothing
+    sent), `NotPaired`, `NotFound` without a session, `Forbidden` when the peer lacks the
+    `notifications` capability, `BadRequest` for a key that is not 32 lowercase hex. Cuts
+    `app`, `title`, `text` to 64 B, 256 B, 1 KiB at a character boundary.
+  - `send_notification_removed(&self, peer: &DeviceId, key: String) -> Result<()>`: needs
+    no grant (no content; it clears the peer's copies after `notifications_out` went off,
+    SR-42), otherwise the same errors.
+  - `send_notification_dismiss(&self, peer: &DeviceId, key: String) -> Result<()>`: desktop
+    to phone; needs this host's `notifications_in` for the peer.
+  - `notification_key(&self, raw: &str) -> String`: first 128 bits of BLAKE3 keyed by a
+    per-process random 32-byte salt over `raw`, lowercase hex. Stable within a process.
+- `HostEvent` gains `NotificationPosted { peer, notification: MirroredNotification }`,
+  `NotificationRemoved { peer, key: String }` (both only with the receiver's
+  `notifications_in`) and `NotificationDismiss { peer, key: String }` (only with the
+  receiver's `notifications_out`). Over-limit frames are dropped with `error`
+  `bad_request`, malformed keys and `posted` frames past 30 a minute per connection are
+  dropped silently.
+- Section 6: `notifications` is added to both capability lists.
+
+`playdrop-ffi` 0.5.0 binds the same surface: the `MirroredNotification` record,
+`send_notification(peer, notification)`, `send_notification_removed(peer, key)`,
+`send_notification_dismiss(peer, key)`, `notification_key(raw)`, the three events, and the
+two `Grants` fields with UniFFI defaults (`notificationsIn = true`, `notificationsOut =
+false`), so existing Kotlin and Swift constructors keep compiling.

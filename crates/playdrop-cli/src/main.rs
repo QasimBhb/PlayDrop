@@ -113,8 +113,9 @@ enum Command {
     ///   cancel <id>                   cancel a transfer in either direction
     ///   transfers                     list running and recent transfers
     ///   grants <peer> [+g|-g]...      show or change grants (files, clipboardIn,
-    ///                                 clipboardOut, input, media, find; remote in a build with
-    ///                                 reach across networks)
+    ///                                 clipboardOut, input, media, find, notificationsIn,
+    ///                                 notificationsOut; remote in a build with reach across
+    ///                                 networks)
     ///   ping <peer> [message]         ping a peer
     ///   clip <peer> <text>            push clipboard text
     ///   unpair <peer>                 unpair a peer

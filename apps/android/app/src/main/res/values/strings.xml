@@ -126,4 +126,7 @@
     <string name="share_pick_hint">Your choice becomes the default for one-tap sends.</string>
     <string name="share_offline">offline</string>
     <string name="share_preparing">Preparing</string>
+
+    <!-- Notification mirroring (SR-41) -->
+    <string name="mirror_listener_label">PlayDrop notification mirroring</string>
 </resources>

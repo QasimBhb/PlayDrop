@@ -35,10 +35,10 @@ pub mod wire;
 pub mod types {
     pub use playdrop_core::host::{
         AddDeviceCandidate, Base64Bytes, DeliveredFile, Diagnostics, DialFailure, DiscoveryPath,
-        FileRoot, HostEvent, InterfaceInfo, JoinFailure, MdnsStatus, MediaState, MulticastStatus,
-        OfferedFile, OutboxItem, PairingPromptKind, PeerBattery, PeerDiagnostic, PeerSummary,
-        Secret, TransferDirection, TransferSnapshot, TransferStatus, OFFER_FILES_MAX,
-        TRANSFER_NAMES_MAX,
+        FileRoot, HostEvent, InterfaceInfo, JoinFailure, MdnsStatus, MediaState,
+        MirroredNotification, MulticastStatus, OfferedFile, OutboxItem, PairingPromptKind,
+        PeerBattery, PeerDiagnostic, PeerSummary, Secret, TransferDirection, TransferSnapshot,
+        TransferStatus, OFFER_FILES_MAX, TRANSFER_NAMES_MAX,
     };
     pub use playdrop_core::pin_store::Grants;
     pub use playdrop_core::session::types::{

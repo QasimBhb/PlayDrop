@@ -62,7 +62,7 @@ A new connection from the same dialler replaces the old one (it redials only whe
 
 ### 3.4 Keep-alive
 
-HTTP/2 PING frames, not application frames: desktop every 60 s, mobile every 300 s, announced in `hello.keepAlive`; only the side with the shorter interval pings. No ACK within 15 s means dead. Nobody closes an idle connection sooner than 2.5 times the larger interval. A connection that has carried no request other than a path probe is not idle in this sense: the serving side may close it after 20 s (3.5), and a dialler that keeps a connection sends a request on it at once. A dialler from before 3.5 has no such request, so a connection it leaves unused closes after 20 s; its session, on the peer's connection, is not touched, and its next send dials again. A phone about to sleep SHOULD send `presence` `asleep` first.
+HTTP/2 PING frames, not application frames: desktop every 60 s, mobile every 300 s, announced in `hello.keepAlive`; only the side with the shorter interval pings. No ACK within 15 s means dead. The other side, which does not ping, watches for silence: when no byte at all has arrived for the shorter interval plus 15 s (75 s for a phone facing a desktop), it sends one PING itself, and if neither the ACK nor any other byte arrives within 15 s the connection is dead. It looks at the byte count every fifth of that limit, so a peer that dropped off the network without a close is found within about 105 s, not after the idle close below. *Choice:* a live peer that pings is heard every interval, so this costs nothing while the peer is there; added in v0.10.0, and a peer from before only answers the PING. Where the OS offers it (Linux, Android) a host also sets `TCP_USER_TIMEOUT` to 60 s on every connection, so anything it sends to a peer that is gone ends the connection within 60 s. The same limit cuts a connection whose peer stopped reading entirely for 60 s (a zero TCP window); a slow disk does not, since HTTP/2 flow control holds the data back first. Nobody closes an idle connection sooner than 2.5 times the larger interval. A connection that has carried no request other than a path probe is not idle in this sense: the serving side may close it after 20 s (3.5), and a dialler that keeps a connection sends a request on it at once. A dialler from before 3.5 has no such request, so a connection it leaves unused closes after 20 s; its session, on the peer's connection, is not touched, and its next send dials again. A phone about to sleep SHOULD send `presence` `asleep` first.
 
 ### 3.5 Path choice
 
@@ -90,7 +90,7 @@ A peer may answer on several addresses at once: a phone on Wi-Fi with USB tether
 - **The version is chosen by ALPN only.** A host offers one ALPN per version at or above its minimum, highest first (`playdrop/2`, `playdrop/1`), and TLS selects one. No fallback to older, plaintext or unauthenticated modes. A release raises the minimum by dropping old ALPN strings.
 - `hello.protocolVersion` MUST equal the ALPN result, else close with `unsupported_version`. *Choice:* hello carries no version list, so there is one authenticated source of truth.
 - The discovery `v` key is a UI hint only. New versions are for incompatible changes; compatible additions use capabilities and per-frame `v`.
-- **Capabilities** come in two lists, as in KDE Connect: `in` (what this host accepts) and `out` (what it may send). A host MUST NOT send anything the peer's `in` list lacks. v1 strings: `ping`, `find`, `clipboard`, `clipboard.image`, `battery`, `media.state`, `media.control`, `presence`, `input.pointer`, `input.key`, `input.presenter`, `transfer`, `transfer.bundle`, `outbox`, `blobs`.
+- **Capabilities** come in two lists, as in KDE Connect: `in` (what this host accepts) and `out` (what it may send). A host MUST NOT send anything the peer's `in` list lacks. v1 strings: `ping`, `find`, `clipboard`, `clipboard.image`, `battery`, `media.state`, `media.control`, `presence`, `input.pointer`, `input.key`, `input.presenter`, `transfer`, `transfer.bundle`, `outbox`, `blobs`, `notifications` (5.16; added in v0.10.0 as a compatible addition, the protocol stays 1).
 - Unknown capabilities, fields and frame types are ignored.
 
 ---
@@ -129,6 +129,7 @@ The dialler sends `POST /v1/session` (`content-type: application/vnd.playdrop.fr
 | `outbox_ready` | both | `outbox` | - | no |
 | `input` | controller | `input.*` | `input` | no |
 | `transfer` | receiver | `transfer` | - | no |
+| `notification` | `posted`, `removed`: phone; `dismiss`: desktop | `notifications` | `notificationsIn` (`posted`, `removed`), `notificationsOut` (`dismiss`) | no |
 | `pair_request`, `pair_response`, `pair_reveal`, `pair_confirm`, `pair_reject` | see 6 | - | - | yes |
 | `unpair` | both | - | - | no |
 | `error` | both | - | - | yes |
@@ -246,6 +247,23 @@ The receiver pushes this when a pending offer is accepted or declined, or when i
 
 `GET /v1/blobs/{id}` returns the bytes with `content-type` and `content-length`. `id` = lowercase hex BLAKE3 of the bytes, so the fetcher verifies it. A blob lives 5 minutes after its frame and is served only to the Device ID it was announced to.
 
+### 5.16 notification
+
+```json
+{"t":"notification","v":1,"op":"posted","key":"3f9a...c1","app":"Signal",
+ "title":"Alex","text":"On my way","when":1762900000000}
+{"t":"notification","v":1,"op":"removed","key":"3f9a...c1"}
+{"t":"notification","v":1,"op":"dismiss","key":"3f9a...c1"}
+```
+
+Notification mirroring from a phone to a desktop (SR-41 to SR-44). Capability `notifications`, in both lists.
+
+- `posted` and `removed` go phone to desktop; a later `posted` with the same `key` replaces the copy. `dismiss` goes desktop to phone and asks it to cancel that notification. `when` is when it was posted, Unix ms; `title` and `text` may be empty.
+- `key` is opaque: the first 128 bits of BLAKE3 keyed by a per-process random salt over the platform notification key, as 32 lowercase hex characters. The platform key (which names the package and a tag) never leaves the phone. A frame whose `key` is not exactly 32 lowercase hex characters is dropped.
+- Limits: `app` at most 64 bytes, `title` 256, `text` 1 KiB (UTF-8, cut at a character boundary by the sender, refused over the limit by the receiver with `error` `bad_request` and dropped). At most 30 `posted` frames per minute per connection; more are dropped. The desktop shows at most 20 mirrored notifications per peer at once, closing the oldest.
+- Sending `posted` needs the sender's `notificationsOut`. Sending `removed` needs no grant: it carries no content, and a phone that just turned `notificationsOut` off sends it to close the desktop's copies (SR-42). Showing `posted` or acting on `removed` needs the receiver's `notificationsIn`. `dismiss` needs the phone's `notificationsOut` (a desktop the phone does not mirror to has nothing to dismiss), and a desktop sends it only with its `notificationsIn`. A frame without its grant is dropped (5.3).
+- `notificationsOut` is off by default and never turned on by pairing (6.4); the phone mirrors only with Android notification access and only apps on its allow list, filtered as SR-41 lists. Turning a grant off, unpairing or going offline closes every copy on the desktop for that peer (SR-42). App names, titles, text and keys are never logged (SR-43).
+
 ---
 
 ## 6. Pairing
@@ -323,7 +341,7 @@ A checks `proof_b` against B's certificate and this session, then shows "Add <na
 
 ### 6.4 Grants, unpair and auto-accept (SR-14)
 
-Each pin holds per-device grants: `files` (auto-accept), `clipboardIn`, `clipboardOut`, `input`, `media`, `find`. Defaults at pairing: all on except `input`. Grants change only from the local UI, never from a frame.
+Each pin holds per-device grants: `files` (auto-accept), `clipboardIn`, `clipboardOut`, `input`, `media`, `find`, `notificationsIn`, `notificationsOut` (5.16). Defaults at pairing: all on except `input` and `notificationsOut`. Grants added after a pin was stored take their defaults when it is read. Grants change only from the local UI, never from a frame.
 
 - With `files`, an offer from that device is accepted at once (`201`) whenever `totalBytes` fits in free space minus max(2 GiB, 5% of the volume), however large. A notification with "Open" and "Show in folder" appears when it finishes. Auto-accept is per pinned key only, never per name, address or network.
 - Without `files`, offers wait for the user (`202`).

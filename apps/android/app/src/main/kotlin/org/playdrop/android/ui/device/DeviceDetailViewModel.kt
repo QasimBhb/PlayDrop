@@ -15,6 +15,7 @@ import kotlinx.coroutines.launch
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.data.Settings
+import org.playdrop.android.service.NotificationMirror
 import org.playdrop.android.ui.common.CoreViewModel
 import org.playdrop.android.ui.common.UiMessage
 import org.playdrop.android.ui.common.nowTicker
@@ -26,7 +27,7 @@ import org.playdrop.core.HostEvent
 import org.playdrop.core.MediaAction
 import org.playdrop.core.MediaState
 
-/** One of the six per-device permissions (SR-14). */
+/** One of the per-device permissions (SR-14). */
 enum class GrantKind {
     /** Receive files without asking (auto-accept). */
     FILES,
@@ -48,6 +49,9 @@ enum class GrantKind {
      * (it does not advertise `input.*`), so the screen does not offer this toggle.
      */
     INPUT,
+
+    /** Mirror this phone's notifications to the device (SR-41; off until the user turns it on). */
+    NOTIFICATIONS_OUT,
 }
 
 /** Reads and changes one grant on a plain [Grants] value. */
@@ -60,6 +64,7 @@ object GrantEdit {
         GrantKind.MEDIA -> g.media
         GrantKind.FIND -> g.find
         GrantKind.INPUT -> g.input
+        GrantKind.NOTIFICATIONS_OUT -> g.notificationsOut
     }
 
     /** A copy of [g] with [kind] set to [value]. */
@@ -70,6 +75,7 @@ object GrantEdit {
         GrantKind.MEDIA -> g.copy(media = value)
         GrantKind.FIND -> g.copy(find = value)
         GrantKind.INPUT -> g.copy(input = value)
+        GrantKind.NOTIFICATIONS_OUT -> g.copy(notificationsOut = value)
     }
 }
 
@@ -89,6 +95,8 @@ data class DeviceDetailUiState(
     val capabilities: List<String> = emptyList(),
     /** Media players the device reports, for the "Now playing" cards. */
     val media: List<MediaState> = emptyList(),
+    /** How many apps are on the notification mirroring allow list (shared by every device). */
+    val mirrorApps: Int = 0,
 ) {
     /** Show the "Remote input" button: online and able to take pointer or key input. */
     val canControl: Boolean get() = row?.online == true && InputSupport.canControl(capabilities)
@@ -124,6 +132,7 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
                 ringing = ring,
                 capabilities = if (peer.online) peer.capabilities else emptyList(),
                 media = media[peerId].orEmpty(),
+                mirrorApps = settings.mirrorApps.size,
             )
         }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DeviceDetailUiState())
@@ -172,19 +181,31 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
         launchCore({ it.connect(peerId) })
     }
 
-    /** Changes one grant; only this local screen may do so (SR-14). */
+    /**
+     * Changes one grant; only this local screen may do so (SR-14). Turning
+     * [GrantKind.NOTIFICATIONS_OUT] off then withdraws every copy mirrored to the device
+     * (SR-42); turning it on sends the current notifications that pass the filter.
+     */
     fun setGrant(kind: GrantKind, value: Boolean) {
         if (kind == GrantKind.INPUT) return
         val base = pendingGrants.value ?: state.value.grants
         val next = GrantEdit.with(base, kind, value)
         pendingGrants.value = next
+        val app = getApplication<Application>()
         viewModelScope.launch {
+            if (kind == GrantKind.NOTIFICATIONS_OUT && value && !NotificationMirror.hasAccess(app)) {
+                post(UiMessage(R.string.ui_mirror_need_access))
+            }
             if (core {
                     it.setGrants(peerId, next)
                     CoreHost.refreshPeers()
                 } == null
             ) {
                 pendingGrants.value = null
+                return@launch
+            }
+            if (kind == GrantKind.NOTIFICATIONS_OUT) {
+                if (value) NotificationMirror.resyncPeer(app, peerId) else NotificationMirror.withdrawFrom(peerId)
             }
         }
     }

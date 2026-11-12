@@ -24,6 +24,11 @@ object Settings {
         val batteryPromptShown: Boolean,
         /** Trackpad pointer speed on the remote input screen, a multiplier on finger travel in dp. */
         val trackpadSensitivity: Float = DEFAULT_TRACKPAD_SENSITIVITY,
+        /**
+         * Package names whose notifications may be mirrored to devices with the
+         * `notificationsOut` grant (SR-41, third lock). Empty until the user picks apps.
+         */
+        val mirrorApps: Set<String> = emptySet(),
     )
 
     /** Trackpad speed used until the user picks one. */

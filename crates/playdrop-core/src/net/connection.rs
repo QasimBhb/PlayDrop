@@ -114,6 +114,18 @@ impl KeepAlive {
     pub fn min_idle_close(&self) -> Duration {
         self.local.max(self.peer).mul_f64(2.5)
     }
+
+    /// The interval of the side that PINGs: the shorter one, at least 1 s.
+    pub fn ping_interval(&self) -> Duration {
+        self.local.min(self.peer).max(Duration::from_secs(1))
+    }
+
+    /// How long the side that does not PING waits without hearing a byte before it PINGs
+    /// itself (protocol.md 3.4): one PING interval plus the time its ACK may take. A live
+    /// peer that PINGs is heard at least that often.
+    pub fn silence_limit(&self) -> Duration {
+        self.ping_interval() + PING_DEADLINE
+    }
 }
 
 /// The HTTP/2 PING handle and whether a PING is still waiting for its ACK.
@@ -582,29 +594,79 @@ impl Connection {
 
     /// Starts the protocol.md 3.4 keep-alive once both intervals are known: the side with
     /// the shorter interval PINGs every interval and closes the connection when an ACK is
-    /// 15 s late. Starting it twice does nothing. Idle connections are never closed here,
-    /// which satisfies "nobody closes sooner than 2.5 times the larger interval".
+    /// 15 s late. The other side watches for silence ([`KeepAlive::silence_limit`]): when
+    /// nothing at all arrived for that long it PINGs once itself, and closes the connection
+    /// if neither the ACK nor any other byte comes back within 15 s. Without that, a phone
+    /// whose desktop dropped off the network uncleanly showed it online until the idle close,
+    /// up to 12.5 minutes. Starting it twice does nothing. Idle connections are never closed
+    /// here, which satisfies "nobody closes sooner than 2.5 times the larger interval".
     pub fn start_keepalive(self: &Arc<Self>, ka: KeepAlive) {
+        self.start_keepalive_with(ka, PING_DEADLINE);
+    }
+
+    /// [`Connection::start_keepalive`] with `deadline` for every ACK and in place of the
+    /// 15 s in the silence limit. Tests use a short one.
+    #[doc(hidden)]
+    pub fn start_keepalive_with(self: &Arc<Self>, ka: KeepAlive, deadline: Duration) {
         if self.keepalive_started.swap(true, Ordering::AcqRel) {
             return;
         }
+        let conn = Arc::clone(self);
+        let interval = ka.ping_interval();
         if !ka.we_ping(self.direction) {
+            tokio::spawn(async move { conn.watch_silence(interval + deadline, deadline).await });
             return;
         }
-        let conn = Arc::clone(self);
-        let interval = ka.local.min(ka.peer).max(Duration::from_secs(1));
         tokio::spawn(async move {
             loop {
                 tokio::select! {
                     () = tokio::time::sleep(interval) => {}
                     () = conn.closed() => return,
                 }
-                if let Err(e) = conn.ping(PING_DEADLINE).await {
+                if let Err(e) = conn.ping(deadline).await {
                     tracing::info!(peer = %short(&conn.peer.device_id), error = %e, "keep-alive failed; closing");
                     conn.close(CloseReason::Dead);
                     return;
                 }
             }
         });
+    }
+
+    /// The silent side of the keep-alive (see [`Connection::start_keepalive`]). Looks at
+    /// the byte count every fifth of `limit`, so a drop is noticed within `limit` plus that
+    /// tick plus `deadline` of the last byte. The ticks cost nothing while the device
+    /// sleeps: a timer does not wake it, and the monotonic clock stands still meanwhile, so
+    /// sleeping alone never reads as silence.
+    async fn watch_silence(&self, limit: Duration, deadline: Duration) {
+        let tick = (limit / 5).max(Duration::from_millis(200));
+        let mut seen = self.bytes_read.load(Ordering::Relaxed);
+        let mut since = Instant::now();
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(tick) => {}
+                () = self.closed() => return,
+            }
+            let now = self.bytes_read.load(Ordering::Relaxed);
+            if now != seen {
+                seen = now;
+                since = Instant::now();
+                continue;
+            }
+            if since.elapsed() < limit {
+                continue;
+            }
+            match self.heard_from(deadline).await {
+                Heard::Ack | Heard::Bytes => {
+                    seen = self.bytes_read.load(Ordering::Relaxed);
+                    since = Instant::now();
+                }
+                Heard::Nothing => {
+                    tracing::info!(peer = %short(&self.peer.device_id), "peer silent and no PING answer; closing");
+                    self.close(CloseReason::Dead);
+                    return;
+                }
+                Heard::Closed => return,
+            }
+        }
     }
 }

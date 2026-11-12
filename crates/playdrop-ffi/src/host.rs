@@ -14,8 +14,8 @@ use crate::error::PlayDropError;
 use crate::traits::HostListener;
 use crate::types::{
     parse_addr, parse_peer, AddDeviceCandidate, ClipboardPush, Diagnostics, Grants, HostConfig,
-    InputEvent, MediaAction, MediaState, OutboxItem, PeerSummary, PresenceState, SendSource,
-    TransferSnapshot,
+    InputEvent, MediaAction, MediaState, MirroredNotification, OutboxItem, PeerSummary,
+    PresenceState, SendSource, TransferSnapshot,
 };
 
 /// Worker threads for the core runtime. *Choice:* two is enough for one connection's TLS
@@ -343,6 +343,53 @@ impl PlayDropHost {
         Ok(self
             .host
             .send_media_command(&peer, &player, action.into(), value)?)
+    }
+
+    /// Mirrors one notification to a peer (protocol.md 5.16 `posted`; ffi 0.5.0). Needs our
+    /// `notificationsOut` grant for it (`Forbidden`, nothing sent), a session (`NotFound`)
+    /// and the peer's `notifications` capability (`Forbidden`). `key` must come from
+    /// `notificationKey` (`BadRequest`). `app`, `title` and `text` are cut to 64 B, 256 B
+    /// and 1 KiB. The app filters what may be mirrored (SR-41) and never logs it (SR-43).
+    pub fn send_notification(
+        &self,
+        peer: String,
+        notification: MirroredNotification,
+    ) -> Result<(), PlayDropError> {
+        let _rt = self.rt.enter();
+        let peer = parse_peer(&peer)?;
+        Ok(self.host.send_notification(&peer, notification.into())?)
+    }
+
+    /// Tells a peer a mirrored notification went away (5.16 `removed`; ffi 0.5.0). Needs
+    /// no grant, so after turning `notificationsOut` off the app can still clear the
+    /// peer's copies (SR-42); otherwise the errors of `send_notification`.
+    pub fn send_notification_removed(
+        &self,
+        peer: String,
+        key: String,
+    ) -> Result<(), PlayDropError> {
+        let _rt = self.rt.enter();
+        let peer = parse_peer(&peer)?;
+        Ok(self.host.send_notification_removed(&peer, key)?)
+    }
+
+    /// Asks a peer to dismiss a notification it mirrored to us (5.16 `dismiss`; ffi 0.5.0).
+    /// Needs our `notificationsIn` grant for it.
+    pub fn send_notification_dismiss(
+        &self,
+        peer: String,
+        key: String,
+    ) -> Result<(), PlayDropError> {
+        let _rt = self.rt.enter();
+        let peer = parse_peer(&peer)?;
+        Ok(self.host.send_notification_dismiss(&peer, key)?)
+    }
+
+    /// The opaque key for a platform notification key (5.16; ffi 0.5.0): 128 bits of
+    /// BLAKE3 keyed by a per-process random salt, 32 lowercase hex characters. Stable for
+    /// the life of the process; the raw key never leaves the device.
+    pub fn notification_key(&self, raw: String) -> String {
+        self.host.notification_key(&raw)
     }
 
     /// Pushes our media player state to peers, coalesced to 2 per second per player.

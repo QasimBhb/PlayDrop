@@ -78,8 +78,13 @@ object CoreHost {
      */
     suspend fun <T> withHost(block: suspend (PlayDropHost) -> T): T = CoreHostImpl.withHost(block)
 
-    /** Starts the foreground service if needed (no-op when it already runs). */
-    fun ensureServiceRunning(context: Context) = CoreHostImpl.ensureServiceRunning(context)
+    /**
+     * Starts the foreground service if needed (no-op when it already runs). With [repost],
+     * used when the app opens, a running service posts its notification again, in case the
+     * user swiped it away.
+     */
+    fun ensureServiceRunning(context: Context, repost: Boolean = false) =
+        CoreHostImpl.ensureServiceRunning(context, repost)
 
     /**
      * Starts the service if needed and suspends until [running] is true, at most

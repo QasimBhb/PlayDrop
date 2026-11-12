@@ -561,6 +561,47 @@ async fn sr32_no_secret_reaches_the_logs_or_the_diagnostics_export() {
         .wait_for(T, |e| matches!(e, HostEvent::Clipboard { text, .. } if text.0.as_deref() == Some(long.as_str())))
         .await;
 
+    // 3b. A mirrored notification (SR-43): bravo mirrors to alpha, alpha dismisses it.
+    // App name, title, text, the opaque key and the raw platform key are canaries.
+    let mut g = bravo.host.grants(&alpha_id).unwrap();
+    g.notifications_out = true;
+    bravo.host.set_grants(&alpha_id, g).await.unwrap();
+    let raw_key = hex_canary(&mut rng, "canary-rawkey");
+    let key = bravo.host.notification_key(&raw_key);
+    let n = playdrop_core::host::MirroredNotification {
+        key: key.clone(),
+        app: hex_canary(&mut rng, "canary-app"),
+        title: hex_canary(&mut rng, "canary-title"),
+        text: hex_canary(&mut rng, "canary-text"),
+        when_ms: 1_762_900_000_000,
+    };
+    c.add("raw notification key", raw_key);
+    c.add("notification key", key.clone());
+    c.add("notification app", n.app.clone());
+    c.add("notification title", n.title.clone());
+    c.add("notification text", n.text.clone());
+    bravo.host.send_notification(&alpha_id, n.clone()).unwrap();
+    alpha
+        .events
+        .wait_for(T, |e| matches!(e, HostEvent::NotificationPosted { notification, .. } if *notification == n))
+        .await;
+    bravo
+        .host
+        .send_notification_removed(&alpha_id, key.clone())
+        .unwrap();
+    alpha
+        .events
+        .wait_for(T, |e| matches!(e, HostEvent::NotificationRemoved { .. }))
+        .await;
+    alpha
+        .host
+        .send_notification_dismiss(&bravo_id, key.clone())
+        .unwrap();
+    bravo
+        .events
+        .wait_for(T, |e| matches!(e, HostEvent::NotificationDismiss { .. }))
+        .await;
+
     // 4. Files at TRACE into the sink: a streamed file and a bundled one; names and
     // contents are canaries (names may appear at TRACE, contents never).
     let src = root.path().join("src");

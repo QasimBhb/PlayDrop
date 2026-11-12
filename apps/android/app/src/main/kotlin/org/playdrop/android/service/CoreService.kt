@@ -39,6 +39,9 @@ class CoreService : LifecycleService() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var tetherWatcher: TetherWatcher? = null
 
+    /** What the notification shows now, so a repeated start posts it with the same text. */
+    @Volatile private var shown: ServiceStart.Shown? = null
+
     /** Posts the foreground notification, then wires the platform hooks. */
     override fun onCreate() {
         super.onCreate()
@@ -52,12 +55,16 @@ class CoreService : LifecycleService() {
                 val default = settings.defaultPeer?.let { id -> peers.firstOrNull { it.deviceId == id } }
                 Triple(running, peers.count { it.online }, default?.label?.ifBlank { default.shortId })
             }.collectLatest { (running, online, label) ->
+                shown = ServiceStart.Shown(running, online, label)
                 Notifications.updateService(this@CoreService, running, online, label)
             }
         }
     }
 
-    /** Starts the core once; repeated starts only re-assert the foreground state. */
+    /**
+     * Starts the core once; repeated starts only re-assert the foreground state, which posts
+     * the notification again (the app asks for that when it opens, see [ServiceStart]).
+     */
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         if (!goForeground()) return START_NOT_STICKY
@@ -88,7 +95,8 @@ class CoreService : LifecycleService() {
      * the system refuses, for example a start from the background on Android 12+.
      */
     private fun goForeground(): Boolean {
-        val n = Notifications.service(this, CoreHost.running.value, CoreHost.peers.value.count { it.online }, null)
+        val now = shown ?: ServiceStart.Shown(CoreHost.running.value, CoreHost.peers.value.count { it.online }, null)
+        val n = Notifications.service(this, now.running, now.online, now.defaultLabel)
         return try {
             val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
             ServiceCompat.startForeground(this, NotificationPlan.SERVICE_ID, n, type)

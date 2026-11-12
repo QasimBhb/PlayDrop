@@ -15,7 +15,7 @@ pub mod limits;
 pub mod pairing;
 pub mod types;
 
-mod util;
+pub(crate) mod util;
 
 pub use frame::{
     Envelope, FrameDecoder, FrameError, FrameReader, FrameWriter, Inbound, InboundDecoder,

@@ -152,6 +152,8 @@ internal object Notifications {
             is HostEvent.ClipboardImage -> clipboard(context, event.peer, event.sensitive, labelOf(event.peer)) {
                 ClipboardApplier.applyImage(context, event.data, event.mime, event.sensitive)
             }
+            // A desktop closed its mirrored copy: cancel the notification on this phone.
+            is HostEvent.NotificationDismiss -> NotificationMirror.dismiss(event.peer, event.key)
             else -> Unit
         }
     }

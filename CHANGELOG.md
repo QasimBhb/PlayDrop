@@ -8,6 +8,38 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.10.0] - Unreleased
+
+### Added
+
+- Phone notifications on the computer (Android to desktop). Notifications from the apps you
+  pick on the phone show up on a paired computer, close there when they go away on the phone,
+  and closing one on the computer dismisses it on the phone. It is off until you turn it on,
+  on the phone, in three places: Android's "Notification access" for PlayDrop, a switch for
+  the one computer, and a tick for each app. Ongoing notifications, group summaries and
+  anything an app marks secret are never sent, and notification text is never written to
+  logs. The computer has its own switch per phone to refuse them. Linux shows, replaces and
+  closes them; Windows shows a plain notification. No replies, buttons or icons yet.
+  See `docs/guide/notifications.md`.
+
+### Fixed
+
+- The phone no longer shows a computer as online for up to 12 minutes after the computer
+  dropped off the network without saying goodbye (lid closed, Wi-Fi cut). The side that
+  waits for the other's regular check-in now asks by itself after 75 seconds of silence and
+  gives up 15 seconds later, so a dead link is noticed in under two minutes. On Linux and
+  Android anything sent to a peer that is gone also ends the link within a minute.
+- Android: opening the app brings back the always-on notification if you swiped it away.
+  Before, only a Force stop and a fresh start did.
+
+### Changed
+
+- The saved list of paired devices and the answers the background service gives now carry
+  two more permissions. They are only written once you change one, so an older PlayDrop
+  keeps reading them until then; after that, update the panel applet together with the
+  rest, and an older PlayDrop installed over this one will not start until the two new
+  permissions are back at their defaults.
+
 ## [0.9.0] - 2026-11-10
 
 ### Fixed

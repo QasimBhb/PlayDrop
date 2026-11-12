@@ -103,7 +103,22 @@ pub(crate) fn tune_socket(tcp: &tokio::net::TcpStream) {
     if let Err(e) = tcp.set_nodelay(true) {
         tracing::debug!(error = %e, "TCP_NODELAY not set");
     }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Err(e) = socket2::SockRef::from(tcp).set_tcp_user_timeout(Some(TCP_USER_TIMEOUT)) {
+        tracing::debug!(error = %e, "TCP_USER_TIMEOUT not set");
+    }
 }
+
+/// How long bytes this host sent may stay unacknowledged before the kernel ends the
+/// connection (protocol.md 3.4), where the OS offers it (Linux and Android). Anything sent
+/// to a peer that dropped off the network, a clipboard or a battery report, then ends the
+/// connection within this time instead of waiting for the keep-alive. The kernel applies
+/// the same limit while the peer advertises a zero window, so a peer whose process stopped
+/// reading for this long is cut too. *Choice:* 60 s, four times the keep-alive ACK
+/// deadline: a path that stalls for a moment or a receiver that hangs briefly is not cut,
+/// and a slow disk never gets here, because HTTP/2 flow control stops the data first.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub const TCP_USER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Resolves once `rx` holds `true`. Wraps `wait_for` so its borrow guard is not held across
 /// an await inside `select!`, which would make the future non-`Send`.
@@ -503,5 +518,17 @@ mod tests {
             .min_idle_close(),
             Duration::from_secs(750)
         );
+    }
+
+    #[test]
+    fn a_phone_facing_a_desktop_asks_after_75_s_of_silence() {
+        let ka = KeepAlive {
+            local: Duration::from_secs(300),
+            peer: Duration::from_secs(60),
+        };
+        assert_eq!(ka.ping_interval(), Duration::from_secs(60));
+        assert_eq!(ka.silence_limit(), Duration::from_secs(75));
+        // Far below the 750 s idle close the phone waited for before.
+        assert!(ka.silence_limit() * 5 <= ka.min_idle_close());
     }
 }

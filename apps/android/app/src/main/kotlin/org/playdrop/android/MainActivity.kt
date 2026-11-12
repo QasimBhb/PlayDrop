@@ -1,8 +1,10 @@
 package org.playdrop.android
 
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
 import org.playdrop.android.core.CoreHost
+import org.playdrop.android.core.HostLog
 import org.playdrop.android.data.Settings
 import android.content.ClipDescription
 import android.content.ClipboardManager
@@ -53,10 +55,17 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         // The service owns the core; the window is only a client of it. Opening the app
-        // after onboarding makes sure the service is up even when no screen asked for it.
+        // after onboarding makes sure the service is up even when no screen asked for it, and
+        // brings back its notification if the user swiped it away (Android 14 and newer).
         lifecycleScope.launch {
-            if (Settings.read(applicationContext).onboarded) {
-                CoreHost.ensureServiceRunning(applicationContext)
+            if (!Settings.read(applicationContext).onboarded) return@launch
+            // The read suspends: start only while still visible, since Android 12 and newer
+            // refuse a foreground service start from the background.
+            if (!lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) return@launch
+            try {
+                CoreHost.ensureServiceRunning(applicationContext, repost = true)
+            } catch (e: Exception) {
+                HostLog.w("app", "starting the service from the window failed: ${e.javaClass.simpleName}")
             }
         }
     }

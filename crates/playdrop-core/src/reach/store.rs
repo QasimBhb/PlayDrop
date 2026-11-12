@@ -1,8 +1,9 @@
 //! The `remote` grant and what peers said in their `reach` frames, per pinned peer, in
 //! `reach.json` next to `pins.json` (protocol.md 12, SR-14, SR-28).
 //!
-//! *Choice:* a file of its own and not fields on the pin. `Pin` and `Grants` refuse unknown
-//! fields, so a field in `pins.json` would stop every other build (a release, or this source
+//! *Choice:* a file of its own and not fields on the pin. `Pin` refuses unknown fields (and
+//! `Grants` did until the notification grants, which older readers see only when changed),
+//! so a field in `pins.json` would stop every other build (a release, or this source
 //! without the feature) from loading the file, and `playdrop-ffi` builds `Grants` with a struct
 //! literal, so a new field there would change a surface that must stay as it is. This way
 //! `pins.json` is the same in every build and a data dir can move between builds both ways.

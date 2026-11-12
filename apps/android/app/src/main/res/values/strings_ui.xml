@@ -110,6 +110,24 @@
     <string name="ui_grant_find_body">Rings at full volume, even on silent, so you can find it.</string>
     <string name="ui_grant_input_phone">This phone cannot be controlled remotely.</string>
 
+    <!-- Notification mirroring (SR-41, SR-42) -->
+    <string name="ui_mirror_title">Notifications</string>
+    <string name="ui_mirror_toggle">Mirror notifications to this device</string>
+    <string name="ui_mirror_body">Title and text of notifications from the apps you pick are sent to %1$s.</string>
+    <string name="ui_mirror_no_access">Mirroring is off because PlayDrop has no notification access.</string>
+    <string name="ui_mirror_open_access">Open settings</string>
+    <string name="ui_mirror_need_access">Give PlayDrop notification access to start mirroring.</string>
+    <string name="ui_mirror_access_unavailable">This phone did not open the notification access settings. Find PlayDrop under Settings, Notifications, Device and app notifications.</string>
+    <string name="ui_mirror_choose_apps">Choose apps</string>
+    <string name="ui_mirror_no_apps">No apps picked yet, so nothing is sent.</string>
+    <plurals name="ui_mirror_apps_picked">
+        <item quantity="one">%1$d app picked</item>
+        <item quantity="other">%1$d apps picked</item>
+    </plurals>
+    <string name="ui_mirror_apps_title">Apps to mirror</string>
+    <string name="ui_mirror_apps_body">The title and text of every notification from the apps you tick are sent to each device with mirroring turned on, including notifications this phone hides on its lock screen. Ongoing notifications, group summaries and anything an app marks as secret stay on this phone.</string>
+    <string name="ui_mirror_apps_empty">No apps found.</string>
+
     <!-- Add device -->
     <string name="ui_add_tab_nearby">Nearby</string>
     <string name="ui_add_tab_show_qr">Show QR</string>

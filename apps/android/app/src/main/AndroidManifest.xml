@@ -20,6 +20,14 @@
     <!-- Used only from the Settings battery card after an explicit tap (PLAN.md anti-pattern 14). -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
+    <!-- The notification mirroring app picker lists launcher apps only; no QUERY_ALL_PACKAGES. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:name=".PlayDropApp"
         android:allowBackup="false"
@@ -90,6 +98,18 @@
             android:name=".service.CoreService"
             android:exported="false"
             android:foregroundServiceType="connectedDevice" />
+
+        <!-- Notification mirroring (SR-41): bound by the system only after the user grants
+             "Notification access"; the permission keeps every other app from binding it. -->
+        <service
+            android:name=".service.MirrorListener"
+            android:exported="false"
+            android:label="@string/mirror_listener_label"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
 
         <receiver
             android:name=".service.ActionReceiver"

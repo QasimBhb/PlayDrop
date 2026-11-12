@@ -33,7 +33,7 @@ const FORMAT_VERSION: u32 = 1;
 /// Per-device grants (protocol.md 6.4, SR-14). They change only from the local UI.
 #[allow(clippy::struct_excessive_bools)] // One flag per grant is the protocol's model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct Grants {
     /// Auto-accept file offers.
     pub files: bool,
@@ -47,10 +47,43 @@ pub struct Grants {
     pub media: bool,
     /// "Find my device" ring.
     pub find: bool,
+    /// Show mirrored notifications the peer sends (protocol.md 5.16, SR-41). Added after
+    /// pairing existed, so stores written before it load with the default `true`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub notifications_in: bool,
+    /// Mirror this device's notifications to the peer (protocol.md 5.16, SR-41). Pairing
+    /// never turns it on; only the local UI does. Stores without it load with `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub notifications_out: bool,
+}
+
+/// Serde default for grants added after pairing that start on.
+fn default_true() -> bool {
+    true
+}
+
+/// Leaves a grant added after pairing out of the JSON while it is at its default, so a
+/// reader from before it (an older applet or daemon) still reads the grants.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes a reference"
+)]
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+/// See [`is_true`].
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde passes a reference"
+)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for Grants {
-    /// Defaults at pairing: all on except `input` (protocol.md 6.4, SR-14).
+    /// Defaults at pairing: all on except `input` and `notifications_out` (protocol.md 6.4,
+    /// SR-14, SR-41).
     fn default() -> Self {
         Self {
             files: true,
@@ -59,6 +92,8 @@ impl Default for Grants {
             input: false,
             media: true,
             find: true,
+            notifications_in: true,
+            notifications_out: false,
         }
     }
 }
@@ -562,6 +597,66 @@ mod tests {
         let json = serde_json::to_value(g).unwrap();
         assert_eq!(json["clipboardIn"], true);
         assert_eq!(json["input"], false);
+        assert!(g.notifications_in);
+        assert!(!g.notifications_out);
+        // At their defaults the new grants are left out, so the JSON has exactly the
+        // fields a reader from before notification mirroring knows.
+        let keys: Vec<&str> = json
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let mut keys = keys;
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "clipboardIn",
+                "clipboardOut",
+                "files",
+                "find",
+                "input",
+                "media"
+            ]
+        );
+        let changed = serde_json::to_value(Grants {
+            notifications_in: false,
+            notifications_out: true,
+            ..g
+        })
+        .unwrap();
+        assert_eq!(changed["notificationsIn"], false);
+        assert_eq!(changed["notificationsOut"], true);
+    }
+
+    #[test]
+    fn grants_ignore_unknown_future_fields() {
+        let json = r#"{"files":true,"clipboardIn":true,"clipboardOut":true,"input":false,
+            "media":true,"find":true,"someFutureGrant":true}"#;
+        let g: Grants = serde_json::from_str(json).unwrap();
+        assert_eq!(g, Grants::default());
+    }
+
+    #[test]
+    fn grants_without_notification_fields_load_with_defaults() {
+        // A pin store written before notification mirroring existed (SR-41).
+        let old = r#"{"files":false,"clipboardIn":true,"clipboardOut":false,
+            "input":true,"media":false,"find":true}"#;
+        let g: Grants = serde_json::from_str(old).unwrap();
+        assert!(!g.files && g.clipboard_in && !g.clipboard_out && g.input && !g.media && g.find);
+        assert!(g.notifications_in);
+        assert!(!g.notifications_out);
+        let back: Grants = serde_json::from_value(
+            serde_json::to_value(Grants {
+                notifications_in: false,
+                notifications_out: true,
+                ..Grants::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(!back.notifications_in && back.notifications_out);
     }
 
     #[test]

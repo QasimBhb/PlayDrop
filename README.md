@@ -70,6 +70,8 @@ More in [docs/guide/pairing.md](docs/guide/pairing.md).
 - **Media control.** See and control what the computer is playing from the phone.
 - **Remote input.** Use the phone as a trackpad, keyboard or presentation remote. It is off until
   you turn it on, on the computer, and there is a kill switch. [Guide](docs/guide/remote-input.md).
+- **Phone notifications on the computer** (Android). Off until you turn it on, on the phone, for
+  one computer and for the apps you pick. [Guide](docs/guide/notifications.md).
 
 ## Command line
 
@@ -109,6 +111,7 @@ KDE Connect and LocalSend can stay installed: PlayDrop never uses their ports. F
 [Sending files](docs/guide/sending.md) -
 [Clipboard](docs/guide/clipboard.md) -
 [Remote input](docs/guide/remote-input.md) -
+[Phone notifications](docs/guide/notifications.md) -
 [Can't find your device?](docs/guide/cant-find-your-device.md) -
 [Command line](docs/guide/cli.md) -
 [Troubleshooting](docs/guide/troubleshooting.md)

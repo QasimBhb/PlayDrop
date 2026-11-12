@@ -180,6 +180,13 @@ pub struct Grants {
     pub media: bool,
     /// Ring on `find`.
     pub find: bool,
+    /// Show mirrored notifications the peer sends (protocol.md 5.16; ffi 0.5.0).
+    #[uniffi(default = true)]
+    pub notifications_in: bool,
+    /// Mirror this device's notifications to the peer (protocol.md 5.16, SR-41; ffi
+    /// 0.5.0). Pairing never turns it on.
+    #[uniffi(default = false)]
+    pub notifications_out: bool,
 }
 
 impl From<playdrop_core::pin_store::Grants> for Grants {
@@ -191,6 +198,8 @@ impl From<playdrop_core::pin_store::Grants> for Grants {
             input: g.input,
             media: g.media,
             find: g.find,
+            notifications_in: g.notifications_in,
+            notifications_out: g.notifications_out,
         }
     }
 }
@@ -204,6 +213,8 @@ impl From<Grants> for playdrop_core::pin_store::Grants {
             input: g.input,
             media: g.media,
             find: g.find,
+            notifications_in: g.notifications_in,
+            notifications_out: g.notifications_out,
         }
     }
 }
@@ -702,6 +713,57 @@ impl From<host::MediaState> for MediaState {
             position_at_ms: m.position_at_ms,
             volume: m.volume,
             can: m.can.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------------------
+
+/// A mirrored notification (protocol.md 5.16; ffi 0.5.0). `key` comes from
+/// `notificationKey`; `when_ms` is Unix ms. Show it, never log it (SR-43): `Debug` hides
+/// every field.
+#[derive(Clone, PartialEq, Eq, uniffi::Record)]
+pub struct MirroredNotification {
+    /// Opaque key, 32 lowercase hex characters.
+    pub key: String,
+    /// App name; cut to 64 bytes when sent.
+    pub app: String,
+    /// Title; cut to 256 bytes when sent. May be empty.
+    pub title: String,
+    /// Text; cut to 1 KiB when sent. May be empty.
+    pub text: String,
+    /// When it was posted, Unix ms.
+    pub when_ms: u64,
+}
+
+impl std::fmt::Debug for MirroredNotification {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MirroredNotification(redacted)")
+    }
+}
+
+impl From<MirroredNotification> for host::MirroredNotification {
+    fn from(n: MirroredNotification) -> Self {
+        Self {
+            key: n.key,
+            app: n.app,
+            title: n.title,
+            text: n.text,
+            when_ms: n.when_ms,
+        }
+    }
+}
+
+impl From<host::MirroredNotification> for MirroredNotification {
+    fn from(n: host::MirroredNotification) -> Self {
+        Self {
+            key: n.key,
+            app: n.app,
+            title: n.title,
+            text: n.text,
+            when_ms: n.when_ms,
         }
     }
 }
@@ -1261,5 +1323,39 @@ mod input_tests {
             action: wire::PresenterAction::Unknown("spin".into()),
         };
         assert_eq!(InputEvent::from_wire(unknown), None);
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+
+    /// The two notification grants and the record cross the FFI unchanged (ffi 0.5.0), and
+    /// the record's `Debug` shows nothing (SR-43).
+    #[test]
+    fn notification_grants_and_record_round_trip() {
+        let core = playdrop_core::pin_store::Grants::default();
+        let g: Grants = core.into();
+        assert!(g.notifications_in && !g.notifications_out);
+        let on = Grants {
+            notifications_out: true,
+            notifications_in: false,
+            ..g
+        };
+        let back: playdrop_core::pin_store::Grants = on.into();
+        assert!(back.notifications_out && !back.notifications_in);
+        assert_eq!(Grants::from(back), on);
+
+        let n = MirroredNotification {
+            key: "ab".repeat(16),
+            app: "Signal".into(),
+            title: "Alex".into(),
+            text: "On my way".into(),
+            when_ms: 1_762_900_000_000,
+        };
+        let core: host::MirroredNotification = n.clone().into();
+        assert_eq!(MirroredNotification::from(core), n);
+        let d = format!("{n:?}");
+        assert!(!d.contains("Signal") && !d.contains("abab"), "{d}");
     }
 }

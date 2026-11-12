@@ -25,6 +25,18 @@ pub const PING_MESSAGE_MAX: usize = 256;
 /// Maximum inline clipboard text in bytes; longer text goes as a blob (protocol.md 5.7).
 pub const CLIPBOARD_INLINE_MAX: usize = 32 * 1024;
 
+/// Maximum `notification.app` length in bytes (protocol.md 5.16, SR-44).
+pub const NOTIFICATION_APP_MAX: usize = 64;
+
+/// Maximum `notification.title` length in bytes (protocol.md 5.16, SR-44).
+pub const NOTIFICATION_TITLE_MAX: usize = 256;
+
+/// Maximum `notification.text` length in bytes (protocol.md 5.16, SR-44).
+pub const NOTIFICATION_TEXT_MAX: usize = 1024;
+
+/// Length of a notification `key`: 128 bits as lowercase hex (protocol.md 5.16).
+pub const NOTIFICATION_KEY_LEN: usize = 32;
+
 /// A closed wire vocabulary with an `Unknown` passthrough.
 trait WireStr: Sized {
     fn from_wire(s: &str) -> Self;
@@ -146,6 +158,8 @@ wire_enum! {
         Outbox => "outbox",
         /// `blobs`: `GET /v1/blobs/{id}`.
         Blobs => "blobs",
+        /// `notifications`: mirrored notifications (protocol.md 5.16).
+        Notifications => "notifications",
     }
 }
 
@@ -436,6 +450,11 @@ pub enum GrantKind {
     Media,
     /// `find`: ring this device.
     Find,
+    /// `notificationsIn`: show notifications the peer mirrors (5.16).
+    NotificationsIn,
+    /// `notificationsOut`: mirror this device's notifications to the peer (5.16). Off by
+    /// default and never turned on by pairing (SR-41).
+    NotificationsOut,
 }
 
 /// Capability lists in `hello` and `capabilities` (protocol.md section 4).
@@ -647,6 +666,95 @@ pub struct MediaCommand {
     /// Seek position in ms or volume 0 to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<u64>,
+}
+
+/// `notification`, protocol.md 5.16, tagged on `op`. `Debug` hides every field (SR-43).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Notification {
+    /// `op: posted`, phone to desktop: show or replace the copy with this `key`.
+    Posted(NotificationPosted),
+    /// `op: removed`, phone to desktop: the notification went away; close the copy.
+    Removed {
+        /// The opaque key of a posted notification.
+        key: String,
+    },
+    /// `op: dismiss`, desktop to phone: the user closed the copy; cancel the original.
+    Dismiss {
+        /// The opaque key of a posted notification.
+        key: String,
+    },
+}
+
+impl fmt::Debug for Notification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let op = match self {
+            Self::Posted(_) => "posted",
+            Self::Removed { .. } => "removed",
+            Self::Dismiss { .. } => "dismiss",
+        };
+        write!(f, "Notification({op}, redacted)")
+    }
+}
+
+impl Notification {
+    /// The opaque key every op carries.
+    pub fn key(&self) -> &str {
+        match self {
+            Self::Posted(p) => &p.key,
+            Self::Removed { key } | Self::Dismiss { key } => key,
+        }
+    }
+
+    /// True if the key is exactly 32 lowercase hex characters (protocol.md 5.16).
+    pub fn key_is_valid(&self) -> bool {
+        notification_key_is_valid(self.key())
+    }
+
+    /// True if `app`, `title` and `text` are within their limits (protocol.md 5.16, SR-44).
+    /// Ops without them always are.
+    pub fn within_limits(&self) -> bool {
+        match self {
+            Self::Posted(p) => {
+                p.app.len() <= NOTIFICATION_APP_MAX
+                    && p.title.len() <= NOTIFICATION_TITLE_MAX
+                    && p.text.len() <= NOTIFICATION_TEXT_MAX
+            }
+            Self::Removed { .. } | Self::Dismiss { .. } => true,
+        }
+    }
+}
+
+/// True if `key` is exactly [`NOTIFICATION_KEY_LEN`] lowercase hex characters.
+pub fn notification_key_is_valid(key: &str) -> bool {
+    key.len() == NOTIFICATION_KEY_LEN
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// `notification` `op: posted`, protocol.md 5.16.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationPosted {
+    /// Opaque key: 128 bits of salted BLAKE3 over the platform key, lowercase hex.
+    pub key: String,
+    /// App name, at most 64 bytes.
+    pub app: String,
+    /// Title, at most 256 bytes; may be empty.
+    #[serde(default)]
+    pub title: String,
+    /// Text, at most 1 KiB; may be empty.
+    #[serde(default)]
+    pub text: String,
+    /// When it was posted, Unix ms.
+    pub when: u64,
+}
+
+impl fmt::Debug for NotificationPosted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("NotificationPosted(redacted)")
+    }
 }
 
 /// `presence`, protocol.md 5.10.
@@ -862,6 +970,8 @@ pub enum Frame {
     Media(Media),
     /// 5.10
     Presence(Presence),
+    /// 5.16
+    Notification(Notification),
     /// 5.11
     OutboxReady(OutboxReady),
     /// 5.12
@@ -924,6 +1034,7 @@ const CAP_INPUT_ANY: &[Capability] = &[
     Capability::InputPresenter,
 ];
 const CAP_TRANSFER: &[Capability] = &[Capability::Transfer];
+const CAP_NOTIFICATIONS: &[Capability] = &[Capability::Notifications];
 
 /// Every `t` known to this version, protocol.md 5.3.
 pub const KNOWN_TYPES: &[&str] = &[
@@ -937,6 +1048,7 @@ pub const KNOWN_TYPES: &[&str] = &[
     "battery",
     "media",
     "presence",
+    "notification",
     "outbox_ready",
     "input",
     "transfer",
@@ -965,6 +1077,7 @@ impl Frame {
             Frame::Battery(_) => "battery",
             Frame::Media(_) => "media",
             Frame::Presence(_) => "presence",
+            Frame::Notification(_) => "notification",
             Frame::OutboxReady(_) => "outbox_ready",
             Frame::Input(_) => "input",
             Frame::Transfer(_) => "transfer",
@@ -1028,15 +1141,24 @@ impl Frame {
             Frame::Clipboard(_) => Some(GrantKind::ClipboardIn),
             Frame::Media(_) => Some(GrantKind::Media),
             Frame::Input(_) => Some(GrantKind::Input),
+            // Showing needs `notificationsIn`; a dismiss acts on the phone's own
+            // notifications, so it needs the phone's `notificationsOut` (5.16).
+            Frame::Notification(Notification::Posted(_) | Notification::Removed { .. }) => {
+                Some(GrantKind::NotificationsIn)
+            }
+            Frame::Notification(Notification::Dismiss { .. }) => Some(GrantKind::NotificationsOut),
             _ => None,
         }
     }
 
     /// Grant the sender must hold for the peer before sending this frame: `clipboardOut` for
-    /// `clipboard` (protocol.md 5.7).
+    /// `clipboard` (protocol.md 5.7), `notificationsOut` for `notification` `posted`, and
+    /// `notificationsIn` for `dismiss` (5.16). `removed` needs none (SR-42).
     pub fn required_send_grant(&self) -> Option<GrantKind> {
         match self {
             Frame::Clipboard(_) => Some(GrantKind::ClipboardOut),
+            Frame::Notification(Notification::Posted(_)) => Some(GrantKind::NotificationsOut),
+            Frame::Notification(Notification::Dismiss { .. }) => Some(GrantKind::NotificationsIn),
             _ => None,
         }
     }
@@ -1080,6 +1202,7 @@ impl Frame {
             Frame::Input(Input::Key(_)) => CapRequirement::AllOf(CAP_KEY),
             Frame::Input(Input::Presenter { .. }) => CapRequirement::AllOf(CAP_PRESENTER),
             Frame::Transfer(_) => CapRequirement::AllOf(CAP_TRANSFER),
+            Frame::Notification(_) => CapRequirement::AllOf(CAP_NOTIFICATIONS),
             _ => CapRequirement::None,
         }
     }
@@ -1122,6 +1245,10 @@ pub(crate) mod tests {
  "can":["play","pause","next","previous","seek","volume"],"art":{"id":"5c0e...19","size":40211}}"#,
         r#"{"t":"media","v":1,"op":"command","player":"spotify","action":"seek","value":90000}"#,
         r#"{"t":"presence","v":1,"state":"asleep","reason":"doze","expectBackMs":900000}"#,
+        r#"{"t":"notification","v":1,"op":"posted","key":"3f9a0000000000000000000000000c1a","app":"Signal",
+ "title":"Alex","text":"On my way","when":1762900000000}"#,
+        r#"{"t":"notification","v":1,"op":"removed","key":"3f9a0000000000000000000000000c1a"}"#,
+        r#"{"t":"notification","v":1,"op":"dismiss","key":"3f9a0000000000000000000000000c1a"}"#,
         r#"{"t":"outbox_ready","v":1,"count":3,"bytes":734003200,"ids":["c1d2...f0"]}"#,
         r#"{"t":"input","v":1,"kind":"session","op":"start"}"#,
         r#"{"t":"input","v":1,"kind":"pointer","op":"move","dx":12.5,"dy":-3}"#,
@@ -1220,6 +1347,7 @@ pub(crate) mod tests {
             "transfer.bundle",
             "outbox",
             "blobs",
+            "notifications",
         ];
         for s in all {
             let c = Capability::from_wire(s);
@@ -1249,6 +1377,7 @@ pub(crate) mod tests {
             ("battery", None, false),
             ("media", Some(GrantKind::Media), false),
             ("presence", None, false),
+            ("notification", Some(GrantKind::NotificationsIn), false),
             ("outbox_ready", None, false),
             ("input", Some(GrantKind::Input), false),
             ("transfer", None, false),
@@ -1285,6 +1414,87 @@ pub(crate) mod tests {
             let f: Frame = serde_json::from_str(b).unwrap();
             assert!(f.validate().is_err(), "{b}");
         }
+    }
+
+    #[test]
+    fn notification_frames_parse_and_check_their_limits() {
+        let parse = |s: &str| serde_json::from_str::<Frame>(s).unwrap();
+        let key = "0123456789abcdef0123456789abcdef";
+        let Frame::Notification(Notification::Posted(p)) = parse(&format!(
+            r#"{{"t":"notification","v":1,"op":"posted","key":"{key}","app":"Signal","title":"Alex","text":"On my way","when":1762900000000}}"#
+        )) else {
+            panic!("not posted");
+        };
+        assert_eq!(
+            (p.app.as_str(), p.title.as_str(), p.text.as_str(), p.when),
+            ("Signal", "Alex", "On my way", 1_762_900_000_000)
+        );
+        // Title and text may be missing (a private notification without a public version).
+        let f = parse(&format!(
+            r#"{{"t":"notification","v":1,"op":"posted","key":"{key}","app":"A","when":1}}"#
+        ));
+        let Frame::Notification(n) = &f else { panic!() };
+        assert!(n.key_is_valid() && n.within_limits());
+        // Grants: showing needs `notificationsIn`, a dismiss needs `notificationsOut`.
+        assert_eq!(f.required_grant(), Some(GrantKind::NotificationsIn));
+        assert_eq!(f.required_send_grant(), Some(GrantKind::NotificationsOut));
+        let removed = parse(&format!(
+            r#"{{"t":"notification","v":1,"op":"removed","key":"{key}"}}"#
+        ));
+        assert_eq!(removed.required_grant(), Some(GrantKind::NotificationsIn));
+        assert_eq!(removed.required_send_grant(), None);
+        let dismiss = parse(&format!(
+            r#"{{"t":"notification","v":1,"op":"dismiss","key":"{key}"}}"#
+        ));
+        assert_eq!(dismiss.required_grant(), Some(GrantKind::NotificationsOut));
+        assert_eq!(
+            dismiss.required_send_grant(),
+            Some(GrantKind::NotificationsIn)
+        );
+        assert_eq!(
+            dismiss.required_capabilities(),
+            CapRequirement::AllOf(&[Capability::Notifications])
+        );
+        assert!(!dismiss.allowed_unpaired());
+        // Wire spelling: camelCase fields, `op` snake_case.
+        let json = serde_json::to_value(&f).unwrap();
+        assert_eq!(json["op"], "posted");
+        assert_eq!(json["when"], 1);
+
+        // Limits, exactly at and one byte over.
+        let mut over = NotificationPosted {
+            key: key.into(),
+            app: "a".repeat(NOTIFICATION_APP_MAX),
+            title: "t".repeat(NOTIFICATION_TITLE_MAX),
+            text: "x".repeat(NOTIFICATION_TEXT_MAX),
+            when: 0,
+        };
+        assert!(Notification::Posted(over.clone()).within_limits());
+        over.app.push('a');
+        assert!(!Notification::Posted(over.clone()).within_limits());
+        over.app.pop();
+        over.title.push('t');
+        assert!(!Notification::Posted(over.clone()).within_limits());
+        over.title.pop();
+        over.text.push('x');
+        assert!(!Notification::Posted(over).within_limits());
+
+        // Keys: exactly 32 lowercase hex characters.
+        for bad in [
+            "",
+            "0123456789abcdef0123456789abcde",
+            "0123456789abcdef0123456789abcdef0",
+            "0123456789ABCDEF0123456789abcdef",
+            "0123456789abcdeg0123456789abcdef",
+            "0123456789abcdef0123456789abcd\u{e9}",
+        ] {
+            assert!(!notification_key_is_valid(bad), "{bad}");
+        }
+        assert!(notification_key_is_valid(key));
+
+        // `Debug` never shows content or keys (SR-43).
+        let dbg = format!("{f:?} {removed:?}");
+        assert!(!dbg.contains("Signal") && !dbg.contains(key), "{dbg}");
     }
 
     #[test]

@@ -880,6 +880,8 @@ pub fn apply_grant(grants: Grants, grant: &str, on: bool, input_supported: bool)
         "clipboard_out" => g.clipboard_out = on,
         "find" => g.find = on,
         "media" => g.media = on,
+        // `notifications_out` is not offered: a desktop has no notifications to mirror.
+        "notifications_in" => g.notifications_in = on,
         "input" if input_supported || !on => g.input = on,
         _ => return None,
     }
@@ -1183,6 +1185,7 @@ pub fn device_row(p: &PeerView, now: u64) -> DeviceRow {
         grant_find: p.grants.find,
         grant_input: p.grants.input,
         grant_media: p.grants.media,
+        grant_notifications_in: p.grants.notifications_in,
         can_be_controlled: can_be_controlled(&p.capabilities),
         can_control_media,
         players: ModelRc::new(VecModel::from(players)),
@@ -1696,6 +1699,15 @@ mod tests {
         assert!(!apply_grant(on, "input", false, false).unwrap().input);
         assert!(!apply_grant(g, "files", false, false).unwrap().files);
         assert_eq!(apply_grant(g, "bogus", true, true), None);
+        // Mirrored notifications: shown by default, can be turned off; the outgoing grant
+        // is never offered on the desktop.
+        assert!(g.notifications_in);
+        assert!(
+            !apply_grant(g, "notifications_in", false, false)
+                .unwrap()
+                .notifications_in
+        );
+        assert_eq!(apply_grant(g, "notifications_out", true, true), None);
     }
 
     #[test]

@@ -39,7 +39,7 @@ use playdrop_core::host::{
 };
 use playdrop_core::identity::{DeviceId, DeviceIdentity};
 use playdrop_core::net::client::ALTERNATIVE_GRACE;
-use playdrop_core::net::connection::{Heard, DRAIN_GRACE};
+use playdrop_core::net::connection::{Heard, KeepAlive, DRAIN_GRACE};
 use playdrop_core::net::probe::{
     parse_probe_bytes, probe, probe_in_use, probe_noting, InUseProbe, ProbeOutcome,
     PROBES_PER_MINUTE, PROBE_BYTES, PROBE_MAX_BYTES, PROBE_PATH,
@@ -1103,6 +1103,43 @@ async fn a_dead_path_reads_as_dead_and_recovers_with_working_pings() {
     conn.ping(WAIT).await.expect("and the next PING works");
     assert!(!conn.is_closed());
     conn.close(CloseReason::Shutdown);
+}
+
+/// The side that does not PING (protocol.md 3.4, a phone facing a desktop) finds a peer that
+/// went silent: while the peer answers, its own PING after the silence limit keeps the
+/// connection; once the path stops passing anything, it closes the connection within the
+/// limit plus one tick plus the ACK deadline, not after the 2.5 times idle close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_side_that_does_not_ping_finds_a_silent_peer() {
+    init_logs();
+    let _serial = SERIAL.lock().await;
+    let (_router, addr, opts) = bare_server_opts(true, None);
+    let proxy = Proxy::start(addr, UNTHROTTLED, true, None).await;
+    let conn = dial(&[proxy.addr], &opts).await.unwrap();
+    assert_eq!(get(&conn, "/v1/other").await.0, StatusCode::NOT_FOUND);
+    // The dialler's interval is the longer one, so it is the silent side; the bare server
+    // never PINGs, so nothing arrives unless the dialler asks.
+    let ka = KeepAlive {
+        local: Duration::from_secs(5),
+        peer: Duration::from_secs(1),
+    };
+    assert!(!ka.we_ping(playdrop_core::net::Direction::Outbound));
+    let deadline = Duration::from_millis(500);
+    conn.start_keepalive_with(ka, deadline);
+    // Silence alone, with a peer that answers, is not death: several limits pass.
+    let limit = ka.ping_interval() + deadline;
+    tokio::time::sleep(limit * 4).await;
+    assert!(!conn.is_closed(), "a peer that answers its PING stays");
+    // The path stops passing anything, both ways, with no FIN: an unclean drop.
+    proxy.set_flowing(false);
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(WAIT, conn.closed())
+        .await
+        .expect("the silent peer is found");
+    let took = started.elapsed();
+    let bound = limit + limit / 5 + deadline + Duration::from_secs(1);
+    assert!(took <= bound, "found after {took:?}, bound {bound:?}");
+    proxy.set_flowing(true);
 }
 
 /// Kept connections (protocol.md 3.4, 3.5). The session lives on the peer's dial, so the
