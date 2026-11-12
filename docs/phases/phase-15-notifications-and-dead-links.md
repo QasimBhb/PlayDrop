@@ -250,6 +250,23 @@ prompt inside a session (`pkexec` can).
   ("Sent to calliope and Pixel 9 Pro XL"), and consider the same chooser as for sharing when
   more than one would receive it.
 
+**Windows does not open (reported by the user on 2026-11-12, second hand, not yet looked into).**
+Someone launched the installed program and nothing appeared; it seems to exit at once. No
+Windows PC here, so start from the code and from what CI can show. Leads from a first look,
+none verified: (a) the release is built for `x86_64-pc-windows-msvc` and nothing in the repo
+sets `crt-static`, so the three `.exe` files need the Visual C++ runtime (`vcruntime140.dll`),
+which a clean Windows does not have, and a missing DLL fails with no window of ours; the CI
+runner has the runtime, which would explain why its installer test passes; (b) the window uses
+Slint with `renderer-femtovg` first, which needs working OpenGL, and a failure there before any
+window exists would also be silent if the window is built for the GUI subsystem; check that it
+falls back to `renderer-software`; (c) the window needs the daemon and the named pipe: see what
+it does when the daemon is not running or failed to start (DPAPI, the data dir ACL and the
+exclusive port from Phase 10 only ever ran on CI). Wanted: a start-up failure on Windows must
+show a message box and write a log file a user can send; make CI run the installed window and
+daemon for a few seconds on a runner without the runtime (or check the import table for
+`VCRUNTIME`) so this cannot ship again; ask the user for the reporter's Windows version and
+whether a message appeared.
+
 Then, in order of value: (1) the mirroring follow-ups in section 5 that
 need no one: no re-popup after a reconnect (send only what changed, or let the desktop keep its
 table across a reconnect), rate limits for `removed` and `dismiss`, announce the capability only
