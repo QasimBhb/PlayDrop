@@ -243,6 +243,12 @@ prompt inside a session (`pkexec` can).
   keep today's one-tap path (the user's complaint about LocalSend is taps per send). The cancel
   window of SR-29 has to hold for every recipient. The core sends per peer, so this is one send
   per ticked device from one prepared source; check `UriSource.prepare` can serve several.
+- *"Send clipboard" on the always-on notification does not say where it goes.* It pushes to
+  every online device whose "Receive this phone's clipboard" switch is on
+  (`Host::push_clipboard`, `share/ClipboardSendActivity.kt`) and the toast only gives a count.
+  The user could not tell whether one or both devices got it. Name the devices in the toast
+  ("Sent to calliope and Pixel 9 Pro XL"), and consider the same chooser as for sharing when
+  more than one would receive it.
 
 Then, in order of value: (1) the mirroring follow-ups in section 5 that
 need no one: no re-popup after a reconnect (send only what changed, or let the desktop keep its
