@@ -13,7 +13,7 @@ it offers **Update** or **Later**.
 
 | Install | What "Update" does |
 |---|---|
-| `.deb` (Pop!_OS, Ubuntu) | Downloads the new `.deb` (and the applet's, when the applet is installed), verifies it, installs it through `pkexec` (the system password prompt) and restarts the daemon |
+| `.deb` (Pop!_OS, Ubuntu) | Downloads the new `.deb` (and the `playdrop-cosmic-applet` package, when that package is installed and the release lists it; section 6), verifies it, installs it through `pkexec` (the system password prompt) and restarts the daemon |
 | Windows installer | Downloads the new installer, verifies it, runs it (Windows asks for permission) and waits for it; the installer starts PlayDrop again |
 | Android | Downloads the APK, verifies it, hands it to the system installer. Android itself refuses an APK signed with another key |
 | Flatpak | Notice only, with the release page link. A Flatpak cannot replace itself |
@@ -121,8 +121,10 @@ one line.
   version (`playdrop-<version>-linux-amd64.deb`), which must be strictly newer than the running
   one, or nothing is offered. Every `playdrop-` name must be exactly `playdrop-<version>-` plus
   one of `android.apk`, `ios-unsigned.ipa`, `linux-amd64.deb`, `linux-x86_64.flatpak`,
-  `windows-x64-setup.exe` (and `playdrop-cosmic-applet-<version>-linux-amd64.deb`), all with one
-  version, or the whole file is refused: `playdrop-0.11.0-rc.1-linux-amd64.deb` can never read
+  `windows-x64-setup.exe` (and `playdrop-cosmic-applet-<version>-linux-amd64.deb`: the applet's
+  own package up to 0.11.0, an empty transitional package from 0.12.0, section 6; the name stays
+  known for as long as any release carries it), all with one version, or the whole file is
+  refused: `playdrop-0.11.0-rc.1-linux-amd64.deb` can never read
   as 0.11.0; (3) after "Update", the downloaded file's SHA-256 must equal the
   signed line for its exact name, or the file is deleted and the update refused with a message.
 - **What the signature protects against.** A tampered download, a swapped file, a forged "newer
@@ -158,13 +160,12 @@ only ever looks at "latest", and it refuses anything unsigned.
 ## 6. Installing
 
 - **`.deb`.** Files are downloaded to a fresh directory under the daemon's own data dir (mode
-  700, files 600). Right before the install step the daemon asks `dpkg-query` again whether the
-  COSMIC applet's package is installed (the answer cached when the offer was made is not used):
-  if it is, the applet's new `.deb` goes along; if the question fails, the update stops with a
-  plain sentence instead of reading the failure as "not installed", since the applet depends on
-  `playdrop (= version)` and updating the main package alone would remove it. The files are then
-  made read-only (0400 in a 0500 folder), hashed once more from an open descriptor, and installed
-  by absolute path with
+  700, files 600). When the release lists `playdrop-cosmic-applet-<version>-linux-amd64.deb`, the
+  daemon asks `dpkg-query` right before the install step whether a `playdrop-cosmic-applet`
+  package is installed (the answer cached when the offer was made is not used): if it is, that
+  file goes along; if the question fails, the update stops with a plain sentence instead of
+  guessing. The files are then made read-only (0400 in a 0500 folder), hashed once more from an
+  open descriptor, and installed by absolute path with
 
   ```
   pkexec /usr/bin/apt-get install --yes --no-install-recommends --no-remove \
@@ -173,6 +174,19 @@ only ever looks at "latest", and it refuses anything unsigned.
       /home/<user>/.local/share/PlayDrop/updates/<version>-<time>-<n>/playdrop-<version>-linux-amd64.deb \
       [.../playdrop-cosmic-applet-<version>-linux-amd64.deb]
   ```
+
+  **The applet package.** Up to 0.11.0 the COSMIC applet was its own package depending on
+  `playdrop (= <version>)`, so updating the main package alone would have removed it, and
+  0.11.0 shows a notice instead of Update when the release lacks the applet's file. From 0.12.0
+  the applet is inside `playdrop` (`Replaces: playdrop-cosmic-applet (<< 0.12.0)`, no `Breaks`
+  or `Conflicts`, which would need a removal), and the release carries an empty transitional
+  `playdrop-cosmic-applet` under the old file name that depends on `playdrop (>= 0.12.0)`.
+  0.11.0's updater installs both files in one call, which upgrades both packages and removes
+  nothing (`packaging/deb/README.md`, "The COSMIC applet", has the simulation). A 0.12.0 or
+  later daemon can only ever have that transitional package beside it, which bounds `playdrop`
+  from below only, so it takes the file along while releases carry it (keeping its version in
+  step) and updates the main package alone once they stop (two releases after the merge,
+  `docs/release/distribution.md`).
 
   `pkexec` shows the system's own password prompt; PlayDrop never sees the password. `apt-get`
   resolves dependencies and refuses a broken package; `--no-remove` makes it refuse any plan that
@@ -188,7 +202,9 @@ only ever looks at "latest", and it refuses anything unsigned.
   `exec`s `/usr/bin/playdropd` with its own arguments, keeping its PID; the new process takes the
   bus name afresh, so if something else started a daemon in the gap exactly one remains.
   Clients see `restarting`, then `shutting_down`, and follow the name back
-  (`crates/playdropd/src/update/restart.rs`).
+  (`crates/playdropd/src/update/restart.rs`). An install made by hand outside PlayDrop
+  (`sudo apt install ./playdrop-<version>-linux-amd64.deb`) restarts nothing; `playdrop restart`
+  does it afterwards, choosing among the same ways (`docs/guide/cli.md`).
 - **Windows.** The installer is downloaded to a fresh folder under
   `%LOCALAPPDATA%\PlayDrop\updates`, beside the data dir rather than in it: the data dir has a
   protected owner-only DACL (SR-28), and when an administrator's password is typed for a standard

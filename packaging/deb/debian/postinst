@@ -1,7 +1,35 @@
 #!/bin/sh
-# Refresh desktop caches so the launcher and icon show up. Nothing else:
-# no firewall changes, no services started on the user's behalf.
+# Refresh desktop caches so the launcher and icon show up, and say when the person who ran
+# the install still has the old daemon or panel applet running. Nothing else: no firewall
+# changes, no services started or stopped on the user's behalf.
 set -e
+
+# Whether a process of user $1 still runs the program $2 from before this install. dpkg
+# replaces a file by renaming the new one over it, so the old process's /proc/<pid>/exe
+# then reads "<path> (deleted)". Only /proc is read; no process is signalled or asked.
+runs_replaced() {
+    for proc in /proc/[0-9]*; do
+        [ "$(stat -c %u "$proc" 2>/dev/null)" = "$1" ] || continue
+        [ "$(readlink "$proc/exe" 2>/dev/null)" = "$2 (deleted)" ] && return 0
+    done
+    return 1
+}
+
+# A hint for the person who ran apt through sudo or pkexec. PlayDrop's own updater
+# (pkexec) restarts the daemon by itself afterwards, so for it the line is only a note.
+hint_restart() {
+    uid="${SUDO_UID:-${PKEXEC_UID:-}}"
+    case "$uid" in
+        '' | 0 | *[!0-9]*) return 0 ;;
+    esac
+    if runs_replaced "$uid" /usr/bin/playdropd; then
+        echo "PlayDrop: the background service is still running the version from before this install;"
+        echo "PlayDrop: run 'playdrop restart' (as yourself, not with sudo) to start the new one."
+    fi
+    if runs_replaced "$uid" /usr/bin/playdrop-cosmic-applet; then
+        echo "PlayDrop: log out and back in to load the new COSMIC panel applet."
+    fi
+}
 
 if [ "$1" = "configure" ]; then
     if command -v update-desktop-database >/dev/null 2>&1; then
@@ -10,6 +38,7 @@ if [ "$1" = "configure" ]; then
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
     fi
+    hint_restart || true
 fi
 
 exit 0

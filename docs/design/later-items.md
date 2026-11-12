@@ -13,7 +13,7 @@ starts with USB-tether path choice (`docs/phases/phase-10-daily-speed.md` sectio
 | 1 | iroh for cross-network reach | large | a second network to prove it for real | spike built in Phase 12, off in every release (`docs/design/iroh-reach.md`); real network, phone and relay choice owed |
 | 2 | iOS Local Push Connectivity | medium | Apple entitlement grant, paid team | research only |
 | 3 | Wi-Fi Aware | large | a second Aware phone | research only |
-| 4 | libcosmic panel applet | small to medium | nothing | built in Phase 13 (`apps/cosmic-applet`, optional `.deb`); looked at and clicked through by a person on 2026-11-10 (Phase 14) |
+| 4 | libcosmic panel applet | small to medium | nothing | built in Phase 13 (`apps/cosmic-applet`, optional `.deb`); looked at and clicked through by a person on 2026-11-10 (Phase 14); inside the main `.deb` from 0.12.0 |
 | 5 | Notification mirroring (Android to desktop) | medium | the user wanting it | built in Phase 15 (2026-11-11, v0.10.0): posted, replaced, removed and dismiss, three locks on the phone, off by default (`docs/design/notification-mirroring.md`, `docs/guide/notifications.md`); proven with the A54 against a stand-in notification service; no replies, actions or icons yet |
 | 6 | MSIX for Windows | medium | signing certificate, a Windows machine | drop (for now) |
 | 7 | iOS App Group for the share extension | small | paid Apple team | build later (blocked) |
@@ -135,6 +135,11 @@ Flatpak packaging of an applet is **unverified** (applets live in the panel proc
 
 **Anti-patterns.** 12 (must stay optional and off by default in packages), 3 (no socket).
 **Size.** Small to medium. **Verdict: build later**: polish for one desktop, no user complaint.
+
+**Decision, 2026-11-12.** The owner chose to ship the applet inside the one `playdrop` `.deb`
+from 0.12.0 instead of as a second package, so one download and one install gives everything;
+it stays optional and off by default as anti-pattern 12 asks, since only COSMIC's panel runs it
+and only after the user adds it (`packaging/deb/README.md`, "The COSMIC applet").
 
 ## 5. Notification mirroring (Android to desktop)
 

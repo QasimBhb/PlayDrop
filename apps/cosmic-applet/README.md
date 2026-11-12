@@ -16,6 +16,16 @@ The panel icon is hollow and struck through while the daemon is not running.
 The applet is optional. The daemon's tray icon keeps working without it. It is a thin client:
 it talks to `playdropd` over D-Bus only (`docs/ipc.md`) and never opens a network socket.
 
+## Installed with PlayDrop
+
+From 0.12.0 the PlayDrop `.deb` contains the applet (`/usr/bin/playdrop-cosmic-applet` and its
+desktop file), so installing PlayDrop is all it takes: open COSMIC Settings, go to Desktop, Panel
+(or Dock), Applets, choose "Add applet", and pick PlayDrop. Nothing starts it until then, and on
+another desktop nothing ever does. `packaging/deb/build-deb.sh` builds this workspace together
+with the main one (`packaging/deb/README.md`). Up to 0.11.0 it was a separate package,
+`playdrop-cosmic-applet`; that name is now an empty transitional package that moves old installs
+over. After an update, log out and back in so the panel runs the new applet.
+
 ## Build
 
 It is its own Cargo workspace with its own `Cargo.lock`, because libcosmic comes from git and
@@ -64,7 +74,8 @@ rm ~/.local/bin/playdrop-cosmic-applet \
    ~/.local/share/applications/org.playdrop.PlayDrop.CosmicApplet.desktop
 ```
 
-Keep the icon if the PlayDrop package installed it too.
+Keep the icon if the PlayDrop package installed it too. An applet that came with the `.deb`
+goes away with `sudo apt remove playdrop`.
 
 ## Notes
 

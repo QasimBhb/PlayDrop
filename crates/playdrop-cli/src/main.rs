@@ -2,7 +2,7 @@
 //!
 //! Most commands are clients of the running desktop daemon (`playdropd`), so scripts and
 //! the shell can send files and drive it without the window: `send`, `peers`, `status`,
-//! `transfers`, `clip`, `ping`, `outbox`, `diagnose` and `update` (module [`daemon`]). They talk to
+//! `transfers`, `clip`, `ping`, `outbox`, `diagnose`, `update` and `restart` (module [`daemon`]). They talk to
 //! the daemon through `playdrop-ipc` (D-Bus on Linux, the per-user named pipe on
 //! Windows) and exit 0 on success, 1 when the operation failed, 2 on a usage error or an
 //! unknown peer, 3 when the daemon is not running.
@@ -24,8 +24,8 @@ use clap::{Parser, Subcommand};
 
 /// playdrop: phone-to-computer companion for the local network.
 ///
-/// send, peers, status, transfers, clip, ping, outbox, diagnose and update talk to the
-/// running daemon (playdropd). host runs a standalone host in the foreground (no daemon needed) and
+/// send, peers, status, transfers, clip, ping, outbox, diagnose, update and restart talk to
+/// the running daemon (playdropd). host runs a standalone host in the foreground (no daemon needed) and
 /// bench measures the transport.
 ///
 /// Exit codes: 0 ok, 1 the operation failed (or was declined or cancelled), 2 usage error
@@ -110,6 +110,17 @@ enum Command {
     ///   playdrop update --install
     #[command(verbatim_doc_comment)]
     Update(daemon::update::UpdateArgs),
+    /// Stop the running daemon and start the installed one again.
+    ///
+    /// For after installing a new package by hand (`sudo apt install ./playdrop-....deb`),
+    /// which leaves the old daemon running. It starts again the way it ran: through the
+    /// systemd user unit when it was the unit's, otherwise through D-Bus activation, or by
+    /// running playdropd. When no daemon runs it only starts one. Prints the old and the new
+    /// version. Exits 1 when the daemon did not stop or the new one did not answer.
+    ///
+    ///   playdrop restart
+    #[command(verbatim_doc_comment)]
+    Restart(daemon::restart::RestartArgs),
     /// Run a host in the foreground until Ctrl-C or `quit`, printing events as lines.
     ///
     /// Type commands on stdin while it runs:
@@ -229,6 +240,7 @@ async fn main() -> ExitCode {
         Command::Outbox(a) => daemon::DaemonCommand::Outbox(a),
         Command::Diagnose(a) => daemon::DaemonCommand::Diagnose(a),
         Command::Update(a) => daemon::DaemonCommand::Update(a),
+        Command::Restart(a) => daemon::DaemonCommand::Restart(a),
     };
     daemon::run(daemon_command).await
 }

@@ -74,13 +74,11 @@ pub const OTHER_REASON: &str =
 /// The note when the release lacks this computer's file.
 const NO_FILE_REASON: &str =
     "This release has no file for this computer; get it from the release page.";
-/// The note when the applet is installed but the release has no applet package: installing
-/// the main package alone would make the package manager remove the applet.
-const NO_APPLET_REASON: &str =
-    "This release has no COSMIC applet package, and updating without it would remove the applet; get the release from its page.";
-/// The failure when the install step cannot tell whether the applet is installed.
+/// The failure when the install step cannot tell whether the `playdrop-cosmic-applet`
+/// package is installed. A package database `dpkg-query` cannot read is one `apt-get`
+/// would stumble on too, so the update stops rather than guess.
 const APPLET_UNKNOWN: &str =
-    "PlayDrop could not tell whether the COSMIC applet is installed, and updating without it could remove it, so nothing was changed. Try again in a moment.";
+    "PlayDrop could not tell whether the COSMIC applet package is installed, so nothing was changed. Try again in a moment.";
 /// The answer to "Cancel" once the files are with the system installer.
 const CANNOT_CANCEL: &str =
     "The update is already with the system installer and cannot be cancelled from PlayDrop.";
@@ -108,10 +106,11 @@ pub struct Setup {
     /// How this copy was installed; asked once, when first needed (it may run `dpkg`). Only
     /// what the offer says depends on it.
     pub install: Arc<dyn Fn() -> Install + Send + Sync>,
-    /// Whether the COSMIC applet's package is installed, asked again by the install step
-    /// itself, right before the download: the answer decides whether `apt-get` gets the
-    /// applet's package too, so it must be current, and a question that fails stops the
-    /// update rather than reading as "no" ([`kind::applet_installed_now`]).
+    /// Whether the `playdrop-cosmic-applet` package is installed, asked again by the install
+    /// step itself, right before the download, when the release lists that package: the
+    /// answer decides whether `apt-get` gets it too, so it must be current, and a question
+    /// that fails stops the update rather than reading as "no"
+    /// ([`kind::applet_installed_now`]).
     pub applet_installed: Arc<dyn Fn() -> Result<bool, String> + Send + Sync>,
     /// Replaces [`RELEASES`] in every URL (test hooks only; [`RELEASES`] otherwise).
     pub releases_base: String,
@@ -233,8 +232,9 @@ pub struct Refused(pub String);
 struct Pending {
     offer: UpdateOffer,
     asset: Option<Asset>,
-    /// The release's applet package, for a `.deb` install whether or not the applet looked
-    /// installed when the offer was made: the install step asks again and takes it then.
+    /// The release's `playdrop-cosmic-applet` package (the transitional one from 0.12.0), for
+    /// a `.deb` install whether or not that package looked installed when the offer was
+    /// made: the install step asks again and takes it then.
     applet: Option<Asset>,
 }
 
@@ -549,7 +549,6 @@ impl Updater {
             InstallKind::Deb | InstallKind::Windows if found.asset.is_none() => {
                 Some(NO_FILE_REASON)
             }
-            InstallKind::Deb if install.applet && applet.is_none() => Some(NO_APPLET_REASON),
             InstallKind::Deb | InstallKind::Windows => None,
             InstallKind::Android | InstallKind::Ios | InstallKind::Other => Some(OTHER_REASON),
         };
@@ -763,9 +762,18 @@ impl Updater {
         }
     }
 
-    /// The files run `id` downloads: the installer's, and for a `.deb` the applet's too
-    /// when the applet is installed now (asked again here, not taken from the offer, and a
-    /// failed question stops the update). `None` when the run ended here.
+    /// The files run `id` downloads: the installer's, and for a `.deb` the
+    /// `playdrop-cosmic-applet` package too when the release lists it and that package is
+    /// installed now (asked again here, not taken from the offer, and a failed question
+    /// stops the update). `None` when the run ended here.
+    ///
+    /// From 0.12.0 the applet is inside the `playdrop` package and `playdrop-cosmic-applet`
+    /// is an empty transitional package depending on `playdrop (>= 0.12.0)`. This build is
+    /// such a `playdrop`, so an applet package installed beside it can only be that
+    /// transitional one (0.11.0's depends on `playdrop (= 0.11.0)` and cannot stay installed
+    /// next to a newer `playdrop`). It never holds an upgrade back, so a release without the
+    /// file updates the main package alone; when the file is listed it goes along, as in
+    /// 0.11.0, which keeps the transitional package's version in step.
     async fn files_to_fetch(
         &self,
         id: u64,
@@ -773,9 +781,10 @@ impl Updater {
         pending: &Pending,
     ) -> Option<Vec<Asset>> {
         let mut files: Vec<Asset> = pending.asset.iter().cloned().collect();
-        if kind != InstallKind::Deb {
+        let Some(applet_asset) = pending.applet.as_ref().filter(|_| kind == InstallKind::Deb)
+        else {
             return Some(files);
-        }
+        };
         let probe = Arc::clone(&self.setup.applet_installed);
         let applet = tokio::task::spawn_blocking(move || probe())
             .await
@@ -783,19 +792,8 @@ impl Updater {
         match applet {
             Ok(false) => Some(files),
             Ok(true) => {
-                if let Some(asset) = &pending.applet {
-                    files.push(asset.clone());
-                    Some(files)
-                } else {
-                    self.fail(
-                        id,
-                        UpdateStage::Install,
-                        NO_APPLET_REASON.to_owned(),
-                        pending,
-                        None,
-                    );
-                    None
-                }
+                files.push(applet_asset.clone());
+                Some(files)
             }
             Err(e) => {
                 tracing::warn!(error = %e, "could not tell whether the applet is installed");

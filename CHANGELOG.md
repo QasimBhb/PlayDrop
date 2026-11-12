@@ -8,6 +8,28 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.12.0] - Unreleased
+
+### Added
+
+- `playdrop restart` stops the running background service and starts the installed one again,
+  then prints the old and the new version. Use it after installing a new `.deb` by hand
+  (`sudo apt install ./playdrop-<version>-linux-amd64.deb`), which leaves the old service
+  running. It starts the service the same way it was running (the systemd user unit, D-Bus
+  activation, or by running `playdropd`), so it also works when `systemctl --user restart`
+  does not. The package now prints a one-line reminder when the old service is still running
+  after an install.
+
+### Changed
+
+- One `.deb` for Pop!_OS and Ubuntu: the COSMIC panel applet is now inside the `playdrop`
+  package, so one download and one install gives everything. The applet still only runs once
+  you add it to a panel in COSMIC Settings, and other desktops never start it. Updating from
+  0.11.0 needs nothing special: the Update button and `apt` move an installed applet over by
+  themselves. The release still carries a small `playdrop-cosmic-applet` file for two releases
+  so that 0.11.0's Update button keeps working; it is an empty package you can remove at any
+  time with `sudo apt remove playdrop-cosmic-applet`.
+
 ## [0.11.0] - 2026-11-12
 
 ### Added

@@ -43,7 +43,7 @@ Every file is on the [Releases](https://github.com/QasimBhb/PlayDrop/releases) p
 
 | Device | File | Notes |
 |---|---|---|
-| Pop!_OS, Ubuntu | `playdrop-<version>-linux-amd64.deb` or `playdrop-<version>-linux-x86_64.flatpak` | `sudo apt install ./file.deb`, or `flatpak install --user ./file.flatpak` |
+| Pop!_OS, Ubuntu | `playdrop-<version>-linux-amd64.deb` or `playdrop-<version>-linux-x86_64.flatpak` | `sudo apt install ./file.deb` (everything, the COSMIC panel applet included; after updating by hand, run `playdrop restart`), or `flatpak install --user ./file.flatpak` |
 | Windows 10, 11 | `playdrop-<version>-windows-x64-setup.exe` | Asks for administrator rights to add a firewall rule for `playdropd.exe` on port 42187. Not code signed, so SmartScreen warns: More info, then Run anyway |
 | Android 8+ | `playdrop-<version>-android.apk` | Allow installs from your browser once. [Obtainium](https://github.com/ImranR98/Obtainium) can update it from this repository |
 | iPhone, iOS 17+ | `playdrop-<version>-ios-unsigned.ipa` | Unsigned. Sideload with SideStore or AltStore, and refresh every 7 days. See [docs/release/distribution.md](docs/release/distribution.md) |
@@ -85,6 +85,7 @@ playdrop peers | status | transfers | outbox | diagnose  [--json]
 playdrop clip (<TEXT> | --stdin) [--to <peer>]
 playdrop ping [--to <peer>] [MESSAGE]
 playdrop outbox add <PATH>... --to <peer>
+playdrop restart
 ```
 
 Exit codes: 0 ok, 1 failed, 2 usage or unknown device, 3 daemon not running. Details in

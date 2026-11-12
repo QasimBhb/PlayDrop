@@ -9,6 +9,8 @@ Homepage: https://github.com/QasimBhb/PlayDrop
 Depends: libc6 (>= 2.39), libgcc-s1, libfontconfig1, libxkbcommon0, libgl1, libegl1, libwayland-client0
 Recommends: xdg-desktop-portal
 Suggests: ufw
+Enhances: cosmic-panel
+Replaces: playdrop-cosmic-applet (<< @FIRST_MERGED@)
 Description: phone-to-computer link and fast local file drop
  PlayDrop links a phone and a computer over the local network. It sends
  files in both directions without an account or cloud service, resumes
@@ -16,4 +18,6 @@ Description: phone-to-computer link and fast local file drop
  .
  This package installs the background service (playdropd), which starts at
  login and stays reachable while the window is closed, the desktop window
- (playdrop-desktop) and the command line (playdrop).
+ (playdrop-desktop), the command line (playdrop) and a panel applet for the
+ COSMIC desktop (playdrop-cosmic-applet). The applet only runs once it is
+ added to a panel in COSMIC Settings; other desktops never start it.

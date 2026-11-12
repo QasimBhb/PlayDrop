@@ -6,10 +6,12 @@
 //!   and runs nothing elevated itself. `apt-get` reads an argument that contains a `/` and
 //!   ends in `.deb` as a local package file (checked with `apt-get --simulate` on apt
 //!   2.8.4), resolves its dependencies and refuses a broken package. `--no-remove` makes
-//!   it refuse, rather than carry out, a plan that would remove any package (the COSMIC
-//!   applet depends on `playdrop (= version)`, so updating the main package alone would
-//!   otherwise remove it), and `DPkg::Lock::Timeout=60` waits up to a minute for a running
-//!   unattended upgrade instead of failing at once.
+//!   it refuse, rather than carry out, a plan that would remove any package (0.11.0's
+//!   separate COSMIC applet package depends on `playdrop (= 0.11.0)`; from 0.12.0 the
+//!   applet is inside `playdrop` and an empty transitional `playdrop-cosmic-applet` takes
+//!   the old package's place, so an update never needs to remove anything), and
+//!   `DPkg::Lock::Timeout=60` waits up to a minute for a running unattended upgrade instead
+//!   of failing at once.
 //! - Windows: the verified installer is started through the shell (`ShellExecuteExW`),
 //!   which runs Inno Setup's loader; the loader starts the elevated setup, so UAC appears.
 //!   `/SILENT /RELAUNCH=1` (a window asked) or `/SILENT /RELAUNCH=daemon` (no window did)
@@ -65,8 +67,9 @@ impl Relaunch {
 
 /// Installs verified release files. Every call blocks until the OS prompt is answered.
 pub trait Installer: Send + Sync {
-    /// Installs `.deb` files (the main package, and the applet's when it is installed),
-    /// all in one transaction.
+    /// Installs `.deb` files (the main package, and the transitional
+    /// `playdrop-cosmic-applet` package when it is installed and listed), all in one
+    /// transaction.
     fn install_debs(&self, files: &[PathBuf]) -> Result<(), InstallFailure>;
     /// Runs the Windows installer and waits for it to exit. A successful install stops
     /// this daemon before it returns, so a return at all means the installer did not
@@ -79,8 +82,7 @@ pub trait Installer: Send + Sync {
 /// package to fetch from the archive rather than as this local file.
 ///
 /// `--no-install-recommends` so an update never pulls in more than the package needs.
-/// `--no-remove` so a plan that would remove a package (the applet, if it was missed) is
-/// refused instead of carried out. `DPkg::Lock::Timeout=60` waits for a running
+/// `--no-remove` so a plan that would remove a package is refused instead of carried out. `DPkg::Lock::Timeout=60` waits for a running
 /// unattended upgrade to let go of the package lock. The two `Dpkg::Options` keep a
 /// configuration file the user changed (the autostart entry and the ufw profile under
 /// `/etc` are conffiles) without asking: nothing can answer a question here, and the user's

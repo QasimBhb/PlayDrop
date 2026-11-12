@@ -34,7 +34,8 @@ release is created.
 | File | For | Notes |
 |---|---|---|
 | `playdrop-<ver>-android.apk` | Android 8 (API 26) and newer | Signed with the PlayDrop release key; arm64 phones and x86_64 emulators in one APK |
-| `playdrop-<ver>-linux-amd64.deb` | Pop!_OS 24.04 (COSMIC), Ubuntu 24.04 (GNOME) and newer | Native package, daemon starts at login |
+| `playdrop-<ver>-linux-amd64.deb` | Pop!_OS 24.04 (COSMIC), Ubuntu 24.04 (GNOME) and newer | Native package with everything: daemon (starts at login), window, `playdrop` command and, from 0.12.0, the COSMIC panel applet (runs only once added to a panel) |
+| `playdrop-cosmic-applet-<ver>-linux-amd64.deb` | Installs that had the 0.11.0 applet package | Empty transitional package (`Architecture: all`, depends on `playdrop (>= 0.12.0)`), see below. Nobody else needs it |
 | `playdrop-<ver>-linux-x86_64.flatpak` | Any distro with Flatpak | Sandboxed, single-file bundle |
 | `playdrop-<ver>-windows-x64-setup.exe` | Windows 10 and 11, x64 | Inno Setup installer, not code signed |
 | `playdrop-<ver>-ios-unsigned.ipa` | iPhone, iOS 17 and newer | Unsigned, for SideStore or AltStore to sign and install |
@@ -162,8 +163,23 @@ sudo apt install ./playdrop-<ver>-linux-amd64.deb
 ```
 
 Use `apt`, not `dpkg -i`, so dependencies come along. Log out and in, or run `playdropd`
-once, to start the background service. Details, autostart choices and the firewall:
-`packaging/deb/README.md`.
+once, to start the background service. After installing a newer `.deb` by hand, run
+`playdrop restart` (as yourself) so the running service moves to the new version. Details,
+autostart choices and the firewall: `packaging/deb/README.md`.
+
+**The transitional applet package.** Up to 0.11.0 the COSMIC panel applet was a separate
+`.deb` that depended on `playdrop` at exactly the same version. From 0.12.0 the applet is inside
+the main `.deb`, and `playdrop-cosmic-applet-<ver>-linux-amd64.deb` is an empty package that
+only moves an old applet install over: 0.11.0's Update button, when it finds the applet
+installed, installs that file together with the main one and refuses any plan that removes a
+package, so the release must carry it under that exact name. It depends on
+`playdrop (>= 0.12.0)` with no upper bound, so it never blocks a later update, and anyone can
+remove it. It is published for two releases after the merge, **0.12.0 and 0.13.0**, and
+dropped from 0.14.0: then remove `build-transitional-deb.sh`'s step and the rename from the
+`linux-deb` job in `release.yml`, set the file count check in the release job to 5, and drop
+the asset from the table above. The daemon's updater from 0.12.0 on handles a release without
+it (it updates the main package alone), and a 0.11.0 install that skipped both releases gets a
+notice and updates by hand.
 
 **Flatpak**:
 

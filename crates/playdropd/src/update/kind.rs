@@ -16,7 +16,8 @@ use playdrop_core::update::InstallKind;
 pub const DEB_DAEMON: &str = "/usr/bin/playdropd";
 /// The main package's name.
 pub const DEB_PACKAGE: &str = "playdrop";
-/// The optional COSMIC applet's package name.
+/// The COSMIC applet's package name: its own package up to 0.11.0, an empty transitional
+/// package from 0.12.0, when the applet moved into [`DEB_PACKAGE`].
 pub const APPLET_PACKAGE: &str = "playdrop-cosmic-applet";
 /// Inno Setup's uninstaller, written beside the installed program.
 const WINDOWS_UNINSTALLER: &str = "unins000.exe";
@@ -42,7 +43,8 @@ pub trait Probe {
 pub struct Install {
     /// How `PlayDrop` was installed.
     pub kind: InstallKind,
-    /// The `.deb` of the COSMIC applet is installed and is updated with the main one.
+    /// The `playdrop-cosmic-applet` package is installed (the transitional one from 0.12.0)
+    /// and is updated with the main one when the release lists it.
     pub applet: bool,
 }
 
@@ -91,9 +93,8 @@ pub fn dpkg_status_installed(output: &str) -> bool {
 }
 
 /// Asks `dpkg-query` whether `package` is installed, telling "not installed" apart from
-/// "could not tell". The update's install step relies on the difference: reading a failed
-/// question as "not installed" would leave the applet out of the update, and `apt-get` would
-/// then remove it (it depends on `playdrop (= version)`).
+/// "could not tell". The update's install step relies on the difference: it stops on a
+/// failed question rather than read it as "not installed" and leave the package out.
 ///
 /// `dpkg-query` exits 0 with the status line for a package it knows, 1 when it knows no
 /// such package (dpkg-query(1), "EXIT STATUS"), and 2 on a fatal error.
@@ -121,7 +122,7 @@ pub fn dpkg_answer(code: Option<i32>, stdout: &str) -> Result<bool, String> {
     }
 }
 
-/// Whether the COSMIC applet's package is installed right now (asked again at install time,
+/// Whether the `playdrop-cosmic-applet` package is installed right now (asked again at install time,
 /// never taken from the answer cached when the offer was made).
 pub fn applet_installed_now() -> Result<bool, String> {
     dpkg_query(APPLET_PACKAGE)

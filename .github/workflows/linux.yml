@@ -157,8 +157,9 @@ jobs:
           cargo test -p playdrop-core --locked --features iroh-test --test sr32_canary
 
   cosmic-applet:
-    # The optional COSMIC panel applet is its own cargo workspace (apps/cosmic-applet) with a
-    # pinned libcosmic from git, so the job above never compiles it. It depends on
+    # The COSMIC panel applet (shipped inside the .deb, used only when added to a panel) is
+    # its own cargo workspace (apps/cosmic-applet) with a pinned libcosmic from git, so the
+    # job above never compiles it. It depends on
     # playdrop-ipc and playdrop-core by path: a change there can break it, which is why this
     # runs on the same pushes.
     name: COSMIC panel applet (Linux)

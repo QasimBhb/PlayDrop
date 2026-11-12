@@ -48,6 +48,7 @@ playdrop outbox [--json]
 playdrop outbox add <PATH>... --to <peer>
 playdrop diagnose [--json]
 playdrop update [--check | --install] [--json]
+playdrop restart [--json]
 ```
 
 ## Choosing a device
@@ -148,6 +149,38 @@ playdrop update --check
 playdrop update --install
 ```
 
+**`restart`** stops the running daemon and starts the installed one again, then prints the old
+and the new version. Use it after installing a new package by hand, which replaces the files but
+leaves the old daemon running:
+
+```sh
+sudo apt install ./playdrop-<version>-linux-amd64.deb
+playdrop restart
+```
+
+Run it as yourself, not with `sudo`. It asks the daemon to shut down, waits until it is gone (up
+to 30 seconds), and starts it again the way it was running:
+
+- **Linux, as the systemd user unit** (`playdropd.service`, enabled by you or used by D-Bus
+  activation): `systemctl --user start playdropd.service`.
+- **Linux, any other way** (login autostart, D-Bus activation without the unit, a terminal):
+  through D-Bus activation, as opening the window would, which runs the daemon the session's
+  D-Bus service file names. This is the case `systemctl --user restart` cannot handle: a
+  daemon the bus started outside the unit keeps running, and the unit's new copy exits with
+  "already running".
+- **Windows, or Linux without a D-Bus service file:** it runs the installed `playdropd`
+  (next to `playdrop`, or one folder up as in the Windows installer's layout), detached from
+  the terminal.
+
+When no daemon is running it only starts one. A daemon you started by hand with options
+(`playdropd --data-dir ...`) comes back without them. It waits up to 30 seconds for the new
+daemon to answer. It exits 0 once the new daemon answers, 1 when the old one did not stop, the
+new one could not be started, stopped at once or did not answer (the message says which), and
+3 when the session bus or pipe cannot be reached at all. In the Flatpak the same command works
+through `flatpak run --command=playdrop org.playdrop.PlayDrop restart`. With `--json` it prints
+`{"old_version":"0.11.0","new_version":"0.12.0","started_by":"activation"}` (`started_by` is
+`systemd`, `activation` or `spawn`; `old_version` is `null` when nothing was running).
+
 ## JSON
 
 `--json` prints the daemon's own answer as JSON on standard output, one result for the command,
@@ -163,7 +196,7 @@ playdrop peers --json
 | Code | Meaning |
 |---|---|
 | 0 | It worked |
-| 1 | It failed (a transfer failed or was refused, the device went away, the daemon could not cancel, an update check or update failed) |
+| 1 | It failed (a transfer failed or was refused, the device went away, the daemon could not cancel, an update check or update failed, a restart did not complete) |
 | 2 | Wrong usage, or an unknown or ambiguous device or transfer ID |
 | 3 | The daemon is not running |
 

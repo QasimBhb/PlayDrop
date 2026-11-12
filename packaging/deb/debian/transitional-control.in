@@ -1,0 +1,13 @@
+Package: playdrop-cosmic-applet
+Version: @VERSION@
+Architecture: all
+Maintainer: PlayDrop maintainers <playdrop@users.noreply.github.com>
+Installed-Size: @INSTALLED_SIZE@
+Section: oldlibs
+Priority: optional
+Homepage: https://github.com/QasimBhb/PlayDrop
+Depends: playdrop (>= @FIRST_MERGED@)
+Description: transitional package for the PlayDrop COSMIC panel applet
+ The COSMIC panel applet is now part of the playdrop package. This empty
+ package only moves an existing applet install over to it, and can be
+ removed safely.

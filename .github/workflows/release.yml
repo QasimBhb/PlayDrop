@@ -15,9 +15,14 @@
 #
 # Assets (names stay the same from release to release, apart from the version):
 #   playdrop-<ver>-android.apk                 signed with the PlayDrop release key
-#   playdrop-<ver>-linux-amd64.deb             Pop!_OS and Ubuntu 24.04
+#   playdrop-<ver>-linux-amd64.deb             Pop!_OS and Ubuntu 24.04: daemon, window, command
+#                                              line and COSMIC panel applet in one package
 #   playdrop-<ver>-linux-x86_64.flatpak        single-file Flatpak bundle
-#   playdrop-cosmic-applet-<ver>-linux-amd64.deb  optional COSMIC panel applet
+#   playdrop-cosmic-applet-<ver>-linux-amd64.deb  empty transitional package (Architecture: all)
+#                                              that moves 0.11.0 applet installs over; 0.11.0's
+#                                              updater looks for this exact name. Published
+#                                              until two releases after 0.12.0, then dropped
+#                                              (docs/release/distribution.md)
 #   playdrop-<ver>-windows-x64-setup.exe       Inno Setup installer, not code signed
 #   playdrop-<ver>-ios-unsigned.ipa            for SideStore or AltStore, which re-sign it
 #   SHA256SUMS                                 sha256sum of every file above
@@ -106,16 +111,17 @@ jobs:
           printf 'Release notes for %s:\n%s\n' "$VERSION" "$notes"
 
   linux-deb:
-    name: Debian package
+    name: Debian packages
     needs: version
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
       - name: Install system packages
-        # Slint window: fontconfig, xkbcommon, GL and Wayland headers. The validators check
-        # the desktop and AppStream files that go into the package.
+        # Slint window: fontconfig, xkbcommon, GL and Wayland headers; the COSMIC applet
+        # needs pkg-config and xkbcommon too. The validators check the desktop and AppStream
+        # files that go into the package.
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -123,19 +129,30 @@ jobs:
             desktop-file-utils appstream
 
       - name: Cache cargo
+        # Two cargo workspaces, each with its own lock file and target folder: the main one
+        # and apps/cosmic-applet (libcosmic from git).
         uses: Swatinem/rust-cache@v2
         with:
+          workspaces: |
+            . -> target
+            apps/cosmic-applet -> target
           key: release-linux
 
       - name: Validate the desktop and AppStream files
         run: |
           desktop-file-validate packaging/linux/org.playdrop.PlayDrop.desktop
           desktop-file-validate packaging/linux/org.playdrop.Daemon.desktop
+          desktop-file-validate apps/cosmic-applet/data/org.playdrop.PlayDrop.CosmicApplet.desktop
           appstreamcli validate --no-net packaging/linux/org.playdrop.PlayDrop.metainfo.xml
 
       - name: Build the .deb
-        # Called through bash: the script is stored without the executable bit in git.
+        # Called through bash: the script is stored without the executable bit in git. It
+        # builds both workspaces and fails when the applet's own version was not bumped with
+        # the workspace, or when a program links a library Depends does not cover.
         run: bash packaging/deb/build-deb.sh
+
+      - name: Build the transitional applet package
+        run: bash packaging/deb/build-transitional-deb.sh
 
       - name: Inspect and rename
         run: |
@@ -143,63 +160,36 @@ jobs:
           deb="packaging/deb/dist/playdrop_${ver}_amd64.deb"
           dpkg-deb --info "$deb"
           dpkg-deb --contents "$deb"
-          # The guides tell people to run `playdrop`, so a package without it, or with one
-          # that does not start, must not be published.
+          # The guides tell people to run `playdrop`, and COSMIC finds the applet by its
+          # binary and desktop file, so a package that lacks one, or whose command line does
+          # not start, must not be published.
           dpkg-deb -x "$deb" "$RUNNER_TEMP/deb-root"
-          for bin in playdropd playdrop-desktop playdrop; do
+          for bin in playdropd playdrop-desktop playdrop playdrop-cosmic-applet; do
             test -x "$RUNNER_TEMP/deb-root/usr/bin/$bin" || { echo "::error::the .deb lacks /usr/bin/$bin"; exit 1; }
           done
+          test -f "$RUNNER_TEMP/deb-root/usr/share/applications/org.playdrop.PlayDrop.CosmicApplet.desktop" \
+            || { echo "::error::the .deb lacks the applet's desktop file"; exit 1; }
           got="$("$RUNNER_TEMP/deb-root/usr/bin/playdrop" --version)"
           [ "$got" = "playdrop $ver" ] || { echo "::error::playdrop --version printed '$got'"; exit 1; }
+          # The merged package takes the applet's files over from 0.11.0's applet package.
+          dpkg-deb -f "$deb" Replaces | grep -q 'playdrop-cosmic-applet (<< ' \
+            || { echo "::error::the .deb does not replace the old applet package"; exit 1; }
+
+          # The transitional package: empty apart from its doc folder.
+          tdeb="packaging/deb/dist/playdrop-cosmic-applet_${ver}_all.deb"
+          dpkg-deb --info "$tdeb"
+          dpkg-deb --contents "$tdeb"
+          extra="$(dpkg-deb --contents "$tdeb" | awk '$1 !~ /^d/ && $6 !~ /^\.\/usr\/share\/doc\// {print $6}')"
+          [ -z "$extra" ] || { echo "::error::the transitional package ships files: $extra"; exit 1; }
+
           mkdir -p out
           cp "$deb" "out/playdrop-${ver}-linux-amd64.deb"
+          # 0.11.0's updater looks for exactly this name when its applet package is installed.
+          cp "$tdeb" "out/playdrop-cosmic-applet-${ver}-linux-amd64.deb"
 
       - uses: actions/upload-artifact@v7
         with:
           name: linux-deb
-          path: out/*.deb
-          if-no-files-found: error
-
-  cosmic-applet-deb:
-    name: COSMIC applet package
-    needs: version
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install system packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends pkg-config libxkbcommon-dev desktop-file-utils
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "apps/cosmic-applet -> target"
-          key: release-cosmic-applet
-
-      - name: Validate the desktop file
-        run: desktop-file-validate apps/cosmic-applet/data/org.playdrop.PlayDrop.CosmicApplet.desktop
-
-      - name: Build the .deb
-        # Fails when the applet's own version was not bumped with the workspace.
-        run: bash packaging/deb/build-applet-deb.sh
-
-      - name: Inspect and rename
-        run: |
-          ver="${{ needs.version.outputs.version }}"
-          deb="packaging/deb/dist/playdrop-cosmic-applet_${ver}_amd64.deb"
-          dpkg-deb --info "$deb"
-          dpkg-deb --contents "$deb"
-          dpkg-deb -x "$deb" "$RUNNER_TEMP/applet-root"
-          test -x "$RUNNER_TEMP/applet-root/usr/bin/playdrop-cosmic-applet"
-          mkdir -p out
-          cp "$deb" "out/playdrop-cosmic-applet-${ver}-linux-amd64.deb"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: cosmic-applet-deb
           path: out/*.deb
           if-no-files-found: error
 
@@ -481,7 +471,7 @@ jobs:
 
   release:
     name: Publish the GitHub release
-    needs: [version, linux-deb, cosmic-applet-deb, flatpak, android, windows, ios]
+    needs: [version, linux-deb, flatpak, android, windows, ios]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-24.04
     permissions:
@@ -500,6 +490,8 @@ jobs:
         working-directory: dist
         run: |
           ls -la
+          # Six files: the APK, the .deb, the transitional applet package, the Flatpak, the
+          # Windows installer and the iOS app.
           test "$(ls | wc -l)" -eq 6
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS

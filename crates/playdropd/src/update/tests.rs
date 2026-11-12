@@ -55,6 +55,19 @@ const SUMS_C: &str = "\
 const SIG_C: &str =
     "E0qkqXIjvU9lV/XbgrZ3bBRTu6Ck0znWPdsGT+HiK44rXiqYqoghlC6zInkbhVwYXWsim5jLVJwQjdnov5uFDw==";
 
+/// Release 1.2.3 with the `.deb` and the Windows installer but no applet package, as a
+/// release after the transitional `playdrop-cosmic-applet` is dropped will be. Signed with a
+/// second throwaway key, made the same way, which [`Rig`] also trusts (a key list, as in
+/// a rotation).
+const SUMS_D: &str = "\
+7de919f3f0a0592205ad23c3c8a687deea32ed8791072b5ae8a36c6512e694dd  playdrop-1.2.3-linux-amd64.deb
+65ee7c114a378fbca6bf345e1cb6b02519ad160edddcff8d0ce1f2a36a4e83c3  playdrop-1.2.3-windows-x64-setup.exe
+";
+const SIG_D: &str =
+    "xDilYY8NHkM+512YblL1zkNdGL8mIlaNZYNCJ8ydOfIfVZPCY3yjThxC20PKFXy9/c76enSYCVBSd4k2QUUVCA==";
+/// Public half of the second throwaway key, which signed only [`SUMS_D`].
+const TEST_KEY_D: &str = "64e01fd69ed8c8b2eafcc86e1423b7bf4268842448d0f5a0b26af01bf66e3a75";
+
 const PATH_BASE: &str = "/QasimBhb/PlayDrop/releases";
 const SUMS_PATH: &str = "/QasimBhb/PlayDrop/releases/latest/download/SHA256SUMS";
 const SIG_PATH: &str = "/QasimBhb/PlayDrop/releases/latest/download/SHA256SUMS.sig";
@@ -322,7 +335,10 @@ impl Rig {
             install: Arc::new(move || install),
             applet_installed: Arc::new(move || applet_now.clone()),
             releases_base: format!("{origin}{PATH_BASE}"),
-            keys: vec![key_from_hex(TEST_KEY).unwrap()],
+            keys: vec![
+                key_from_hex(TEST_KEY).unwrap(),
+                key_from_hex(TEST_KEY_D).unwrap(),
+            ],
             fetch: FetchConfig {
                 timeout: o.timeout,
                 download_deadline: o.download_deadline,
@@ -800,8 +816,9 @@ async fn an_offer_survives_a_restart_and_is_verified_again() {
     assert_eq!(rig.updater.status().state, UpdateState::Idle);
 }
 
-/// SR-47: the `.deb` goes to `pkexec apt-get` from a fresh private folder; success
-/// announces `Restarting`, restarts once and removes the files.
+/// SR-47: the `.deb` goes to `pkexec apt-get` from a fresh private folder, with the
+/// `playdrop-cosmic-applet` package (transitional from 0.12.0) when it is installed and
+/// listed; success announces `Restarting`, restarts once and removes the files.
 #[tokio::test]
 async fn a_deb_update_installs_both_packages_and_restarts() {
     let mut rig = Rig::new(Options {
@@ -962,23 +979,37 @@ async fn a_flatpak_is_told_where_updates_come_from() {
     assert_eq!(rig.updater.page_url(), Some(offer.page_url));
 }
 
-/// The applet installed but missing from the release: installing the main package alone
-/// would remove it, so the offer is notice only.
+/// The applet package installed but missing from the release (a release after the
+/// transitional package is dropped). Beside this build that package can only be the
+/// transitional one, which depends on `playdrop (>= 0.12.0)` and holds nothing back, so the
+/// main package is installed alone and the applet package is not even asked about.
 #[tokio::test]
-async fn an_installed_applet_missing_from_the_release_blocks_the_install() {
-    let sums_without_applet = SUMS_C; // has no applet line (and no amd64 .deb either)
-    let rig = Rig::new(Options {
+async fn an_installed_applet_package_missing_from_the_release_does_not_block_the_install() {
+    let mut rig = Rig::new(Options {
         install: Install {
             kind: InstallKind::Deb,
             applet: true,
         },
+        // Would stop the update if it were asked.
+        applet_now: Some(Err("must not be asked".into())),
         ..Options::default()
     });
-    rig.server.release(sums_without_applet, SIG_C);
+    rig.server.release(SUMS_D, SIG_D);
     assert_eq!(
         available_version(&rig.check(false).await),
-        Some(("1.2.3", false))
+        Some(("1.2.3", true))
     );
+    assert!(matches!(
+        rig.install().await,
+        UpdateState::Restarting { .. }
+    ));
+    let calls = rig.installer.calls.lock().unwrap().clone();
+    let names: Vec<String> = calls[0]
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, ["playdrop-1.2.3-linux-amd64.deb"]);
+    assert_eq!(rig.server.paths()[2..], [DEB_PATH.to_owned()]);
 }
 
 /// Windows: the installer runs from the verified file and the daemon waits for it. A
@@ -1242,7 +1273,7 @@ async fn the_applet_is_asked_about_again_at_install_time() {
     let (at, message) = failed(&state).unwrap();
     assert_eq!(at, UpdateStage::Install);
     assert!(
-        message.contains("could not tell whether the COSMIC applet"),
+        message.contains("could not tell whether the COSMIC applet package"),
         "{message}"
     );
     assert_eq!(rig.server.paths().len(), 2, "nothing downloaded");
