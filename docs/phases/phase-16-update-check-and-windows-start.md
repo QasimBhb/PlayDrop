@@ -199,7 +199,7 @@ unpaired after.
 | Device page | Three send buttons on top; a 1 KiB file arrived with a matching hash; the clipboard went to the chosen device only |
 | Share chooser | 2 files to 2 hosts arrived with matching hashes; Home after Send still completes; a `file://` share is refused |
 | 500 files to 2 hosts | 1,000 deliveries correct in about 10 s |
-| Found and fixed | "Cancelled" shown although the files had arrived; the clipboard toast calling delivered devices offline; the notification's "Send files" opening the photo picker; tick boxes not announced. A second run checks the fixes (result in the commit that follows this file, or in section 5 if it found more) |
+| Found and fixed | "Cancelled" shown although the files had arrived; the clipboard toast calling delivered devices offline; the notification's "Send files" opening the photo picker; tick boxes not announced. A second run on the release build of `b83ebae` passed all six checks: "Sent 2 items to test-one and test-two.", "Stopped sending to ..." matching what the hosts got, tick boxes reported as checkable, "Sent to test-one and test-two.", the document picker from "Send files", no raw codes on screen |
 
 The stand-in for a release: a Python handler that logs request heads, a directory laid out as
 `/QasimBhb/PlayDrop/releases/...`, `adb reverse`, and the debug build type's intent extras
