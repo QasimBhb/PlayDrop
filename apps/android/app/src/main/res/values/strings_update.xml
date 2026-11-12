@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Settings: update check (docs/design/update-check.md) -->
+    <string name="update_settings_title">Updates</string>
+    <string name="update_settings_switch">Check for updates when PlayDrop opens</string>
+    <string name="update_settings_hint">Asks GitHub for the latest version, at most once a day. No name, ID or version is sent. GitHub sees your IP address, as with any download.</string>
+    <string name="update_settings_not_release">This build does not check for updates.</string>
+    <string name="update_settings_check_now">Check now</string>
+    <string name="update_settings_checking">Checking</string>
+    <string name="update_settings_last_checked">Last checked %1$s</string>
+    <string name="update_settings_never_checked">Not checked yet</string>
+    <string name="update_settings_up_to_date">PlayDrop is up to date.</string>
+
+    <!-- The offer and the update -->
+    <string name="update_available_title">PlayDrop %1$s is available</string>
+    <string name="update_available_body">Update downloads it from GitHub, checks it against its signed checksum and hands it to Android to install.</string>
+    <string name="update_available_no_file">This release has no file for Android. See what is new on the release page.</string>
+    <string name="update_whats_new">What is new</string>
+    <string name="update_update">Update</string>
+    <string name="update_later">Later</string>
+    <string name="update_ok">OK</string>
+    <string name="update_cancel">Cancel</string>
+    <string name="update_permission_title">Allow PlayDrop to install the update</string>
+    <string name="update_permission_body">Android installs apps from PlayDrop only with your permission. Open the setting, turn on \"Allow from this source\" for PlayDrop, then come back. Android still asks you before it installs anything.</string>
+    <string name="update_permission_open">Open setting</string>
+    <string name="update_permission_unavailable">The setting could not be opened. Allow PlayDrop under Settings, Apps, Special app access, Install unknown apps.</string>
+    <string name="update_downloading_title">Downloading PlayDrop %1$s</string>
+    <string name="update_downloading_progress">%1$s of %2$s</string>
+    <string name="update_downloading_bytes">%1$s</string>
+    <string name="update_verifying">Checking the download against its signed checksum</string>
+    <string name="update_handing_over">Android is asking you to confirm the update. PlayDrop restarts in the background. Open it again to see the new version.</string>
+    <string name="update_failed_title">Update did not work</string>
+    <string name="update_check_failed_title">Could not check for updates</string>
+
+    <!-- Why it failed: one plain sentence each, never an HTTP status or a code -->
+    <string name="update_fail_no_connection">GitHub could not be reached. Check the internet connection and try again.</string>
+    <string name="update_fail_timed_out">GitHub did not answer in time. Try again later.</string>
+    <string name="update_fail_server">GitHub could not give the update right now. Try again later.</string>
+    <string name="update_fail_redirect">The update server sent PlayDrop to a place it does not trust, so it stopped.</string>
+    <string name="update_fail_redirects">The update server redirected too many times, so PlayDrop stopped.</string>
+    <string name="update_fail_too_large">The answer from the update server was larger than allowed, so PlayDrop ignored it.</string>
+    <string name="update_fail_wrong_length">The download was cut short or longer than announced. Try again.</string>
+    <string name="update_fail_not_verified">The update could not be verified with the PlayDrop release key, so nothing is offered.</string>
+    <string name="update_fail_bad_version">This copy of PlayDrop has no plain release number, so it cannot tell whether a release is newer.</string>
+    <string name="update_fail_digest">The download did not match its signed checksum and was deleted.</string>
+    <string name="update_fail_storage">The download could not be saved on this phone. Free some space and try again.</string>
+    <string name="update_fail_install_aborted">The installation was cancelled. PlayDrop stays on this version.</string>
+    <string name="update_fail_install_blocked">Android blocked the installation. PlayDrop stays on this version.</string>
+    <string name="update_fail_install_signature">This copy of PlayDrop was signed with a different key than the update, so Android refused it. Install the new version by hand.</string>
+    <string name="update_fail_install_invalid">Android could not read the downloaded app, so it refused it.</string>
+    <string name="update_fail_install_storage">There is not enough room on this phone to install the update.</string>
+    <string name="update_fail_install_incompatible">This version of PlayDrop cannot be installed on this phone.</string>
+    <string name="update_fail_install_other">Android could not install the update. Try again later.</string>
+</resources>

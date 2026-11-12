@@ -127,6 +127,9 @@
     <string name="ui_mirror_apps_title">Apps to mirror</string>
     <string name="ui_mirror_apps_body">The title and text of every notification from the apps you tick are sent to each device with mirroring turned on, including notifications this phone hides on its lock screen. Ongoing notifications, group summaries and anything an app marks as secret stay on this phone.</string>
     <string name="ui_mirror_apps_empty">No apps found.</string>
+    <string name="ui_mirror_apps_not_found_header">Ticked apps not found</string>
+    <string name="ui_mirror_apps_not_found">Not found on this phone</string>
+    <string name="ui_mirror_apps_remove">Remove</string>
 
     <!-- Add device -->
     <string name="ui_add_tab_nearby">Nearby</string>
@@ -335,8 +338,17 @@
     <string name="ui_input_more">More options</string>
     <string name="ui_input_offline">%1$s is offline. Input picks up again when it reconnects.</string>
     <string name="ui_input_unsupported">This device cannot be controlled remotely</string>
-    <string name="ui_input_refused">Allow remote input for this phone on %1$s first</string>
-    <string name="ui_input_ended">The computer ended remote input: %1$s</string>
+    <string name="ui_input_end_title">Remote input stopped</string>
+    <string name="ui_input_end_grant_off">Remote control is turned off for this phone on %1$s. In PlayDrop on %1$s, open this phone under Devices and turn on "Control the pointer and keyboard (remote input)", then try again.</string>
+    <string name="ui_input_end_locked">%1$s is locked. Unlock it and try again.</string>
+    <string name="ui_input_end_not_accepted">%1$s does not take remote input. PlayDrop there cannot control its pointer and keyboard.</string>
+    <string name="ui_input_end_stopped">Remote input was stopped on %1$s. Try again to go on.</string>
+    <string name="ui_input_end_idle">Remote input stopped after 10 minutes without use. Try again to go on.</string>
+    <string name="ui_input_end_connection">The connection to %1$s was lost. Check that both are on the same network, then try again.</string>
+    <string name="ui_input_end_other">%1$s ended remote input. Try again, or check PlayDrop on %1$s.</string>
+    <string name="ui_input_end_other_detail">%1$s ended remote input (%2$s). Try again, or check PlayDrop on %1$s.</string>
+    <string name="ui_input_try_again">Try again</string>
+    <string name="ui_input_close">Close</string>
     <string name="ui_input_refused_other">The computer refused remote input: %1$s</string>
     <string name="ui_input_tab_trackpad">Trackpad</string>
     <string name="ui_input_tab_keyboard">Keyboard</string>

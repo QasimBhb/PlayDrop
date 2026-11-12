@@ -67,16 +67,22 @@ pub use events::{
     Base64Bytes, DeliveredFile, DiscoveryPath, FileRoot, HostEvent, OfferedFile, PairingPromptKind,
     Secret, TransferDirection, OFFER_FILES_MAX,
 };
+pub use input::InputEndReason;
 pub use lock::{AlwaysUnlocked, LockFlag, LockState};
-pub use notifications::{MirroredNotification, NOTIFICATIONS_POSTED_PER_MINUTE};
+pub use notifications::{
+    MirroredNotification, NotificationRole, NOTIFICATIONS_DISMISS_PER_MINUTE,
+    NOTIFICATIONS_POSTED_PER_MINUTE, NOTIFICATIONS_REMOVED_PER_MINUTE,
+};
 pub use outbox::OutboxItem;
 pub use path::{PathOutcome, PathReport, PathTiming, ProbeReport};
 #[cfg(feature = "iroh-test")]
 pub use reach_link::ReachCounters;
 pub use send::{SendSource, TransferHandle, TransferSummary};
 pub use status::{MediaState, PeerBattery};
+pub(crate) use transfers::Failure;
 pub use transfers::{
-    TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISHED, KEEP_FOR, TRANSFER_NAMES_MAX,
+    TransferFailure, TransferSnapshot, TransferStatus, KEEP_AT_LEAST, KEEP_FINISHED, KEEP_FOR,
+    TRANSFER_NAMES_MAX,
 };
 
 use crate::discovery::{BeaconSchedule, DialLimiter, Discovery, DiscoveryConfig, InterfaceSource};
@@ -184,6 +190,11 @@ pub struct HostConfig {
     /// daemon with `SendInput` or the `RemoteDesktop` portal). Off by default; phones never
     /// accept input. Any host may send input (`caps.out`) regardless.
     pub accepts_input: bool,
+    /// What this host does with notification mirroring (protocol.md section 4, 5.16):
+    /// [`NotificationRole::Off`] (the default: the capability is not announced, nothing is
+    /// sent and every `notification` frame is dropped), [`NotificationRole::Source`] (a
+    /// phone) or [`NotificationRole::Sink`] (a desktop that shows the copies).
+    pub notifications: NotificationRole,
     /// How long a send (and an outbox pull) keeps trying to reach the other device after
     /// a drop before it is reported failed (protocol.md 7.6). Default 10 minutes. A send
     /// that gives up keeps its record and resumes when the device is back
@@ -231,6 +242,7 @@ impl HostConfig {
             secret_store: None,
             listener_setup: None,
             accepts_input: false,
+            notifications: NotificationRole::Off,
             reconnect_for: send::RECONNECT_FOR,
             path_choice: true,
             path_timing: PathTiming::default(),
@@ -340,6 +352,10 @@ pub struct ClipboardPush {
     /// `clipboard.image`, or long text to one without `blobs`.
     #[serde(default)]
     pub skipped_unsupported: usize,
+    /// Peers named in a push to chosen peers ([`Host::push_clipboard_to`]) that are not
+    /// paired with this host: nothing went to them, and the rest of the push went on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_not_paired: Vec<DeviceId>,
 }
 
 /// Per-peer reachability notes for the 10 s report and [`Host::diagnose`].
@@ -418,6 +434,8 @@ pub(crate) struct Inner {
     pub(crate) status: Mutex<status::StatusState>,
     /// Whether this host applies remote input (`caps.in` carries `input.*`, 5.12).
     pub(crate) accepts_input: bool,
+    /// [`HostConfig::notifications`].
+    pub(crate) notification_role: NotificationRole,
     /// Remote input sessions and pending motion, both directions (5.12, SR-25).
     pub(crate) input: Mutex<input::InputState>,
     /// Outbox items held for peers (7.8).
@@ -428,6 +446,9 @@ pub(crate) struct Inner {
     pub(crate) reconnect_for: Duration,
     /// "Add device" adverts already reported in this window, by address (name, type).
     pub(crate) add_device_seen: Mutex<HashMap<SocketAddr, (String, String)>>,
+    /// When each peer was last told about a transfer refused for lack of space, for the
+    /// once a minute rule of [`HostEvent::ReceiveRefusedNoSpace`].
+    pub(crate) no_space_reported: Mutex<HashMap<DeviceId, Instant>>,
     pub(crate) interfaces: Arc<dyn InterfaceSource>,
     pub(crate) lock_state: Box<dyn LockState>,
     shutdown: watch::Sender<bool>,
@@ -449,12 +470,12 @@ pub(crate) enum TransferEnd {
         delivered: Vec<DeliveredFile>,
     },
     /// Failed, with the reason shown to the user (SR-22 wording).
-    Failed(String),
+    Failed(Failure),
     /// A send that failed but keeps its record and resumes later (protocol.md 7.6); the
     /// reason says how. Listed with `resumable` set.
-    FailedResumable(String),
+    FailedResumable(Failure),
     /// Cancelled or declined by either side, with the reason.
-    Cancelled(String),
+    Cancelled(Failure),
 }
 
 /// Hashes for clipboard echo prevention (protocol.md 5.7).
@@ -468,6 +489,28 @@ pub(crate) struct ClipboardEcho {
 /// state consistent.
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A clipboard image is at most 16 MiB with an `image/` MIME type fit for a header
+/// (protocol.md 5.7, 5.15).
+fn check_clipboard_image(bytes: &[u8], mime: &str) -> Result<()> {
+    if bytes.len() > blobs::IMAGE_BLOB_MAX {
+        return Err(Error::TooLarge("clipboard image over 16 MiB".into()));
+    }
+    if !mime.starts_with("image/") || http::HeaderValue::from_str(mime).is_err() {
+        return Err(Error::BadRequest("not an image MIME type".into()));
+    }
+    Ok(())
+}
+
+/// Which clips a push treats as echoes (protocol.md 5.7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Echo {
+    /// The automatic path and single-device sends: the last clip applied from a peer and
+    /// the last one sent.
+    ReceivedOrSent,
+    /// A push to devices the user chose: only the last clip applied from a peer.
+    ReceivedOnly,
 }
 
 /// Refuses clipboard text over the 1 MiB sync limit (protocol.md 5.7, SR-24).
@@ -576,6 +619,14 @@ impl Inner {
         echo.last_applied.as_deref() == Some(hash) || echo.last_sent.as_deref() == Some(hash)
     }
 
+    /// True if a clip with this hash was the last one applied from a peer: the only echo
+    /// check for a push to chosen devices (protocol.md 5.7), since received clipboards are
+    /// never forwarded, while sending the same text to one device and then another is what
+    /// the user asked for.
+    pub(crate) fn is_received_clipboard(&self, hash: &str) -> bool {
+        lock(&self.clipboard_echo).last_applied.as_deref() == Some(hash)
+    }
+
     /// Queues an event for the UI. If the UI is not reading, events are dropped rather
     /// than queued without bound.
     pub(crate) fn emit(&self, ev: HostEvent) {
@@ -614,7 +665,7 @@ impl Inner {
         direction: TransferDirection,
         end: TransferEnd,
     ) {
-        let (status, note, saved, folder, delivered) = match &end {
+        let (status, failure, saved, folder, delivered) = match &end {
             TransferEnd::Complete {
                 saved,
                 folder,
@@ -644,7 +695,8 @@ impl Inner {
         };
         {
             let mut book = lock(&self.transfers);
-            book.finish_with_files(id, direction, status, note, saved, folder, delivered);
+            let (note, code) = failure.map_or((None, None), |f| (Some(f.text), Some(f.code)));
+            book.finish_failed(id, direction, status, note, code, saved, folder, delivered);
             if matches!(end, TransferEnd::FailedResumable(_)) {
                 book.set_resumable(id, direction, true);
             }
@@ -670,13 +722,14 @@ impl Inner {
                 folder,
                 delivered,
             },
-            TransferEnd::Failed(reason)
-            | TransferEnd::FailedResumable(reason)
-            | TransferEnd::Cancelled(reason) => HostEvent::TransferFailed {
+            TransferEnd::Failed(f)
+            | TransferEnd::FailedResumable(f)
+            | TransferEnd::Cancelled(f) => HostEvent::TransferFailed {
                 id: id.to_owned(),
                 peer: peer.to_hex(),
                 direction,
-                reason,
+                reason: f.text,
+                code: f.code,
             },
         };
         self.emit(ev);
@@ -864,11 +917,13 @@ impl Host {
             blobs: Mutex::new(blobs::BlobStore::default()),
             status: Mutex::new(status::StatusState::default()),
             accepts_input: config.accepts_input,
+            notification_role: config.notifications,
             input: Mutex::new(input::InputState::default()),
             outbox: Mutex::new(HashMap::new()),
             pulling: Mutex::new(HashSet::new()),
             reconnect_for: config.reconnect_for,
             add_device_seen: Mutex::new(HashMap::new()),
+            no_space_reported: Mutex::new(HashMap::new()),
             interfaces: Arc::clone(&interfaces),
             lock_state: config.lock_state,
             shutdown: watch::Sender::new(false),
@@ -1109,7 +1164,13 @@ impl Host {
         self.inner
             .pins
             .update(move |s| s.set_grants(&id, grants))
-            .await
+            .await?;
+        // Turning `input` off also ends a session the peer holds here, and tells it why,
+        // instead of leaving it open with every frame refused (SR-25: fail closed).
+        if !grants.input {
+            input::end_incoming(&self.inner, id, InputEndReason::GrantOff);
+        }
+        Ok(())
     }
 
     /// Renames a peer locally (SR-8: peer renames never change it).
@@ -1299,9 +1360,86 @@ impl Host {
         check_clipboard_size(text)?;
         let hash = crate::session::types::clipboard_text_hash(text);
         let body = ClipBody::of(text);
-        Ok(self.push_clip(&hash, None, |s| {
+        Ok(self.push_clip(&hash, None, Echo::ReceivedOrSent, |s| {
             body.frame_for(&self.inner, s, &hash, sensitive)
         }))
+    }
+
+    /// [`Host::push_clipboard`] to the chosen `peers` only, for a "send to these devices"
+    /// choice. The echo check is only against the last clip applied from a peer (received
+    /// clipboards are never forwarded, 5.7), not the last one sent: a push to one device
+    /// and then the same text to another is not an echo, and neither is a second chosen
+    /// device within one push (as calling [`Host::send_clipboard`] per device would make
+    /// it). The text is still remembered as sent, so the automatic path does not send it
+    /// again. Each chosen peer is under the usual rules (online,
+    /// `clipboardOut` grant, able to take the clip), counted as in
+    /// [`Host::push_clipboard`]. A peer that is not paired is listed in
+    /// [`ClipboardPush::skipped_not_paired`] and the others still get the clip. An empty
+    /// list sends nothing and changes nothing. Text over 1 MiB is [`Error::TooLarge`].
+    pub fn push_clipboard_to(
+        &self,
+        peers: &[DeviceId],
+        text: &str,
+        sensitive: bool,
+    ) -> Result<ClipboardPush> {
+        check_clipboard_size(text)?;
+        let hash = crate::session::types::clipboard_text_hash(text);
+        let body = ClipBody::of(text);
+        Ok(self.push_chosen(peers, |only| {
+            self.push_clip(&hash, Some(only), Echo::ReceivedOnly, |s| {
+                body.frame_for(&self.inner, s, &hash, sensitive)
+            })
+        }))
+    }
+
+    /// [`Host::push_clipboard_image`] to the chosen `peers` only, with the rules of
+    /// [`Host::push_clipboard_to`]. A chosen peer that cannot take images is counted in
+    /// [`ClipboardPush::skipped_unsupported`]; the others still get it.
+    pub fn push_clipboard_image_to(
+        &self,
+        peers: &[DeviceId],
+        bytes: Vec<u8>,
+        mime: &str,
+        sensitive: bool,
+    ) -> Result<ClipboardPush> {
+        // Checked before the split, so a bad image fails the same with or without a
+        // paired peer in the list.
+        check_clipboard_image(&bytes, mime)?;
+        let mut failed = None;
+        let out = self.push_chosen(peers, |only| {
+            self.image_clip(Some(only), Echo::ReceivedOnly, bytes, mime, sensitive)
+                .unwrap_or_else(|e| {
+                    failed = Some(e);
+                    ClipboardPush::default()
+                })
+        });
+        failed.map_or(Ok(out), Err)
+    }
+
+    /// Splits `peers` into paired ones, handed to `push` as one set, and unpaired ones,
+    /// reported in [`ClipboardPush::skipped_not_paired`]. Nothing is pushed for an empty
+    /// set, so an empty choice neither sends nor counts as "last sent".
+    fn push_chosen(
+        &self,
+        peers: &[DeviceId],
+        push: impl FnOnce(&HashSet<DeviceId>) -> ClipboardPush,
+    ) -> ClipboardPush {
+        let mut paired = HashSet::new();
+        let mut not_paired = Vec::new();
+        for p in peers {
+            if self.inner.pins.contains(p) {
+                paired.insert(*p);
+            } else if !not_paired.contains(p) {
+                not_paired.push(*p);
+            }
+        }
+        let mut out = if paired.is_empty() {
+            ClipboardPush::default()
+        } else {
+            push(&paired)
+        };
+        out.skipped_not_paired = not_paired;
+        out
     }
 
     /// Pushes a clipboard image (at most 16 MiB) to every online peer with the
@@ -1314,7 +1452,7 @@ impl Host {
         mime: &str,
         sensitive: bool,
     ) -> Result<ClipboardPush> {
-        self.image_clip(None, bytes, mime, sensitive)
+        self.image_clip(None, Echo::ReceivedOrSent, bytes, mime, sensitive)
     }
 
     /// Sends a clipboard image (at most 16 MiB) to one peer, as a blob it fetches and verifies
@@ -1338,27 +1476,29 @@ impl Host {
         if self.inner.registry.session(peer).is_none() {
             return Err(Error::NotFound);
         }
-        self.image_clip(Some(*peer), bytes, mime, sensitive)
+        self.image_clip(
+            Some(&HashSet::from([*peer])),
+            Echo::ReceivedOrSent,
+            bytes,
+            mime,
+            sensitive,
+        )
     }
 
-    /// [`Host::push_clipboard_image`] to every eligible peer, or to `only`.
+    /// [`Host::push_clipboard_image`] to every eligible peer, or to those in `only`.
     fn image_clip(
         &self,
-        only: Option<DeviceId>,
+        only: Option<&HashSet<DeviceId>>,
+        echo: Echo,
         bytes: Vec<u8>,
         mime: &str,
         sensitive: bool,
     ) -> Result<ClipboardPush> {
-        if bytes.len() > blobs::IMAGE_BLOB_MAX {
-            return Err(Error::TooLarge("clipboard image over 16 MiB".into()));
-        }
-        if !mime.starts_with("image/") || http::HeaderValue::from_str(mime).is_err() {
-            return Err(Error::BadRequest("not an image MIME type".into()));
-        }
+        check_clipboard_image(&bytes, mime)?;
         let hash = blobs::blob_id(&bytes);
         let bytes = bytes::Bytes::from(bytes);
         let inner = &self.inner;
-        Ok(self.push_clip(&hash, only, |s| {
+        Ok(self.push_clip(&hash, only, echo, |s| {
             if !(s.peer_accepts(&Capability::ClipboardImage) && s.peer_accepts(&Capability::Blobs))
             {
                 return None;
@@ -1380,13 +1520,23 @@ impl Host {
     }
 
     /// The fan-out shared by text and image pushes (protocol.md 5.7 echo rule), to every
-    /// paired peer or to `only`.
-    fn push_clip<F>(&self, hash: &str, only: Option<DeviceId>, mut frame_for: F) -> ClipboardPush
+    /// paired peer or to the paired peers in `only`.
+    fn push_clip<F>(
+        &self,
+        hash: &str,
+        only: Option<&HashSet<DeviceId>>,
+        echo: Echo,
+        mut frame_for: F,
+    ) -> ClipboardPush
     where
         F: FnMut(&session::Session) -> Option<Frame>,
     {
         let mut out = ClipboardPush::default();
-        if self.inner.is_clipboard_echo(hash) {
+        let is_echo = match echo {
+            Echo::ReceivedOrSent => self.inner.is_clipboard_echo(hash),
+            Echo::ReceivedOnly => self.inner.is_received_clipboard(hash),
+        };
+        if is_echo {
             out.skipped_echo = true;
             return out;
         }
@@ -1395,7 +1545,7 @@ impl Host {
             .pins
             .read()
             .iter()
-            .filter(|p| only.is_none_or(|o| o == p.device_id))
+            .filter(|p| only.is_none_or(|o| o.contains(&p.device_id)))
             .map(|p| (p.device_id, p.grants.clipboard_out))
             .collect();
         for (id, granted) in targets {
@@ -1452,7 +1602,8 @@ impl Host {
     }
 
     /// Mirrors one notification to `peer` (protocol.md 5.16): `posted`, which shows a copy
-    /// or replaces the one with the same `key`. Needs this host's `notificationsOut` grant
+    /// or replaces the one with the same `key`. Needs [`NotificationRole::Source`]
+    /// ([`Error::Forbidden`] otherwise), this host's `notificationsOut` grant
     /// for the peer ([`Error::Forbidden`], nothing sent), a session ([`Error::NotFound`])
     /// and the peer's `notifications` capability ([`Error::Forbidden`]). `key` comes from
     /// [`Host::notification_key`] ([`Error::BadRequest`] otherwise). `app`, `title` and
@@ -1465,14 +1616,15 @@ impl Host {
     /// Tells `peer` a mirrored notification went away (protocol.md 5.16 `removed`). Needs
     /// no grant (it carries no content), so a phone that just turned `notificationsOut` off
     /// can still clear the peer's copies (SR-42); otherwise the errors of
-    /// [`Host::send_notification`]. The peer acts on it only with its `notificationsIn`.
+    /// [`Host::send_notification`] (it also needs [`NotificationRole::Source`]). The peer
+    /// acts on it only with its `notificationsIn`.
     pub fn send_notification_removed(&self, peer: &DeviceId, key: String) -> Result<()> {
         notifications::send_removed(&self.inner, peer, key)
     }
 
     /// Asks `peer` to dismiss the notification it mirrored under `key`, after the user
-    /// closed the copy here (protocol.md 5.16 `dismiss`). Needs this host's
-    /// `notificationsIn` grant for the peer ([`Error::Forbidden`]), a session
+    /// closed the copy here (protocol.md 5.16 `dismiss`). Needs [`NotificationRole::Sink`]
+    /// and this host's `notificationsIn` grant for the peer ([`Error::Forbidden`]), a session
     /// ([`Error::NotFound`]) and the peer's `notifications` capability; the peer acts on it
     /// only with its `notificationsOut` grant for us.
     pub fn send_notification_dismiss(&self, peer: &DeviceId, key: String) -> Result<()> {
@@ -1500,7 +1652,9 @@ impl Host {
     /// capability on the peer ([`Error::Forbidden`]; see [`PeerSummary::capabilities`]).
     /// Pointer moves and scrolls are coalesced to one frame per 8 ms. A peer that refuses
     /// a frame (no `input` grant on its side) answers with an `error` that arrives as
-    /// [`HostEvent::PeerRefused`].
+    /// [`HostEvent::PeerRefused`]. Every `start` (sent, or failed here) is followed by
+    /// exactly one [`HostEvent::InputSessionEnded`] with an [`InputEndReason`] when the
+    /// session ends or is refused, unless this host sends `stop` first.
     pub fn send_input(&self, peer: &DeviceId, input: Input) -> Result<()> {
         input::send_input(&self.inner, peer, input)
     }
@@ -1589,6 +1743,45 @@ impl Host {
     #[doc(hidden)]
     pub fn verified_advert_for_test(&self, peer: &DeviceId, addr: SocketAddr) {
         connect::on_verified_advert(&self.inner, *peer, addr, crate::discovery::Via::Beacon);
+    }
+
+    /// Sends `frame` to `peer` as it is, answering `re` when given, past every role, grant
+    /// and capability check, as an older or hostile peer would. For tests; false without a
+    /// session.
+    #[doc(hidden)]
+    pub fn send_frame_for_test(
+        &self,
+        peer: &DeviceId,
+        frame: crate::session::Frame,
+        re: Option<u64>,
+    ) -> bool {
+        match self.inner.registry.session(peer) {
+            Some(s) => {
+                s.send_raw(frame, re);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The `seq` of the last frame of type `frame_type` this host wrote to `peer` on the
+    /// live session, so a test can answer it as an older peer would. For tests.
+    #[doc(hidden)]
+    pub fn last_sent_seq_for_test(&self, peer: &DeviceId, frame_type: &str) -> Option<u64> {
+        self.inner.registry.session(peer)?.last_sent_seq(frame_type)
+    }
+
+    /// Makes the live session with `peer` read its `hello.app` as `app`, so a test can stand
+    /// in for an older release. For tests; false without a session.
+    #[doc(hidden)]
+    pub fn set_peer_app_for_test(&self, peer: &DeviceId, app: &str) -> bool {
+        match self.inner.registry.session(peer) {
+            Some(s) => {
+                s.set_peer_app_for_test(app);
+                true
+            }
+            None => false,
+        }
     }
 
     /// How many peers path choice keeps state for, for tests: unpair clears a peer's.

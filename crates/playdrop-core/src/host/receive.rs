@@ -14,7 +14,7 @@ use http::{HeaderMap, Request, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use super::events::{FileRoot, HostEvent, OfferedFile, TransferDirection, OFFER_FILES_MAX};
-use super::transfers::{TransferSnapshot, TransferStatus};
+use super::transfers::{Failure, TransferFailure, TransferSnapshot, TransferStatus};
 use super::{lock, Inner, TransferEnd};
 use crate::identity::{secure_fs, DeviceId};
 use crate::net::connection::short;
@@ -588,7 +588,7 @@ pub(crate) async fn fail_local(inner: &Arc<Inner>, id: &str, why: String) {
         id,
         &owner,
         TransferDirection::Receive,
-        TransferEnd::Failed(why),
+        TransferEnd::Failed(Failure::other(why)),
     );
 }
 
@@ -662,6 +662,7 @@ async fn offer_inner(
             .space(inner.receive_root())
             .map_err(|e| HttpError::from(Error::Io(e)))?;
         if !space.fits(manifest.total_bytes) {
+            report_no_space_with(inner, peer, manifest.total_bytes, Some(space));
             return Err(HttpError::from_code(ErrorCode::NoSpace, ""));
         }
         let state = if grants.files {
@@ -720,10 +721,77 @@ async fn offer_inner(
                 &id,
                 &peer,
                 TransferDirection::Receive,
-                TransferEnd::Failed(format!("could not accept: {e}")),
+                TransferEnd::Failed(accept_failure(&e)),
             );
+            if matches!(e, Error::NoSpace) {
+                report_no_space(inner, peer, manifest.total_bytes);
+            }
             Err(HttpError::from(e))
         }
+    }
+}
+
+/// The reason a local accept failed, as the receiving side shows it.
+fn accept_failure(e: &Error) -> Failure {
+    match e {
+        Error::NoSpace => Failure::new(
+            TransferFailure::NoSpace,
+            "not enough free space here to accept it",
+        ),
+        e => Failure::other(format!("could not accept: {e}")),
+    }
+}
+
+/// At most one [`HostEvent::ReceiveRefusedNoSpace`] per peer in this window, so a sender
+/// that retries cannot flood the UI.
+pub(crate) const NO_SPACE_REPORT_EVERY: Duration = Duration::from_mins(1);
+
+/// Tells the UI this host refused `offered` bytes from `peer` for lack of space (`507`,
+/// SR-20), with the free space and reserve as measured now. Rate limited per peer
+/// ([`NO_SPACE_REPORT_EVERY`]); names no file (SR-32).
+pub(crate) fn report_no_space(inner: &Inner, peer: DeviceId, offered: u64) {
+    report_no_space_with(inner, peer, offered, None);
+}
+
+/// [`report_no_space`] with the space already measured, when the caller has it.
+fn report_no_space_with(
+    inner: &Inner,
+    peer: DeviceId,
+    offered: u64,
+    space: Option<crate::transfer::receiver::SpaceInfo>,
+) {
+    let now = Instant::now();
+    {
+        let mut seen = lock(&inner.no_space_reported);
+        if seen
+            .get(&peer)
+            .is_some_and(|t| now.duration_since(*t) < NO_SPACE_REPORT_EVERY)
+        {
+            return;
+        }
+        // Old entries go, so the map holds at most the peers of the last minute.
+        seen.retain(|_, t| now.duration_since(*t) < NO_SPACE_REPORT_EVERY);
+        seen.insert(peer, now);
+    }
+    let space = space.or_else(|| inner.free_space.space(inner.receive_root()).ok());
+    let (free, reserve) = space.map_or((0, 0), |s| (s.available, s.reserve()));
+    tracing::info!(peer = %short(&peer), offered, free, reserve, "refused a transfer: not enough free space");
+    inner.emit(HostEvent::ReceiveRefusedNoSpace {
+        peer: peer.to_hex(),
+        offered_bytes: offered,
+        free_bytes: free,
+        reserve_bytes: reserve,
+    });
+}
+
+/// A `PUT` refused for lack of space (a write that would cross the reserve) is reported
+/// like a refused offer.
+fn note_put_refusal(inner: &Inner, id: &str, peer: DeviceId, e: &HttpError) {
+    if e.body.error.code == ErrorCode::NoSpace {
+        let offered = lock(&inner.incoming)
+            .get(id)
+            .map_or(0, |en| en.manifest.total_bytes);
+        report_no_space(inner, peer, offered);
     }
 }
 
@@ -862,7 +930,9 @@ pub(crate) async fn put(
         Ok(u) => u,
         Err(e) => {
             tracing::debug!(error = %e, ?target, "PUT refused at begin");
-            let _ = respond_error(&mut respond, &put_error(e)).await;
+            let e = put_error(e);
+            note_put_refusal(&inner, &id, peer, &e);
+            let _ = respond_error(&mut respond, &e).await;
             return;
         }
     };
@@ -912,6 +982,7 @@ pub(crate) async fn put(
             let _ = respond_json(&mut respond, StatusCode::OK, &r).await;
         }
         Err(e) => {
+            note_put_refusal(&inner, &id, peer, &e);
             // The 422 replies stop the sender; dropping the unread body afterwards makes
             // `h2` reset the stream with NO_ERROR (protocol.md 7.4, SR-22).
             let _ = respond_error(&mut respond, &e).await;
@@ -983,6 +1054,7 @@ pub(crate) fn after_put(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver, tar
             peer: owner.to_hex(),
             direction: TransferDirection::Receive,
             reason: format!("failed integrity check from {}", inner.label(&owner)),
+            code: TransferFailure::Integrity,
         });
     }
     report_if_done(inner, id, rx);
@@ -1032,11 +1104,27 @@ fn report_if_done(inner: &Arc<Inner>, id: &str, rx: &TransferReceiver) {
                 delivered: rx.delivered(),
             }
         }
-        TransferState::Cancelled => TransferEnd::Cancelled("transfer cancelled".into()),
-        _ => TransferEnd::Failed(
-            rx.failure()
-                .unwrap_or_else(|| format!("transfer {state:?}").to_lowercase()),
-        ),
+        TransferState::Cancelled => TransferEnd::Cancelled(Failure::other("transfer cancelled")),
+        // A failure with no message of its own is labelled an integrity failure only when
+        // a stream is known to have failed its checks; anything else (a record loaded as
+        // failed with no failed stream, say) is not claimed to be one.
+        _ => TransferEnd::Failed(rx.failure().map_or_else(
+            || {
+                let st = rx.state();
+                let integrity = st.files.iter().any(|f| f.state == FileState::Failed)
+                    || st
+                        .bundle
+                        .as_ref()
+                        .is_some_and(|b| b.state == FileState::Failed);
+                let text = format!("transfer {state:?}").to_lowercase();
+                if integrity {
+                    Failure::new(TransferFailure::Integrity, text)
+                } else {
+                    Failure::other(text)
+                }
+            },
+            Failure::other,
+        )),
     };
     inner.transfer_ended(id, &owner, TransferDirection::Receive, end);
 }
@@ -1167,7 +1255,10 @@ pub(crate) async fn cancel(
             &id,
             &peer,
             TransferDirection::Receive,
-            TransferEnd::Cancelled(format!("cancelled by sender ({safe_reason})")),
+            TransferEnd::Cancelled(Failure::new(
+                TransferFailure::CancelledByPeer,
+                format!("cancelled by sender ({safe_reason})"),
+            )),
         );
     }
 }
@@ -1215,7 +1306,7 @@ pub(crate) async fn cancel_local(inner: &Arc<Inner>, id: &str) -> Result<()> {
         id,
         &owner,
         TransferDirection::Receive,
-        TransferEnd::Cancelled("cancelled by you".into()),
+        TransferEnd::Cancelled(Failure::plain(TransferFailure::CancelledByYou)),
     );
     Ok(())
 }
@@ -1254,13 +1345,23 @@ pub(crate) async fn respond_offer(inner: &Arc<Inner>, id: &str, accept: bool) ->
                     en.reported = true;
                 }
                 record_end(inner, id, owner, &manifest, TransferState::Failed);
-                send_decision(inner, owner, id, FrameState::Failed, Some("error"));
+                // `no_space` lets the sender say why (5.13); an older sender ignores the
+                // value and shows a plain failure.
+                let reason = if matches!(e, Error::NoSpace) {
+                    DECISION_NO_SPACE
+                } else {
+                    "error"
+                };
+                send_decision(inner, owner, id, FrameState::Failed, Some(reason));
                 inner.transfer_ended(
                     id,
                     &owner,
                     TransferDirection::Receive,
-                    TransferEnd::Failed(format!("could not accept: {e}")),
+                    TransferEnd::Failed(accept_failure(&e)),
                 );
+                if matches!(e, Error::NoSpace) {
+                    report_no_space(inner, owner, manifest.total_bytes);
+                }
                 return Err(e);
             }
         }
@@ -1273,13 +1374,17 @@ pub(crate) async fn respond_offer(inner: &Arc<Inner>, id: &str, accept: bool) ->
             id,
             &owner,
             TransferDirection::Receive,
-            TransferEnd::Cancelled("declined".into()),
+            TransferEnd::Cancelled(Failure::new(TransferFailure::Declined, "declined")),
         );
         FrameState::Declined
     };
     send_decision(inner, owner, id, state, None);
     Ok(())
 }
+
+/// The `reason` of a `failed` decision frame when an accepted offer could not start for
+/// lack of space (protocol.md 5.13).
+pub(crate) const DECISION_NO_SPACE: &str = "no_space";
 
 fn send_decision(
     inner: &Inner,
@@ -1369,6 +1474,9 @@ pub(crate) async fn load_persisted(inner: &Arc<Inner>) {
 
 /// Cancels and forgets every transfer from an unpaired peer (protocol.md 6.4).
 pub(crate) async fn drop_peer(inner: &Arc<Inner>, peer: &DeviceId) {
+    // A device paired again is a new start: its first refusal for space is reported at
+    // once, not held back by a report about the device it was before.
+    lock(&inner.no_space_reported).remove(peer);
     let gone: Vec<(String, Option<TransferReceiver>)> = {
         let mut map = lock(&inner.incoming);
         let ids: Vec<String> = map
@@ -1483,7 +1591,7 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                 &id,
                 &owner,
                 TransferDirection::Receive,
-                TransferEnd::Failed("offer expired".into()),
+                TransferEnd::Failed(Failure::new(TransferFailure::TimedOut, "offer expired")),
             );
         }
         if last_cleanup.is_none_or(|t| now.duration_since(t) >= CLEANUP_EVERY) {
@@ -1505,7 +1613,10 @@ pub(crate) async fn maintenance(inner: Arc<Inner>) {
                                 &id,
                                 &e.owner,
                                 TransferDirection::Receive,
-                                TransferEnd::Failed("no data for 24 hours; removed".into()),
+                                TransferEnd::Failed(Failure::new(
+                                    TransferFailure::TimedOut,
+                                    "no data for 24 hours; removed",
+                                )),
                             );
                         }
                     }

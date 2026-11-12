@@ -108,6 +108,7 @@ fn status() -> Status {
             autostart: false,
             autostart_refused: None,
             notifications: true,
+            update_check: true,
         },
         add_device_window_open: false,
         locked: false,

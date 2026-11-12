@@ -20,6 +20,9 @@ internal sealed class ClipboardOutcome {
     /** Nobody eligible is online. */
     data object NoDeviceOnline : ClipboardOutcome()
 
+    /** The clip is an image and no device that would take the clip can take images. */
+    data object NoImageSupport : ClipboardOutcome()
+
     companion object {
         /** Picks the outcome from the core's `ClipboardPush` counters. */
         fun of(

@@ -45,7 +45,6 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -66,6 +65,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.TextFieldValue
@@ -95,14 +97,7 @@ fun InputRoute(
     vm: InputViewModel = viewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
-    val context = LocalContext.current
     CollectMessages(vm.messages, showMessage)
-    LaunchedEffect(vm) {
-        vm.closed.collect {
-            showMessage(it.resolve(context))
-            onBack()
-        }
-    }
     LifecycleStartEffect(vm) {
         vm.start()
         onStopOrDispose { vm.stop() }
@@ -118,6 +113,7 @@ fun InputRoute(
         onSend = vm::send,
         onPresenter = vm::presenter,
         onSensitivity = vm::setSensitivity,
+        onRetry = vm::retry,
     )
 }
 
@@ -136,6 +132,7 @@ fun InputScreen(
     onSend: (List<InputEvent>) -> Unit,
     onPresenter: (PresenterAction) -> Unit,
     onSensitivity: (Float) -> Unit,
+    onRetry: () -> Unit = {},
 ) {
     var menu by remember { mutableStateOf(false) }
     var speedDialog by rememberSaveable { mutableStateOf(false) }
@@ -181,7 +178,9 @@ fun InputScreen(
         },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
+            val end = state.ended
             when {
+                end != null -> EndNotice(end, onRetry = onRetry, onClose = onBack)
                 !state.online -> Notice(stringResource(R.string.ui_input_offline, state.label))
                 tabs.isEmpty() -> Notice(stringResource(R.string.ui_input_unsupported))
                 else -> {
@@ -207,6 +206,26 @@ fun InputScreen(
             speedDialog = false
             onSensitivity(it)
         }, onDismiss = { speedDialog = false })
+    }
+}
+
+/**
+ * Why remote input stopped and what to do, kept on screen until the user tries again or
+ * closes the screen (it never vanishes by itself).
+ */
+@Composable
+private fun EndNotice(end: InputEnd, onRetry: () -> Unit, onClose: () -> Unit) {
+    val context = LocalContext.current
+    Column(
+        Modifier.fillMaxWidth().padding(24.dp).semantics { liveRegion = LiveRegionMode.Polite },
+        verticalArrangement = Arrangement.spacedBy(16.dp),
+    ) {
+        Text(stringResource(R.string.ui_input_end_title), style = MaterialTheme.typography.titleMedium)
+        Text(end.message.resolve(context), style = MaterialTheme.typography.bodyLarge)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (end.canRetry) Button(onClick = onRetry) { Text(stringResource(R.string.ui_input_try_again)) }
+            OutlinedButton(onClick = onClose) { Text(stringResource(R.string.ui_input_close)) }
+        }
     }
 }
 

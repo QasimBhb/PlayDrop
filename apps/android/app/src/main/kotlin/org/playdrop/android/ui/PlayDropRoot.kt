@@ -42,6 +42,7 @@ import org.playdrop.android.ui.adddevice.AddDeviceRoute
 import org.playdrop.android.ui.common.CollectMessages
 import org.playdrop.android.ui.device.DeviceDetailRoute
 import org.playdrop.android.ui.device.DeviceDetailViewModel
+import org.playdrop.android.ui.device.PermissionsRoute
 import org.playdrop.android.ui.devices.DevicesRoute
 import org.playdrop.android.ui.diagnostics.DiagnosticsRoute
 import org.playdrop.android.ui.help.CantFindRoute
@@ -54,6 +55,9 @@ import org.playdrop.android.ui.pairing.PairingDialog
 import org.playdrop.android.ui.settings.SettingsRoute
 import org.playdrop.android.ui.transfers.TransfersRoute
 import org.playdrop.android.ui.transfers.TransfersViewModel
+import org.playdrop.android.update.UpdateActions
+import org.playdrop.android.update.UpdateDialog
+import org.playdrop.android.update.UpdateViewModel
 
 /** Navigation routes. Device IDs are hex, so they are safe in a path segment. */
 object Routes {
@@ -84,11 +88,17 @@ object Routes {
     /** Remote input for one device, with the hex Device ID as argument. */
     const val INPUT = "input/{${InputViewModel.ARG_ID}}"
 
+    /** Permissions of one device, with the hex Device ID as argument. */
+    const val PERMISSIONS = "permissions/{${DeviceDetailViewModel.ARG_ID}}"
+
     /** The app picker for notification mirroring (one allow list for every device). */
     const val MIRROR_APPS = "mirror-apps"
 
     /** The detail route for one device. */
     fun device(id: String) = "device/$id"
+
+    /** The permissions route for one device. */
+    fun permissions(id: String) = "permissions/$id"
 
     /** The remote input route for one device. */
     fun input(id: String) = "input/$id"
@@ -111,7 +121,7 @@ private val TABS = listOf(
  * [openTab] selects a tab once (for example from a notification).
  */
 @Composable
-fun PlayDropRoot(appVm: AppViewModel, openTab: String?, onTabOpened: () -> Unit) {
+fun PlayDropRoot(appVm: AppViewModel, updateVm: UpdateViewModel, openTab: String?, onTabOpened: () -> Unit) {
     val transfersVm: TransfersViewModel = viewModel()
     val settings by appVm.settings.collectAsStateWithLifecycle()
     val prompt by appVm.pairingPrompt.collectAsStateWithLifecycle()
@@ -126,7 +136,11 @@ fun PlayDropRoot(appVm: AppViewModel, openTab: String?, onTabOpened: () -> Unit)
         !s.onboarded -> Scaffold(snackbarHost = { SnackbarHost(snackbar) }) { padding ->
             Box(Modifier.padding(padding).consumeWindowInsets(padding)) { OnboardingRoute(show) }
         }
-        else -> MainScaffold(transfersVm, snackbar, show, openTab, onTabOpened)
+        else -> {
+            MainScaffold(transfersVm, updateVm, snackbar, show, openTab, onTabOpened)
+            val update by updateVm.state.collectAsStateWithLifecycle()
+            UpdateDialog(update, UpdateActions(onUpdate = updateVm::update, onLater = updateVm::later, onDismiss = updateVm::dismiss))
+        }
     }
     prompt?.let { PairingDialog(it, appVm::answerPairing) }
 }
@@ -134,6 +148,7 @@ fun PlayDropRoot(appVm: AppViewModel, openTab: String?, onTabOpened: () -> Unit)
 @Composable
 private fun MainScaffold(
     transfersVm: TransfersViewModel,
+    updateVm: UpdateViewModel,
     snackbar: SnackbarHostState,
     show: (String) -> Unit,
     openTab: String?,
@@ -192,7 +207,7 @@ private fun MainScaffold(
             }
             composable(Routes.TRANSFERS) { TransfersRoute(transfersVm, show) }
             composable(Routes.SETTINGS) {
-                SettingsRoute(onOpenDiagnostics = { nav.navigate(Routes.DIAGNOSTICS) }, showMessage = show)
+                SettingsRoute(onOpenDiagnostics = { nav.navigate(Routes.DIAGNOSTICS) }, showMessage = show, updateVm = updateVm)
             }
             composable(
                 Routes.DEVICE,
@@ -203,6 +218,17 @@ private fun MainScaffold(
                     onBack = { nav.popIfAt(Routes.DEVICE) },
                     onPairAgain = { nav.navigate(Routes.ADD_DEVICE) },
                     onOpenInput = { nav.navigate(Routes.input(id)) { launchSingleTop = true } },
+                    onOpenPermissions = { nav.navigate(Routes.permissions(id)) { launchSingleTop = true } },
+                    onOpenTransfers = { nav.selectTab(Routes.TRANSFERS) },
+                    showMessage = show,
+                )
+            }
+            composable(
+                Routes.PERMISSIONS,
+                arguments = listOf(navArgument(DeviceDetailViewModel.ARG_ID) { type = NavType.StringType }),
+            ) {
+                PermissionsRoute(
+                    onBack = { nav.popIfAt(Routes.PERMISSIONS) },
                     onChooseMirrorApps = { nav.navigate(Routes.MIRROR_APPS) { launchSingleTop = true } },
                     showMessage = show,
                 )

@@ -73,3 +73,10 @@ path = "fuzz_targets/qr_uri.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "update_sums"
+path = "fuzz_targets/update_sums.rs"
+test = false
+doc = false
+bench = false

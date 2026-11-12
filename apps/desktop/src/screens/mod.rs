@@ -11,6 +11,7 @@ mod diagnostics;
 mod pairing;
 mod settings;
 mod transfers;
+mod update;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -60,6 +61,9 @@ pub struct Controller {
     /// replaced, times out or is dismissed, so a press counts as consent only while the
     /// question is on screen.
     consent: RefCell<Option<(String, ConsentToken)>>,
+    /// The update check was asked for once: this window's first connection is "a UI
+    /// opened"; reconnections only read the state.
+    update_asked: Cell<bool>,
 }
 
 thread_local! {
@@ -90,6 +94,7 @@ pub fn install(app: &App, ipc: Arc<Ipc>) {
         start_attempts: Cell::new(0),
         stopping_timer: Timer::default(),
         consent: RefCell::new(None),
+        update_asked: Cell::new(false),
     });
     CONTROLLER.with(|slot| *slot.borrow_mut() = Some(Rc::clone(&c)));
 
@@ -105,10 +110,14 @@ pub fn install(app: &App, ipc: Arc<Ipc>) {
     pairing::install(app, &c);
     transfers::install(app, &c);
     settings::install(app);
+    update::install(app);
     diagnostics::install(app);
 
     c.clock.start(TimerMode::Repeated, CLOCK_TICK, || {
-        with(devices::refresh_all);
+        with(|c| {
+            devices::refresh_all(c);
+            update::refresh(c);
+        });
     });
     c.ipc.connect();
 }
@@ -160,6 +169,7 @@ impl Controller {
             }
         }
         self.load(Refetch::All);
+        update::on_connected(self);
     }
 
     /// Re-requests state from the daemon.
@@ -171,6 +181,7 @@ impl Controller {
                         c.store.borrow_mut().set_status(s);
                         refresh_input_banner(c);
                         settings::refresh(c);
+                        update::refresh(c);
                         pairing::refresh_lock(c);
                     }
                     other => c.report("Could not read the daemon status", other),
@@ -220,7 +231,11 @@ impl Controller {
                 Change::WindowClosed => pairing::window_closed(self),
                 Change::PairingStatus(text, error) => pairing::set_status(self, &text, error),
                 Change::Notice(text, error) => self.notice(&text, error),
-                Change::Settings => settings::refresh(self),
+                Change::Settings => {
+                    settings::refresh(self);
+                    update::refresh(self);
+                }
+                Change::Update => update::refresh(self),
                 Change::Lock => pairing::refresh_lock(self),
                 Change::InputSessions => refresh_input_banner(self),
                 Change::Refetch(what) => self.load(what),
@@ -329,6 +344,7 @@ fn kind_name(ok: &Ok) -> &'static str {
         Ok::TransferStarted { .. } => "transfer_started",
         Ok::ClipboardPushed { .. } => "clipboard_pushed",
         Ok::Settings { .. } => "settings",
+        Ok::Update(_) => "update",
         _ => "unknown",
     }
 }

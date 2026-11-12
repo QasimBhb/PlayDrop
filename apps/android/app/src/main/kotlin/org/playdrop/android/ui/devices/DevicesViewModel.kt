@@ -62,11 +62,8 @@ class DevicesViewModel(application: Application) : CoreViewModel(application) {
     fun send(peer: String, uris: List<Uri>) {
         if (uris.isEmpty()) return
         val label = state.value.rows.firstOrNull { it.deviceId == peer }?.label ?: ""
-        viewModelScope.launch {
-            val id = guarded { CoreHost.sendUris(getApplication(), peer, uris) }
-            if (id != null) {
-                post(UiMessage(R.plurals.ui_devices_sending, listOf(uris.size, label), quantity = uris.size))
-            }
+        sendUrisFromScreen(peer, uris) {
+            post(UiMessage(R.plurals.ui_devices_sending, listOf(uris.size, label), quantity = uris.size))
         }
     }
 }

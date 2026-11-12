@@ -180,6 +180,60 @@ public final class AppSettings {
         }
     }
 
+    /// UserDefaults keys of the update check. App-only (the share extension never reads them),
+    /// so they are not in `SharedSettingsKeys`. Changing one loses that setting.
+    static let updateCheckEnabledKey = "updateCheckEnabled"
+    static let updateLastAnswerKey = "updateLastAnswerMs"
+    static let updateLastFailureKey = "updateLastFailureMs"
+
+    /// Ask GitHub for the latest version when the app opens, at most once a day
+    /// (`docs/design/update-check.md`). Default true.
+    public var updateCheckEnabled: Bool {
+        get {
+            access(keyPath: \.updateCheckEnabled)
+            return bool(Self.updateCheckEnabledKey, default: true)
+        }
+        set {
+            withMutation(keyPath: \.updateCheckEnabled) { defaults.set(newValue, forKey: Self.updateCheckEnabledKey) }
+        }
+    }
+
+    /// Unix milliseconds of the last update check that got an answer, or nil.
+    public var updateLastAnswerMs: UInt64? {
+        get {
+            access(keyPath: \.updateLastAnswerMs)
+            return milliseconds(Self.updateLastAnswerKey)
+        }
+        set {
+            withMutation(keyPath: \.updateLastAnswerMs) { setMilliseconds(newValue, Self.updateLastAnswerKey) }
+        }
+    }
+
+    /// Unix milliseconds of the last update check that failed, or nil.
+    public var updateLastFailureMs: UInt64? {
+        get {
+            access(keyPath: \.updateLastFailureMs)
+            return milliseconds(Self.updateLastFailureKey)
+        }
+        set {
+            withMutation(keyPath: \.updateLastFailureMs) { setMilliseconds(newValue, Self.updateLastFailureKey) }
+        }
+    }
+
+    /// A stored time in Unix milliseconds, or nil when never written (or not a positive number).
+    private func milliseconds(_ key: String) -> UInt64? {
+        guard let number = defaults.object(forKey: key) as? NSNumber, number.int64Value > 0 else { return nil }
+        return UInt64(number.int64Value)
+    }
+
+    private func setMilliseconds(_ value: UInt64?, _ key: String) {
+        if let value, value <= UInt64(Int64.max) {
+            defaults.set(Int64(value), forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+
     /// A stored Bool, or `fallback` when the key was never written.
     private func bool(_ key: String, default fallback: Bool) -> Bool {
         defaults.object(forKey: key) == nil ? fallback : defaults.bool(forKey: key)

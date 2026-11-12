@@ -49,4 +49,28 @@ final class InputMappingTests: XCTestCase {
         XCTAssertEqual(MediaRows.toggleAction(playing: false, can: [.play, .pause]), .play)
         XCTAssertNil(MediaRows.toggleAction(playing: false, can: [.pause]))
     }
+
+    func testEveryCoreEndReasonMapsToItsCode() {
+        let pairs: [(InputEndReason, InputEndCode)] = [
+            (.grantOff, .grantOff), (.locked, .locked), (.notAccepted, .notAccepted),
+            (.stoppedByUser, .stoppedByUser), (.idleTimeout, .idleTimeout),
+            (.connectionLost, .connectionLost), (.other, .other),
+        ]
+        for (reason, code) in pairs {
+            XCTAssertEqual(InputEndCode(reason), code, "\(reason)")
+        }
+        XCTAssertEqual(pairs.count, InputEndCode.allCases.count, "every package code has a core reason")
+    }
+
+    func testEveryEndNoticeHasASentenceNamingTheComputerWhereItHelps() {
+        let notices: [InputEndNotice] = [
+            .grantOff, .locked, .notAccepted, .stoppedByUser, .idleTimeout, .other(reason: "gone"), .other(reason: nil),
+        ]
+        for notice in notices {
+            XCTAssertFalse(L10n.Input.endNotice(notice, label: "Desk").isEmpty, "\(notice)")
+        }
+        XCTAssertTrue(L10n.Input.endNotice(.grantOff, label: "Desk").contains("Desk"))
+        XCTAssertTrue(L10n.Input.endNotice(.locked, label: "Desk").contains("Desk is locked"))
+        XCTAssertTrue(L10n.Input.endNotice(.other(reason: "gone"), label: "Desk").contains("gone"))
+    }
 }

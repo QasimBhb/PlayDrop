@@ -727,8 +727,11 @@ fn print_event(ev: &HostEvent, json: bool) {
                 .map(|m| format!(" ({m})"))
                 .unwrap_or_default()
         ),
-        HostEvent::InputSessionEnded { peer, reason } => {
-            println!("{} ended the input session: {reason}", short(peer));
+        HostEvent::InputSessionEnded { peer, reason, code } => {
+            println!(
+                "input session with {} ended: {reason} ({code:?})",
+                short(peer)
+            );
         }
         _ => {}
     }

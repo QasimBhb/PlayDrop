@@ -479,6 +479,7 @@ mod tests {
             folder: None,
             delivered: Vec::new(),
             resumable: false,
+            failure: None,
         }
     }
 

@@ -109,6 +109,35 @@ pub struct HostConfig {
     /// accepts input. Any host may send input regardless.
     #[uniffi(default = false)]
     pub accepts_input: bool,
+    /// What this host does with notification mirroring (protocol.md section 4, 5.16; ffi
+    /// 0.6.0): `Source` for the Android app, which mirrors its notifications; `None` (the
+    /// default) for a host that neither sends nor shows them, such as the iPhone app. A
+    /// host with `None` lists no `notifications` capability and drops every such frame.
+    #[uniffi(default = None)]
+    pub notifications: Option<NotificationRole>,
+}
+
+/// A host's part in notification mirroring (protocol.md 5.16; ffi 0.6.0). No role is
+/// `HostConfig.notifications` = `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum NotificationRole {
+    /// A phone that mirrors its notifications: sends `posted` and `removed`, acts on
+    /// `dismiss`.
+    Source,
+    /// A computer that shows mirrored copies: acts on `posted` and `removed`, sends
+    /// `dismiss`.
+    Sink,
+}
+
+impl NotificationRole {
+    /// The core's role for an optional binding role.
+    fn to_core(role: Option<Self>) -> host::NotificationRole {
+        match role {
+            None => host::NotificationRole::Off,
+            Some(Self::Source) => host::NotificationRole::Source,
+            Some(Self::Sink) => host::NotificationRole::Sink,
+        }
+    }
 }
 
 impl HostConfig {
@@ -142,6 +171,7 @@ impl HostConfig {
             cfg.secret_store = Some(Arc::new(ForeignSecretStore(store)));
         }
         cfg.accepts_input = self.accepts_input;
+        cfg.notifications = NotificationRole::to_core(self.notifications);
         Ok(cfg)
     }
 }
@@ -404,6 +434,54 @@ pub struct TransferSnapshot {
     /// A failed send whose record is kept: it resumes by itself or when the same files
     /// are sent again, and `Host::cancel_transfer` forgets it. False otherwise.
     pub resumable: bool,
+    /// Why it did not complete, on a failed or cancelled transfer (`note` holds the words);
+    /// `None` otherwise (ffi 0.6.0).
+    #[uniffi(default = None)]
+    pub failure: Option<TransferFailure>,
+}
+
+/// Why a transfer did not complete (ffi 0.6.0). A UI words it itself; the core's text
+/// reads after "Sending to <device> failed: ".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TransferFailure {
+    /// The receiving device does not have enough free space.
+    NoSpace,
+    /// The receiving user declined it.
+    Declined,
+    /// Too large for the receiving device to accept.
+    TooLarge,
+    /// The receiving device is busy with other transfers from this one.
+    RateLimited,
+    /// The other device cancelled it.
+    CancelledByPeer,
+    /// This device's user cancelled it.
+    CancelledByYou,
+    /// Data failed its integrity check.
+    Integrity,
+    /// The other device could not be reached, or kept dropping the connection.
+    ConnectionLost,
+    /// Nobody answered in time (offer expired, no data for 24 hours).
+    TimedOut,
+    /// Anything else; the text says what.
+    Other,
+}
+
+impl From<host::TransferFailure> for TransferFailure {
+    fn from(f: host::TransferFailure) -> Self {
+        use host::TransferFailure as F;
+        match f {
+            F::NoSpace => Self::NoSpace,
+            F::Declined => Self::Declined,
+            F::TooLarge => Self::TooLarge,
+            F::RateLimited => Self::RateLimited,
+            F::CancelledByPeer => Self::CancelledByPeer,
+            F::CancelledByYou => Self::CancelledByYou,
+            F::Integrity => Self::Integrity,
+            F::ConnectionLost => Self::ConnectionLost,
+            F::TimedOut => Self::TimedOut,
+            F::Other => Self::Other,
+        }
+    }
 }
 
 impl From<host::TransferSnapshot> for TransferSnapshot {
@@ -423,6 +501,7 @@ impl From<host::TransferSnapshot> for TransferSnapshot {
             note: t.note,
             delivered: t.delivered.into_iter().map(Into::into).collect(),
             resumable: t.resumable,
+            failure: t.failure.map(Into::into),
         }
     }
 }
@@ -523,6 +602,10 @@ pub struct ClipboardPush {
     pub skipped_no_grant: u32,
     /// Peers whose build lacks `blobs` or `clipboard.image`.
     pub skipped_unsupported: u32,
+    /// Chosen peers (`push_clipboard_to`, `push_clipboard_image_to`) that are not paired
+    /// or not a Device ID, as given; nothing went to them (ffi 0.6.0).
+    #[uniffi(default = [])]
+    pub skipped_not_paired: Vec<String>,
 }
 
 impl From<host::ClipboardPush> for ClipboardPush {
@@ -537,6 +620,11 @@ impl From<host::ClipboardPush> for ClipboardPush {
             skipped_offline: u32::try_from(p.skipped_offline).unwrap_or(u32::MAX),
             skipped_no_grant: u32::try_from(p.skipped_no_grant).unwrap_or(u32::MAX),
             skipped_unsupported: u32::try_from(p.skipped_unsupported).unwrap_or(u32::MAX),
+            skipped_not_paired: p
+                .skipped_not_paired
+                .iter()
+                .map(playdrop_core::identity::DeviceId::to_hex)
+                .collect(),
         }
     }
 }
@@ -1329,6 +1417,20 @@ mod input_tests {
 #[cfg(test)]
 mod notification_tests {
     use super::*;
+
+    /// No role is the core's `Off`; each role maps to its own (ffi 0.6.0).
+    #[test]
+    fn notification_roles_map_to_the_core() {
+        assert_eq!(NotificationRole::to_core(None), host::NotificationRole::Off);
+        assert_eq!(
+            NotificationRole::to_core(Some(NotificationRole::Source)),
+            host::NotificationRole::Source
+        );
+        assert_eq!(
+            NotificationRole::to_core(Some(NotificationRole::Sink)),
+            host::NotificationRole::Sink
+        );
+    }
 
     /// The two notification grants and the record cross the FFI unchanged (ffi 0.5.0), and
     /// the record's `Debug` shows nothing (SR-43).

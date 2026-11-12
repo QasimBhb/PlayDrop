@@ -15,6 +15,14 @@
 ;   - a firewall rule scoped to playdropd.exe for TCP and UDP 42187 (SR-31),
 ;     never a bare port rule
 ;   - stops the daemon before upgrading or uninstalling, and removes the rule
+;   - /RELAUNCH=1 or /RELAUNCH=daemon on the command line (the daemon's update
+;     check passes one of them to the new installer): after the install, start
+;     again as the signed-in user what the update stopped, even though the
+;     install is silent. /RELAUNCH=1 starts the daemon and then the window,
+;     /RELAUNCH=daemon the daemon only (no window was open). Any other value, or
+;     none, changes nothing: a silent install starts nothing. If such an
+;     install fails or is cancelled after the old daemon was stopped, the same
+;     programs are started again from the files still installed.
 ;
 ; Keys and pins in %LOCALAPPDATA%\PlayDrop (SR-28) are left alone on uninstall.
 
@@ -105,8 +113,13 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""{#RuleName}"" dir=in action=allow program=""{app}\{#DaemonExe}"" protocol=UDP localport={#Port}"; Flags: runhidden waituntilterminated; StatusMsg: "Configuring Windows Firewall..."
 ; Start the daemon as the signed-in user (not the elevated installer), then
 ; offer to open the window.
-Filename: "{app}\{#DaemonExe}"; Flags: nowait runasoriginaluser skipifsilent; Tasks: autostart
-Filename: "{app}\{#WindowExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall runasoriginaluser skipifsilent
+Filename: "{app}\{#DaemonExe}"; Flags: nowait runasoriginaluser skipifsilent; Tasks: autostart; Check: not IsRelaunch
+Filename: "{app}\{#WindowExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall runasoriginaluser skipifsilent; Check: not IsRelaunch
+; /RELAUNCH=1 or /RELAUNCH=daemon (an update the daemon started): bring back
+; what the update stopped, silent or not, whatever the autostart task says.
+; The daemon first; the window keeps looking for it until its pipe is up.
+Filename: "{app}\{#DaemonExe}"; Flags: nowait runasoriginaluser; Check: IsRelaunch
+Filename: "{app}\{#WindowExe}"; Flags: nowait runasoriginaluser; Check: RelaunchWindow
 
 [UninstallRun]
 ; Stop the window and the daemon so their files can be removed.
@@ -115,22 +128,91 @@ Filename: "{sys}\taskkill.exe"; Parameters: "/F /T /IM {#DaemonExe}"; Flags: run
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""{#RuleName}"""; Flags: runhidden waituntilterminated; RunOnceId: "DeleteFirewallRule"
 
 [Code]
+var
+  { Set once PrepareToInstall has stopped the running programs: from then on
+    nothing runs unless this Setup starts it again. }
+  StoppedRunning: Boolean;
+  { Set when the installation itself has finished. }
+  InstallDone: Boolean;
+  { Full paths, captured while the install folder is known, for
+    DeinitializeSetup. }
+  DaemonPath: String;
+  WindowPath: String;
+
+{ The /RELAUNCH value, lower case; '0' when absent. }
+function RelaunchValue: String;
+begin
+  Result := Lowercase(ExpandConstant('{param:RELAUNCH|0}'));
+end;
+
+{ True for /RELAUNCH=1 (daemon and window) and /RELAUNCH=daemon (daemon only). }
+function IsRelaunch: Boolean;
+begin
+  Result := (RelaunchValue = '1') or (RelaunchValue = 'daemon');
+end;
+
+{ True for /RELAUNCH=1 only: the window was open when the update started. }
+function RelaunchWindow: Boolean;
+begin
+  Result := RelaunchValue = '1';
+end;
+
 { Stop a running daemon and window before files are replaced on upgrade.
   taskkill exits non-zero when nothing is running; that is fine. Transfers in
-  flight resume after the new daemon starts, so a hard stop loses nothing. }
+  flight resume after the new daemon starts, so a hard stop loses nothing.
+  No /T (whole process tree): an update runs this installer as a child of the
+  daemon, and /T on the daemon would end Setup itself. }
 procedure StopProcess(const ExeName: String);
 var
   ResultCode: Integer;
 begin
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM ' + ExeName, '',
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM ' + ExeName, '',
        SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  DaemonPath := ExpandConstant('{app}\{#DaemonExe}');
+  WindowPath := ExpandConstant('{app}\{#WindowExe}');
   StopProcess('{#WindowExe}');
   StopProcess('{#DaemonExe}');
+  StoppedRunning := True;
   Result := '';
+end;
+
+{ Starts one program as the signed-in user without waiting. A program that is
+  missing or does not start is logged, never an error: Setup is ending. }
+procedure StartAsOriginalUser(const Path: String);
+var
+  ResultCode: Integer;
+begin
+  if not FileExists(Path) then
+  begin
+    Log('not restarting ' + Path + ': the file is missing');
+    exit;
+  end;
+  if not ExecAsOriginalUser(Path, '', ExtractFileDir(Path), SW_SHOWNORMAL,
+                            ewNoWait, ResultCode) then
+    Log('could not restart ' + Path + ': ' + SysErrorMessage(ResultCode));
+end;
+
+{ An update (/RELAUNCH) that failed or was cancelled after PrepareToInstall
+  stopped the daemon would otherwise leave the user with nothing running and
+  no sign of why. Start what the update would have started, from the files
+  that are installed now (the old ones, or the new ones as far as they got). }
+procedure DeinitializeSetup;
+begin
+  if IsRelaunch and StoppedRunning and not InstallDone then
+  begin
+    Log('the update did not finish; starting the installed PlayDrop again');
+    try
+      StartAsOriginalUser(DaemonPath);
+      if RelaunchWindow then
+        StartAsOriginalUser(WindowPath);
+    except
+      Log('restarting PlayDrop failed: ' + GetExceptionMessage);
+    end;
+  end;
 end;
 
 { The system PATH. Setup runs as admin, so the machine-wide value is the one
@@ -205,6 +287,7 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
   begin
+    InstallDone := True;
     if WizardIsTaskSelected('addtopath') then
       AddToSystemPath(ExpandConstant('{app}\bin'))
     else

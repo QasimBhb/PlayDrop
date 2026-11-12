@@ -2,12 +2,47 @@
 //! with FFI-friendly fields. Secrets (SAS, clipboard contents) arrive as plain values; the
 //! foreign side must show them and never log them (SR-32).
 
-use playdrop_core::host::HostEvent as CoreEvent;
+use playdrop_core::host::{HostEvent as CoreEvent, InputEndReason as CoreEndReason};
 
 use crate::types::{
     DeliveredFile, DiscoveryPath, FileRoot, InputEvent, MediaAction, MediaState,
-    MirroredNotification, OfferedFile, PairingPrompt, TransferDirection,
+    MirroredNotification, OfferedFile, PairingPrompt, TransferDirection, TransferFailure,
 };
+
+/// Why an input session we control ended or never started (protocol.md 5.12; ffi 0.6.0).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum InputEndReason {
+    /// The device has remote input turned off for us (its `input` grant). Also what a
+    /// device from 0.10.0 or older reports this way.
+    GrantOff,
+    /// The device is locked.
+    Locked,
+    /// The device does not accept remote input at all (no `input.*` capability: no input
+    /// backend, or the feature is hidden there).
+    NotAccepted,
+    /// The device's user ended it (Stop, the kill switch).
+    StoppedByUser,
+    /// No input for 10 minutes.
+    IdleTimeout,
+    /// The connection to the device ended, or there was none.
+    ConnectionLost,
+    /// Anything else, such as an older device with an unknown message.
+    Other,
+}
+
+impl From<CoreEndReason> for InputEndReason {
+    fn from(r: CoreEndReason) -> Self {
+        match r {
+            CoreEndReason::GrantOff => Self::GrantOff,
+            CoreEndReason::Locked => Self::Locked,
+            CoreEndReason::NotAccepted => Self::NotAccepted,
+            CoreEndReason::StoppedByUser => Self::StoppedByUser,
+            CoreEndReason::IdleTimeout => Self::IdleTimeout,
+            CoreEndReason::ConnectionLost => Self::ConnectionLost,
+            CoreEndReason::Other => Self::Other,
+        }
+    }
+}
 
 /// Everything the host tells the app. Peers are hex Device IDs.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
@@ -148,8 +183,24 @@ pub enum HostEvent {
         peer: String,
         /// Our side.
         direction: TransferDirection,
-        /// Reason for the user (SR-22 wording).
+        /// Reason for the user, a plain sentence that reads after "Sending to <device>
+        /// failed: " on the send side.
         reason: String,
+        /// Why, for the UI to act on (ffi 0.6.0).
+        code: TransferFailure,
+    },
+    /// This device refused a transfer from `peer` because it would cross the free-space
+    /// reserve (the larger of 2 GiB and 5% of the volume): at most one per peer per minute
+    /// (ffi 0.6.0). Show "Refused a file from <label>: not enough free space".
+    ReceiveRefusedNoSpace {
+        /// Hex Device ID.
+        peer: String,
+        /// Bytes the transfer needs.
+        offered_bytes: u64,
+        /// Bytes free when it was refused.
+        free_bytes: u64,
+        /// Bytes kept free.
+        reserve_bytes: u64,
     },
     /// Clipboard text from a peer that passed the `clipboardIn` grant. Never log it.
     Clipboard {
@@ -280,13 +331,18 @@ pub enum HostEvent {
         /// The peer's message, if any.
         message: Option<String>,
     },
-    /// The device we were controlling ended our input session (it locked, saw no input
-    /// for 10 minutes, or its user hit Stop). Leave the input screen and show `reason`.
+    /// An input session we control ended, or its start was refused (protocol.md 5.12):
+    /// exactly one per `Session { start: true }` that went out or failed, unless we sent
+    /// `start: false` first. Leave the input screen and say why from `code`; `reason` is the
+    /// device's own English text (or ours when the end was seen here). `code` is new in ffi
+    /// 0.6.0.
     InputSessionEnded {
         /// Hex Device ID.
         peer: String,
-        /// Why, in the device's words.
+        /// Why, in words.
         reason: String,
+        /// Why, for the UI to act on.
+        code: InputEndReason,
     },
     /// A frame this build parses but does not act on. Unused since Phase 5.
     Unsupported {
@@ -433,11 +489,13 @@ impl From<CoreEvent> for HostEvent {
                 peer,
                 direction,
                 reason,
+                code,
             } => Self::TransferFailed {
                 id,
                 peer,
                 direction: direction.into(),
                 reason,
+                code: code.into(),
             },
             CoreEvent::Clipboard {
                 peer,
@@ -524,9 +582,22 @@ impl From<CoreEvent> for HostEvent {
                 code,
                 message,
             },
-            CoreEvent::InputSessionEnded { peer, reason } => {
-                Self::InputSessionEnded { peer, reason }
-            }
+            CoreEvent::ReceiveRefusedNoSpace {
+                peer,
+                offered_bytes,
+                free_bytes,
+                reserve_bytes,
+            } => Self::ReceiveRefusedNoSpace {
+                peer,
+                offered_bytes,
+                free_bytes,
+                reserve_bytes,
+            },
+            CoreEvent::InputSessionEnded { peer, reason, code } => Self::InputSessionEnded {
+                peer,
+                reason,
+                code: code.into(),
+            },
             CoreEvent::DiscoveryDiagnostic {
                 peer,
                 short_id,
@@ -541,6 +612,76 @@ impl From<CoreEvent> for HostEvent {
             other => Self::Unknown {
                 description: format!("{other:?}"),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The failure code and the no-space refusal cross the FFI (ffi 0.6.0).
+    #[test]
+    fn transfer_failure_and_no_space_refusal_cross() {
+        let ev = HostEvent::from(CoreEvent::TransferFailed {
+            id: "t1".into(),
+            peer: "ab".repeat(32),
+            direction: playdrop_core::host::TransferDirection::Send,
+            reason: "the receiving device does not have enough free space".into(),
+            code: playdrop_core::host::TransferFailure::NoSpace,
+        });
+        assert!(matches!(
+            ev,
+            HostEvent::TransferFailed {
+                code: TransferFailure::NoSpace,
+                ..
+            }
+        ));
+        let ev = HostEvent::from(CoreEvent::ReceiveRefusedNoSpace {
+            peer: "ab".repeat(32),
+            offered_bytes: 3,
+            free_bytes: 2,
+            reserve_bytes: 1,
+        });
+        assert_eq!(
+            ev,
+            HostEvent::ReceiveRefusedNoSpace {
+                peer: "ab".repeat(32),
+                offered_bytes: 3,
+                free_bytes: 2,
+                reserve_bytes: 1,
+            }
+        );
+    }
+
+    /// The end reason crosses the FFI next to the text (ffi 0.6.0).
+    #[test]
+    fn input_session_ended_carries_its_reason() {
+        let ev = HostEvent::from(CoreEvent::InputSessionEnded {
+            peer: "ab".repeat(32),
+            reason: "the desktop is locked".into(),
+            code: CoreEndReason::Locked,
+        });
+        assert_eq!(
+            ev,
+            HostEvent::InputSessionEnded {
+                peer: "ab".repeat(32),
+                reason: "the desktop is locked".into(),
+                code: InputEndReason::Locked,
+            }
+        );
+        for (core, ffi) in [
+            (CoreEndReason::GrantOff, InputEndReason::GrantOff),
+            (CoreEndReason::NotAccepted, InputEndReason::NotAccepted),
+            (CoreEndReason::StoppedByUser, InputEndReason::StoppedByUser),
+            (CoreEndReason::IdleTimeout, InputEndReason::IdleTimeout),
+            (
+                CoreEndReason::ConnectionLost,
+                InputEndReason::ConnectionLost,
+            ),
+            (CoreEndReason::Other, InputEndReason::Other),
+        ] {
+            assert_eq!(InputEndReason::from(core), ffi);
         }
     }
 }

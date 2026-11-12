@@ -29,6 +29,19 @@ object Settings {
          * `notificationsOut` grant (SR-41, third lock). Empty until the user picks apps.
          */
         val mirrorApps: Set<String> = emptySet(),
+        /**
+         * Ask GitHub for a newer release when the app opens, at most once a day
+         * (`docs/design/update-check.md`, SR-45). On until the user turns it off.
+         */
+        val updateCheck: Boolean = true,
+        /** When an update check last got an answer, Unix milliseconds; null before the first. */
+        val updateLastAnswerMs: Long? = null,
+        /** When an update check last failed (no network, refused answer), Unix milliseconds. */
+        val updateLastFailureMs: Long? = null,
+        /** The version the user answered "Later" for, or null. */
+        val updateLaterVersion: String? = null,
+        /** When the user answered "Later", Unix milliseconds, or null. */
+        val updateLaterAtMs: Long? = null,
     )
 
     /** Trackpad speed used until the user picks one. */

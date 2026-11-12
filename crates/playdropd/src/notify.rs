@@ -14,6 +14,8 @@
 //!   passes. Windows shows one reminder toast with the system sound; it cannot tell a
 //!   dismissal apart, so it ends on stop or the limit only.
 //! - `RemovedByPeer`: "<label> no longer has you paired".
+//! - `ReceiveRefusedNoSpace`: "Not enough free space", naming the peer, the size, the free
+//!   space and the reserve (SR-20; the core reports at most one a minute per peer).
 //! - Clipboard content is never shown in a notification, sensitive or not (SR-24); the
 //!   daemon only reports a clip it could not apply, without its text.
 //! - Notifications a phone mirrors (protocol.md 5.16): "<app> - <label>" with the title and
@@ -37,7 +39,7 @@ use tokio::time::Instant;
 pub mod mirror;
 mod toast;
 
-use mirror::{Cmd, Dismiss, DismissSlot, MirrorUi};
+use mirror::{Cmd, ContentKey, Dismiss, DismissSlot, MirrorUi};
 
 /// Most notifications at once that wait for an action click, each on a blocking thread.
 /// Beyond this, received-file notifications are shown without buttons rather than tying up
@@ -174,6 +176,44 @@ pub enum Render {
     FindStop(String, Note),
 }
 
+/// A byte count with a binary unit and one decimal above bytes, worded as the command
+/// line's `size` does so both say the same number for the same drive.
+// Display only: precision lost converting u64 to f64 is far below the one decimal shown.
+#[allow(clippy::cast_precision_loss)]
+fn size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let b = bytes as f64;
+    if b >= GIB {
+        format!("{:.1} GiB", b / GIB)
+    } else if b >= MIB {
+        format!("{:.1} MiB", b / MIB)
+    } else if b >= KIB {
+        format!("{:.1} KiB", b / KIB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// "Not enough free space" for a transfer from `label` this host refused (SR-20).
+fn no_space_note(label: &str, offered: u64, free: u64, reserve: u64) -> Note {
+    // Both zero: the core could not measure the drive, so there are no numbers worth
+    // showing.
+    let body = if free == 0 && reserve == 0 {
+        format!("Refused a file from {label}: it needs {}.", size(offered))
+    } else {
+        format!(
+            "Refused a file from {label}: it needs {} and {} is free. \
+             PlayDrop keeps {} free on this drive.",
+            size(offered),
+            size(free),
+            size(reserve)
+        )
+    };
+    Note::plain("Not enough free space".to_owned(), body)
+}
+
 /// True for the events [`render`] turns into a notification.
 pub fn notifies(ev: &HostEvent) -> bool {
     matches!(
@@ -187,6 +227,7 @@ pub fn notifies(ev: &HostEvent) -> bool {
             | HostEvent::Ping { .. }
             | HostEvent::Find { .. }
             | HostEvent::RemovedByPeer { .. }
+            | HostEvent::ReceiveRefusedNoSpace { .. }
     )
 }
 
@@ -269,6 +310,17 @@ pub fn render(ev: &HostEvent, label: &str) -> Option<Render> {
             format!("{label} no longer has you paired"),
             "Pair again from the PlayDrop window to reconnect.".to_owned(),
         )),
+        HostEvent::ReceiveRefusedNoSpace {
+            offered_bytes,
+            free_bytes,
+            reserve_bytes,
+            ..
+        } => Render::Show(no_space_note(
+            label,
+            *offered_bytes,
+            *free_bytes,
+            *reserve_bytes,
+        )),
         _ => return None,
     };
     Some(r)
@@ -289,6 +341,8 @@ pub struct Notifier {
     mirror: OnceLock<mpsc::UnboundedSender<Cmd>>,
     /// Sends `dismiss` back to the phone; set by the daemon.
     mirror_dismiss: DismissSlot,
+    /// Keys the content fingerprints that match a copy over a reconnect (memory only).
+    mirror_content: ContentKey,
 }
 
 impl std::fmt::Debug for Notifier {
@@ -311,6 +365,7 @@ impl Notifier {
             waiters: Arc::new(Semaphore::new(MAX_ACTION_WAITERS)),
             mirror: OnceLock::new(),
             mirror_dismiss: Arc::new(Mutex::new(None)),
+            mirror_content: ContentKey::random(),
         })
     }
 
@@ -344,6 +399,7 @@ impl Notifier {
             peer: peer.to_owned(),
             note,
             key: n.key.clone(),
+            content: self.mirror_content.fingerprint(n),
         });
     }
 
@@ -357,7 +413,26 @@ impl Notifier {
         }
     }
 
-    /// Closes every mirrored copy of `peer` (SR-42).
+    /// `peer` went offline: its mirrored copies stay for a grace period, since the phone
+    /// sends its current notifications again when it returns (`mirror` module docs).
+    fn mirror_peer_offline(&self, peer: &str) {
+        if self.mirror.get().is_some() {
+            self.mirror_send(Cmd::PeerOffline {
+                peer: peer.to_owned(),
+            });
+        }
+    }
+
+    /// `peer` came online: copies kept over its absence wait to be sent again.
+    fn mirror_peer_online(&self, peer: &str) {
+        if self.mirror.get().is_some() {
+            self.mirror_send(Cmd::PeerOnline {
+                peer: peer.to_owned(),
+            });
+        }
+    }
+
+    /// Closes every mirrored copy of `peer` at once (SR-42: unpair, grant off).
     pub fn mirror_close_peer(&self, peer: &str) {
         if self.mirror.get().is_some() {
             self.mirror_send(Cmd::ClosePeer {
@@ -415,6 +490,12 @@ impl Notifier {
     /// is called only when a notification is shown, so frequent events (progress) cost
     /// nothing.
     pub fn host_event(&self, ev: &HostEvent, label: impl FnOnce() -> String) {
+        // Whatever the setting: copies already shown follow the peer's link (SR-42).
+        match ev {
+            HostEvent::PeerOffline { peer, .. } => self.mirror_peer_offline(peer),
+            HostEvent::PeerOnline { peer, .. } => self.mirror_peer_online(peer),
+            _ => {}
+        }
         // A stop always ends a running ring, even if notifications were turned off since.
         let stop = matches!(ev, HostEvent::Find { start: false, .. });
         if !notifies(ev) || !(self.enabled() || stop) {
@@ -560,6 +641,10 @@ impl MirrorUi for PlatformMirror {
     fn watch_closed(&self, tx: mpsc::UnboundedSender<Cmd>) {
         platform::watch_closed(tx);
     }
+
+    fn closes(&self) -> bool {
+        platform::MIRROR_CLOSES
+    }
 }
 
 /// Shows `note` and shows it again every `timing.repeat` (where the platform replays the
@@ -609,6 +694,9 @@ mod platform {
 
     /// Showing the notification again with the same ID replays its sound.
     pub(super) const RING_REPEATS: bool = true;
+
+    /// A mirrored copy can be closed by ID later (`CloseNotification`).
+    pub(super) const MIRROR_CLOSES: bool = true;
 
     const APP_NAME: &str = "PlayDrop";
 
@@ -833,6 +921,9 @@ mod platform {
     /// One toast with the system reminder sound is the whole ring on Windows.
     pub(super) const RING_REPEATS: bool = false;
 
+    /// Toasts are not closed by ID yet (the SR-42 exception).
+    pub(super) const MIRROR_CLOSES: bool = false;
+
     fn notifier() -> windows::core::Result<ToastNotifier> {
         ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))
     }
@@ -992,6 +1083,9 @@ mod platform {
     use super::Note;
 
     pub(super) const RING_REPEATS: bool = false;
+
+    /// Nothing is shown, so nothing is closed.
+    pub(super) const MIRROR_CLOSES: bool = false;
 
     pub(super) async fn closed(_id: Option<u32>) {
         std::future::pending::<()>().await;
@@ -1197,6 +1291,35 @@ mod tests {
         assert_eq!(rings, 19);
         assert_eq!(end - t0, RING_LIMIT);
         assert_eq!(last - t0, Duration::from_secs(57));
+    }
+
+    #[test]
+    fn no_space_names_the_sizes_and_the_reserve() {
+        let ev = |free_bytes, reserve_bytes| HostEvent::ReceiveRefusedNoSpace {
+            peer: "ab".into(),
+            offered_bytes: 3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024,
+            free_bytes,
+            reserve_bytes,
+        };
+        assert!(notifies(&ev(0, 0)));
+        let Some(Render::Show(note)) = render(&ev(2_254_857_830, 2 << 30), "Phone") else {
+            panic!("no space should notify");
+        };
+        assert_eq!(note.summary, "Not enough free space");
+        assert_eq!(
+            note.body,
+            "Refused a file from Phone: it needs 3.5 GiB and 2.1 GiB is free. \
+             PlayDrop keeps 2.0 GiB free on this drive."
+        );
+        assert_eq!(note.actions, Vec::new());
+        // The drive could not be measured: no made-up numbers.
+        let Some(Render::Show(note)) = render(&ev(0, 0), "Phone") else {
+            panic!("no space should notify");
+        };
+        assert_eq!(note.body, "Refused a file from Phone: it needs 3.5 GiB.");
+        assert_eq!(size(512), "512 B");
+        assert_eq!(size(1536), "1.5 KiB");
+        assert_eq!(size(5 * 1024 * 1024), "5.0 MiB");
     }
 
     #[test]

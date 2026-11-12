@@ -1,4 +1,5 @@
 import Foundation
+import PlayDropShared
 
 // Strings of the remote input screen and the "Now playing" rows. See `L10n.swift` for the
 // scheme; keys follow the Android `strings_ui.xml` naming.
@@ -12,17 +13,50 @@ extension L10n {
         static var unsupported: String {
             String(localized: "ui_input_unsupported", defaultValue: "This device cannot be controlled remotely")
         }
-        /// Shown when the computer refuses input from this phone.
-        static func refused(_ label: String) -> String {
-            String(
-                localized: "ui_input_refused",
-                defaultValue: "Allow remote input for this phone on \(label) first"
-            )
+        /// Why the session is over, as a sentence that stays until the user goes back. `label` is
+        /// the computer's name. The first two tell what to do on the computer, as the user
+        /// reported the screen closing with no reason.
+        static func endNotice(_ notice: InputEndNotice, label: String) -> String {
+            switch notice {
+            case .grantOff:
+                return String(
+                    localized: "ui_input_end_grant_off",
+                    defaultValue: "Remote control is turned off for this iPhone on \(label). Turn it on for this iPhone in PlayDrop on \(label)."
+                )
+            case .locked:
+                return String(
+                    localized: "ui_input_end_locked",
+                    defaultValue: "\(label) is locked. Unlock it and try again."
+                )
+            case .notAccepted:
+                return String(
+                    localized: "ui_input_end_not_accepted",
+                    defaultValue: "\(label) cannot be controlled from this iPhone. It does not accept remote input."
+                )
+            case .stoppedByUser:
+                return String(
+                    localized: "ui_input_end_stopped",
+                    defaultValue: "Remote input was stopped on \(label). Open this screen again to start it."
+                )
+            case .idleTimeout:
+                return String(
+                    localized: "ui_input_end_idle",
+                    defaultValue: "Remote input ended after 10 minutes without use. Open this screen again to start it."
+                )
+            case .other(let reason?):
+                return String(
+                    localized: "ui_input_end_other_reason",
+                    defaultValue: "\(label) ended remote input: \(reason)"
+                )
+            case .other(nil):
+                return String(
+                    localized: "ui_input_end_other",
+                    defaultValue: "\(label) ended remote input. Open this screen again to try again."
+                )
+            }
         }
-        /// Shown when the computer ended the session itself; `reason` is its own words.
-        static func ended(_ label: String, reason: String) -> String {
-            String(localized: "ui_input_ended", defaultValue: "\(label) ended remote input: \(reason)")
-        }
+        /// "Remote input ended".
+        static var endedTitle: String { String(localized: "ui_input_ended_title", defaultValue: "Remote input ended") }
         /// Shown while the session is not open (connecting, or the device went offline).
         static var connecting: String {
             String(localized: "ui_input_connecting", defaultValue: "Connecting to the device...")

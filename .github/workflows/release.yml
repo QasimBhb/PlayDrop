@@ -21,6 +21,8 @@
 #   playdrop-<ver>-windows-x64-setup.exe       Inno Setup installer, not code signed
 #   playdrop-<ver>-ios-unsigned.ipa            for SideStore or AltStore, which re-sign it
 #   SHA256SUMS                                 sha256sum of every file above
+#   SHA256SUMS.sig                             Ed25519 signature over SHA256SUMS, base64; the
+#                                              update check inside PlayDrop trusts only this
 #
 # The APK name contains "android" and ends in .apk, and it is the only APK in the release,
 # so Obtainium picks it without an asset filter.
@@ -29,6 +31,10 @@
 #   PLAYDROP_KEYSTORE_BASE64   the release keystore (.jks), base64 encoded
 #   PLAYDROP_KEYSTORE_PASSWORD, PLAYDROP_KEY_ALIAS, PLAYDROP_KEY_PASSWORD
 # The android job fails when any of them is missing rather than ship a debug-signed APK.
+#   PLAYDROP_UPDATE_SIGNING_KEY  the Ed25519 private key (PEM) that signs SHA256SUMS; its
+#                                public half is docs/release/playdrop-update.pub and is pinned
+#                                in crates/playdrop-core/src/update.rs
+# The release job fails when it is missing rather than publish a release no install would trust.
 
 name: Release
 
@@ -480,9 +486,12 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+    # This job holds the update-signing key, so its three actions are pinned to exact commits
+    # (a moved tag could otherwise run new code next to the key) and the checkout keeps no
+    # token on disk.
     steps:
       - name: Download every asset
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: dist
           merge-multiple: true
@@ -495,8 +504,42 @@ jobs:
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
 
+      - name: Fetch the public half of the update-signing key
+        # Only this one file is needed from the repository: the signature made below is
+        # checked against it before anything is published.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          path: repo
+          sparse-checkout: docs/release/playdrop-update.pub
+          sparse-checkout-cone-mode: false
+
+      - name: Sign SHA256SUMS
+        # The update check inside PlayDrop trusts a release only through this signature
+        # (docs/design/update-check.md): Ed25519 over the exact bytes of SHA256SUMS, base64
+        # on one line. A release without it would never be offered to anyone, so a missing
+        # secret or a signature that does not verify stops the run before publishing.
+        working-directory: dist
+        env:
+          PLAYDROP_UPDATE_SIGNING_KEY: ${{ secrets.PLAYDROP_UPDATE_SIGNING_KEY }}
+        run: |
+          if [ -z "$PLAYDROP_UPDATE_SIGNING_KEY" ]; then
+            echo "::error::the PLAYDROP_UPDATE_SIGNING_KEY secret is missing; SHA256SUMS cannot be signed"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/update-signing-key.pem"
+          ( umask 077; printf '%s\n' "$PLAYDROP_UPDATE_SIGNING_KEY" > "$key" )
+          trap 'rm -f "$key"' EXIT
+          openssl pkeyutl -sign -inkey "$key" -rawin -in SHA256SUMS | base64 -w0 > SHA256SUMS.sig
+          echo >> SHA256SUMS.sig
+          base64 -d SHA256SUMS.sig > "$RUNNER_TEMP/SHA256SUMS.sig.bin"
+          test "$(wc -c < "$RUNNER_TEMP/SHA256SUMS.sig.bin")" -eq 64
+          openssl pkeyutl -verify -pubin -inkey ../repo/docs/release/playdrop-update.pub \
+            -rawin -in SHA256SUMS -sigfile "$RUNNER_TEMP/SHA256SUMS.sig.bin"
+          cat SHA256SUMS.sig
+
       - name: Create the release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: ${{ github.ref_name }}
           name: PlayDrop ${{ needs.version.outputs.version }}

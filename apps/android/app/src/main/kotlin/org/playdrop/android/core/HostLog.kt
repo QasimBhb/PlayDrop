@@ -26,6 +26,19 @@ internal object HostLog {
      * the exception is included because core and platform errors carry no secrets.
      */
     fun w(area: String, message: String, error: Throwable? = null) {
+        logW(area, message, error)
+    }
+
+    /**
+     * Warning with the exception class only, for errors whose text can name a shared file
+     * ("Cannot read <name>"): file names stay at debug level (SR-32), where the text goes.
+     */
+    fun wNoDetail(area: String, message: String, error: Throwable) {
+        Log.w(TAG, "[$area] $message: ${error.javaClass.simpleName}")
+        Log.d(TAG, "[$area] $message: ${error.message}")
+    }
+
+    private fun logW(area: String, message: String, error: Throwable?) {
         if (error == null) {
             Log.w(TAG, "[$area] $message")
         } else {

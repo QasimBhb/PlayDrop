@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Device page: send actions -->
+    <string name="ui_device_send_files">Send files</string>
+    <string name="ui_device_send_media">Send photos and videos</string>
+    <string name="ui_device_send_clipboard">Send clipboard</string>
+    <plurals name="ui_send_started">
+        <item quantity="one">Sending %1$d file to %2$s</item>
+        <item quantity="other">Sending %1$d files to %2$s</item>
+    </plurals>
+    <string name="ui_send_offline">%1$s is offline. PlayDrop keeps trying for 10 minutes.</string>
+    <string name="ui_send_progress">See progress</string>
+    <string name="ui_send_dismiss">Dismiss</string>
+    <string name="ui_send_clip_no_images">%1$s cannot take copied images. Update PlayDrop on it to send images.</string>
+    <string name="ui_send_clip_needs_grant">Turn on \"Receive this phone\'s clipboard\" under Permissions first.</string>
+    <string name="ui_send_removed">Pair again to send anything to this device.</string>
+
+    <!-- Device page: permissions row and page -->
+    <string name="ui_permissions_title">Permissions</string>
+    <string name="ui_permissions_none">Nothing allowed</string>
+    <string name="ui_permissions_some">%1$d of %2$d allowed</string>
+</resources>

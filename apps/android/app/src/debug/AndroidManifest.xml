@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug build type only: lets the update check reach a stand-in server on loopback over
+     plain HTTP (res/xml/network_security_config_debug.xml). The release manifest has no
+     network security config and no cleartext anywhere. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:networkSecurityConfig="@xml/network_security_config_debug" />
+</manifest>

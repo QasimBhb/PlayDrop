@@ -25,4 +25,14 @@ class MirrorAppsTest {
         assertEquals(setOf("a", "b"), MirrorApps.toggled(setOf("a"), "b", true))
         assertEquals(setOf("a"), MirrorApps.toggled(setOf("a", "b"), "b", false))
     }
+
+    @Test
+    fun appsTheQueryMissedAreReportedNotDropped() {
+        val allowed = setOf("chat", "gone", "archived")
+        // "chat" is listed; the other two are reported for the person to remove, sorted.
+        assertEquals(listOf("archived", "gone"), MirrorApps.notFound(allowed, setOf("chat", "maps")))
+        assertEquals(emptyList<String>(), MirrorApps.notFound(setOf("chat"), setOf("chat")))
+        // A failed query (nothing listed) reports nothing.
+        assertEquals(emptyList<String>(), MirrorApps.notFound(allowed, emptySet()))
+    }
 }

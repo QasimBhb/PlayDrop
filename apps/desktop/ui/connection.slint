@@ -3,7 +3,7 @@
 import { Button, Spinner, Palette } from "std-widgets.slint";
 import { ConnPhase } from "types.slint";
 import { ConnState } from "globals.slint";
-import { Label, Heading } from "widgets.slint";
+import { Heading } from "widgets.slint";
 
 export component ConnectionScreen inherits Rectangle {
     VerticalLayout {
@@ -16,9 +16,15 @@ export component ConnectionScreen inherits Rectangle {
             horizontal-alignment: center;
         }
 
-        if ConnState.message != "": Label {
+        // Selectable, so the path of a log file in the reason can be copied.
+        if ConnState.message != "": TextInput {
             text: ConnState.message;
+            read-only: true;
+            wrap: word-wrap;
             horizontal-alignment: center;
+            color: Palette.foreground;
+            selection-background-color: Palette.selection-background;
+            selection-foreground-color: Palette.selection-foreground;
         }
 
         if ConnState.phase == ConnPhase.connecting || ConnState.starting: HorizontalLayout {

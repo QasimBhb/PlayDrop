@@ -152,12 +152,17 @@ final class LocalNotifications {
                 body: String(localized: "From \(label(peer)), saved in Files > PlayDrop")
             )
 
-        case let .transferFailed(id, peer, direction, reason):
+        case let .transferFailed(id, peer, direction, reason, code):
             removeOffer(id)
             let title = direction == .send
                 ? String(localized: "Sending to \(label(peer)) failed")
                 : String(localized: "Receiving from \(label(peer)) failed")
-            await post(id: "failed.\(id)", title: title, body: reason)
+            // Never the core's raw text: it may still carry an HTTP status or a wire code.
+            await post(
+                id: "failed.\(id)",
+                title: title,
+                body: TransferFailureText.message(failure: code, reason: reason, direction: direction)
+            )
 
         case let .ping(peer, message):
             let text = message?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

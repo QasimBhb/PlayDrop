@@ -2,7 +2,7 @@
 //!
 //! Most commands are clients of the running desktop daemon (`playdropd`), so scripts and
 //! the shell can send files and drive it without the window: `send`, `peers`, `status`,
-//! `transfers`, `clip`, `ping`, `outbox` and `diagnose` (module [`daemon`]). They talk to
+//! `transfers`, `clip`, `ping`, `outbox`, `diagnose` and `update` (module [`daemon`]). They talk to
 //! the daemon through `playdrop-ipc` (D-Bus on Linux, the per-user named pipe on
 //! Windows) and exit 0 on success, 1 when the operation failed, 2 on a usage error or an
 //! unknown peer, 3 when the daemon is not running.
@@ -24,8 +24,8 @@ use clap::{Parser, Subcommand};
 
 /// playdrop: phone-to-computer companion for the local network.
 ///
-/// send, peers, status, transfers, clip, ping, outbox and diagnose talk to the running
-/// daemon (playdropd). host runs a standalone host in the foreground (no daemon needed) and
+/// send, peers, status, transfers, clip, ping, outbox, diagnose and update talk to the
+/// running daemon (playdropd). host runs a standalone host in the foreground (no daemon needed) and
 /// bench measures the transport.
 ///
 /// Exit codes: 0 ok, 1 the operation failed (or was declined or cancelled), 2 usage error
@@ -97,6 +97,19 @@ enum Command {
     /// Covers interfaces, multicast, mDNS, the port probe and each device's last failed
     /// dial. The first lines are the findings, worded for the user.
     Diagnose(daemon::JsonArgs),
+    /// Show whether a newer `PlayDrop` exists, check now, or install it.
+    ///
+    /// Without options it shows what the daemon knows and asks no one. --check asks GitHub
+    /// now (the same anonymous question as "Check now" in Settings; nothing about this
+    /// computer is sent). --install downloads the offered version, checks its signature
+    /// and installs it; the system password prompt appears, and the daemon restarts on the
+    /// new version. Exits 1 when the check or the update failed, or checks are off.
+    ///
+    ///   playdrop update
+    ///   playdrop update --check
+    ///   playdrop update --install
+    #[command(verbatim_doc_comment)]
+    Update(daemon::update::UpdateArgs),
     /// Run a host in the foreground until Ctrl-C or `quit`, printing events as lines.
     ///
     /// Type commands on stdin while it runs:
@@ -215,6 +228,7 @@ async fn main() -> ExitCode {
         Command::Ping(a) => daemon::DaemonCommand::Ping(a),
         Command::Outbox(a) => daemon::DaemonCommand::Outbox(a),
         Command::Diagnose(a) => daemon::DaemonCommand::Diagnose(a),
+        Command::Update(a) => daemon::DaemonCommand::Update(a),
     };
     daemon::run(daemon_command).await
 }
@@ -314,6 +328,23 @@ mod tests {
         };
         assert_eq!(add.to, "iphone");
         assert!(parse(&["outbox", "add", "f"]).is_err(), "--to is required");
+    }
+
+    #[test]
+    fn update_checks_or_installs_but_not_both() {
+        let Ok(Command::Update(a)) = parse(&["update"]) else {
+            panic!("update did not parse");
+        };
+        assert!(!a.check && !a.install && !a.json);
+        let Ok(Command::Update(a)) = parse(&["update", "--check", "--json"]) else {
+            panic!("update --check did not parse");
+        };
+        assert!(a.check && a.json);
+        assert!(matches!(
+            parse(&["update", "--install"]),
+            Ok(Command::Update(_))
+        ));
+        assert!(parse(&["update", "--check", "--install"]).is_err());
     }
 
     #[test]

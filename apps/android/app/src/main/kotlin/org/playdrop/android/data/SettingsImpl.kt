@@ -4,12 +4,14 @@ import android.content.Context
 import android.os.Build
 import android.util.Log
 import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.MutablePreferences
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.emptyPreferences
 import androidx.datastore.preferences.core.floatPreferencesKey
 import androidx.datastore.preferences.core.intPreferencesKey
+import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.core.stringSetPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
@@ -38,6 +40,11 @@ internal object SettingsImpl {
     private val BATTERY_PROMPT_SHOWN = booleanPreferencesKey("battery_prompt_shown")
     private val TRACKPAD_SENSITIVITY = floatPreferencesKey("trackpad_sensitivity")
     private val MIRROR_APPS = stringSetPreferencesKey("mirror_apps")
+    private val UPDATE_CHECK = booleanPreferencesKey("update_check")
+    private val UPDATE_LAST_ANSWER = longPreferencesKey("update_last_answer_ms")
+    private val UPDATE_LAST_FAILURE = longPreferencesKey("update_last_failure_ms")
+    private val UPDATE_LATER_VERSION = stringPreferencesKey("update_later_version")
+    private val UPDATE_LATER_AT = longPreferencesKey("update_later_at_ms")
 
     /** Live settings; a read error logs and falls back to the defaults instead of crashing. */
     fun flow(context: Context): Flow<Settings.Values> =
@@ -69,6 +76,11 @@ internal object SettingsImpl {
             prefs[BATTERY_PROMPT_SHOWN] = after.batteryPromptShown
             prefs[TRACKPAD_SENSITIVITY] = after.trackpadSensitivity
             prefs[MIRROR_APPS] = after.mirrorApps
+            prefs[UPDATE_CHECK] = after.updateCheck
+            prefs.putOrRemove(UPDATE_LAST_ANSWER, after.updateLastAnswerMs)
+            prefs.putOrRemove(UPDATE_LAST_FAILURE, after.updateLastFailureMs)
+            prefs.putOrRemove(UPDATE_LATER_VERSION, after.updateLaterVersion)
+            prefs.putOrRemove(UPDATE_LATER_AT, after.updateLaterAtMs)
         }
     }
 
@@ -86,7 +98,18 @@ internal object SettingsImpl {
             ?: Settings.DEFAULT_TRACKPAD_SENSITIVITY,
         // Nothing is mirrored until the user picks apps (SR-41).
         mirrorApps = prefs[MIRROR_APPS].orEmpty(),
+        // The update check starts on (the user's decision, docs/design/update-check.md 2).
+        updateCheck = prefs[UPDATE_CHECK] ?: true,
+        updateLastAnswerMs = prefs[UPDATE_LAST_ANSWER]?.takeIf { it > 0 },
+        updateLastFailureMs = prefs[UPDATE_LAST_FAILURE]?.takeIf { it > 0 },
+        updateLaterVersion = prefs[UPDATE_LATER_VERSION]?.takeIf { it.isNotBlank() },
+        updateLaterAtMs = prefs[UPDATE_LATER_AT]?.takeIf { it > 0 },
     )
+
+    /** Stores [value], or removes the key for null. */
+    private fun <T> MutablePreferences.putOrRemove(key: Preferences.Key<T>, value: T?) {
+        if (value == null) remove(key) else set(key, value)
+    }
 
     /** The device model, e.g. "SM-A546B"; the core sanitises it further (SR-8). */
     private fun defaultDeviceName(): String = Build.MODEL?.takeIf { it.isNotBlank() } ?: "Android phone"

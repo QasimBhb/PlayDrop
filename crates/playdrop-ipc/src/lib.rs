@@ -37,8 +37,8 @@ pub mod types {
         AddDeviceCandidate, Base64Bytes, DeliveredFile, Diagnostics, DialFailure, DiscoveryPath,
         FileRoot, HostEvent, InterfaceInfo, JoinFailure, MdnsStatus, MediaState,
         MirroredNotification, MulticastStatus, OfferedFile, OutboxItem, PairingPromptKind,
-        PeerBattery, PeerDiagnostic, PeerSummary, Secret, TransferDirection, TransferSnapshot,
-        TransferStatus, OFFER_FILES_MAX, TRANSFER_NAMES_MAX,
+        PeerBattery, PeerDiagnostic, PeerSummary, Secret, TransferDirection, TransferFailure,
+        TransferSnapshot, TransferStatus, OFFER_FILES_MAX, TRANSFER_NAMES_MAX,
     };
     pub use playdrop_core::pin_store::Grants;
     pub use playdrop_core::session::types::{
@@ -328,6 +328,41 @@ pub enum Request {
     },
     /// Ask the daemon to exit cleanly.
     Shutdown,
+    /// A UI opened (`force: false`) or the user pressed "Check now" (`force: true`): ask
+    /// GitHub whether a newer release exists (`docs/design/update-check.md`, SR-45). The
+    /// daemon never checks on its own. Without `force` a check runs at most once per 24 h
+    /// (one hour after a failed one); `force` skips that wait but never the
+    /// `update_check` setting: with the setting off the answer is [`UpdateState::Off`] and no
+    /// request leaves the computer. Answers [`Ok::Update`] once the check is over.
+    UpdateCheck {
+        /// "Check now".
+        #[serde(default)]
+        force: bool,
+    },
+    /// The user pressed "Update": download, verify and install the offered release (SR-47).
+    /// Answers [`Ok::Update`] at once with the download started; progress and the outcome
+    /// arrive as [`DaemonEvent::UpdateChanged`]. `invalid_state` when nothing installable
+    /// is offered (no offer, a Flatpak or another install kind, or one already running).
+    UpdateInstall {
+        /// The request comes from the window, which the Windows installer then starts again
+        /// along with the daemon (`/RELAUNCH=1`); without it only the daemon is started
+        /// again (`/RELAUNCH=daemon`). Ignored on Linux.
+        #[serde(default)]
+        window: bool,
+    },
+    /// The user pressed "Cancel" while the update downloads: stop the download, remove what
+    /// was downloaded and offer the release again. Answers [`Ok::Update`].
+    /// `invalid_state` when no download runs, including once the files were handed to the
+    /// system installer, which cannot be stopped from here.
+    UpdateCancel,
+    /// The user pressed "Later": hide the offer until the next check that runs. Answers
+    /// [`Ok::Update`].
+    UpdateLater,
+    /// The update state as it is now, without contacting anyone. Answers [`Ok::Update`].
+    UpdateState,
+    /// Open the offered release's page in the browser. The daemon opens only the page of
+    /// the release it offers, never a URL a client names. `invalid_state` without an offer.
+    UpdateOpenPage,
 }
 
 impl Request {
@@ -371,6 +406,12 @@ impl Request {
             Self::StopInput => "stop_input",
             Self::MediaCommand { .. } => "media_command",
             Self::Shutdown => "shutdown",
+            Self::UpdateCheck { .. } => "update_check",
+            Self::UpdateInstall { .. } => "update_install",
+            Self::UpdateCancel => "update_cancel",
+            Self::UpdateLater => "update_later",
+            Self::UpdateState => "update_state",
+            Self::UpdateOpenPage => "update_open_page",
         }
     }
 }
@@ -438,6 +479,12 @@ pub struct Settings {
     pub autostart_refused: Option<String>,
     /// Show desktop notifications.
     pub notifications: bool,
+    /// Ask GitHub for the latest version when a UI opens, at most once a day
+    /// (`docs/design/update-check.md`, SR-45). Default on. Missing from an older daemon's
+    /// answer reads as on; such a daemon has no update check at all, so a client also
+    /// treats a `bad_request` answer to [`Request::UpdateCheck`] as "not available".
+    #[serde(default = "default_true")]
+    pub update_check: bool,
 }
 
 fn default_true() -> bool {
@@ -465,6 +512,10 @@ pub struct SettingsPatch {
     /// Notifications on or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notifications: Option<bool>,
+    /// The update check on or off. A patch from an older client has no such field, which
+    /// reads as `None` and leaves the setting as it is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_check: Option<bool>,
 }
 
 /// Daemon identity and state, the answer to [`Request::Status`].
@@ -624,6 +675,130 @@ pub enum Ok {
         /// The host was restarted to apply them.
         restarted: bool,
     },
+    /// [`Request::UpdateCheck`], [`Request::UpdateInstall`], [`Request::UpdateLater`] and
+    /// [`Request::UpdateState`].
+    Update(UpdateStatus),
+}
+
+/// The update check's state (`docs/design/update-check.md`, `docs/ipc.md` 1.9): the answer
+/// to every update request and the payload of [`DaemonEvent::UpdateChanged`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateStatus {
+    /// Where the update stands.
+    pub state: UpdateState,
+    /// When a check last got an answer from GitHub, Unix milliseconds. `None` before the
+    /// first one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked_ms: Option<u64>,
+    /// When the last check failed, Unix milliseconds, while that failure is newer than the
+    /// last answer; `None` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failed_ms: Option<u64>,
+    /// Why that check failed, one plain sentence, while the daemon still knows it (it is
+    /// not kept across a restart). A failed check leaves an offer that verified earlier on
+    /// screen, so this is where Settings reads the failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_failure: Option<String>,
+    /// The version the daemon runs, exactly as built (a pre-release keeps its suffix).
+    pub running_version: String,
+    /// Set when this build has no update check at all, with one plain sentence for Settings
+    /// ("This is not a release build, so it does not check for updates."): the running
+    /// version is not a plain release, so no request is ever made and nothing offered.
+    /// The state then stays `idle` (or `off` with the setting off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<String>,
+}
+
+/// Where an update stands. Tagged on `phase`. A phase added by a newer daemon reads as
+/// [`UpdateState::Other`], so an answer that carries one still decodes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "phase", rename_all = "snake_case")]
+pub enum UpdateState {
+    /// The `update_check` setting is off: nothing is asked and nothing is offered.
+    Off,
+    /// No check has run in this daemon's life, or the offer was put off with "Later".
+    Idle,
+    /// Asking GitHub now.
+    Checking,
+    /// The last check found no newer release.
+    UpToDate,
+    /// A newer, signed release exists.
+    Available {
+        /// The release.
+        offer: UpdateOffer,
+    },
+    /// Downloading the release files.
+    Downloading {
+        /// Version being downloaded.
+        version: String,
+        /// Bytes so far, all files together.
+        done: u64,
+        /// Bytes in all, from the server's lengths; 0 while unknown.
+        total: u64,
+    },
+    /// Comparing the download with its signed checksum.
+    Verifying {
+        /// Version being verified.
+        version: String,
+    },
+    /// The system's own prompt (polkit, UAC) and the package install. On Windows this is
+    /// the last state: the installer stops the daemon and starts the new one.
+    Installing {
+        /// Version being installed.
+        version: String,
+    },
+    /// Installed; the daemon is starting its new version. A window that is still the old
+    /// program says so (`docs/ipc.md` 1.9).
+    Restarting {
+        /// Version now installed.
+        version: String,
+    },
+    /// The last step failed; the old version keeps running and nothing downloaded is kept.
+    Failed {
+        /// Which step.
+        stage: UpdateStage,
+        /// What happened, one plain sentence for the user.
+        message: String,
+        /// The offer, still valid, when a download or install failed: the UI may offer
+        /// "Update" again.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        offer: Option<UpdateOffer>,
+    },
+    /// A phase this build does not know.
+    #[serde(other)]
+    Other,
+}
+
+/// A newer release, as the user is offered it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateOffer {
+    /// The release version, `major.minor.patch`.
+    pub version: String,
+    /// The release page ("What is new"), opened through [`Request::UpdateOpenPage`].
+    pub page_url: String,
+    /// Whether "Update" can install it here (the `.deb` or the Windows installer). False
+    /// for the Flatpak and other installs, which get the release page instead.
+    pub can_install: bool,
+    /// With `can_install: false`: one sentence saying why, for the UI to show.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The step an update failed at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateStage {
+    /// Asking GitHub, or checking the signature of its answer.
+    Check,
+    /// Downloading a release file.
+    Download,
+    /// Comparing a download with its signed checksum.
+    Verify,
+    /// The system prompt or the package install.
+    Install,
+    /// A stage added by a newer daemon.
+    #[serde(other)]
+    Other,
 }
 
 /// The one-use SR-24 consent token of [`Request::SendLocalClipboard`] and
@@ -830,6 +1005,9 @@ pub enum DaemonEvent {
     },
     /// The daemon is shutting down; clients should disconnect.
     ShuttingDown,
+    /// The update state changed (`docs/ipc.md` 1.9): a check started or ended, download
+    /// progress, the install outcome, "Later", or the setting was switched.
+    UpdateChanged(UpdateStatus),
 }
 
 /// What the server needs from the daemon: a handler for authenticated requests. The
@@ -1240,6 +1418,7 @@ mod tests {
             folder: None,
             delivered: vec![],
             resumable: false,
+            failure: None,
         };
         let json = serde_json::to_string(&Ok::Transfers(vec![snap.clone()])).expect("json");
         assert!(json.contains(r#""names":["Photos","notes.txt"]"#), "{json}");
@@ -1255,6 +1434,147 @@ mod tests {
             "clipboard_watch_supported":true,"autostart":false,"notifications":true}"#;
         let s: Settings = serde_json::from_str(json).expect("parse");
         assert!(s.clipboard_images);
+    }
+
+    #[test]
+    fn update_check_setting_defaults_on_and_an_old_patch_leaves_it_alone() {
+        let json = r#"{"receive_dir":"/tmp/in","device_name":"a","clipboard_sync":true,
+            "clipboard_watch_supported":true,"autostart":false,"notifications":true}"#;
+        let s: Settings = serde_json::from_str(json).expect("parse");
+        assert!(s.update_check, "an older daemon's answer reads as on");
+        // A 0.10.0 client's patch has no such field: it must not touch the setting.
+        let old: SettingsPatch = serde_json::from_str(r#"{"notifications":false}"#).expect("old");
+        assert_eq!(old.update_check, None);
+        let off = SettingsPatch {
+            update_check: Some(false),
+            ..SettingsPatch::default()
+        };
+        let json = serde_json::to_string(&off).expect("json");
+        assert_eq!(json, r#"{"update_check":false}"#);
+        assert_eq!(
+            serde_json::from_str::<SettingsPatch>(&json).expect("parse"),
+            off
+        );
+    }
+
+    #[test]
+    fn update_requests_have_their_tags_and_force_defaults_off() {
+        let requests = [
+            Request::UpdateCheck { force: true },
+            Request::UpdateInstall { window: true },
+            Request::UpdateInstall { window: false },
+            Request::UpdateCancel,
+            Request::UpdateLater,
+            Request::UpdateState,
+            Request::UpdateOpenPage,
+        ];
+        for r in requests {
+            let value = serde_json::to_value(&r).expect("serialise");
+            assert_eq!(value["op"], r.op());
+            let back: Request = serde_json::from_value(value).expect("parse");
+            assert_eq!(back, r);
+        }
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"update_check"}"#).expect("bare"),
+            Request::UpdateCheck { force: false }
+        );
+        // A client that names no window gets the daemon-only relaunch.
+        assert_eq!(
+            serde_json::from_str::<Request>(r#"{"op":"update_install"}"#).expect("bare"),
+            Request::UpdateInstall { window: false }
+        );
+    }
+
+    fn offer() -> UpdateOffer {
+        UpdateOffer {
+            version: "0.11.0".into(),
+            page_url: "https://github.com/QasimBhb/PlayDrop/releases/tag/v0.11.0".into(),
+            can_install: true,
+            reason: None,
+        }
+    }
+
+    #[test]
+    fn update_states_round_trip_in_answers_and_events() {
+        let states = [
+            UpdateState::Off,
+            UpdateState::Idle,
+            UpdateState::Checking,
+            UpdateState::UpToDate,
+            UpdateState::Available { offer: offer() },
+            UpdateState::Downloading {
+                version: "0.11.0".into(),
+                done: 12,
+                total: 48,
+            },
+            UpdateState::Verifying {
+                version: "0.11.0".into(),
+            },
+            UpdateState::Installing {
+                version: "0.11.0".into(),
+            },
+            UpdateState::Restarting {
+                version: "0.11.0".into(),
+            },
+            UpdateState::Failed {
+                stage: UpdateStage::Verify,
+                message: "The download did not match.".into(),
+                offer: Some(offer()),
+            },
+        ];
+        for state in states {
+            let report = UpdateStatus {
+                state,
+                last_checked_ms: Some(5),
+                last_failed_ms: None,
+                last_failure: None,
+                running_version: "0.10.0".into(),
+                unavailable: None,
+            };
+            let answer = Response::Ok(Ok::Update(report.clone()));
+            let json = serde_json::to_string(&answer).expect("json");
+            assert!(json.contains(r#""kind":"update""#), "{json}");
+            assert_eq!(
+                serde_json::from_str::<Response>(&json).expect("parse"),
+                answer
+            );
+            let event = Event::Daemon(DaemonEvent::UpdateChanged(report));
+            let json = serde_json::to_string(&event).expect("json");
+            assert!(json.contains(r#""event":"update_changed""#), "{json}");
+            assert_eq!(serde_json::from_str::<Event>(&json).expect("parse"), event);
+        }
+        let json = serde_json::to_string(&UpdateState::Available { offer: offer() }).expect("j");
+        assert_eq!(
+            json,
+            r#"{"phase":"available","offer":{"version":"0.11.0","page_url":"https://github.com/QasimBhb/PlayDrop/releases/tag/v0.11.0","can_install":true}}"#
+        );
+    }
+
+    #[test]
+    fn an_update_phase_or_stage_from_a_newer_daemon_still_decodes() {
+        let status: UpdateStatus = serde_json::from_str(
+            r#"{"state":{"phase":"rolling_back","step":3},"running_version":"0.11.0"}"#,
+        )
+        .expect("parse");
+        assert_eq!(status.state, UpdateState::Other);
+        assert_eq!(status.last_checked_ms, None);
+        assert_eq!(status.unavailable, None);
+        let not_release: UpdateStatus = serde_json::from_str(
+            r#"{"state":{"phase":"idle"},"running_version":"0.11.0-rc.1","unavailable":"No."}"#,
+        )
+        .expect("parse");
+        assert_eq!(not_release.unavailable.as_deref(), Some("No."));
+        let failed: UpdateState =
+            serde_json::from_str(r#"{"phase":"failed","stage":"quarantine","message":"m"}"#)
+                .expect("parse");
+        assert_eq!(
+            failed,
+            UpdateState::Failed {
+                stage: UpdateStage::Other,
+                message: "m".into(),
+                offer: None
+            }
+        );
     }
 
     #[test]

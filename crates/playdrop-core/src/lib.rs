@@ -19,6 +19,7 @@ pub mod reach;
 pub mod session;
 pub mod tls;
 pub mod transfer;
+pub mod update;
 
 pub use error::{Error, Result};
 
@@ -34,5 +35,13 @@ pub mod fuzz_api {
     /// (protocol.md 8.1).
     pub fn mdns_txt(rdata: &[u8], srv_port: u16) -> Option<Advert> {
         crate::discovery::mdns::txt_advert(&mdns_sd::TxtProperties::from(rdata), srv_port)
+    }
+
+    /// Parses the bytes of a release's `SHA256SUMS` as if their signature had verified
+    /// (`docs/design/update-check.md`, SR-48). Real callers can only reach this parser
+    /// through `update::verify_sums`; the fuzzer skips the signature so it can reach the
+    /// line parser at all.
+    pub fn update_sums(sums: &[u8]) -> Option<crate::update::SignedSums> {
+        crate::update::parse_sums_for_fuzzing(sums)
     }
 }

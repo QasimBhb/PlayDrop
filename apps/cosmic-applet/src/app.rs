@@ -20,7 +20,7 @@ use cosmic::surface;
 use cosmic::widget::{self, button, divider, icon, text};
 use cosmic::{Element, Task};
 use playdrop_ipc::types::{PeerSummary, TransferSnapshot};
-use playdrop_ipc::{ConsentToken, Ok as Answer, Request, Status, MAX_SEND_ITEMS};
+use playdrop_ipc::{ConsentToken, Ok as Answer, Request, Status, UpdateStatus, MAX_SEND_ITEMS};
 use tokio::sync::mpsc;
 
 use crate::clipboard::{self, Clip};
@@ -163,6 +163,8 @@ pub enum Message {
     Transfers(Vec<TransferSnapshot>),
     /// Fresh status.
     Status(Box<Status>),
+    /// The update state, the answer to the check made when the popup opened.
+    Update(Box<UpdateStatus>),
     /// Nothing to do.
     Ignore,
 }
@@ -353,18 +355,41 @@ impl Applet {
                 let _ = w.send(Wake::Retry);
             }
         }
-        cosmic::surface::surface_task(cosmic::surface::action::app_popup(
-            |_| cosmic::surface::action::LiveSettings::default(),
-            |app: &mut Applet| {
-                let id = window::Id::unique();
-                app.popup = Some(id);
-                let parent = app.core.main_window_id().unwrap_or(window::Id::RESERVED);
-                app.core
-                    .applet
-                    .get_popup_settings(parent, id, None, None, None)
-            },
-            None,
-        ))
+        Task::batch([
+            cosmic::surface::surface_task(cosmic::surface::action::app_popup(
+                |_| cosmic::surface::action::LiveSettings::default(),
+                |app: &mut Applet| {
+                    let id = window::Id::unique();
+                    app.popup = Some(id);
+                    let parent = app.core.main_window_id().unwrap_or(window::Id::RESERVED);
+                    app.core
+                        .applet
+                        .get_popup_settings(parent, id, None, None, None)
+                },
+                None,
+            )),
+            self.check_update(),
+        ])
+    }
+
+    /// Tells the daemon the popup opened, so it may run its once-a-day update check. This
+    /// uses the connection that is already up and never starts or activates the daemon;
+    /// without a connection nothing is sent.
+    fn check_update(&self) -> Task<cosmic::Action<Message>> {
+        let Some(Handle(client)) = self.client.clone() else {
+            return Task::none();
+        };
+        cosmic::task::future(async move {
+            match daemon::check_update(&client).await {
+                Ok(Some(status)) => Message::Update(Box::new(status)),
+                // An older daemon has no update check.
+                Ok(None) => Message::Ignore,
+                Err(e) => {
+                    tracing::debug!(code = %e.code, "update check request failed");
+                    Message::Ignore
+                }
+            }
+        })
     }
 
     fn send_clipboard(&mut self, device: String) -> Task<cosmic::Action<Message>> {
@@ -693,6 +718,7 @@ impl cosmic::Application for Applet {
             Message::Peers(p) => return self.apply(Input::Peers(p)),
             Message::Transfers(t) => return self.apply(Input::Transfers(t)),
             Message::Status(s) => return self.apply(Input::Status(s)),
+            Message::Update(u) => return self.apply(Input::Update(u)),
             Message::Ignore => {}
         }
         Task::none()
@@ -725,6 +751,21 @@ impl cosmic::Application for Applet {
         let mut content = widget::Column::new()
             .spacing(spacing.space_xxs)
             .padding([8, 0]);
+
+        // An update the daemon offers; installing it is the window's job.
+        if let Some(line) = &v.update_line {
+            if matches!(v.open_window, WindowAction::Available) {
+                content = content.push(padded_control(
+                    widget::Row::new()
+                        .spacing(spacing.space_xs)
+                        .align_y(Alignment::Center)
+                        .push(text::body(line.clone()).width(Length::Fill))
+                        .push(button::standard("Open PlayDrop").on_press(Message::OpenWindow)),
+                ));
+            } else {
+                content = content.push(padded_control(text::body(line.clone())));
+            }
+        }
 
         // Daemon state, start, notices.
         let mut header = widget::Column::new()

@@ -21,6 +21,7 @@ pub mod host;
 pub mod logging;
 pub mod traits;
 pub mod types;
+pub mod update;
 
 pub use error::PlayDropError;
 pub use events::HostEvent;

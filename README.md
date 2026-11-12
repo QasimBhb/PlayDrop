@@ -9,7 +9,8 @@ PlayDrop links your phone and your computer over the local network. It does two 
 always-on companion link (clipboard, ping and find, battery, media control, remote input) and a
 fast file drop that resumes after a dropped connection and holds its speed for thousands of small
 files. There is no account and no cloud: devices talk directly to each other on your LAN, and
-nothing leaves it.
+nothing you send leaves it. The one request PlayDrop makes to the internet is an anonymous check
+for a newer release when you open it, at most once a day, which Settings can turn off.
 
 Licence: GPL-3.0-or-later. Version: 0.4.0; the latest release is
 [v0.4.0](https://github.com/QasimBhb/PlayDrop/releases/tag/v0.4.0). See [CHANGELOG.md](CHANGELOG.md).

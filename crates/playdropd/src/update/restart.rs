@@ -1,0 +1,131 @@
+//! Starting the new daemon after a `.deb` update (`docs/design/update-check.md` section 6).
+//!
+//! `apt-get` replaced `/usr/bin/playdropd` on disk; the running process is still the old
+//! program. Two ways to put the new one in its place, picked by how this process was
+//! started:
+//!
+//! - **As the systemd user unit `playdropd.service`** (D-Bus activation goes through it
+//!   when the session has a user manager). The unit is `Type=dbus`: systemd stops a unit
+//!   of that type whose bus name goes away, so releasing the name and `exec`ing would get
+//!   the new process killed as it starts. Instead the daemon asks systemd to restart the
+//!   unit (`systemctl --user --no-block restart`); systemd sends `SIGTERM`, the daemon
+//!   shuts down cleanly as for any `SIGTERM`, and systemd starts the new binary.
+//! - **Otherwise** (XDG autostart, a terminal, the D-Bus daemon's own activation): after
+//!   the usual clean shutdown (host stopped, IPC server stopped so the bus name is
+//!   released, tray gone) the process `exec`s `/usr/bin/playdropd` with its own arguments.
+//!   The PID stays, so a parent that waits for it keeps waiting for the right process.
+//!   Every descriptor Rust and tokio open is close-on-exec, so the old bus connection and
+//!   listening socket close with the old image, and the new process takes the bus name
+//!   afresh: owning it is the single-instance check, so if anything else started a daemon
+//!   in the gap (a `playdrop` command activating one), the new process says "already
+//!   running" and exits, leaving exactly one daemon, of the new version. Clients saw
+//!   `Restarting` and then `ShuttingDown`, and the window and the applet follow the name
+//!   back without starting a daemon themselves.
+
+use std::path::Path;
+
+use super::kind::DEB_DAEMON;
+
+/// The systemd user unit name (`packaging/linux/playdropd.service`).
+pub const SYSTEMD_UNIT: &str = "playdropd.service";
+
+/// How to start the new version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Plan {
+    /// Ask systemd to restart the unit; it stops this process with `SIGTERM`.
+    Systemd,
+    /// Shut down, then `exec` the new binary in this process.
+    Exec,
+}
+
+/// The plan for a process whose `/proc/self/cgroup` reads `cgroup`: the unit's own cgroup
+/// path ends in `/playdropd.service`.
+pub fn plan_for(cgroup: &str) -> Plan {
+    let in_unit = cgroup.lines().any(|line| {
+        line.rsplit(':')
+            .next()
+            .is_some_and(|path| path.trim_end().ends_with(&format!("/{SYSTEMD_UNIT}")))
+    });
+    if in_unit {
+        Plan::Systemd
+    } else {
+        Plan::Exec
+    }
+}
+
+/// The plan for this process.
+pub fn plan() -> Plan {
+    std::fs::read_to_string("/proc/self/cgroup").map_or(Plan::Exec, |c| plan_for(&c))
+}
+
+/// Asks systemd to restart the unit, without waiting for it (systemd stops this process
+/// as part of the restart). Returns `false` when `systemctl` could not be started, so the
+/// caller falls back to [`Plan::Exec`].
+pub fn ask_systemd() -> bool {
+    let started = std::process::Command::new("/usr/bin/systemctl")
+        .args(["--user", "--no-block", "restart", SYSTEMD_UNIT])
+        .stdin(std::process::Stdio::null())
+        .status();
+    match started {
+        Ok(status) if status.success() => {
+            tracing::info!("asked systemd to restart {SYSTEMD_UNIT} on the new version");
+            true
+        }
+        Ok(status) => {
+            tracing::warn!(code = ?status.code(), "systemctl refused the restart; restarting in place");
+            false
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "systemctl could not be started; restarting in place");
+            false
+        }
+    }
+}
+
+/// Replaces this process with the installed `/usr/bin/playdropd`, same arguments and
+/// environment. Returns only when `exec` failed; the caller then exits, and the next UI or
+/// login starts the new version.
+#[cfg(unix)]
+pub fn exec_new_daemon() -> std::io::Error {
+    use std::os::unix::process::CommandExt as _;
+    tracing::info!("starting the new daemon in place");
+    std::process::Command::new(Path::new(DEB_DAEMON))
+        .args(std::env::args_os().skip(1))
+        .exec()
+}
+
+/// Windows never restarts in place: the installer does it.
+#[cfg(not(unix))]
+pub fn exec_new_daemon() -> std::io::Error {
+    let _ = Path::new(DEB_DAEMON);
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "restarting in place is for the .deb only",
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_systemd_unit_is_recognised_from_its_cgroup() {
+        assert_eq!(
+            plan_for(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/playdropd.service\n"
+            ),
+            Plan::Systemd
+        );
+        // XDG autostart under GNOME or COSMIC runs in an app scope; a terminal in a
+        // session scope; cgroup v1 lists several lines.
+        for other in [
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-org.playdrop.Daemon-1234.scope\n",
+            "0::/user.slice/user-1000.slice/session-2.scope\n",
+            "12:pids:/user.slice\n1:name=systemd:/user.slice/session-2.scope\n",
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/not-playdropd.service.d\n",
+            "",
+        ] {
+            assert_eq!(plan_for(other), Plan::Exec, "{other:?}");
+        }
+    }
+}

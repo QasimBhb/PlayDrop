@@ -78,13 +78,43 @@ values at their defaults.
   above. *Test:* with any lock off nothing is sent; filtered kinds are never sent.
 - **SR-42 (P15)** Turning the grant off, unpairing, or revoking notification access stops
   mirroring at once and removes every mirrored copy on the desktop for that peer (the phone
-  sends nothing more; the desktop closes copies on unpair, offline and on its own grant off).
+  sends nothing more; the desktop closes copies at once on unpair and on its own grant off,
+  and 5 minutes after going offline unless the peer came back, see "After a reconnect").
   *Test:* unpair closes the desktop copies.
 - **SR-43 (P15)** Notification app names, titles, text and keys are never logged at any level
   and are not in the diagnostics report (SR-32 canary extended). *Test:* the canary test seeds
   a notification and greps the logs.
 - **SR-44 (P15)** Size limits, 30 posted frames per minute per connection, 20 shown per peer.
   *Test:* the 31st frame in a minute is dropped; the 21st copy closes the oldest.
+
+## After a reconnect (2026-11-12)
+
+The phone cannot know what a desktop still shows, so each time a peer comes online it sends
+its current notifications again (at most 20). When the desktop closed every copy at offline,
+up to 20 old notifications popped up again after every Wi-Fi drop. No wire or phone change
+fixes it; the desktop table (`crates/playdropd/src/notify/mirror.rs`) now keeps its copies
+over a short absence:
+
+- Offline, a peer's copies stay for 5 minutes. Unpair, the desktop's `notificationsIn`
+  grant going off, notifications turned off and daemon shutdown still close them at once.
+- Back within the 5 minutes, a `posted` that matches a kept copy changes nothing: no popup,
+  no replace. The key is salted per phone process, so a kept copy also matches by content:
+  a keyed BLAKE3 (random key per daemon run, memory only) over app, title, text and `when`.
+  A match under a new key re-maps the copy to it, so a later `removed` or dismissal works.
+- Kept copies not sent again within 10 s of the return were removed on the phone while it
+  was away, and close.
+- Still offline after 5 minutes, the copies close and their content fingerprints are
+  remembered (at most 64 per peer, memory only, never logged). When the phone returns, the
+  resend that follows (the 10 s after it comes back) does not show them again; when that
+  window ends the memory is cleared, so an app that later posts the same content again is
+  shown as usual. Trade-off: an old notification still on the phone is missing from the
+  desktop's list after a long absence; the user already saw it once. A copy the user
+  dismisses while the phone is away, or a kept copy dismissed inside the resend window, is
+  remembered the same way, since the `dismiss` cannot reach the phone under its old key.
+- The same content under the same key is never shown twice, online or not, so a phone
+  listener that reconnects (and sends its set again) does not pop everything up either.
+- Windows toasts cannot be closed later (the SR-42 exception), so there going offline only
+  remembers the fingerprints at once.
 
 ## Fit
 

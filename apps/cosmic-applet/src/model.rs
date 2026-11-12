@@ -15,6 +15,7 @@ use playdrop_ipc::types::{
 };
 use playdrop_ipc::{
     ClipSkip, ConsentToken, DaemonEvent, ErrorCode, Event, IpcError, Ok as Answer, Request, Status,
+    UpdateState, UpdateStatus,
 };
 
 /// Most finished transfers the popup lists.
@@ -238,6 +239,9 @@ fn offer_names<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
     names
 }
 
+/// Longest an offered version is shown, in characters.
+const UPDATE_VERSION_SHOWN: usize = 24;
+
 /// Longest one name is shown, in characters.
 const NAME_SHOWN: usize = 28;
 /// Longest the whole "what" part of a transfer title is shown, in characters.
@@ -398,6 +402,9 @@ pub struct Model {
     start_in_flight: bool,
     /// Device waiting for the user to confirm sending a password-manager clip (SR-24).
     confirm_sensitive: Option<String>,
+    /// Version of the release the daemon offers (phase `available`), when it does. The
+    /// applet only announces it; installing is the window's job.
+    update_offer: Option<String>,
 }
 
 /// An action in flight for one device. A device can have both at once.
@@ -439,6 +446,8 @@ pub enum Input {
     Status(Box<Status>),
     /// A daemon event.
     Event(Box<Event>),
+    /// The update state: the answer to `update_check`.
+    Update(Box<UpdateStatus>),
     /// The user clicked "Start `PlayDrop`".
     StartRequested,
     /// The start did not bring the daemon up, with the reason.
@@ -460,6 +469,7 @@ impl Model {
             busy: HashSet::new(),
             start_in_flight: false,
             confirm_sensitive: None,
+            update_offer: None,
         }
     }
 
@@ -522,6 +532,12 @@ impl Model {
                 }
                 Refresh::NONE
             }
+            Input::Update(status) => {
+                if self.is_running() {
+                    self.apply_update(&status);
+                }
+                Refresh::NONE
+            }
             Input::Disconnected => {
                 self.go_offline();
                 self.daemon = DaemonState::NotRunning;
@@ -571,6 +587,16 @@ impl Model {
         self.busy.clear();
         self.confirm_sensitive = None;
         self.locked = false;
+        self.update_offer = None;
+    }
+
+    /// Keeps the offered version while the phase is `available`; every other phase (a
+    /// download the window started, `later`, the switch turned off) shows nothing here.
+    fn apply_update(&mut self, status: &UpdateStatus) {
+        self.update_offer = match &status.state {
+            UpdateState::Available { offer } => Some(offer.version.clone()),
+            _ => None,
+        };
     }
 
     fn apply_status(&mut self, status: &Status) {
@@ -876,6 +902,7 @@ impl Model {
                 peer,
                 direction,
                 reason,
+                ..
             } => {
                 let (t, _) = self.transfer_entry(&id, peer, direction, TransferStatus::Failed, now);
                 // The snapshot tells a cancel from a failure; the event does not.
@@ -910,6 +937,10 @@ impl Model {
             }
             DaemonEvent::LockChanged { locked } => {
                 self.locked = locked;
+                Refresh::NONE
+            }
+            DaemonEvent::UpdateChanged(status) => {
+                self.apply_update(&status);
                 Refresh::NONE
             }
             // Settings, lock state and input sessions may all have changed too.
@@ -1072,6 +1103,11 @@ impl Model {
             start,
             notice: self.notice.clone(),
             input_banner,
+            update_line: self
+                .update_offer
+                .as_ref()
+                .filter(|_| running)
+                .map(|v| format!("PlayDrop {} is available", elide(v, UPDATE_VERSION_SHOWN))),
             locked_note: (running && self.locked).then(|| {
                 "This desktop is locked. Some actions wait until it is unlocked.".to_owned()
             }),
@@ -1493,6 +1529,8 @@ pub struct View {
     pub notice: Option<String>,
     /// "Remote input from X", with a Stop button, while a session is open.
     pub input_banner: Option<String>,
+    /// "`PlayDrop` X is available", above everything else, with an "Open `PlayDrop`" button.
+    pub update_line: Option<String>,
     /// Shown while the desktop is locked.
     pub locked_note: Option<String>,
     /// Show the device section at all (only while connected).

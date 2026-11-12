@@ -1,8 +1,8 @@
-// Settings: receive folder, device name, clipboard sync and images, autostart, notifications, and
-// this computer's identity.
+// Settings: receive folder, device name, clipboard sync and images, autostart, notifications, the
+// update check, and this computer's identity.
 
 import { Button, LineEdit, ScrollView, Palette } from "std-widgets.slint";
-import { SettingsState } from "globals.slint";
+import { SettingsState, UpdateUi } from "globals.slint";
 import { Label, Muted, Heading, Toggle } from "widgets.slint";
 
 export component SettingsPage inherits Rectangle {
@@ -120,6 +120,41 @@ export component SettingsPage inherits Rectangle {
                 toggled(on) => {
                     SettingsState.set-notifications(on);
                 }
+            }
+
+            Toggle {
+                text: "Check for updates when PlayDrop opens";
+                checked: UpdateUi.enabled;
+                enabled: UpdateUi.supported;
+                toggled(on) => {
+                    UpdateUi.set-enabled(on);
+                }
+            }
+
+            Muted {
+                text: "Asks GitHub for the latest version, at most once a day. No name, ID or version is sent. GitHub sees your IP address, as with any download.";
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Button {
+                    text: "Check now";
+                    enabled: UpdateUi.supported && UpdateUi.enabled && !UpdateUi.checking;
+                    clicked => {
+                        UpdateUi.check-now();
+                    }
+                }
+
+                Muted {
+                    text: UpdateUi.last-checked;
+                    horizontal-stretch: 1;
+                }
+            }
+
+            if UpdateUi.last-failure != "": Muted {
+                text: UpdateUi.last-failure;
+                color: #c42b1c;
+                opacity: 1;
             }
 
             Label {

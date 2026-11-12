@@ -49,11 +49,50 @@ class InputSessionControllerTest {
     fun goingOfflineStopsAndComingBackRestarts() = runBlocking {
         controller.start()
         assertEquals(InputSessionController.Outcome.Sent, controller.setOnline(false))
+        // The core reports the drop too; that must not turn the session into a final end.
+        controller.connectionLost()
         assertEquals(InputSessionController.State.IDLE, controller.state)
         // A start while offline waits for the peer.
         assertEquals(InputSessionController.Outcome.Skipped, controller.start())
         assertEquals(InputSessionController.Outcome.Sent, controller.setOnline(true))
         assertEquals(listOf(open, close, open), sent)
+    }
+
+    @Test
+    fun aLostConnectionIsResumedOnReconnect() = runBlocking {
+        controller.start()
+        // The core's event can come before the peer list shows the device offline.
+        controller.connectionLost()
+        assertEquals(InputSessionController.State.IDLE, controller.state)
+        assertEquals(InputSessionController.Outcome.Skipped, controller.send(move))
+        controller.setOnline(false)
+        assertEquals(InputSessionController.Outcome.Sent, controller.setOnline(true))
+        assertEquals(InputSessionController.State.ACTIVE, controller.state)
+        // No stop frame went out for the lost session: the desktop had already closed it.
+        assertEquals(listOf(open, open), sent)
+    }
+
+    @Test
+    fun aLostConnectionIsResumedWhenThePeerNeverLookedOffline() = runBlocking {
+        controller.start()
+        controller.connectionLost()
+        assertEquals(InputSessionController.Outcome.Sent, controller.resume())
+        assertEquals(InputSessionController.Outcome.Skipped, controller.resume())
+        assertEquals(listOf(open, open), sent)
+    }
+
+    @Test
+    fun aLostConnectionKeepsARefusalOrAnEndAndAClosedScreen() = runBlocking {
+        controller.start()
+        controller.remoteEnded()
+        controller.connectionLost()
+        assertEquals(InputSessionController.State.ENDED, controller.state)
+        assertEquals(InputSessionController.Outcome.Skipped, controller.resume())
+        controller.retry()
+        controller.stop()
+        controller.connectionLost()
+        // The screen left: nothing reopens.
+        assertEquals(InputSessionController.Outcome.Skipped, controller.resume())
     }
 
     @Test
@@ -108,5 +147,27 @@ class InputSessionControllerTest {
         assertEquals(InputSessionController.State.IDLE, controller.state)
         fail = null
         assertEquals(InputSessionController.Outcome.Sent, controller.start())
+    }
+
+    @Test
+    fun tryAgainReopensAfterAnEndOrARefusal() = runBlocking {
+        controller.start()
+        controller.remoteEnded()
+        assertEquals(InputSessionController.Outcome.Sent, controller.retry())
+        assertEquals(InputSessionController.State.ACTIVE, controller.state)
+        assertEquals(InputSessionController.Outcome.Skipped, controller.retry())
+        controller.refused()
+        assertEquals(InputSessionController.Outcome.Sent, controller.retry())
+        assertEquals(listOf(open, open, open), sent)
+    }
+
+    @Test
+    fun tryAgainWhileOfflineOpensOnReconnect() = runBlocking {
+        controller.start()
+        controller.remoteEnded()
+        controller.setOnline(false)
+        assertEquals(InputSessionController.Outcome.Skipped, controller.retry())
+        assertEquals(InputSessionController.Outcome.Sent, controller.setOnline(true))
+        assertEquals(InputSessionController.State.ACTIVE, controller.state)
     }
 }

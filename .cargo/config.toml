@@ -1,0 +1,6 @@
+# Windows programs carry the C runtime inside them. Without this the three .exe files need
+# vcruntime140.dll, which a fresh Windows install does not have: the program then fails
+# before any of our code runs. packaging/windows/test-installer.ps1 checks the import table
+# of every installed .exe so this cannot be lost (Phase 16).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

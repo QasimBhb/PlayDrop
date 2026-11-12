@@ -1,6 +1,7 @@
 package org.playdrop.android.service
 
 import org.playdrop.android.core.FileNames
+import org.playdrop.core.TransferFailure
 
 /**
  * The decisions behind each notification, kept free of Android types so they are
@@ -177,6 +178,24 @@ internal object NotificationPlan {
         endedEarly -> MoveNotice.ARRIVED_BEFORE_END
         else -> MoveNotice.MOVED_AFTER_RESTART
     }
+
+    /**
+     * True when a `TransferFailed` gets a "failed" notification: only when it ended the
+     * transfer ([endedForGood]; one file's failed check while the rest goes on does not), and
+     * never for [TransferFailure.CANCELLED_BY_YOU]: the person just tapped Cancel (on the
+     * "Sending to A and B" card that would be one notification per device).
+     */
+    fun postsFailure(code: TransferFailure, endedForGood: Boolean): Boolean =
+        endedForGood && code != TransferFailure.CANCELLED_BY_YOU
+
+    /**
+     * The device the service notification's file action names: with exactly one paired
+     * device the picks go straight to it, so the action reads "Send to <label>". With none
+     * or several (then the device chooser follows the picker) it is null and the action
+     * reads "Send files". [pairedLabels] holds one display label per paired device that can take files
+     * (a device that removed this phone is left out by the caller).
+     */
+    fun sendActionTarget(pairedLabels: List<String>): String? = pairedLabels.singleOrNull()
 
     /** Human size, binary units with one decimal ("1.5 MiB"). */
     fun humanBytes(bytes: Long): String {

@@ -1,5 +1,6 @@
 //! Settings screen: receive folder, device name, clipboard sync and images, autostart,
-//! notifications, and this computer's identity.
+//! notifications, and this computer's identity. The update check's section lives in
+//! `update.rs` beside its banner.
 
 use playdrop_ipc::{Ok, Request, SettingsPatch};
 use slint::ComponentHandle;
@@ -108,7 +109,8 @@ pub(super) fn refresh(c: &Controller) {
     );
 }
 
-fn patch(c: &Controller, patch: SettingsPatch) {
+/// Sends a settings change and shows what the daemon has afterwards.
+pub(super) fn patch(c: &Controller, patch: SettingsPatch) {
     c.ipc().request(Request::SetSettings(patch), |r| {
         with(|c| match r {
             Result::Ok(Ok::Settings {
@@ -117,6 +119,7 @@ fn patch(c: &Controller, patch: SettingsPatch) {
             }) => {
                 c.store.borrow_mut().set_settings(settings);
                 refresh(c);
+                super::update::refresh(c);
                 if restarted {
                     c.notice("Settings saved. Reconnecting devices...", false);
                 }
@@ -124,6 +127,7 @@ fn patch(c: &Controller, patch: SettingsPatch) {
             other => {
                 // Snap the switches back to what the daemon has.
                 refresh(c);
+                super::update::refresh(c);
                 c.report("Could not save the setting", other);
             }
         });

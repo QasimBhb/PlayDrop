@@ -82,4 +82,42 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertLessThanOrEqual(AppSettings.cleanDeviceName(String(repeating: "é", count: 60)).utf8.count, AppSettings.maxDeviceNameBytes)
         XCTAssertFalse(AppSettings.cleanDeviceName("a/b").contains("/"))
     }
+
+    @MainActor
+    func testUpdateCheckDefaultsToOnWithNoTimes() {
+        withSettings { s, defaults in
+            XCTAssertTrue(s.updateCheckEnabled)
+            XCTAssertNil(s.updateLastAnswerMs)
+            XCTAssertNil(s.updateLastFailureMs)
+            XCTAssertNil(defaults.object(forKey: AppSettings.updateCheckEnabledKey), "a default is not written")
+        }
+    }
+
+    @MainActor
+    func testUpdateCheckSettingsRoundTrip() {
+        withSettings { s, defaults in
+            s.updateCheckEnabled = false
+            s.updateLastAnswerMs = 1_762_000_000_000
+            s.updateLastFailureMs = 1_762_000_500_000
+            XCTAssertFalse(s.updateCheckEnabled)
+            XCTAssertEqual(s.updateLastAnswerMs, 1_762_000_000_000)
+            XCTAssertEqual(defaults.object(forKey: AppSettings.updateLastFailureKey) as? Int64, 1_762_000_500_000)
+            s.updateLastAnswerMs = nil
+            XCTAssertNil(s.updateLastAnswerMs)
+            XCTAssertNil(defaults.object(forKey: AppSettings.updateLastAnswerKey))
+        }
+    }
+
+    @MainActor
+    func testStorageProtocolReadsTheSameValues() {
+        withSettings { s, _ in
+            s.updateCheckEnabled = false
+            s.updateLastAnswerMs = 42
+            let storage: any UpdateCheckStorage = s
+            XCTAssertFalse(storage.isEnabled)
+            XCTAssertEqual(storage.lastAnswerMs, 42)
+            storage.lastFailureMs = 7
+            XCTAssertEqual(s.updateLastFailureMs, 7)
+        }
+    }
 }

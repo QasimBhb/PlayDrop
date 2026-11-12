@@ -43,6 +43,7 @@ data class UiMessage(
             is PlayDropException.PairRejected -> UiMessage(R.string.ui_err_pair_rejected)
             is PlayDropException.Io -> UiMessage(R.string.ui_err_io, listOf(error.detail))
             is PlayDropException.Other -> UiMessage(R.string.ui_err_other, listOf(error.detail))
+            is org.playdrop.android.core.UriSource.TooManyItems -> UiMessage(R.string.toast_too_many_items_open)
             is IllegalStateException -> UiMessage(R.string.ui_err_not_running)
             else -> UiMessage(R.string.ui_err_other, listOf(error.message ?: error.javaClass.simpleName))
         }

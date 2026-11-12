@@ -53,6 +53,24 @@
     <string name="received_from">From %1$s, saved in Download/PlayDrop</string>
     <string name="transfer_failed_send">Sending to %1$s failed</string>
     <string name="transfer_failed_receive">Receiving from %1$s failed</string>
+    <!-- Body of a failed transfer notification, one per failure code (FailureText); never an HTTP status or wire code -->
+    <string name="failure_no_space_peer">%1$s does not have enough free space.</string>
+    <string name="failure_no_space_here">This phone does not have enough free space.</string>
+    <string name="failure_declined_peer">%1$s declined the files.</string>
+    <string name="failure_declined_here">The files were declined on this phone.</string>
+    <string name="failure_too_large_peer">The transfer is too large for %1$s to accept.</string>
+    <string name="failure_too_large_here">The transfer is too large for this phone to accept.</string>
+    <string name="failure_busy_peer">%1$s is busy with other transfers from this phone. Try again shortly.</string>
+    <string name="failure_busy_here">%1$s sent too many transfers at once. Try again shortly.</string>
+    <string name="failure_cancelled_by_peer">%1$s cancelled it.</string>
+    <string name="failure_cancelled_by_you">You cancelled it.</string>
+    <string name="failure_integrity_send">The files did not arrive intact. Send them again.</string>
+    <string name="failure_integrity_receive">The files did not arrive intact. Ask %1$s to send them again.</string>
+    <string name="failure_connection_lost">The connection to %1$s was lost.</string>
+    <string name="failure_timed_out_send">%1$s did not answer in time.</string>
+    <string name="failure_timed_out_receive">Nothing more came from %1$s in time.</string>
+    <string name="failure_other">Something went wrong. Try again.</string>
+    <string name="failure_other_detail">%1$s</string>
     <string name="offer_answer_failed">Could not answer the offer: %1$s</string>
     <string name="moving_title">Moving received files into Downloads</string>
     <plurals name="moving_text">
@@ -91,10 +109,6 @@
     <string name="action_stop">Stop</string>
 
     <!-- Toasts from the share target and notification actions -->
-    <plurals name="toast_sent_to">
-        <item quantity="one">Sent to %d device</item>
-        <item quantity="other">Sent to %d devices</item>
-    </plurals>
     <string name="toast_nothing_to_send">Nothing to send</string>
     <string name="toast_no_device_online">No device online</string>
     <string name="toast_no_clipboard_grant">No device accepts this phone\'s clipboard. Turn it on in the device settings.</string>
@@ -122,9 +136,6 @@
         <item quantity="other">Sending %1$d items to %2$s</item>
     </plurals>
     <string name="share_sending_text">Sending text to %1$s</string>
-    <string name="share_pick_device">Send to which device?</string>
-    <string name="share_pick_hint">Your choice becomes the default for one-tap sends.</string>
-    <string name="share_offline">offline</string>
     <string name="share_preparing">Preparing</string>
 
     <!-- Notification mirroring (SR-41) -->

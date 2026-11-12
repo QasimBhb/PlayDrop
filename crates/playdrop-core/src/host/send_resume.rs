@@ -19,7 +19,6 @@ use super::transfers::{TransferSnapshot, TransferStatus};
 use super::{connect, lock, Inner};
 use crate::identity::DeviceId;
 use crate::net::connection::short;
-use crate::session::types::TransferState as FrameState;
 use crate::transfer::{Manifest, SourceInfo};
 
 /// Running sends, the index of recorded ones and the cancels not yet delivered, under one
@@ -38,7 +37,7 @@ pub(crate) struct Sends {
 pub(crate) struct Claim {
     pub(super) peer: DeviceId,
     pub(super) id: String,
-    pub(super) decision_rx: watch::Receiver<Option<FrameState>>,
+    pub(super) decision_rx: watch::Receiver<Option<super::send::Decision>>,
     pub(super) cancel: Arc<watch::Sender<bool>>,
 }
 

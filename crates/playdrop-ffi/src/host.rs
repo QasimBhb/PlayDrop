@@ -313,6 +313,41 @@ impl PlayDropHost {
             .into())
     }
 
+    /// Pushes clipboard text to the chosen peers only (hex Device IDs), with one echo
+    /// check for the whole push, so every chosen device gets it (calling `send_clipboard`
+    /// per device skips all but the first as an echo). Each chosen peer is counted as in
+    /// `push_clipboard`; one that is not paired, or not a Device ID, is listed in
+    /// `skipped_not_paired` and the rest still get it. An empty list sends nothing.
+    pub fn push_clipboard_to(
+        &self,
+        peers: Vec<String>,
+        text: String,
+        sensitive: bool,
+    ) -> Result<ClipboardPush, PlayDropError> {
+        let _rt = self.rt.enter();
+        let (ids, bad) = parse_peers(&peers);
+        let pushed = self.host.push_clipboard_to(&ids, &text, sensitive)?;
+        Ok(with_unparsed(pushed.into(), bad))
+    }
+
+    /// Pushes a clipboard image (at most 16 MiB) to the chosen peers only, with the rules
+    /// of `push_clipboard_to`. A chosen peer that cannot take images is counted in
+    /// `skipped_unsupported`.
+    pub fn push_clipboard_image_to(
+        &self,
+        peers: Vec<String>,
+        data: Vec<u8>,
+        mime: String,
+        sensitive: bool,
+    ) -> Result<ClipboardPush, PlayDropError> {
+        let _rt = self.rt.enter();
+        let (ids, bad) = parse_peers(&peers);
+        let pushed = self
+            .host
+            .push_clipboard_image_to(&ids, data, &mime, sensitive)?;
+        Ok(with_unparsed(pushed.into(), bad))
+    }
+
     /// Reports our battery; pushed to peers now and at every session start (5.8).
     pub fn set_battery(&self, level: u8, charging: bool, low: bool) {
         let _rt = self.rt.enter();
@@ -403,7 +438,9 @@ impl PlayDropHost {
     /// without a session and `Forbidden` when the peer does not list the needed
     /// `input.*` capability (see `PeerSummary.capabilities`). Pointer moves and scrolls
     /// are coalesced to one frame per 8 ms, so send them as fast as the touch surface
-    /// reports. A peer with remote input off for us answers with `PeerRefused`.
+    /// reports. A peer with remote input off for us answers with `PeerRefused`. Every
+    /// `start` (sent, or failed here) is followed by exactly one `InputSessionEnded` with
+    /// an `InputEndReason` when the session ends or is refused, unless we stop it first.
     pub fn send_input(&self, peer: String, input: InputEvent) -> Result<(), PlayDropError> {
         let _rt = self.rt.enter();
         let peer = parse_peer(&peer)?;
@@ -487,4 +524,24 @@ fn pump(mut events: mpsc::Receiver<CoreEvent>, listener: &dyn HostListener) {
         }
     }
     tracing::debug!("event pump ended");
+}
+
+/// Splits chosen peers into Device IDs and strings that are not one (kept as given, so a
+/// bad entry is reported for that device instead of failing the whole push).
+fn parse_peers(peers: &[String]) -> (Vec<playdrop_core::identity::DeviceId>, Vec<String>) {
+    let mut ids = Vec::with_capacity(peers.len());
+    let mut bad = Vec::new();
+    for p in peers {
+        match parse_peer(p) {
+            Ok(id) => ids.push(id),
+            Err(_) => bad.push(p.clone()),
+        }
+    }
+    (ids, bad)
+}
+
+/// Adds the entries that were not Device IDs to the push's not-paired list.
+fn with_unparsed(mut push: ClipboardPush, bad: Vec<String>) -> ClipboardPush {
+    push.skipped_not_paired.extend(bad);
+    push
 }

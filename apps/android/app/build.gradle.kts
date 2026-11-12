@@ -11,10 +11,15 @@ plugins {
 // Rust: the core and its UniFFI surface live in the workspace two levels up. Two task
 // types bridge them into this module through the variant API, so Gradle knows the
 // generated Kotlin and the .so files are outputs and the configuration cache stays valid:
-//   buildRust<Variant>   cargo ndk builds libplaydrop_ffi.so per ABI into build/rustJniLibs
-//   generateBindings     builds the host library once and runs uniffi-bindgen in library
-//                        mode to produce the Kotlin package org.playdrop.core
+//   buildRust<Variant>         cargo ndk builds libplaydrop_ffi.so per ABI into build/rustJniLibs
+//   generateBindings<Variant>  builds the host library and runs uniffi-bindgen in library
+//                              mode to produce the Kotlin package org.playdrop.core
 // Both need cargo, cargo-ndk and the NDK (ANDROID_HOME/ndk). ~/.cargo/bin is added to PATH.
+// Debug variants build playdrop-ffi with the cargo feature `update-test-key`, release
+// variants without it, so a release APK's library has no `update_offer_with_test_key` at
+// all. The bindings are generated per variant from a library built with the same features:
+// UniFFI checks at load time that every function the Kotlin side names exists in the .so,
+// so one set of bindings shared by both variants could not name it.
 // ---------------------------------------------------------------------------------------
 
 val workspaceDir: File = rootProject.projectDir.parentFile.parentFile
@@ -37,12 +42,17 @@ abstract class CargoTask : DefaultTask() {
             commandLine(listOf(cargo) + args.toList())
         }
     }
+
+    /** `--features a,b`, or nothing for an empty list. */
+    protected fun featureArgs(features: List<String>): List<String> =
+        if (features.isEmpty()) emptyList() else listOf("--features", features.joinToString(","))
 }
 
 /** cargo ndk build of the FFI library for every ABI in `playdrop.rustAbis`. */
 abstract class BuildRustTask : CargoTask() {
     @get:Input abstract val abis: ListProperty<String>
     @get:Input abstract val release: Property<Boolean>
+    @get:Input abstract val features: ListProperty<String>
 
     @TaskAction
     fun build() {
@@ -50,15 +60,18 @@ abstract class BuildRustTask : CargoTask() {
         abis.get().forEach { args += listOf("-t", it) }
         args += listOf("-o", outputDir.get().asFile.absolutePath, "build", "-p", "playdrop-ffi")
         if (release.get()) args += "--release"
+        args += featureArgs(features.get())
         cargo(*args.toTypedArray())
     }
 }
 
 /** Host build of the FFI library plus uniffi-bindgen in library mode. */
 abstract class GenerateBindingsTask : CargoTask() {
+    @get:Input abstract val features: ListProperty<String>
+
     @TaskAction
     fun generate() {
-        cargo("build", "-p", "playdrop-ffi")
+        cargo(*(listOf("build", "-p", "playdrop-ffi") + featureArgs(features.get())).toTypedArray())
         val hostLib = workspace.get().asFile.resolve("target/debug/libplaydrop_ffi.so")
         cargo(
             "run", "-p", "uniffi-bindgen", "--", "generate",
@@ -69,14 +82,9 @@ abstract class GenerateBindingsTask : CargoTask() {
     }
 }
 
-val generateBindings = tasks.register<GenerateBindingsTask>("generateBindings") {
-    description = "Builds playdrop-ffi for the host and generates the Kotlin bindings"
-    group = "rust"
-    workspace.set(workspaceDir)
-    ffiSources.set(workspaceDir.resolve("crates/playdrop-ffi/src"))
-    coreSources.set(workspaceDir.resolve("crates/playdrop-core/src"))
-    outputDir.set(layout.buildDirectory.dir("generated/uniffi/kotlin"))
-}
+/** The playdrop-ffi features of a build type: the test-key entry point in debug only. */
+fun ffiFeatures(buildType: String?): List<String> =
+    if (buildType == "debug") listOf("update-test-key") else emptyList()
 
 // ---------------------------------------------------------------------------------------
 // Version and release signing. The version follows [workspace.package] in the root
@@ -205,7 +213,17 @@ androidComponents {
             coreSources.set(workspaceDir.resolve("crates/playdrop-core/src"))
             abis.set(rustAbis)
             release.set(variant.buildType == "release")
+            features.set(ffiFeatures(variant.buildType))
             outputDir.set(layout.buildDirectory.dir("rustJniLibs/${variant.name}"))
+        }
+        val generateBindings = tasks.register<GenerateBindingsTask>("generateBindings$cap") {
+            description = "Builds playdrop-ffi for the host and generates the Kotlin bindings (${variant.name})"
+            group = "rust"
+            workspace.set(workspaceDir)
+            ffiSources.set(workspaceDir.resolve("crates/playdrop-ffi/src"))
+            coreSources.set(workspaceDir.resolve("crates/playdrop-core/src"))
+            features.set(ffiFeatures(variant.buildType))
+            outputDir.set(layout.buildDirectory.dir("generated/uniffi/${variant.name}/kotlin"))
         }
         variant.sources.jniLibs?.addGeneratedSourceDirectory(buildRust, BuildRustTask::outputDir)
         variant.sources.kotlin?.addGeneratedSourceDirectory(generateBindings, GenerateBindingsTask::outputDir)

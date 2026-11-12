@@ -24,6 +24,18 @@ object MirrorApps {
             .toList()
     }
 
+    /**
+     * Packages on [allowed] that the picker's query did not find, sorted. Such an app may be
+     * uninstalled, but it may also be archived, disabled or hidden from PlayDrop by package
+     * visibility, so it is never taken off the list on its own: the picker shows it as "Not
+     * found on this phone" with a Remove button. When the query found nothing at all ([listed]
+     * empty, so it most likely failed) none are reported.
+     */
+    fun notFound(allowed: Set<String>, listed: Set<String>): List<String> {
+        if (listed.isEmpty()) return emptyList()
+        return allowed.filter { it !in listed }.sorted()
+    }
+
     /** [allowed] with [packageName] added when [on], removed otherwise. */
     fun toggled(allowed: Set<String>, packageName: String, on: Boolean): Set<String> =
         if (on) allowed + packageName else allowed - packageName

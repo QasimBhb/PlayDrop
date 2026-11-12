@@ -15,12 +15,12 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.core.CoreHostImpl
 import org.playdrop.android.core.HostLog
-import org.playdrop.android.data.Settings
 import org.playdrop.core.PlayDropException
 
 /**
@@ -51,10 +51,11 @@ class CoreService : LifecycleService() {
         signals.register()
         registerNetworkCallback()
         lifecycleScope.launch {
-            combine(CoreHost.running, CoreHost.peers, Settings.flow(this@CoreService)) { running, peers, settings ->
-                val default = settings.defaultPeer?.let { id -> peers.firstOrNull { it.deviceId == id } }
-                Triple(running, peers.count { it.online }, default?.label?.ifBlank { default.shortId })
-            }.collectLatest { (running, online, label) ->
+            combine(CoreHost.running, CoreHost.peers) { running, peers ->
+                // A device that removed this phone takes no files: it is not "the one device".
+                val target = NotificationPlan.sendActionTarget(peers.filter { !it.removedByPeer }.map { it.label.ifBlank { it.shortId } })
+                Triple(running, peers.count { it.online }, target)
+            }.distinctUntilChanged().collectLatest { (running, online, label) ->
                 shown = ServiceStart.Shown(running, online, label)
                 Notifications.updateService(this@CoreService, running, online, label)
             }
@@ -96,7 +97,7 @@ class CoreService : LifecycleService() {
      */
     private fun goForeground(): Boolean {
         val now = shown ?: ServiceStart.Shown(CoreHost.running.value, CoreHost.peers.value.count { it.online }, null)
-        val n = Notifications.service(this, now.running, now.online, now.defaultLabel)
+        val n = Notifications.service(this, now.running, now.online, now.sendToLabel)
         return try {
             val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
             ServiceCompat.startForeground(this, NotificationPlan.SERVICE_ID, n, type)

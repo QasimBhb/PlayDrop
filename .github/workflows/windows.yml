@@ -2,9 +2,14 @@
 # machine. What this proves: the workspace compiles and links with the MSVC toolchain, the
 # unit and loopback tests pass on Windows, clippy is clean for the Windows code paths, and
 # the Inno Setup installer compiles, installs silently, puts `playdrop` on PATH and uninstalls
-# cleanly (packaging/windows/test-installer.ps1). What it cannot prove: anything that needs
-# someone at the screen (the tray, SendInput, GSMTC media, the firewall prompt, the
-# installer's wizard on a real Windows 11 machine; see packaging/windows/README.md).
+# cleanly, and the installed programs really start (packaging/windows/test-installer.ps1: no
+# C runtime DLL imports, GUI subsystem for the daemon and the window, the daemon stays up
+# and answers `playdrop status`, the window stays open and connects, a daemon that cannot
+# start exits with a FATAL log line and no dialog, /RELAUNCH=1 restarts both and the window
+# connects, /RELAUNCH=daemon restarts the daemon alone). What it cannot
+# prove: anything that needs someone at the screen (the tray, SendInput, GSMTC media, the
+# firewall prompt, the installer's wizard on a real Windows 11 machine; see
+# packaging/windows/README.md).
 #
 # playdrop-ffi is excluded everywhere below: it only targets Android and iOS, and it uses
 # std::os::fd to adopt file descriptors from the Android host, which does not exist on
@@ -33,6 +38,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - ".cargo/**"
       - ".github/workflows/windows.yml"
   pull_request:
     paths:
@@ -42,6 +48,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
+      - ".cargo/**"
       - ".github/workflows/windows.yml"
   workflow_dispatch:
   workflow_call:
@@ -122,8 +129,12 @@ jobs:
 
       - name: Install, check and uninstall on the runner
         # A silent install as admin: the three programs land in Program Files, `playdrop` is
-        # on the system PATH and runs, the firewall rules name playdropd.exe, and uninstall
-        # takes all of it back out. A release run fails here too, before anything is published.
+        # on the system PATH and runs, the firewall rules name playdropd.exe, the installed
+        # daemon and window start and stay up (their logs are printed into this step's
+        # output), and uninstall takes all of it back out. A release run fails here too,
+        # before anything is published. The script sets PLAYDROP_NO_FATAL_DIALOG, so an error
+        # box can never hold the step; the timeout is for anything else that hangs.
+        timeout-minutes: 25
         run: packaging/windows/test-installer.ps1
 
       - name: Name the installer for the release

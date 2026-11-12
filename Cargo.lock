@@ -5712,7 +5712,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playdrop-cli"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -5735,7 +5735,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-core"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -5775,12 +5775,13 @@ dependencies = [
 
 [[package]]
 name = "playdrop-desktop"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "futures-util",
  "playdrop-core",
  "playdrop-ipc",
+ "playdrop-platform",
  "qrcode",
  "rfd",
  "serde",
@@ -5796,7 +5797,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ffi"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "android_logger",
  "jni 0.22.4",
@@ -5814,7 +5815,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ipc"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "futures-util",
  "playdrop-core",
@@ -5834,7 +5835,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-platform"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "playdrop-core",
  "tempfile",
@@ -5844,7 +5845,7 @@ dependencies = [
 
 [[package]]
 name = "playdropd"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5861,6 +5862,7 @@ dependencies = [
  "rustix 1.1.5",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -5868,6 +5870,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "ureq",
  "windows",
  "wl-clipboard-rs",
  "xkeysym",
@@ -8295,7 +8298,7 @@ dependencies = [
 
 [[package]]
 name = "uniffi-bindgen"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "uniffi",
 ]
@@ -8429,6 +8432,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6d49784317cd0d1ee7ec5c716dd598ec5b4483ea832a2dced265471cc0f690ae"
 
 [[package]]
+name = "ureq"
+version = "3.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ac5cecf619ca81f66a96482db09687c9f7465af65f4300a8c30cca05bd5a59d"
+dependencies = [
+ "base64 0.23.1",
+ "log",
+ "percent-encoding",
+ "rustls",
+ "rustls-pki-types",
+ "ureq-proto",
+ "utf8-zero",
+ "webpki-roots",
+]
+
+[[package]]
+name = "ureq-proto"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "622dce33c252115466d83f63e9744a18f12b4406aae51a01c15ad8fcf1185eb3"
+dependencies = [
+ "base64 0.23.1",
+ "http",
+ "httparse",
+ "log",
+]
+
+[[package]]
 name = "url"
 version = "2.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8468,6 +8499,12 @@ dependencies = [
  "unicode-vo",
  "xmlwriter",
 ]
+
+[[package]]
+name = "utf8-zero"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8c0a043c9540bae7c578c88f91dda8bd82e59ae27c21baca69c8b191aaf5a6e"
 
 [[package]]
 name = "utf8_iter"

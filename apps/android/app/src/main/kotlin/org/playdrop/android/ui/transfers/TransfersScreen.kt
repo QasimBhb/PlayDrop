@@ -168,7 +168,8 @@ private fun TransferCard(
                 }
                 Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            row.note?.takeIf { it.isNotBlank() }?.let {
+            val noteText = row.failure?.resolve(LocalContext.current) ?: row.note
+            noteText?.takeIf { it.isNotBlank() }?.let {
                 Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

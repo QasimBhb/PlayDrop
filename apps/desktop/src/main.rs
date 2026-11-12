@@ -9,6 +9,13 @@
 //! Screens (PLAN.md Phase 2, `docs/phases/phase-1-core.md` section 9 task d): devices
 //! with one-click send, add device with the candidate list and QR (SR-6, SR-9), the SAS
 //! prompt with no default-focused button (SR-8), transfers, settings, diagnostics.
+//!
+//! On Windows this is a GUI-subsystem program (no console window behind it). Its log goes
+//! to `%LOCALAPPDATA%\PlayDrop\logs\playdrop-desktop.log` and an error that ends it is
+//! shown in a message box (`playdrop_platform::startup`); started from a terminal it still
+//! prints there.
+
+#![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod daemon;
 mod icon;
@@ -24,6 +31,9 @@ mod ui {
     slint::include_modules!();
 }
 
+use std::process::ExitCode;
+
+use playdrop_platform::startup;
 use slint::ComponentHandle;
 use ui::{
     App, CandidateRow, ConnPhase, ConnState, DeviceRow, DevicesState, DiagSection,
@@ -33,6 +43,18 @@ use ui::{
 
 /// Wayland app ID and X11 class; matches `StartupWMClass` in the packaged `.desktop` file.
 const APP_ID: &str = "org.playdrop.PlayDrop";
+
+/// The program name for the log file and the error box.
+const PROGRAM: &str = "playdrop-desktop";
+
+/// Slint reads this to pick its backend and renderer.
+#[cfg(windows)]
+const SLINT_BACKEND_ENV: &str = "SLINT_BACKEND";
+
+/// The backend the window falls back to on Windows when the default one fails: winit with
+/// Slint's software renderer, which needs no OpenGL driver.
+#[cfg(windows)]
+const SOFTWARE_BACKEND: &str = "winit-software";
 
 /// Tab names accepted by `--page`, in tab order. The tray's "Add device" action opens the
 /// window on its second tab with `--page add-device`.
@@ -68,13 +90,49 @@ fn page_from_args() -> Option<i32> {
     None
 }
 
-fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("playdrop_desktop=info")),
-        )
-        .init();
+/// Runs the window; an error that ends it is reported where a person will see it
+/// (`startup::report_fatal`). On Linux the output and exit code are what a `main` returning
+/// `anyhow::Result` gives.
+fn main() -> ExitCode {
+    startup::attach_parent_console();
+    startup::install_panic_hook(PROGRAM);
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            startup::report_fatal(PROGRAM, &format!("{e:?}"));
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Logs to standard output as always; on Windows to the log file too (and only there when
+/// no terminal started the window).
+fn init_logging() {
+    let builder = tracing_subscriber::fmt().with_env_filter(
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("playdrop_desktop=info")),
+    );
+    #[cfg(windows)]
+    {
+        use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt as _};
+
+        let writer = match (startup::open_program_log(PROGRAM), startup::has_console()) {
+            (Some(f), true) => BoxMakeWriter::new((move || f.clone()).and(std::io::stdout)),
+            (Some(f), false) => BoxMakeWriter::new(move || f.clone()),
+            (None, _) => BoxMakeWriter::new(std::io::stdout),
+        };
+        builder.with_ansi(false).with_writer(writer).init();
+        tracing::info!(
+            version = env!("CARGO_PKG_VERSION"),
+            "playdrop-desktop starting"
+        );
+    }
+    #[cfg(not(windows))]
+    builder.init();
+}
+
+fn run() -> anyhow::Result<()> {
+    init_logging();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -82,7 +140,10 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    let app = App::new()?;
+    let app = match App::new() {
+        Ok(app) => app,
+        Err(e) => return renderer_failed(e.into()),
+    };
     if let Err(e) = slint::set_xdg_app_id(APP_ID) {
         tracing::warn!("could not set the app ID: {e}");
     }
@@ -95,11 +156,54 @@ fn main() -> anyhow::Result<()> {
     screens::install(&app, ipc);
     install_snapshot(&app);
 
-    app.run()?;
+    let ran = app.run();
 
     screens::uninstall();
     rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    match ran {
+        Ok(()) => Ok(()),
+        Err(e) => renderer_failed(e.into()),
+    }
+}
+
+/// The window could not be created or shown. Slint falls back to its software renderer by
+/// itself only while it picks a renderer, before a window exists (an OpenGL 1.1 driver is
+/// caught there); when the OpenGL context of the real window then fails, the event loop just
+/// ends with an error and the process cannot pick another renderer any more. So on Windows,
+/// unless a backend was already forced, start this program again on the software renderer
+/// and leave. A second failure is reported as fatal.
+#[cfg(windows)]
+fn renderer_failed(error: anyhow::Error) -> anyhow::Result<()> {
+    if std::env::var_os(SLINT_BACKEND_ENV).is_some() {
+        return Err(error.context("the window could not be shown"));
+    }
+    tracing::warn!(
+        "the window could not be shown ({error:#}); retrying with the software renderer"
+    );
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe,
+        Err(e) => {
+            return Err(error.context(format!(
+                "the window could not be shown, and this program could not be found to start it again with the software renderer: {e}"
+            )))
+        }
+    };
+    std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(SLINT_BACKEND_ENV, SOFTWARE_BACKEND)
+        .spawn()
+        .map_err(|e| {
+            error.context(format!(
+                "the window could not be shown, and starting it again with the software renderer failed: {e}"
+            ))
+        })?;
     Ok(())
+}
+
+/// Linux keeps Slint's own choice and reports the error as before.
+#[cfg(not(windows))]
+fn renderer_failed(error: anyhow::Error) -> anyhow::Result<()> {
+    Err(error)
 }
 
 /// Development aid: with `PLAYDROP_SNAPSHOT=<file.png>` set, the window renders itself to

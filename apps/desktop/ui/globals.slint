@@ -137,3 +137,28 @@ export global HelpState {
     // The firewall command when `focus` is `firewall`.
     in property <string> firewall-fix;
 }
+
+// The update check (docs/design/update-check.md): the banner above every tab and the
+// section in Settings. Rust fills it from the daemon's update state (`screens/update.rs`).
+export global UpdateUi {
+    in property <bool> banner-visible;
+    in property <string> banner-text;
+    // Why "Update" is not offered here (a Flatpak, a source build); empty otherwise.
+    in property <string> banner-detail;
+    in property <bool> banner-error;
+    // "Update", "Try again" or "Open release page"; empty for no button.
+    in property <string> primary-text;
+    in property <bool> show-later;
+    in property <bool> show-link;
+    // Settings.
+    in property <bool> enabled: true;
+    in property <bool> supported: true;
+    in property <bool> checking;
+    in property <string> last-checked;
+    in property <string> last-failure;
+    callback primary();
+    callback later();
+    callback open-page();
+    callback set-enabled(bool);
+    callback check-now();
+}

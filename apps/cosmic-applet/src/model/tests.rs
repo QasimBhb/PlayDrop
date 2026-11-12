@@ -4,7 +4,7 @@
 use std::path::PathBuf;
 
 use playdrop_ipc::types::{FileRoot, Grants, OfferedFile, PeerBattery};
-use playdrop_ipc::{ConsentToken, Settings};
+use playdrop_ipc::{ConsentToken, Settings, UpdateOffer, UpdateState, UpdateStatus};
 
 use super::*;
 
@@ -52,6 +52,7 @@ fn status(input_from: &[&str]) -> Box<Status> {
             autostart: false,
             autostart_refused: None,
             notifications: true,
+            update_check: true,
         },
         add_device_window_open: false,
         locked: false,
@@ -79,6 +80,7 @@ fn snapshot(tid: &str, n: u8, dir: TransferDirection, state: TransferStatus) -> 
         folder: None,
         delivered: Vec::new(),
         resumable: false,
+        failure: None,
     }
 }
 
@@ -616,6 +618,7 @@ fn failures_show_the_reason_and_ask_for_the_list() {
             peer: id(1),
             direction: TransferDirection::Send,
             reason: "the device went away".into(),
+            code: playdrop_ipc::types::TransferFailure::default(),
         }),
         NOW,
     );
@@ -695,6 +698,7 @@ fn the_model_keeps_a_bounded_number_of_finished_transfers() {
                 peer: id(1),
                 direction: TransferDirection::Send,
                 reason: "x".into(),
+                code: playdrop_ipc::types::TransferFailure::default(),
             }),
             NOW + i,
         );
@@ -988,6 +992,7 @@ fn a_refresh_does_not_bring_back_transfers_the_applet_pruned() {
             peer: id(1),
             direction: TransferDirection::Send,
             reason: "x".into(),
+            code: playdrop_ipc::types::TransferFailure::default(),
         }),
         NOW + 30,
     );
@@ -1595,4 +1600,94 @@ fn more_invisible_characters_go_and_line_separators_become_spaces() {
         "abcdefg"
     );
     assert_eq!(elide("a\u{2028}b\u{2029}c", 20), "a b c");
+}
+
+fn update_status(state: UpdateState) -> UpdateStatus {
+    UpdateStatus {
+        state,
+        last_checked_ms: None,
+        last_failed_ms: None,
+        last_failure: None,
+        running_version: "0.11.0".into(),
+        unavailable: None,
+    }
+}
+
+fn available(version: &str) -> UpdateStatus {
+    update_status(UpdateState::Available {
+        offer: UpdateOffer {
+            version: version.into(),
+            page_url: "https://example.invalid/r".into(),
+            can_install: true,
+            reason: None,
+        },
+    })
+}
+
+#[test]
+fn an_available_update_shows_one_line_and_other_phases_show_nothing() {
+    let mut m = connected(vec![], vec![]);
+    assert_eq!(view(&m).update_line, None);
+    m.apply(Input::Update(Box::new(available("0.12.0"))), 0);
+    assert_eq!(
+        view(&m).update_line.as_deref(),
+        Some("PlayDrop 0.12.0 is available")
+    );
+    for state in [
+        UpdateState::Off,
+        UpdateState::Idle,
+        UpdateState::Checking,
+        UpdateState::UpToDate,
+        UpdateState::Downloading {
+            version: "0.12.0".into(),
+            done: 1,
+            total: 2,
+        },
+        UpdateState::Other,
+    ] {
+        m.apply(Input::Update(Box::new(available("0.12.0"))), 0);
+        m.apply(Input::Update(Box::new(update_status(state))), 0);
+        assert_eq!(view(&m).update_line, None);
+    }
+}
+
+#[test]
+fn the_update_line_follows_events_live() {
+    let mut m = connected(vec![], vec![]);
+    m.apply(daemon(DaemonEvent::UpdateChanged(available("0.12.0"))), 0);
+    assert!(view(&m).update_line.is_some());
+    // "Later" in the window hides it again.
+    m.apply(
+        daemon(DaemonEvent::UpdateChanged(update_status(UpdateState::Idle))),
+        0,
+    );
+    assert_eq!(view(&m).update_line, None);
+}
+
+#[test]
+fn the_update_line_goes_with_the_daemon_and_needs_a_connection() {
+    let mut m = Model::new();
+    m.apply(Input::Update(Box::new(available("0.12.0"))), 0);
+    assert_eq!(view(&m).update_line, None);
+    let mut m = connected(vec![], vec![]);
+    m.apply(Input::Update(Box::new(available("0.12.0"))), 0);
+    m.apply(Input::Disconnected, 0);
+    assert_eq!(view(&m).update_line, None);
+    m.apply(
+        Input::Connected {
+            status: status(&[]),
+            peers: vec![],
+            transfers: vec![],
+        },
+        0,
+    );
+    assert_eq!(view(&m).update_line, None);
+}
+
+#[test]
+fn a_long_offered_version_is_cut() {
+    let mut m = connected(vec![], vec![]);
+    m.apply(Input::Update(Box::new(available(&"9".repeat(80)))), 0);
+    let line = view(&m).update_line.expect("line");
+    assert!(line.chars().count() < 60);
 }

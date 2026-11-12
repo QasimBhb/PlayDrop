@@ -116,8 +116,15 @@ enum Followed {
 }
 
 /// Whether [`Client::wait_for_daemon`] can ever resolve here. Only Linux has a bus name to
-/// watch; elsewhere the wait would park the follow task for good.
+/// watch; elsewhere the wait would park the follow task for good, so the follow loop looks
+/// again every [`POLL_FOR_DAEMON_EVERY`] instead.
 const CAN_WATCH_FOR_DAEMON: bool = cfg!(target_os = "linux");
+
+/// Where no bus name can be watched (Windows): how often the follow loop tries the daemon's
+/// pipe again while none is there. A pipe that does not exist fails at once, so this costs
+/// nothing; it is what lets a window started a moment before its daemon (the installer
+/// starts both after an update) connect without anyone pressing a button.
+const POLL_FOR_DAEMON_EVERY: Duration = Duration::from_secs(1);
 
 /// Longest one connect attempt may take. The bus sets no deadline of its own, so a daemon
 /// that owns its name but never answers would otherwise hold the gate for ever and leave
@@ -212,6 +219,12 @@ impl Ipc {
                     tracing::info!("connect to daemon failed: {e}");
                     this.report_failure(&e);
                     drop(gate);
+                    // Where no bus announces a daemon that starts later, keep looking for one
+                    // (it may just not have made its pipe yet). Never starts one: following
+                    // only connects to a daemon that is already there.
+                    if !CAN_WATCH_FOR_DAEMON && matches!(e, ConnectError::NotRunning) {
+                        this.follow();
+                    }
                 }
             }
         });
@@ -234,8 +247,9 @@ impl Ipc {
     ///
     /// Reports "not running" straight away when that is the case, so the window can offer
     /// "Start". Does nothing if already connected or already following. On Windows there is
-    /// no name to watch (and a connect never starts anything there), so it makes one attempt
-    /// and reports it.
+    /// no name to watch, so while no daemon is there it tries the pipe again every
+    /// [`POLL_FOR_DAEMON_EVERY`] (reporting "not running" once, not on every try). That never
+    /// starts a daemon either, so a Quit stays quit there too.
     pub fn follow(self: &Arc<Self>) {
         if self.is_connected() || self.following.swap(true, Ordering::SeqCst) {
             return;
@@ -259,6 +273,10 @@ impl Ipc {
     async fn follow_until_connected(&self) -> Followed {
         // When an owner of the name first failed to answer; cleared when the name is free.
         let mut unanswered_since: Option<tokio::time::Instant> = None;
+        // Polling only: "not running" was already shown and has not changed since, so the
+        // next miss is not posted again (it would also replace whatever a "Start" that gave
+        // up has put on the screen).
+        let mut told_not_running = false;
         loop {
             let gate = self.gate.lock().await;
             if self.is_connected() {
@@ -276,10 +294,14 @@ impl Ipc {
             match follow_step(&error, unanswered_for) {
                 FollowStep::WaitForName => {
                     unanswered_since = None;
-                    self.report_failure(&error);
+                    if CAN_WATCH_FOR_DAEMON || !told_not_running {
+                        self.report_failure(&error);
+                        told_not_running = true;
+                    }
                     drop(gate);
                     if !CAN_WATCH_FOR_DAEMON {
-                        return Followed::Reported;
+                        tokio::time::sleep(POLL_FOR_DAEMON_EVERY).await;
+                        continue;
                     }
                     if let Err(e) = Client::wait_for_daemon(&ClientOptions::default()).await {
                         tracing::debug!("watching for the daemon failed: {e}");
@@ -287,6 +309,7 @@ impl Ipc {
                     }
                 }
                 FollowStep::RetrySoon => {
+                    told_not_running = false;
                     drop(gate);
                     // From the start of the attempt: one against a daemon that hangs lasts
                     // the whole timeout, and that time counts.

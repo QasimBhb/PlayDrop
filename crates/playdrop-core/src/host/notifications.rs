@@ -26,6 +26,78 @@ use crate::{Error, Result};
 /// are dropped (protocol.md 5.16, SR-44).
 pub const NOTIFICATIONS_POSTED_PER_MINUTE: usize = 30;
 
+/// At most this many `removed` frames are handled per connection in any 60 s window; more
+/// are dropped (protocol.md 5.16, SR-44). Set well above any real burst: the Android app
+/// remembers up to 200 mirrored notifications and, when the user turns mirroring off or the
+/// listener goes away, sends `removed` for every one of them at once. A dropped `removed`
+/// would leave a stale copy on the desktop, so the limit only has to stop a flood, at twice
+/// that book.
+pub const NOTIFICATIONS_REMOVED_PER_MINUTE: usize = 400;
+
+/// At most this many `dismiss` frames are handled per connection in any 60 s window; more
+/// are dropped (protocol.md 5.16, SR-44). Only a person closing a copy sends one, and a
+/// desktop shows at most 20 copies per peer and takes at most
+/// [`NOTIFICATIONS_POSTED_PER_MINUTE`] new ones a minute, so no real minute holds more than
+/// 50 dismissals.
+pub const NOTIFICATIONS_DISMISS_PER_MINUTE: usize = 60;
+
+/// What this host does with notification mirroring (protocol.md section 4 and 5.16), set in
+/// [`crate::host::HostConfig::notifications`].
+///
+/// Either role lists `notifications` in both capability lists, because each one sends one
+/// kind of op and handles the other: a source sends `posted` and `removed` and handles
+/// `dismiss`, a sink handles `posted` and `removed` and sends `dismiss`. Only
+/// [`NotificationRole::Off`] changes the lists (it leaves the capability out of both), so a
+/// host from before this setting (0.10.0, which listed it in both and handled every op)
+/// sees the same lists from a source or a sink. Within a role the core refuses to send the
+/// other role's ops and drops them when they arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotificationRole {
+    /// No mirroring: the capability is in neither list, nothing is sent and every
+    /// `notification` frame is dropped. The default, and what the command-line host and
+    /// iOS use, since they have nothing that shows or reads notifications.
+    #[default]
+    Off,
+    /// A phone that mirrors its notifications: sends `posted` and `removed`, handles
+    /// `dismiss`.
+    Source,
+    /// A desktop that shows mirrored copies: handles `posted` and `removed`, sends
+    /// `dismiss`.
+    Sink,
+}
+
+impl NotificationRole {
+    /// Whether `notifications` goes into `caps.in` and `caps.out`.
+    pub fn announces(self) -> bool {
+        self != Self::Off
+    }
+
+    /// Whether this role sends `n`.
+    pub(crate) fn sends(self, n: &Notification) -> bool {
+        match n {
+            Notification::Posted(_) | Notification::Removed { .. } => self == Self::Source,
+            Notification::Dismiss { .. } => self == Self::Sink,
+        }
+    }
+
+    /// Whether this role handles `n` when it arrives.
+    pub(crate) fn handles(self, n: &Notification) -> bool {
+        match n {
+            Notification::Posted(_) | Notification::Removed { .. } => self == Self::Sink,
+            Notification::Dismiss { .. } => self == Self::Source,
+        }
+    }
+}
+
+/// The per-connection limit for an incoming `notification` op (SR-44).
+pub(crate) fn per_minute_limit(n: &Notification) -> usize {
+    match n {
+        Notification::Posted(_) => NOTIFICATIONS_POSTED_PER_MINUTE,
+        Notification::Removed { .. } => NOTIFICATIONS_REMOVED_PER_MINUTE,
+        Notification::Dismiss { .. } => NOTIFICATIONS_DISMISS_PER_MINUTE,
+    }
+}
+
 /// A notification mirrored from a peer, or one this host mirrors to a peer (protocol.md
 /// 5.16). `key` is the opaque key from [`crate::host::Host::notification_key`]; `when_ms`
 /// is when it was posted, in Unix ms. `Debug` hides every field (SR-43).
@@ -122,8 +194,22 @@ enum Need {
     Nothing,
 }
 
-/// The live session with `peer` that accepts notifications, after the grant check.
-fn session_for(inner: &Inner, peer: &DeviceId, need: Need) -> Result<std::sync::Arc<Session>> {
+/// The live session with `peer` that accepts notifications, after the role and grant
+/// checks. `op` is the frame about to go: a host never sends an op its role does not
+/// (protocol.md section 4: nothing that was not announced).
+fn session_for(
+    inner: &Inner,
+    peer: &DeviceId,
+    op: &Notification,
+    need: Need,
+) -> Result<std::sync::Arc<Session>> {
+    if !inner.notification_role.sends(op) {
+        return Err(Error::Forbidden(match inner.notification_role {
+            NotificationRole::Off => "this host does not take part in notification mirroring",
+            NotificationRole::Source => "a mirroring phone does not send dismiss",
+            NotificationRole::Sink => "a desktop that shows notifications does not send them",
+        }));
+    }
     let pin = inner.pins.get(peer).ok_or(Error::NotPaired)?;
     match need {
         Need::Out if !pin.grants.notifications_out => {
@@ -154,8 +240,9 @@ fn check_key(key: &str) -> Result<()> {
 /// Sends `posted` to `peer` (5.16). Needs this host's `notificationsOut` grant for it.
 pub(crate) fn send_posted(inner: &Inner, peer: &DeviceId, n: MirroredNotification) -> Result<()> {
     check_key(&n.key)?;
-    let s = session_for(inner, peer, Need::Out)?;
-    s.send(Frame::Notification(Notification::Posted(n.into_wire())));
+    let frame = Notification::Posted(n.into_wire());
+    let s = session_for(inner, peer, &frame, Need::Out)?;
+    s.send(Frame::Notification(frame));
     Ok(())
 }
 
@@ -163,26 +250,43 @@ pub(crate) fn send_posted(inner: &Inner, peer: &DeviceId, n: MirroredNotificatio
 /// that just turned `notificationsOut` off uses it to clear the peer's copies (SR-42).
 pub(crate) fn send_removed(inner: &Inner, peer: &DeviceId, key: String) -> Result<()> {
     check_key(&key)?;
-    let s = session_for(inner, peer, Need::Nothing)?;
-    s.send(Frame::Notification(Notification::Removed { key }));
+    let frame = Notification::Removed { key };
+    let s = session_for(inner, peer, &frame, Need::Nothing)?;
+    s.send(Frame::Notification(frame));
     Ok(())
 }
 
 /// Sends `dismiss` to `peer` (5.16). Needs this host's `notificationsIn` grant for it.
 pub(crate) fn send_dismiss(inner: &Inner, peer: &DeviceId, key: String) -> Result<()> {
     check_key(&key)?;
-    let s = session_for(inner, peer, Need::In)?;
-    s.send(Frame::Notification(Notification::Dismiss { key }));
+    let frame = Notification::Dismiss { key };
+    let s = session_for(inner, peer, &frame, Need::In)?;
+    s.send(Frame::Notification(frame));
     Ok(())
 }
 
-/// A `notification` frame that passed the grant check (5.3). Bad keys are dropped,
-/// over-limit fields are dropped with `error` `bad_request`, and `posted` frames past
-/// [`NOTIFICATIONS_POSTED_PER_MINUTE`] on this connection are dropped (SR-44).
+/// Whether this host handles `n` at all, checked before the grant (protocol.md section 4:
+/// a host acts only on what its `in` list announced). A frame of the other role's ops, or
+/// any frame while mirroring is off, is dropped with no answer: the peer either is not
+/// `PlayDrop` or predates [`NotificationRole`], and an error would only invite it to retry.
+pub(crate) fn accepts(inner: &Inner, peer: &DeviceId, n: &Notification) -> bool {
+    let ok = inner.notification_role.handles(n);
+    if !ok {
+        // `Debug` of a notification names the op only (SR-43).
+        tracing::debug!(peer = %short(peer), frame = ?n, "notification op this host does not handle; dropped");
+    }
+    ok
+}
+
+/// A `notification` frame that passed the role check ([`accepts`]) and the grant check
+/// (5.3). Frames past their per-op limit on this connection are dropped
+/// ([`NOTIFICATIONS_POSTED_PER_MINUTE`], [`NOTIFICATIONS_REMOVED_PER_MINUTE`],
+/// [`NOTIFICATIONS_DISMISS_PER_MINUTE`], SR-44), bad keys are dropped, and over-limit fields
+/// are dropped with `error` `bad_request`.
 pub(crate) fn on_frame(inner: &Inner, sess: &Session, seq: u64, n: Notification) {
     let peer = sess.peer();
-    if matches!(n, Notification::Posted(_)) && !sess.allow_notification_posted() {
-        tracing::debug!(peer = %short(&peer), "notification over the rate limit; dropped");
+    if !sess.allow_notification(&n) {
+        tracing::debug!(peer = %short(&peer), frame = ?n, "notification over the rate limit; dropped");
         return;
     }
     if !n.key_is_valid() {
@@ -251,6 +355,39 @@ mod tests {
         }
         .into_wire();
         assert_eq!((short.app.as_str(), short.text.as_str()), ("A", "t"));
+    }
+
+    /// Each role sends one kind of op and handles the other; no role does neither, and
+    /// only a role announces the capability.
+    #[test]
+    fn roles_split_the_ops() {
+        let key = || "0".repeat(32);
+        let posted = Notification::Posted(NotificationPosted {
+            key: key(),
+            app: String::new(),
+            title: String::new(),
+            text: String::new(),
+            when: 0,
+        });
+        let removed = Notification::Removed { key: key() };
+        let dismiss = Notification::Dismiss { key: key() };
+        let src = NotificationRole::Source;
+        let sink = NotificationRole::Sink;
+        let off = NotificationRole::Off;
+        for n in [&posted, &removed] {
+            assert!(src.sends(n) && !src.handles(n));
+            assert!(!sink.sends(n) && sink.handles(n));
+        }
+        assert!(!src.sends(&dismiss) && src.handles(&dismiss));
+        assert!(sink.sends(&dismiss) && !sink.handles(&dismiss));
+        for n in [&posted, &removed, &dismiss] {
+            assert!(!off.sends(n) && !off.handles(n));
+        }
+        assert!(src.announces() && sink.announces() && !off.announces());
+        assert_eq!(NotificationRole::default(), off);
+        assert_eq!(per_minute_limit(&posted), NOTIFICATIONS_POSTED_PER_MINUTE);
+        assert_eq!(per_minute_limit(&removed), NOTIFICATIONS_REMOVED_PER_MINUTE);
+        assert_eq!(per_minute_limit(&dismiss), NOTIFICATIONS_DISMISS_PER_MINUTE);
     }
 
     #[test]

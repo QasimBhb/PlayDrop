@@ -20,6 +20,7 @@ import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -52,7 +53,11 @@ data class MirrorAppsUiState(
     val apps: List<MirrorApp>? = null,
     /** Packages on the allow list. */
     val allowed: Set<String> = emptySet(),
-)
+) {
+    /** Allowed packages the query did not find, shown with a Remove button. */
+    val notFound: List<String>
+        get() = apps?.let { list -> MirrorApps.notFound(allowed, list.mapTo(HashSet()) { it.packageName }) }.orEmpty()
+}
 
 /**
  * Lists the apps that have a launcher entry (visible through the manifest's `<queries>`, no
@@ -68,7 +73,9 @@ class MirrorAppsViewModel(application: Application) : AndroidViewModel(applicati
 
     init {
         viewModelScope.launch {
-            apps.value = withContext(Dispatchers.IO) { launcherApps(getApplication()) }
+            val app = getApplication<Application>()
+            val found = withContext(Dispatchers.IO) { launcherApps(app) }
+            apps.value = MirrorApps.forPicker(found, app.packageName)
         }
     }
 
@@ -84,10 +91,9 @@ class MirrorAppsViewModel(application: Application) : AndroidViewModel(applicati
     private fun launcherApps(app: Application): List<MirrorApp> {
         val pm = app.packageManager
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        val found = pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0)).map {
+        return pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0)).map {
             MirrorApp(it.activityInfo.packageName, it.loadLabel(pm).toString())
         }
-        return MirrorApps.forPicker(found, app.packageName)
     }
 }
 
@@ -130,6 +136,25 @@ fun MirrorAppsScreen(state: MirrorAppsUiState, onBack: () -> Unit, onToggle: (St
             }
             if (apps.isEmpty()) {
                 item { Text(stringResource(R.string.ui_mirror_apps_empty), modifier = Modifier.padding(16.dp)) }
+            }
+            val missing = state.notFound
+            if (missing.isNotEmpty()) {
+                item {
+                    Text(
+                        stringResource(R.string.ui_mirror_apps_not_found_header),
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp),
+                    )
+                }
+                items(missing, key = { "missing:$it" }) { pkg ->
+                    ListItem(
+                        headlineContent = { Text(pkg) },
+                        supportingContent = { Text(stringResource(R.string.ui_mirror_apps_not_found)) },
+                        trailingContent = {
+                            TextButton(onClick = { onToggle(pkg, false) }) { Text(stringResource(R.string.ui_mirror_apps_remove)) }
+                        },
+                    )
+                }
             }
             items(apps, key = { it.packageName }) { app ->
                 val checked = app.packageName in state.allowed

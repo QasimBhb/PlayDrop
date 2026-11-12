@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Device chooser for shares, picked files and "Send clipboard" (SR-29) -->
+    <plurals name="share_choose_files">
+        <item quantity="one">Send %d item to</item>
+        <item quantity="other">Send %d items to</item>
+    </plurals>
+    <string name="share_choose_text">Send text to</string>
+    <string name="share_choose_clipboard">Send clipboard to</string>
+    <string name="share_select_all">Select all</string>
+    <string name="share_clear">Clear</string>
+    <string name="share_send">Send</string>
+    <plurals name="share_send_to_devices">
+        <item quantity="one">Send to %d device</item>
+        <item quantity="other">Send to %d devices</item>
+    </plurals>
+    <string name="share_default_marker">Default</string>
+    <string name="share_make_default">Make default</string>
+    <string name="share_row_more">More for %1$s</string>
+    <!-- Short ID, then what is special about the row -->
+    <string name="share_row_detail">%1$s - %2$s</string>
+    <string name="share_row_removed">Pair again to send</string>
+    <string name="share_row_offline">Offline</string>
+    <string name="share_row_offline_files">Offline. PlayDrop keeps trying for 10 minutes.</string>
+    <string name="share_row_offline_text">Offline. PlayDrop tries to reach it first.</string>
+    <string name="share_row_clipboard_off">Clipboard to this device is off</string>
+    <string name="share_row_no_images">Cannot take copied images</string>
+
+    <!-- Result toasts; %1$s is a list of device names such as "A, B and C" -->
+    <string name="share_and">and</string>
+    <plurals name="share_report_sending">
+        <item quantity="one">Sending %1$d item to %2$s.</item>
+        <item quantity="other">Sending %1$d items to %2$s.</item>
+    </plurals>
+    <string name="share_report_sent">Sent to %1$s.</string>
+    <string name="share_report_copied">Copied to %1$s.</string>
+    <plurals name="share_report_waiting">
+        <item quantity="one">%1$s is offline. PlayDrop keeps trying for 10 minutes.</item>
+        <item quantity="other">%1$s are offline. PlayDrop keeps trying for 10 minutes.</item>
+    </plurals>
+    <plurals name="share_report_offline">
+        <item quantity="one">%1$s is offline.</item>
+        <item quantity="other">%1$s are offline.</item>
+    </plurals>
+    <string name="share_report_clipboard_off">Clipboard to %1$s is off.</string>
+    <string name="share_report_no_images">%1$s cannot take copied images.</string>
+    <string name="share_report_already_sent">Already sent to %1$s.</string>
+    <plurals name="share_report_not_paired">
+        <item quantity="one">%1$s is no longer paired.</item>
+        <item quantity="other">%1$s are no longer paired.</item>
+    </plurals>
+    <string name="toast_too_many_items">PlayDrop sends up to 20,000 items at once. Pick fewer and try again.</string>
+    <string name="toast_too_many_items_open">That is too many items to send to this many devices at once. Send to fewer devices, or fewer items.</string>
+    <string name="toast_share_not_allowed">PlayDrop can only send items another app shares with it.</string>
+    <string name="toast_pick_again">PlayDrop was restarted and lost the picked items. Pick them again.</string>
+    <string name="share_report_not_taken">%1$s did not take it.</string>
+    <string name="share_report_failed">Could not send to %1$s: %2$s</string>
+    <string name="share_no_image_device">No device here can take a copied image.</string>
+</resources>

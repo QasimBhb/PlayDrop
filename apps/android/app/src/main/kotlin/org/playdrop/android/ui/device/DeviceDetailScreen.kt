@@ -1,8 +1,5 @@
 package org.playdrop.android.ui.device
 
-import android.content.ActivityNotFoundException
-import android.content.Context
-import android.content.Intent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -11,18 +8,18 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Mouse
-import androidx.compose.material.icons.filled.Notifications
-import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
@@ -37,7 +34,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
@@ -45,22 +41,18 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
-import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import org.playdrop.android.R
-import org.playdrop.android.service.NotificationMirror
 import org.playdrop.android.ui.common.BatteryLabel
 import org.playdrop.android.ui.common.CollectMessages
 import org.playdrop.android.ui.common.Samples
@@ -79,23 +71,16 @@ fun DeviceDetailRoute(
     onBack: () -> Unit,
     onPairAgain: () -> Unit,
     onOpenInput: () -> Unit,
-    onChooseMirrorApps: () -> Unit,
+    onOpenPermissions: () -> Unit,
+    onOpenTransfers: () -> Unit,
     showMessage: (String) -> Unit,
     vm: DeviceDetailViewModel = viewModel(),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
-    val context = LocalContext.current
     CollectMessages(vm.messages, showMessage)
     LaunchedEffect(vm) { vm.closed.collect { onBack() } }
-    // Read again on every resume: the user grants or revokes access in system Settings.
-    var notificationAccess by remember { mutableStateOf(NotificationMirror.hasAccess(context)) }
-    LifecycleResumeEffect(Unit) {
-        notificationAccess = NotificationMirror.hasAccess(context)
-        onPauseOrDispose {}
-    }
     DeviceDetailScreen(
         state = state,
-        notificationAccess = notificationAccess,
         actions = DeviceDetailActions(
             onBack = onBack,
             onRename = vm::rename,
@@ -103,25 +88,21 @@ fun DeviceDetailRoute(
             onPing = vm::ping,
             onToggleFind = vm::toggleFind,
             onConnect = vm::connect,
-            onGrant = vm::setGrant,
             onUnpair = vm::unpair,
             onPairAgain = onPairAgain,
             onOpenInput = onOpenInput,
             onMedia = vm::mediaCommand,
-            onOpenNotificationAccess = {
-                if (!openNotificationAccess(context)) showMessage(context.getString(R.string.ui_mirror_access_unavailable))
-            },
-            onChooseMirrorApps = onChooseMirrorApps,
+            onOpenPermissions = onOpenPermissions,
+            send = SendCallbacks(
+                onPicked = vm::sendFiles,
+                onClipboard = vm::sendClipboard,
+                onConfirmSensitive = vm::confirmSensitive,
+                onCancelSensitive = vm::cancelSensitive,
+                onSeeProgress = onOpenTransfers,
+                onDismissNotice = vm::dismissNotice,
+            ),
         ),
     )
-}
-
-/** Opens the system list of notification listeners; false when this phone has no such screen. */
-private fun openNotificationAccess(context: Context): Boolean = try {
-    context.startActivity(Intent(android.provider.Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-    true
-} catch (e: ActivityNotFoundException) {
-    false
 }
 
 /** Callbacks of [DeviceDetailScreen]. */
@@ -138,8 +119,6 @@ data class DeviceDetailActions(
     val onToggleFind: () -> Unit = {},
     /** Dial now. */
     val onConnect: () -> Unit = {},
-    /** Change a grant. */
-    val onGrant: (GrantKind, Boolean) -> Unit = { _, _ -> },
     /** Unpair after confirmation. */
     val onUnpair: () -> Unit = {},
     /** Open "Add device" to pair again. */
@@ -148,19 +127,20 @@ data class DeviceDetailActions(
     val onOpenInput: () -> Unit = {},
     /** Media command: player ID, action, seek ms or volume. */
     val onMedia: (String, MediaAction, Long?) -> Unit = { _, _, _ -> },
-    /** Open the system "Notification access" screen. */
-    val onOpenNotificationAccess: () -> Unit = {},
-    /** Open the app picker for notification mirroring. */
-    val onChooseMirrorApps: () -> Unit = {},
+    /** Open the Permissions page. */
+    val onOpenPermissions: () -> Unit = {},
+    /** The send buttons and their confirmation. */
+    val send: SendCallbacks = SendCallbacks(),
 )
 
 /**
- * One paired device: actions, grants, notification mirroring, addresses and unpair.
- * [notificationAccess]: PlayDrop holds "Notification access" in system Settings.
+ * One paired device: send buttons, ping and find, remote input, now playing, the way to
+ * Permissions, addresses and unpair.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions, notificationAccess: Boolean = true) {
+fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions) {
+    val context = LocalContext.current
     var renaming by rememberSaveable { mutableStateOf(false) }
     var pinging by rememberSaveable { mutableStateOf(false) }
     var confirmUnpair by rememberSaveable { mutableStateOf(false) }
@@ -228,6 +208,8 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
 
+            SendActions(state, actions.send)
+
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 if (!row.isDefault) {
                     FilledTonalButton(onClick = actions.onSetDefault) { Text(stringResource(R.string.ui_detail_set_default)) }
@@ -279,37 +261,11 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions,
             }
 
             HorizontalDivider()
-            SectionTitle(stringResource(R.string.ui_grants_title))
-            GRANT_ROWS.forEach { (kind, title, body) ->
-                ListItem(
-                    headlineContent = { Text(stringResource(title)) },
-                    supportingContent = { Text(stringResource(body)) },
-                    trailingContent = {
-                        Switch(
-                            checked = GrantEdit.get(state.grants, kind),
-                            onCheckedChange = { actions.onGrant(kind, it) },
-                        )
-                    },
-                )
-            }
-            // GrantKind.INPUT would let the device control this phone, which a phone never
-            // accepts, so it gets a note instead of a toggle that does nothing.
-            Text(
-                stringResource(R.string.ui_grant_input_phone),
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(horizontal = 16.dp),
-            )
-
-            HorizontalDivider()
-            MirrorSection(
-                deviceLabel = row.label,
-                on = state.grants.notificationsOut,
-                access = notificationAccess,
-                apps = state.mirrorApps,
-                onToggle = { actions.onGrant(GrantKind.NOTIFICATIONS_OUT, it) },
-                onOpenAccess = actions.onOpenNotificationAccess,
-                onChooseApps = actions.onChooseMirrorApps,
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.ui_permissions_title)) },
+                supportingContent = { Text(DeviceSend.grantSummary(state.grants).resolve(context)) },
+                trailingContent = { Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null) },
+                modifier = Modifier.heightIn(min = 48.dp).clickable(onClick = actions.onOpenPermissions),
             )
 
             HorizontalDivider()
@@ -385,61 +341,6 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions,
     }
 }
 
-/**
- * Notification mirroring for one device: the `notificationsOut` toggle with what it shares,
- * a row saying why mirroring is off when PlayDrop has no notification access (anti-pattern
- * 18), and the way to the app picker.
- */
-@Composable
-private fun MirrorSection(
-    deviceLabel: String,
-    on: Boolean,
-    access: Boolean,
-    apps: Int,
-    onToggle: (Boolean) -> Unit,
-    onOpenAccess: () -> Unit,
-    onChooseApps: () -> Unit,
-) {
-    SectionTitle(stringResource(R.string.ui_mirror_title))
-    ListItem(
-        headlineContent = { Text(stringResource(R.string.ui_mirror_toggle)) },
-        supportingContent = { Text(stringResource(R.string.ui_mirror_body, deviceLabel)) },
-        leadingContent = { Icon(Icons.Filled.Notifications, contentDescription = null) },
-        trailingContent = { Switch(checked = on, onCheckedChange = onToggle) },
-    )
-    if (!access) {
-        Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer)) {
-            Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-                Icon(
-                    Icons.Filled.NotificationsOff,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.onSecondaryContainer,
-                )
-                Text(
-                    stringResource(R.string.ui_mirror_no_access),
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(start = 12.dp).weight(1f),
-                )
-                TextButton(onClick = onOpenAccess) { Text(stringResource(R.string.ui_mirror_open_access)) }
-            }
-        }
-    }
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Text(
-            if (apps == 0) {
-                stringResource(R.string.ui_mirror_no_apps)
-            } else {
-                pluralStringResource(R.plurals.ui_mirror_apps_picked, apps, apps)
-            },
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 16.dp).weight(1f),
-        )
-        OutlinedButton(onClick = onChooseApps) { Text(stringResource(R.string.ui_mirror_choose_apps)) }
-    }
-}
-
 /** A dialog with one text field. */
 @Composable
 fun TextInputDialog(
@@ -469,16 +370,6 @@ fun TextInputDialog(
 }
 
 private const val MAX_INPUT = 64
-
-private data class GrantRow(val kind: GrantKind, val title: Int, val body: Int)
-
-private val GRANT_ROWS = listOf(
-    GrantRow(GrantKind.FILES, R.string.ui_grant_files, R.string.ui_grant_files_body),
-    GrantRow(GrantKind.CLIPBOARD_IN, R.string.ui_grant_clip_in, R.string.ui_grant_clip_in_body),
-    GrantRow(GrantKind.CLIPBOARD_OUT, R.string.ui_grant_clip_out, R.string.ui_grant_clip_out_body),
-    GrantRow(GrantKind.MEDIA, R.string.ui_grant_media, R.string.ui_grant_media_body),
-    GrantRow(GrantKind.FIND, R.string.ui_grant_find, R.string.ui_grant_find_body),
-)
 
 private const val DISABLED_ALPHA = 0.6f
 

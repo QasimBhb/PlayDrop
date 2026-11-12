@@ -47,6 +47,7 @@ playdrop ping [--to <peer>] [MESSAGE]
 playdrop outbox [--json]
 playdrop outbox add <PATH>... --to <peer>
 playdrop diagnose [--json]
+playdrop update [--check | --install] [--json]
 ```
 
 ## Choosing a device
@@ -118,6 +119,35 @@ queue when you open the app.
 listening, which network interfaces are usable, and whether the multicast, port or firewall layer
 is the problem. See [cant-find-your-device.md](cant-find-your-device.md).
 
+**`update`** shows whether a newer PlayDrop exists, from what the daemon already knows; it asks
+no one. `playdrop update --check` asks GitHub now, like "Check now" in Settings: the same
+anonymous question the window asks when it opens (the address of the release files and
+`User-Agent: PlayDrop`; no name, ID or version is sent, and GitHub sees your IP address, as with
+any download), and it works even if a check ran today or failed within the hour. It exits 1 when
+the check failed, "Check for updates" is off in Settings, or this build is not a release (a
+pre-release or test build never checks, and says so).
+
+`playdrop update --install` downloads the offered version, checks it against the release's
+signed checksums and installs it, printing each step to standard error. With the `.deb` the
+system password prompt appears, and after the install the daemon restarts on the new version;
+an open window then asks to be closed and opened again. With the Windows installer, Windows asks
+for permission and the installer restarts PlayDrop (only the service, since the command line,
+not the window, asked). Ctrl-C during the download cancels it and deletes what was downloaded;
+once the system's prompt or installer has the files it can no longer be cancelled, and the
+command says so and keeps following it. A download that is too slow (under 64 KiB in a minute,
+or over 30 minutes in all) is stopped. It exits 0 once the new version is installed (or, on
+Windows, the installer is replacing PlayDrop), and 1 when nothing is offered, this copy cannot
+install it (the Flatpak, or a copy not installed from a PlayDrop package: the message says
+where to get it), the download did not match its signature, was too slow or was cancelled, or
+the prompt or installer was closed. In every failure the current version keeps running and the
+downloaded files are deleted.
+
+```sh
+playdrop update
+playdrop update --check
+playdrop update --install
+```
+
 ## JSON
 
 `--json` prints the daemon's own answer as JSON on standard output, one result for the command,
@@ -133,7 +163,7 @@ playdrop peers --json
 | Code | Meaning |
 |---|---|
 | 0 | It worked |
-| 1 | It failed (a transfer failed or was refused, the device went away, the daemon could not cancel) |
+| 1 | It failed (a transfer failed or was refused, the device went away, the daemon could not cancel, an update check or update failed) |
 | 2 | Wrong usage, or an unknown or ambiguous device or transfer ID |
 | 3 | The daemon is not running |
 

@@ -9,6 +9,12 @@ scope and `docs/protocol.md` wins for the wire.
 PlayDrop links your phones and computers over the local network with no account, no cloud, one
 tap to send, and zero taps to keep clipboards in sync.
 
+"No cloud" has one stated exception since 0.11.0 (the owner's decision, 2026-11-12): when you open
+PlayDrop it asks GitHub, at most once a day, whether a newer release exists. The request carries
+nothing about you or the device, an update is only trusted through a pinned signature, and a
+switch in Settings turns the check off (`docs/design/update-check.md`). Files, clipboard and
+everything else between your devices still never leave the local network.
+
 ## Platforms
 
 | Platform | Role in v1 |
@@ -49,5 +55,7 @@ internet relay, always-on iPhone receive, LocalSend or KDE Connect compatibility
 - Speed first. Measured against `iperf3`, published before release.
 - Nothing silent. A feature the OS cannot support hides itself and says why.
 - Trust is per device key, never per name, IP or network.
+- Nothing about the user or the device leaves the local network. The update check is the only
+  request to the internet; it is anonymous, on by default and can be switched off.
 - Own protocol, own port (42187). Never 1714-1764 or 53317.
 - GPL-3.0-or-later. Reused code is listed in `THIRD_PARTY.md`.

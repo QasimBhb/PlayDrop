@@ -51,6 +51,7 @@ use crate::notify::Notifier;
 use crate::open::OpenError;
 use crate::settings::{self, Settings};
 use crate::tray::{self, Tray, TrayCommand, TrayDevice, TrayView};
+use crate::update::{self, Updater};
 use crate::{lock, network, probe};
 
 /// Events buffered per UI client before it starts missing them.
@@ -68,6 +69,14 @@ const CLIPBOARD_GRANT_OFF: &str = "clipboardOut grant is off";
 
 /// The message for SR-6 refusals (`docs/ipc.md` section 5).
 const LOCKED_MESSAGE: &str = "desktop is locked";
+
+/// A `stop` sent to a peer's input runner on unpair: the core sends the peer's final `stop`
+/// just before `Unpaired`, but a full event channel drops events, and a held button must
+/// not outlive the pairing (SR-25, T31). With no runner for the peer it is dropped.
+const INPUT_STOP: playdrop_core::session::types::Input =
+    playdrop_core::session::types::Input::Session {
+        op: playdrop_core::session::types::SessionOp::Stop,
+    };
 
 /// Runs the daemon until it is asked to stop.
 #[allow(clippy::too_many_lines, reason = "start-up is one linear sequence")]
@@ -98,6 +107,7 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
             None
         }
     };
+    let update = update::Setup::system(&data_dir);
     let daemon = Daemon::new(Options {
         data_dir,
         persisted,
@@ -120,6 +130,8 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         read_clip: clipboard::read_for_send,
         input_support,
         media_support,
+        update,
+        restart_plan: update::restart::plan,
     });
 
     let server = match Server::start(daemon.handler(), daemon.events()).await {
@@ -185,6 +197,12 @@ pub async fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     tracing::info!("playdropd stopped");
+    if daemon.shared.restart_requested.load(Ordering::SeqCst) {
+        // Everything above released the bus name, the port and the tray; the new binary
+        // takes them afresh (`update/restart.rs` says why this is sound).
+        let e = update::restart::exec_new_daemon();
+        tracing::error!(error = %e, "the updated daemon could not be started in place; it starts with the next window or login");
+    }
     Ok(())
 }
 
@@ -360,6 +378,11 @@ pub struct Options {
     pub input_support: InputSupport,
     /// What the media backend said at start.
     pub media_support: MediaSupport,
+    /// The update check (`update/`): where it asks, what it trusts, how it installs.
+    pub update: update::Setup,
+    /// How to start the new daemon after a `.deb` update: [`update::restart::plan`], or a
+    /// fixed answer in tests.
+    pub restart_plan: fn() -> update::restart::Plan,
 }
 
 /// The daemon state shared by the event loop and the request handler.
@@ -415,6 +438,11 @@ struct Shared {
     /// Counts "Start at login" requests. A late answer or deferred write belongs to the
     /// request it captured and is dropped when a newer request has started since.
     autostart_attempt: AtomicU64,
+    /// The update check and the update itself.
+    update: Arc<Updater>,
+    /// A `.deb` update was installed: once stopped, `exec` the new daemon.
+    restart_requested: AtomicBool,
+    restart_plan: fn() -> update::restart::Plan,
 }
 
 impl Daemon {
@@ -425,6 +453,14 @@ impl Daemon {
         let images = opts.effective.clipboard_images;
         let notifier = opts.notifier;
         let tray_dirty = Arc::new(Notify::new());
+        let update_events = events.clone();
+        let updater = Updater::new(
+            opts.update,
+            opts.effective.update_check,
+            Box::new(move |status| {
+                let _ = update_events.send(Event::Daemon(DaemonEvent::UpdateChanged(status)));
+            }),
+        );
         let input_runners = InputRunners::new(
             opts.data_dir.clone(),
             Arc::clone(&notifier),
@@ -465,7 +501,16 @@ impl Daemon {
             media: tokio::sync::Mutex::new(None),
             autostart_problem: Mutex::new(None),
             autostart_attempt: AtomicU64::new(0),
+            update: updater,
+            restart_requested: AtomicBool::new(false),
+            restart_plan: opts.restart_plan,
         });
+        let weak = Arc::downgrade(&shared);
+        shared.update.set_on_installed(Box::new(move || {
+            if let Some(s) = weak.upgrade() {
+                s.update_installed();
+            }
+        }));
         let weak = Arc::downgrade(&shared);
         shared
             .notifier
@@ -624,6 +669,7 @@ impl Shared {
         c.discovery = s.discovery;
         c.lock_state = Box::new((*self.lock).clone());
         c.accepts_input = self.input_support.supported;
+        c.notifications = playdrop_core::host::NotificationRole::Sink;
         // SR-20, SR-28 and SR-31 on Windows: the core has no unsafe code, so the platform
         // crate supplies free space, DPAPI sealing and the exclusive port.
         playdrop_platform::apply_hooks(&mut c);
@@ -901,7 +947,8 @@ impl Shared {
             | HostEvent::TransferFailed { peer, .. }
             | HostEvent::Ping { peer, .. }
             | HostEvent::Find { peer, .. }
-            | HostEvent::RemovedByPeer { peer, .. } => self.label_for(peer),
+            | HostEvent::RemovedByPeer { peer, .. }
+            | HostEvent::ReceiveRefusedNoSpace { peer, .. } => self.label_for(peer),
             _ => String::new(),
         });
         match ev {
@@ -911,14 +958,19 @@ impl Shared {
             }
             HostEvent::Unpaired { peer, .. } => {
                 lock_std(&self.battery).remove(peer);
+                // Releases the injector even if the core's final `stop` was lost (SR-25).
+                self.input_runners.on_input(peer, String::new(), INPUT_STOP);
                 self.notifier.mirror_close_peer(peer);
                 self.tray_dirty.notify_one();
             }
-            HostEvent::PeerOffline { peer, .. } | HostEvent::RemovedByPeer { peer, .. } => {
+            HostEvent::RemovedByPeer { peer, .. } => {
                 self.notifier.mirror_close_peer(peer);
                 self.tray_dirty.notify_one();
             }
-            HostEvent::PeerOnline { .. } | HostEvent::Paired { .. } => {
+            // Mirrored copies outlive a short absence; `Notifier::host_event` tracks it.
+            HostEvent::PeerOffline { .. }
+            | HostEvent::PeerOnline { .. }
+            | HostEvent::Paired { .. } => {
                 self.tray_dirty.notify_one();
             }
             HostEvent::NotificationPosted { peer, notification } => {
@@ -1282,6 +1334,33 @@ impl Shared {
         Ok(clip_answer(sent_to, clip_skip(&p)))
     }
 
+    /// A `.deb` update is installed and `Restarting` announced: put the new daemon in place
+    /// (`update/restart.rs`). Under the systemd unit, systemd restarts it; otherwise the
+    /// daemon stops as for a `Shutdown` request and `run` then `exec`s the new binary.
+    fn update_installed(&self) {
+        if (self.restart_plan)() == update::restart::Plan::Systemd && update::restart::ask_systemd()
+        {
+            return;
+        }
+        self.restart_requested.store(true, Ordering::SeqCst);
+        self.shutdown_tx.send_replace(true);
+    }
+
+    /// "What is new": opens the offered release's page. Only the page of the release the
+    /// daemon itself offers, never a URL a client names.
+    async fn open_update_page(&self) -> Result<IpcOk, IpcError> {
+        let url = self
+            .update
+            .page_url()
+            .ok_or_else(|| err(ErrorCode::InvalidState, "No update is offered right now."))?;
+        tracing::info!(url, "opening the release page");
+        tokio::task::spawn_blocking(move || open::that_detached(&url))
+            .await
+            .map_err(|e| internal(e.to_string()))?
+            .map(|()| IpcOk::Done)
+            .map_err(|e| internal(format!("the browser could not be opened: {e}")))
+    }
+
     fn status(&self, host: &Host) -> Status {
         Status {
             device_id: host.device_id().to_hex(),
@@ -1338,6 +1417,9 @@ impl Shared {
         if changes.clipboard_sync {
             self.sync_clipboard_watcher().await;
         }
+        if changes.update_check {
+            self.update.set_enabled(new.update_check);
+        }
         let mut view = new.to_ipc(self.clipboard_supported);
         view.remote_input_supported = self.input_support.supported;
         view.remote_input_reason
@@ -1380,6 +1462,32 @@ impl Shared {
                 self.shutdown_tx.send_replace(true);
                 return Ok(IpcOk::Done);
             }
+            // The update check needs no host: it talks to GitHub, not to devices.
+            Request::UpdateCheck { force } => {
+                return Ok(IpcOk::Update(self.update.check(*force).await))
+            }
+            Request::UpdateInstall { window } => {
+                let relaunch = if *window {
+                    update::install::Relaunch::Window
+                } else {
+                    update::install::Relaunch::Daemon
+                };
+                return self
+                    .update
+                    .start_install(relaunch)
+                    .map(IpcOk::Update)
+                    .map_err(|r| err(ErrorCode::InvalidState, r.0));
+            }
+            Request::UpdateCancel => {
+                return self
+                    .update
+                    .cancel()
+                    .map(IpcOk::Update)
+                    .map_err(|r| err(ErrorCode::InvalidState, r.0));
+            }
+            Request::UpdateLater => return Ok(IpcOk::Update(self.update.later())),
+            Request::UpdateState => return Ok(IpcOk::Update(self.update.status())),
+            Request::UpdateOpenPage => return self.open_update_page().await,
             _ => {}
         }
         let host = self
@@ -1973,6 +2081,7 @@ mod tests {
         let h = d.handler();
         let mut ui = d.events().subscribe();
         let mut cfg = HostConfig::new(tmp.join("b-data"), tmp.join("b-in"), "bravo");
+        cfg.notifications = playdrop_core::host::NotificationRole::Source;
         cfg.port = 0;
         cfg.bind_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
         cfg.discovery = false;
@@ -2260,6 +2369,7 @@ mod tests {
             autostart_refused: None,
             notifications: false,
             discovery: false,
+            update_check: false,
         };
         Daemon::new(Options {
             data_dir: tmp.join("data"),
@@ -2289,11 +2399,79 @@ mod tests {
                 backend: "none",
                 reason: Some("test".into()),
             },
+            update: update::test_setup(&tmp.join("data")),
+            restart_plan: || update::restart::Plan::Exec,
         })
     }
 
     async fn call(h: &Arc<dyn RequestHandler>, r: Request) -> Result<IpcOk, IpcError> {
         h.handle(r).await.into()
+    }
+
+    /// The update requests need no host, follow the setting, and with it off answer
+    /// `off` without any request leaving the computer (SR-45; the stand-in tests in
+    /// `update/tests.rs` count connections).
+    #[tokio::test]
+    async fn update_requests_follow_the_setting() {
+        use playdrop_ipc::UpdateState;
+
+        let state = |r: Result<IpcOk, IpcError>| match r {
+            Result::Ok(IpcOk::Update(s)) => s.state,
+            other => panic!("unexpected answer {other:?}"),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon(tmp.path());
+        let h = d.handler();
+        let mut ui = d.events().subscribe();
+        assert_eq!(
+            state(call(&h, Request::UpdateCheck { force: true }).await),
+            UpdateState::Off
+        );
+        assert_eq!(
+            state(call(&h, Request::UpdateState).await),
+            UpdateState::Off
+        );
+        for r in [
+            Request::UpdateInstall { window: true },
+            Request::UpdateCancel,
+            Request::UpdateOpenPage,
+        ] {
+            let e = call(&h, r).await.unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidState);
+        }
+        assert_eq!(
+            state(call(&h, Request::UpdateLater).await),
+            UpdateState::Off
+        );
+
+        let r = call(
+            &h,
+            Request::SetSettings(SettingsPatch {
+                update_check: Some(true),
+                ..SettingsPatch::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let IpcOk::Settings { settings, .. } = r else {
+            panic!("settings answer");
+        };
+        assert!(settings.update_check);
+        let announced = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Event::Daemon(DaemonEvent::UpdateChanged(s)) = ui.recv().await.unwrap() {
+                    return s.state;
+                }
+            }
+        })
+        .await
+        .expect("announced in time");
+        assert_eq!(announced, UpdateState::Idle);
+        assert_eq!(
+            state(call(&h, Request::UpdateState).await),
+            UpdateState::Idle
+        );
+        d.shutdown().await;
     }
 
     #[tokio::test]

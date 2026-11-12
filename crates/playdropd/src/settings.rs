@@ -48,6 +48,10 @@ pub struct Settings {
     pub notifications: bool,
     /// mDNS and the beacon; off means last-known dial only.
     pub discovery: bool,
+    /// Ask GitHub for the latest version when a UI opens, at most once a day
+    /// (`docs/design/update-check.md`). A file from before the setting existed reads as on,
+    /// the default the user chose.
+    pub update_check: bool,
 }
 
 impl Default for Settings {
@@ -62,6 +66,7 @@ impl Default for Settings {
             autostart_refused: None,
             notifications: true,
             discovery: true,
+            update_check: true,
         }
     }
 }
@@ -85,6 +90,8 @@ pub struct Changes {
     pub autostart_refused: bool,
     /// `notifications` changed.
     pub notifications: bool,
+    /// `update_check` changed.
+    pub update_check: bool,
 }
 
 impl Changes {
@@ -96,6 +103,7 @@ impl Changes {
             || self.autostart
             || self.autostart_refused
             || self.notifications
+            || self.update_check
     }
 }
 
@@ -125,6 +133,7 @@ impl Settings {
             autostart: self.autostart,
             autostart_refused: self.autostart_refused.clone(),
             notifications: self.notifications,
+            update_check: self.update_check,
         }
     }
 
@@ -182,6 +191,10 @@ impl Settings {
         if let Some(v) = patch.notifications {
             c.notifications = v != self.notifications;
             self.notifications = v;
+        }
+        if let Some(v) = patch.update_check {
+            c.update_check = v != self.update_check;
+            self.update_check = v;
         }
         Ok(c)
     }
@@ -424,6 +437,7 @@ mod tests {
             autostart_refused: None,
             notifications: true,
             discovery: true,
+            update_check: true,
         }
     }
 
@@ -476,6 +490,10 @@ mod tests {
             s.clipboard_images,
             "a file from before images defaults them on"
         );
+        assert!(
+            s.update_check,
+            "a file from before the update check defaults it on"
+        );
 
         std::fs::write(tmp.path().join(SETTINGS_FILE), b"{not json").unwrap();
         let l = load(tmp.path()).unwrap();
@@ -524,6 +542,30 @@ mod tests {
             .unwrap();
         assert!(c.restart_host);
         assert_eq!(s.device_name, "Work laptop");
+    }
+
+    #[test]
+    fn update_check_is_patched_only_when_named() {
+        let mut s = sample();
+        // A patch from an older client has no `update_check` and leaves it alone.
+        let old: SettingsPatch = serde_json::from_str(r#"{"notifications":false}"#).unwrap();
+        let c = s.apply_patch(&old).unwrap();
+        assert!(!c.update_check && s.update_check);
+        let c = s
+            .apply_patch(&SettingsPatch {
+                update_check: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(c.update_check && c.any() && !s.update_check);
+        assert!(!s.to_ipc(true).update_check);
+        let c = s
+            .apply_patch(&SettingsPatch {
+                update_check: Some(false),
+                ..SettingsPatch::default()
+            })
+            .unwrap();
+        assert!(!c.any());
     }
 
     #[test]

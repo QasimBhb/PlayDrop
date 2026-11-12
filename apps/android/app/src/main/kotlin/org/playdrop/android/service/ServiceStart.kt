@@ -8,8 +8,11 @@ package org.playdrop.android.service
  * back ([needed] with `repost`).
  */
 internal object ServiceStart {
-    /** What the persistent notification shows. */
-    data class Shown(val running: Boolean, val online: Int, val defaultLabel: String?)
+    /**
+     * What the persistent notification shows; [sendToLabel] names the one paired device the
+     * file action goes to ([NotificationPlan.sendActionTarget]).
+     */
+    data class Shown(val running: Boolean, val online: Int, val sendToLabel: String?)
 
     /** True when the service must be started: it is not running, or the caller wants the notification posted again. */
     fun needed(running: Boolean, repost: Boolean): Boolean = !running || repost

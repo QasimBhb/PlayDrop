@@ -733,6 +733,7 @@ pub(crate) async fn pull(inner: &Arc<Inner>, peer: DeviceId) -> Result<Vec<Strin
 fn step_err(s: Step) -> Error {
     match s {
         Step::Conn(e) | Step::Fatal(e) => Error::Protocol(e),
+        Step::Refused(f) => Error::Protocol(f.text),
     }
 }
 
@@ -823,6 +824,10 @@ async fn pull_item(inner: &Arc<Inner>, peer: DeviceId, id: &str) {
             }
             Err(Step::Fatal(e)) => {
                 fail(inner, id, &rx, e).await;
+                return;
+            }
+            Err(Step::Refused(f)) => {
+                fail(inner, id, &rx, f.text).await;
                 return;
             }
         }

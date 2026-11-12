@@ -23,7 +23,7 @@ use cosmic::iced::futures::SinkExt as _;
 use futures_util::StreamExt as _;
 use playdrop_ipc::client::{Activation, Client, ClientOptions, ConnectError, DaemonWatch};
 use playdrop_ipc::types::{PeerSummary, TransferSnapshot};
-use playdrop_ipc::{ErrorCode, Event, IpcError, Ok as Answer, Request, Status};
+use playdrop_ipc::{ErrorCode, Event, IpcError, Ok as Answer, Request, Status, UpdateStatus};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::BroadcastStream;
@@ -43,6 +43,10 @@ const STARTING_LIMIT: u32 = 20;
 /// Longest wait for any one answer from the daemon. zbus has no timeout of its own, so a
 /// hung daemon would otherwise leave the popup waiting forever.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Longest wait for the answer to `update_check`: the daemon answers once its two requests
+/// to GitHub are over, and each may take its full 15 s (SR-48), so 15 s here would give up
+/// on a slow but working check.
+pub const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(40);
 /// After running `playdropd` by hand, the waits between attempts to reach it (about 8 s).
 const START_ATTEMPTS: [Duration; 6] = [
     Duration::from_millis(250),
@@ -130,6 +134,29 @@ fn problem(e: &ConnectError) -> ConnectProblem {
 
 fn unexpected(op: &str) -> IpcError {
     IpcError::new(ErrorCode::Internal, format!("unexpected answer to {op}"))
+}
+
+/// Tells the daemon a UI opened (`update_check`, not forced): the daemon enforces the
+/// setting and the once-a-day rule itself. An older daemon answers `bad_request`, which
+/// means "no update check" and is not an error to show anywhere.
+pub async fn check_update(client: &Client) -> Result<Option<UpdateStatus>, IpcError> {
+    let answer = tokio::time::timeout(
+        UPDATE_CHECK_TIMEOUT,
+        client.request(Request::UpdateCheck { force: false }),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(IpcError::new(
+            ErrorCode::Internal,
+            "the PlayDrop daemon did not answer the update check within 40 seconds",
+        ))
+    });
+    match answer {
+        Ok(Answer::Update(status)) => Ok(Some(status)),
+        Ok(_) => Err(unexpected("update_check")),
+        Err(e) if e.code == ErrorCode::BadRequest => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Loads `status`, `peers` and `transfers`.

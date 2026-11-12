@@ -1,6 +1,8 @@
 package org.playdrop.android.ui.transfers
 
+import org.playdrop.android.service.FailureText
 import org.playdrop.android.ui.common.Format
+import org.playdrop.android.ui.common.UiMessage
 import org.playdrop.core.PeerSummary
 import org.playdrop.core.TransferDirection
 import org.playdrop.core.TransferSnapshot
@@ -48,8 +50,13 @@ data class TransferRow(
     val offeredNames: List<String>,
     /** Files not listed in [offeredNames]. */
     val moreNames: Long,
-    /** Sender's note or failure reason. */
+    /** Sender's note; for a failed or cancelled row only when [failure] is null. */
     val note: String?,
+    /**
+     * Why a failed or cancelled row ended, in the same plain words as its notification
+     * (`FailureText`); shown instead of [note], which then holds the core's own text.
+     */
+    val failure: UiMessage? = null,
     /** Cancel is offered. */
     val canCancel: Boolean,
     /** Forget is offered: a failed send the core keeps for resume (same call as cancel). */
@@ -113,6 +120,8 @@ object TransferRows {
         val filesDone = s.filesDone.toLong()
         val names = offer?.names?.take(NAMES_SHOWN).orEmpty()
         val delivered = if (receive && s.state == TransferStatus.COMPLETE) s.delivered else emptyList()
+        val ended = s.state == TransferStatus.FAILED || s.state == TransferStatus.CANCELLED
+        val failure = s.failure?.takeIf { ended }?.let { FailureText.failureSentence(it, s.note.orEmpty(), label, s.direction) }
         return TransferRow(
             id = s.id,
             receive = receive,
@@ -128,7 +137,9 @@ object TransferRows {
             showFilesDone = active && Format.showFilesDone(filesDone, fileCount),
             offeredNames = names,
             moreNames = (fileCount - names.size).coerceAtLeast(0).takeIf { names.isNotEmpty() } ?: 0,
-            note = s.note ?: offer?.note,
+            // The core's text never shows next to a failure code: it can carry protocol details.
+            note = if (failure != null) null else s.note ?: offer?.note,
+            failure = failure,
             canCancel = !finished && !(receive && offered),
             canForget = !receive && s.state == TransferStatus.FAILED && s.resumable,
             canRespond = receive && offered,

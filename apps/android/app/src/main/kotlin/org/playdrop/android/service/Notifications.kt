@@ -82,15 +82,16 @@ internal object Notifications {
 
     /**
      * The persistent notification: devices online plus "Send clipboard" and "Send to
-     * <default>" (or "Send files" without a default).
+     * <label>" when exactly one device is paired ([sendToLabel], see
+     * [NotificationPlan.sendActionTarget]), otherwise "Send files" (the chooser follows).
      */
-    fun service(context: Context, running: Boolean, online: Int, defaultLabel: String?): Notification {
+    fun service(context: Context, running: Boolean, online: Int, sendToLabel: String?): Notification {
         val text = when {
             !running -> context.getString(R.string.service_starting)
             online == 0 -> context.getString(R.string.service_none_online)
             else -> context.resources.getQuantityString(R.plurals.service_online, online, online)
         }
-        val sendLabel = defaultLabel?.let { context.getString(R.string.action_send_to, it) }
+        val sendLabel = sendToLabel?.let { context.getString(R.string.action_send_to, it) }
             ?: context.getString(R.string.action_send_files)
         return NotificationCompat.Builder(context, CHANNEL_SERVICE)
             .setSmallIcon(R.drawable.ic_stat_playdrop)
@@ -109,8 +110,24 @@ internal object Notifications {
     }
 
     /** Re-posts the persistent notification with fresh numbers. */
-    fun updateService(context: Context, running: Boolean, online: Int, defaultLabel: String?) {
-        post(context, NotificationPlan.SERVICE_ID, service(context, running, online, defaultLabel))
+    fun updateService(context: Context, running: Boolean, online: Int, sendToLabel: String?) {
+        post(context, NotificationPlan.SERVICE_ID, service(context, running, online, sendToLabel))
+    }
+
+    /**
+     * A send started from an app screen that was closed before it could start: "Sending to X
+     * failed" with [reason], since no screen is left to say it (anti-pattern 18).
+     */
+    fun sendDidNotStart(context: Context, peer: String, label: String, reason: String) {
+        val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
+            .setSmallIcon(R.drawable.ic_stat_playdrop)
+            .setContentTitle(context.getString(R.string.transfer_failed_send, label))
+            .setContentText(reason)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(reason))
+            .setContentIntent(openApp(context))
+            .setAutoCancel(true)
+            .build()
+        post(context, NotificationPlan.notificationId(NotificationPlan.Kind.FAILED, "start:$peer"), n)
     }
 
     /** Tells the user the core could not start, with the reason (anti-pattern 18). */
@@ -130,9 +147,17 @@ internal object Notifications {
      * Posts whatever [event] calls for. [labelOf] maps a hex Device ID to the local label
      * (falling back to the Short ID). Clipboard events are applied here too. With
      * [deferReceived] a completed receive posts nothing yet: its files are still being moved
-     * into Downloads and [moveFinished] posts the notification.
+     * into Downloads and [moveFinished] posts the notification. [failedForGood] tells whether a
+     * `TransferFailed` really ended its transfer: the core also reports one file's failed check
+     * that way while the transfer goes on, and that must not read as "failed".
      */
-    suspend fun onEvent(context: Context, event: HostEvent, labelOf: (String) -> String, deferReceived: Boolean = false) {
+    suspend fun onEvent(
+        context: Context,
+        event: HostEvent,
+        labelOf: (String) -> String,
+        deferReceived: Boolean = false,
+        failedForGood: Boolean = true,
+    ) {
         when (event) {
             is HostEvent.Paired -> paired(context, event)
             is HostEvent.TransferOffer -> offer(context, event, labelOf(event.peer))
@@ -142,7 +167,7 @@ internal object Notifications {
             }
             is HostEvent.TransferFailed -> {
                 cancel(context, NotificationPlan.notificationId(NotificationPlan.Kind.OFFER, event.id))
-                failed(context, event, labelOf(event.peer))
+                if (NotificationPlan.postsFailure(event.code, failedForGood)) failed(context, event, labelOf(event.peer))
             }
             is HostEvent.Ping -> ping(context, event, labelOf(event.peer))
             is HostEvent.Find -> if (event.start) find(context, labelOf(event.peer)) else FindRinger.stop(context)
@@ -364,11 +389,13 @@ internal object Notifications {
         } else {
             context.getString(R.string.transfer_failed_receive, label)
         }
+        // The core's own text can carry protocol details; the body comes from FailureText only.
+        val body = FailureText.failureSentence(e.code, e.reason, label, e.direction).resolve(context)
         val n = NotificationCompat.Builder(context, CHANNEL_TRANSFERS)
             .setSmallIcon(R.drawable.ic_stat_playdrop)
             .setContentTitle(title)
-            .setContentText(e.reason)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(e.reason))
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
             .setContentIntent(openApp(context))
             .setAutoCancel(true)
             .build()

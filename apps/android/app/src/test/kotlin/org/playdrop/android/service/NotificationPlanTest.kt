@@ -123,4 +123,20 @@ class NotificationPlanTest {
         val plan = NotificationPlan.received(moved, NotificationPlan.needsFolder(1, 1, true)) { "image/jpeg" }
         assertEquals(NotificationPlan.Received.One("a.jpg", "content://x/received/a%20(1).jpg", "image/jpeg"), plan)
     }
+
+    @Test
+    fun theFileActionNamesTheDeviceOnlyWhenExactlyOneIsPaired() {
+        assertEquals("calliope", NotificationPlan.sendActionTarget(listOf("calliope")))
+        // Several paired devices: the chooser follows the picker, so the action says "Send files".
+        assertEquals(null, NotificationPlan.sendActionTarget(listOf("calliope", "Pixel")))
+        assertEquals(null, NotificationPlan.sendActionTarget(emptyList()))
+    }
+
+    @Test
+    fun failureNotificationsOnlyForRealEndsTheUserDidNotAskFor() {
+        assertTrue(NotificationPlan.postsFailure(org.playdrop.core.TransferFailure.CONNECTION_LOST, endedForGood = true))
+        assertTrue(NotificationPlan.postsFailure(org.playdrop.core.TransferFailure.CANCELLED_BY_PEER, endedForGood = true))
+        assertFalse(NotificationPlan.postsFailure(org.playdrop.core.TransferFailure.CANCELLED_BY_YOU, endedForGood = true))
+        assertFalse(NotificationPlan.postsFailure(org.playdrop.core.TransferFailure.INTEGRITY, endedForGood = false))
+    }
 }

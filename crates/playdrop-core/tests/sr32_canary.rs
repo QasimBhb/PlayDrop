@@ -450,13 +450,17 @@ async fn sr32_no_secret_reaches_the_logs_or_the_diagnostics_export() {
     let s2 = Arc::clone(&sink);
     let mut alpha = start_host_with(root.path(), "alpha", 0, move |cfg| {
         cfg.accepts_input = true;
+        cfg.notifications = playdrop_core::host::NotificationRole::Sink;
         cfg.receive = ReceiveTarget::Staged {
             staging_dir: s2.staging.clone(),
             sink: s2,
         };
     })
     .await;
-    let mut bravo = start_host_with(root.path(), "bravo", 0, |_| {}).await;
+    let mut bravo = start_host_with(root.path(), "bravo", 0, |cfg| {
+        cfg.notifications = playdrop_core::host::NotificationRole::Source;
+    })
+    .await;
     let alpha_id = alpha.host.device_id();
     let bravo_id = bravo.host.device_id();
     for id in [alpha_id, bravo_id] {

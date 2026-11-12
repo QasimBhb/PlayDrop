@@ -91,6 +91,7 @@ A peer may answer on several addresses at once: a phone on Wi-Fi with USB tether
 - `hello.protocolVersion` MUST equal the ALPN result, else close with `unsupported_version`. *Choice:* hello carries no version list, so there is one authenticated source of truth.
 - The discovery `v` key is a UI hint only. New versions are for incompatible changes; compatible additions use capabilities and per-frame `v`.
 - **Capabilities** come in two lists, as in KDE Connect: `in` (what this host accepts) and `out` (what it may send). A host MUST NOT send anything the peer's `in` list lacks. v1 strings: `ping`, `find`, `clipboard`, `clipboard.image`, `battery`, `media.state`, `media.control`, `presence`, `input.pointer`, `input.key`, `input.presenter`, `transfer`, `transfer.bundle`, `outbox`, `blobs`, `notifications` (5.16; added in v0.10.0 as a compatible addition, the protocol stays 1).
+- A host lists only what it acts on: `input.*` in `in` only with something that applies remote input, and `notifications` in both lists only when it takes part in mirroring (5.16), in neither otherwise. An `input` or `notification` frame for a capability the receiver did not list in `in` is dropped (for `input` `session` `start` the receiver answers as 5.12 says). Every other frame type is acted on whatever the lists say, subject only to its grant (5.3): the lists tell a sender what to send, and those receivers do not check them. *Choice (v0.11.0):* 0.10.0 listed `notifications` on every host, including ones with nothing to show or read them.
 - Unknown capabilities, fields and frame types are ignored.
 
 ---
@@ -134,7 +135,7 @@ The dialler sends `POST /v1/session` (`content-type: application/vnd.playdrop.fr
 | `unpair` | both | - | - | no |
 | `error` | both | - | - | yes |
 
-**Authorisation (SR-13, SR-14).** Every frame and request is checked against the grants of the Device ID authenticated by TLS, never against anything in the payload. A frame lacking its grant is dropped with no effect; the receiver MAY send one `error` `forbidden` per frame type per connection so the sender can hide the feature. On an unpaired connection, frames not marked "yes" get `not_paired`.
+**Authorisation (SR-13, SR-14).** Every frame and request is checked against the grants of the Device ID authenticated by TLS, never against anything in the payload. A frame lacking its grant is dropped with no effect; the receiver MAY send one `error` `forbidden` per frame type per connection so the sender can hide the feature. Exception: a refused `input` `session`/`start` is answered every time with `input_session_ended`, within the cap of 5.12. On an unpaired connection, frames not marked "yes" get `not_paired`.
 
 ### 5.4 hello
 
@@ -177,7 +178,7 @@ Full replacement, e.g. when the user turns a feature off.
 
 - `hash` = lowercase hex BLAKE3 of the content. Text is hashed as UTF-8 after converting CRLF and lone CR to LF. *Choice:* Windows rewrites line endings, which would defeat echo detection.
 - Text up to 32 KiB is inline; longer text (up to 1 MiB, the sync limit in SR-24) and images go as a blob whose `id` equals `hash`.
-- **Echo prevention:** each host remembers the hash of the last clipboard it applied from a peer and the last it sent, and MUST NOT send a local change whose hash equals either. Received clipboards are never forwarded to other peers.
+- **Echo prevention:** each host remembers the hash of the last clipboard it applied from a peer and the last it sent, and MUST NOT send a local change whose hash equals either. Received clipboards are never forwarded to other peers. A send the user aims at chosen devices is checked only against the last applied hash: sending the same text to one device and then to another is not an echo. It still counts as the last sent.
 - `sensitive: true` marks a password-manager clip sent by hand (SR-24); it never appears in notifications and is written with history and cloud upload off.
 - Sending needs the sender's `clipboardOut` grant; applying needs the receiver's `clipboardIn`.
 
@@ -227,6 +228,7 @@ Sent when items are queued and on session start if any wait. Foreground-only hos
 - Pointer `op`: `move`, `button` (`left`/`right`/`middle`; `down`/`up`/`click`/`double`), `scroll` (`dx`, `dy`, `unit` `line` or `pixel`). Presenter: `next`, `previous`, `pointerOn`, `pointerOff`, `blackout`.
 - `key` uses W3C UI Events `key` values, or `text` for a literal string; `mods`: `ctrl`, `alt`, `shift`, `meta`. *Choice:* a documented, neutral vocabulary that maps to `SendInput` and libei.
 - Never answered except by `error`. Pointer moves are coalesced to one per 8 ms; receivers cap keys at 60 per second.
+- **Why a session ended (v0.11.0, compatible addition).** The target answers every `session`/`start` it will not honour, and ends a running session, with `error` `input_session_ended` carrying `message` and a machine-readable `reason` (5.14): `not_accepted` (it lists no `input.*`; checked first), `grant_off` (the `input` grant is off for the sender; also sent when the grant is turned off during a session, which ends it), `locked`, `stopped_by_user` (its kill switch), `idle_timeout` (10 minutes without a frame). A refused `start` is answered every time, with `re` set to it, because the controller needs the reason each time a person opens the input screen, up to 60 answers per connection per minute (more are dropped unanswered, so a peer that loops on `start` cannot make the target queue without bound); other refused `input` frames keep the one `forbidden` per connection of 5.3. A controller treats an `input_session_ended` without a known `reason` by its `message` (0.10.0 sent "the desktop is locked", "stopped on the desktop", "no input for 10 minutes") or as a generic end, and a `forbidden` answering an `input` frame as `grant_off` (0.10.0 refused a `start` only that way). It raises one end per `start` it sent and ignores ends that arrive with no session of its own open, and ends (or a `forbidden`) whose `re` names a frame sent before its current `start`, so a late refusal of an earlier `start` cannot end a newer session. Unpairing ends a running session on both sides at once. Against a target older than 0.11.0, see 11.1.
 
 ### 5.13 transfer
 
@@ -234,14 +236,18 @@ Sent when items are queued and on session start if any wait. Foreground-only hos
 {"t":"transfer","v":1,"id":"c1d2...f0","state":"accepted"}
 {"t":"transfer","v":1,"id":"c1d2...f0","state":"cancelled","reason":"user"}
 ```
-The receiver pushes this when a pending offer is accepted or declined, or when it cancels or fails a transfer. The sender then reads `GET /v1/transfers/{id}`. *Choice:* push the decision instead of holding the POST open or polling.
+The receiver pushes this when a pending offer is accepted or declined, or when it cancels or fails a transfer. The sender then reads `GET /v1/transfers/{id}`. `reason` is optional: `user` with `cancelled`; with `failed`, `no_space` when an offer the user accepted could not start for lack of space (v0.11.0, compatible addition; the sender reports it as a lack of space) and `error` otherwise. Unknown values are treated as absent. *Choice:* push the decision instead of holding the POST open or polling.
 
 ### 5.14 error
 
 ```json
 {"t":"error","v":1,"re":45,"code":"forbidden","message":"media control is off for this device"}
 ```
-`re` is omitted for unsolicited errors. Codes are in section 9.
+`re` is omitted for unsolicited errors. Codes are in section 9. An optional `reason` (a short `snake_case` string) gives a machine-readable cause for codes that have several; only `input_session_ended` uses it (5.12). Receivers that do not know a value treat it as absent.
+
+```json
+{"t":"error","v":1,"re":12,"code":"input_session_ended","message":"remote input is turned off for this device on the target","reason":"grant_off"}
+```
 
 ### 5.15 Blobs
 
@@ -256,13 +262,13 @@ The receiver pushes this when a pending offer is accepted or declined, or when i
 {"t":"notification","v":1,"op":"dismiss","key":"3f9a...c1"}
 ```
 
-Notification mirroring from a phone to a desktop (SR-41 to SR-44). Capability `notifications`, in both lists.
+Notification mirroring from a phone to a desktop (SR-41 to SR-44). Capability `notifications`, in both lists of a host that takes part: a phone that mirrors (it sends `posted` and `removed` and acts on `dismiss`) and a desktop that shows copies (it acts on `posted` and `removed` and sends `dismiss`) each send one kind of op and receive the other. A host with neither role (since v0.11.0 the command-line host and the iPhone app) lists it in neither list. A host never sends the other role's ops and drops them, unanswered, when they arrive; a 0.10.0 host listed it in both lists on every host and acted on every op, which a new phone or desktop interoperates with unchanged.
 
-- `posted` and `removed` go phone to desktop; a later `posted` with the same `key` replaces the copy. `dismiss` goes desktop to phone and asks it to cancel that notification. `when` is when it was posted, Unix ms; `title` and `text` may be empty.
+- `posted` and `removed` go phone to desktop; a later `posted` with the same `key` and new content replaces the copy. `dismiss` goes desktop to phone and asks it to cancel that notification. `when` is when it was posted, Unix ms; `title` and `text` may be empty.
 - `key` is opaque: the first 128 bits of BLAKE3 keyed by a per-process random salt over the platform notification key, as 32 lowercase hex characters. The platform key (which names the package and a tag) never leaves the phone. A frame whose `key` is not exactly 32 lowercase hex characters is dropped.
-- Limits: `app` at most 64 bytes, `title` 256, `text` 1 KiB (UTF-8, cut at a character boundary by the sender, refused over the limit by the receiver with `error` `bad_request` and dropped). At most 30 `posted` frames per minute per connection; more are dropped. The desktop shows at most 20 mirrored notifications per peer at once, closing the oldest.
+- Limits: `app` at most 64 bytes, `title` 256, `text` 1 KiB (UTF-8, cut at a character boundary by the sender, refused over the limit by the receiver with `error` `bad_request` and dropped). Per connection, at most 30 `posted`, 400 `removed` and 60 `dismiss` frames per minute; more are dropped. *Choice:* `removed` sits above the 200 copies a phone may withdraw at once when mirroring is turned off, and `dismiss` above the 50 copies a person can close in a minute (20 shown plus 30 new); a dropped `removed` would leave a stale copy. The desktop shows at most 20 mirrored notifications per peer at once, closing the oldest.
 - Sending `posted` needs the sender's `notificationsOut`. Sending `removed` needs no grant: it carries no content, and a phone that just turned `notificationsOut` off sends it to close the desktop's copies (SR-42). Showing `posted` or acting on `removed` needs the receiver's `notificationsIn`. `dismiss` needs the phone's `notificationsOut` (a desktop the phone does not mirror to has nothing to dismiss), and a desktop sends it only with its `notificationsIn`. A frame without its grant is dropped (5.3).
-- `notificationsOut` is off by default and never turned on by pairing (6.4); the phone mirrors only with Android notification access and only apps on its allow list, filtered as SR-41 lists. Turning a grant off, unpairing or going offline closes every copy on the desktop for that peer (SR-42). App names, titles, text and keys are never logged (SR-43).
+- `notificationsOut` is off by default and never turned on by pairing (6.4); the phone mirrors only with Android notification access and only apps on its allow list, filtered as SR-41 lists. Turning a grant off or unpairing closes every copy on the desktop for that peer at once; going offline closes them 5 minutes later unless the peer came back (SR-42). A phone sends its current notifications again each time it comes online, so the desktop shows nothing new for a `posted` that matches a copy it still shows (same `key` and content, or, for a copy kept over the absence, the same content under a new `key` after the phone app restarted) and closes the kept copies not sent again within 10 s of the return. Within those 10 s, and only then, it also does not show again content it closed while the peer was away: copies closed after the 5 minutes, copies the user dismissed while the peer was away or before the phone sent them again, and, on a desktop that cannot close a copy later (Windows toasts), every copy shown when the peer went offline. That remembered content is forgotten when the 10 s end. Outside them a `posted` is shown unless it has the same `key` and content as a copy still shown, so an app that posts the same content again later (a recurring reminder with a fixed `when`) is shown each time. This is desktop behaviour only; the wire is unchanged. App names, titles, text and keys are never logged (SR-43).
 
 ---
 
@@ -594,7 +600,7 @@ t = first 16 bytes of HMAC-SHA256(K, "pd-announce-v1" || n)      (n as its 16 ra
 | `identity_mismatch` | - | `hello.deviceId` differs from certificate; close |
 | `duplicate_connection` | - | GOAWAY debug data (3.3) |
 | `timeout`, `commit_mismatch`, `qr_proof_invalid`, `qr_expired`, `busy` | - | `pair_reject` reasons |
-| `input_session_ended` | - | The target ended the sender's input session (5.12); `message` says why. Phase 5 |
+| `input_session_ended` | - | The target ended the sender's input session or refused its `start` (5.12); `message` says why, and since v0.11.0 `reason` says it machine-readably. Phase 5 |
 
 Session codes travel in `error` frames, HTTP codes in the 7.1 error body. Oversized, malformed and out-of-sequence frames close the connection without an error frame.
 
@@ -643,7 +649,7 @@ Where the Phase 1 code (`crates/playdrop-core`) differs from or settles a gap in
 - **Outbox decline (7.8):** a puller that declines (or cancels) a pulled item still sends `DELETE /v1/outbox/{id}`, so the holder stops announcing it at every session start.
 - **Media state goes only to peers with the sender's `media` grant (5.9):** what is playing is private, so the grant gates sending as well as receiving.
 - **Refusal errors name the frame (5.3, 5.14, Phase 5):** the one `forbidden` or `not_paired` error per frame type carries `message` "<t> is not allowed for this device" or "<t> needs a paired connection", and the sender matches `re` to the frame it sent so a UI can hide that feature with the reason.
-- **Input target rules (5.12, SR-25, Phase 5):** frames outside a `session`/`start` are dropped; a frame arriving while the desktop is locked ends the session; a session with no frame for 10 minutes ends; the target's user can end it with a kill switch. In each case the target sends an `error` frame with code `input_session_ended` and a `message` saying why (an `input` frame flows only from the controller, 5.3, and a phone lists no `input.*` capability), so both sides agree the session is over and the controller's UI says why it must start again. Keys beyond 60 per second are dropped, not queued. Scrolls are coalesced like moves, per unit.
+- **Input target rules (5.12, SR-25, Phase 5):** frames outside a `session`/`start` are dropped; a frame arriving while the desktop is locked ends the session; a session with no frame for 10 minutes ends; the target's user can end it with a kill switch. In each case the target sends an `error` frame with code `input_session_ended` and a `message` saying why (an `input` frame flows only from the controller, 5.3, and a phone lists no `input.*` capability), so both sides agree the session is over and the controller's UI says why it must start again. Keys beyond 60 per second are dropped, not queued. Scrolls are coalesced like moves, per unit. Since v0.11.0 the frame also carries `reason`, a `start` that is refused (no `input.*`, grant off, locked) is answered the same way, and turning the grant off ends a running session (5.12). Against a target older than 0.11.0 a controller cannot keep the one-end-per-`start` promise in full: such a target answers only its first refusal per connection (one `forbidden` for `input`, 5.3) and never answers a `start` while locked, and there is no positive answer to a `start` on the wire. So after that `forbidden`, a later `start` to an older target on the same connection ends at once on the controller with `grant_off` and is not sent, and against an older target a locked desktop gives no event: input is simply not applied.
 - **A player that goes away (5.9, Phase 5):** the host sends one last `media` state for it with `playing: false` and an empty `can` list; receivers treat that as "gone" and drop it from their list. A paused player that cannot be controlled looks the same and is dropped too.
 - **Media state at session start (5.9, Phase 5):** like battery and presence, the host sends the current state of every local player to a peer with the `media` grant when its session starts, so a phone that connects mid-track sees what is playing.
 - **Empty "Add device" window (8.1, Phase 5):** a host whose window has been open for 10 s with no candidate sends a fresh 0/1/3 s beacon burst, and again every 10 s while the list stays empty, so a peer that opened its window after the first burst does not wait for the 60 s steady beacon.

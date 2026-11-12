@@ -29,10 +29,27 @@ if (-not $versionMatch.Success) { throw 'Could not read the workspace version fr
 $Version = $versionMatch.Groups[1].Value
 
 if (-not $NoBuild) {
-    & cargo build --release --locked --target $Target `
-        --manifest-path (Join-Path $Repo 'Cargo.toml') `
-        -p playdropd -p playdrop-desktop -p playdrop-cli
-    if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+    # The repo's .cargo/config.toml links the C runtime into every .exe (+crt-static); without
+    # it the programs need vcruntime140.dll, which a fresh Windows lacks. A RUSTFLAGS or
+    # CARGO_ENCODED_RUSTFLAGS variable replaces those flags without a word, so refuse to build
+    # with one set rather than ship programs that do not start.
+    foreach ($name in 'RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS') {
+        # Set at all, even empty, is enough for cargo to ignore the config's flags.
+        if (Test-Path "Env:$name") {
+            throw "$name is set; it would replace the flags in .cargo/config.toml (+crt-static). Unset it and build again."
+        }
+    }
+    # cargo reads .cargo/config.toml from the current directory upwards, not from the folder
+    # of --manifest-path, so build from the repo root whatever folder this was started in.
+    Push-Location $Repo
+    try {
+        & cargo build --release --locked --target $Target `
+            --manifest-path (Join-Path $Repo 'Cargo.toml') `
+            -p playdropd -p playdrop-desktop -p playdrop-cli
+        if ($LASTEXITCODE -ne 0) { throw "cargo build failed ($LASTEXITCODE)" }
+    } finally {
+        Pop-Location
+    }
 }
 
 # playdrop.exe is the command line from the playdrop-cli crate (docs/guide/cli.md).

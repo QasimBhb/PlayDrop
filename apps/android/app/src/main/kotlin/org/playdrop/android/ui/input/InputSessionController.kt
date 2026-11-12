@@ -20,6 +20,11 @@ import org.playdrop.core.PlayDropException
  * - When the desktop ends the session itself ([remoteEnded]: it locked, saw no input for 10
  *   minutes, or its user hit Stop) nothing reopens it on its own either, and no stop frame
  *   goes out because the desktop already closed it.
+ * - A session the core ended because the connection dropped ([connectionLost]) is not an
+ *   end the user has to answer: it stays wanted and idle, and the reconnect path
+ *   ([setOnline] true, or [resume] when the peer never looked offline) opens it again.
+ * - [retry] (the user's "Try again" after an end or a refusal) is the only way back from
+ *   the other ends: it opens the session again, or as soon as the peer is online.
  *
  * Every method is safe to call from any coroutine: one mutex keeps the frames in order.
  */
@@ -106,6 +111,35 @@ class InputSessionController(private val transport: suspend (InputEvent) -> Unit
     suspend fun remoteEnded() = locked {
         if (state != State.REFUSED) state = State.ENDED
         wanted = false
+    }
+
+    /**
+     * The core ended our session because the connection dropped (`CONNECTION_LOST`): the
+     * session is closed on both sides (no stop frame), but the screen still wants it, so it
+     * reopens once the peer is back. A refusal or an end the desktop chose is kept.
+     */
+    suspend fun connectionLost() = locked {
+        if (state == State.ACTIVE) state = State.IDLE
+    }
+
+    /**
+     * Reopens a wanted session that is idle while the peer counts as online: the case where
+     * the connection was replaced without the peer ever going offline. Does nothing otherwise.
+     */
+    suspend fun resume(): Outcome = locked {
+        if (wanted && online && state == State.IDLE) openLocked() else Outcome.Skipped
+    }
+
+    /** The user asked to try again after an end or a refusal: open the session again. */
+    suspend fun retry(): Outcome = locked {
+        when (state) {
+            State.ACTIVE -> Outcome.Skipped
+            else -> {
+                state = State.IDLE
+                wanted = true
+                if (online) openLocked() else Outcome.Skipped
+            }
+        }
     }
 
     /** Sends one frame inside the open session; skipped when there is none. */

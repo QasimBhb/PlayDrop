@@ -11,7 +11,7 @@ use playdrop_ipc::types::{
     MdnsStatus, MulticastStatus, OutboxItem, PeerBattery, PeerSummary, TransferDirection,
     TransferSnapshot, TransferStatus,
 };
-use playdrop_ipc::{ClipSkip, DiagnosticsReport, PortProbe, Status};
+use playdrop_ipc::{ClipSkip, DiagnosticsReport, PortProbe, Status, UpdateState, UpdateStatus};
 use serde::Serialize;
 use unicode_width::{UnicodeWidthChar as _, UnicodeWidthStr as _};
 
@@ -167,6 +167,72 @@ fn key_values(rows: &[(&str, String)]) -> String {
     out
 }
 
+/// One line for an update state, for `playdrop update` and its progress on stderr.
+pub fn update_state_line(state: &UpdateState) -> String {
+    match state {
+        UpdateState::Off => "update checks are off".to_owned(),
+        UpdateState::Idle => "no update offered".to_owned(),
+        UpdateState::Checking => "checking for updates".to_owned(),
+        UpdateState::UpToDate => "PlayDrop is up to date".to_owned(),
+        UpdateState::Available { offer } if offer.can_install => {
+            format!(
+                "PlayDrop {} is available; `playdrop update --install` installs it",
+                offer.version
+            )
+        }
+        UpdateState::Available { offer } => format!(
+            "PlayDrop {} is available. {}",
+            offer.version,
+            offer
+                .reason
+                .as_deref()
+                .unwrap_or("Get it from the release page.")
+        ),
+        UpdateState::Downloading {
+            version,
+            done,
+            total,
+        } if *total > 0 => format!("downloading {version}: {} of {}", size(*done), size(*total)),
+        UpdateState::Downloading { version, done, .. } => {
+            format!("downloading {version}: {}", size(*done))
+        }
+        UpdateState::Verifying { version } => format!("checking the download of {version}"),
+        UpdateState::Installing { version } => {
+            format!("installing {version}; answer the system prompt")
+        }
+        UpdateState::Restarting { version } => {
+            format!("updated to {version}; the daemon restarts on the new version")
+        }
+        UpdateState::Failed { message, .. } => format!("update failed: {message}"),
+        UpdateState::Other => "the daemon reports a state this playdrop does not know".to_owned(),
+    }
+}
+
+/// `playdrop update` without `--json`. `now` is Unix seconds.
+pub fn update(s: &UpdateStatus, now: u64) -> String {
+    let mut rows = vec![
+        ("running", s.running_version.clone()),
+        ("state", update_state_line(&s.state)),
+    ];
+    if let UpdateState::Available { offer }
+    | UpdateState::Failed {
+        offer: Some(offer), ..
+    } = &s.state
+    {
+        rows.push(("release page", offer.page_url.clone()));
+    }
+    rows.push((
+        "last check",
+        ago(now, s.last_checked_ms.map(|ms| ms / 1000)),
+    ));
+    if let Some(why) = &s.last_failure {
+        rows.push(("last failure", why.clone()));
+    } else if let Some(ms) = s.last_failed_ms {
+        rows.push(("last failure", ago(now, Some(ms / 1000))));
+    }
+    key_values(&rows)
+}
+
 /// "online", "offline" or "removed": whether the peer still has us pinned matters more
 /// than whether it is reachable.
 pub fn peer_state(p: &PeerSummary) -> &'static str {
@@ -295,6 +361,7 @@ pub fn status(s: &Status) -> String {
         ),
         ("start at login", on(s.settings.autostart).to_owned()),
         ("notifications", on(s.settings.notifications).to_owned()),
+        ("update check", on(s.settings.update_check).to_owned()),
         (
             "add device",
             if s.add_device_window_open {
@@ -682,6 +749,70 @@ mod tests {
     use crate::daemon::peer::tests::peer;
 
     #[test]
+    fn update_states_read_plainly() {
+        use playdrop_ipc::{UpdateOffer, UpdateStage};
+        let offer = UpdateOffer {
+            version: "0.12.0".into(),
+            page_url: "https://github.com/QasimBhb/PlayDrop/releases/tag/v0.12.0".into(),
+            can_install: true,
+            reason: None,
+        };
+        let status = UpdateStatus {
+            state: UpdateState::Available {
+                offer: offer.clone(),
+            },
+            last_checked_ms: Some(1_000_000),
+            last_failed_ms: None,
+            last_failure: None,
+            running_version: "0.11.0".into(),
+            unavailable: None,
+        };
+        assert_eq!(
+            update(&status, 1_000 + 300),
+            "running       0.11.0\n\
+             state         PlayDrop 0.12.0 is available; `playdrop update --install` installs it\n\
+             release page  https://github.com/QasimBhb/PlayDrop/releases/tag/v0.12.0\n\
+             last check    5 min ago\n"
+        );
+        assert_eq!(
+            update_state_line(&UpdateState::Downloading {
+                version: "0.12.0".into(),
+                done: 12 * 1024 * 1024,
+                total: 48 * 1024 * 1024
+            }),
+            "downloading 0.12.0: 12.0 MiB of 48.0 MiB"
+        );
+        assert_eq!(
+            update_state_line(&UpdateState::Available {
+                offer: UpdateOffer {
+                    can_install: false,
+                    reason: Some("Flatpak updates come from where it was installed.".into()),
+                    ..offer
+                }
+            }),
+            "PlayDrop 0.12.0 is available. Flatpak updates come from where it was installed."
+        );
+        let failed = UpdateStatus {
+            state: UpdateState::Failed {
+                stage: UpdateStage::Check,
+                message: "Could not reach GitHub.".into(),
+                offer: None,
+            },
+            last_checked_ms: None,
+            last_failed_ms: Some(2_000),
+            last_failure: Some("Could not reach GitHub.".into()),
+            running_version: "0.11.0".into(),
+            unavailable: None,
+        };
+        let text = update(&failed, 2);
+        assert!(text.contains("last check    never\n"), "{text}");
+        assert!(
+            text.contains("last failure  Could not reach GitHub.\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn sizes_pick_a_unit() {
         assert_eq!(size(0), "0 B");
         assert_eq!(size(1023), "1023 B");
@@ -780,6 +911,7 @@ mod tests {
             folder: None,
             delivered: Vec::new(),
             resumable: false,
+            failure: None,
         }
     }
 

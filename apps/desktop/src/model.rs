@@ -17,7 +17,7 @@ use playdrop_ipc::types::{
 };
 use playdrop_ipc::{
     ClipSkip, ConsentToken, DaemonEvent, DiagnosticsReport, Event, FirewallHint, PortProbe,
-    Settings, Status,
+    Settings, Status, UpdateStage, UpdateState, UpdateStatus,
 };
 use slint::{ModelRc, SharedString, VecModel};
 
@@ -234,6 +234,8 @@ pub enum Change {
     Refetch(Refetch),
     /// The daemon is going away.
     ShuttingDown,
+    /// The update state changed (banner and Settings).
+    Update,
 }
 
 /// Everything the window knows about the daemon.
@@ -252,6 +254,11 @@ pub struct Store {
     /// Peers with a remote input session open on this desktop (SR-25), as hex Device ID
     /// and label, in the order they started.
     pub input_sessions: Vec<(String, String)>,
+    /// The update check's last word; `None` until the daemon answered, and from a daemon
+    /// older than 0.11.0, which has no update check.
+    pub update: Option<UpdateStatus>,
+    /// The daemon answered an update request with `bad_request`: it has no update check.
+    pub update_unsupported: bool,
 }
 
 impl Store {
@@ -449,6 +456,10 @@ impl Store {
                 let mut changes = self.clear_input_sessions();
                 changes.push(Change::ShuttingDown);
                 changes
+            }
+            DaemonEvent::UpdateChanged(status) => {
+                self.update = Some(status);
+                vec![Change::Update]
             }
             _ => Vec::new(),
         }
@@ -707,6 +718,7 @@ impl Store {
                 peer,
                 direction,
                 reason,
+                ..
             } => {
                 let mut changes = self.upsert_transfer(&id, &peer, direction, |t| {
                     t.state = TransferStatus::Failed;
@@ -1098,6 +1110,231 @@ pub fn format_date(unix: u64) -> String {
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = yoe + era * 400 + i64::from(month <= 2);
     format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// What the update banner at the top of the window shows (`docs/ipc.md` 1.9).
+// Each bool is one thing the banner shows or not, set independently per state.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateBannerView {
+    /// Shown at all.
+    pub visible: bool,
+    /// The main sentence.
+    pub text: String,
+    /// A second sentence: why "Update" is not offered here.
+    pub detail: String,
+    /// The text is a failure.
+    pub error: bool,
+    /// The main button's label; empty for none.
+    pub primary: String,
+    /// Show "Later".
+    pub later: bool,
+    /// Show the "What is new" link.
+    pub link: bool,
+}
+
+/// What the banner's main button does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateAction {
+    /// Ask the daemon to install the offer.
+    Install,
+    /// Open the release page instead (this copy cannot install).
+    OpenPage,
+    /// Stop the download that runs (`update_cancel`).
+    Cancel,
+    /// Nothing to do.
+    None,
+}
+
+/// "12 of 48 MB": whole decimal megabytes, which is what "MB" means to most people.
+pub fn megabytes_of(done: u64, total: u64) -> String {
+    let mb = |b: u64| b.div_ceil(1_000_000);
+    if total == 0 {
+        format!("{} MB", mb(done))
+    } else {
+        format!("{} of {} MB", mb(done).min(mb(total)), mb(total))
+    }
+}
+
+/// Whether the daemon runs a newer version than this window: after an update the window
+/// that is still open is the old program.
+pub fn daemon_is_newer(daemon_version: &str, window_version: &str) -> bool {
+    use playdrop_core::update::Version;
+    match (
+        Version::parse(daemon_version),
+        Version::parse(window_version),
+    ) {
+        (Ok(d), Ok(w)) => d > w,
+        _ => false,
+    }
+}
+
+/// The sentence for a window that outlived its daemon's update.
+fn reopen_text(version: &str) -> String {
+    format!("Updated to {version}. Close and reopen PlayDrop to finish.")
+}
+
+/// The banner for `status`. `daemon_version` comes from `Status`; `window_version` is this
+/// program's; `windows` picks the wording of the install step. A failed check shows no
+/// banner (Settings says it), so a computer that is offline is not nagged.
+pub fn update_banner(
+    status: Option<&UpdateStatus>,
+    daemon_version: Option<&str>,
+    window_version: &str,
+    windows: bool,
+) -> UpdateBannerView {
+    if let Some(v) = daemon_version.filter(|d| daemon_is_newer(d, window_version)) {
+        return UpdateBannerView {
+            visible: true,
+            text: reopen_text(v),
+            ..UpdateBannerView::default()
+        };
+    }
+    let Some(status) = status else {
+        return UpdateBannerView::default();
+    };
+    // Work in progress: the sentence and no buttons.
+    let busy = |text: String| UpdateBannerView {
+        visible: true,
+        text,
+        ..UpdateBannerView::default()
+    };
+    match &status.state {
+        UpdateState::Available { offer } => UpdateBannerView {
+            visible: true,
+            text: format!("PlayDrop {} is available.", offer.version),
+            detail: if offer.can_install {
+                String::new()
+            } else {
+                offer.reason.clone().unwrap_or_default()
+            },
+            error: false,
+            primary: if offer.can_install {
+                "Update".to_owned()
+            } else {
+                "Open release page".to_owned()
+            },
+            later: true,
+            link: offer.can_install,
+        },
+        UpdateState::Downloading {
+            version,
+            done,
+            total,
+        } => UpdateBannerView {
+            primary: "Cancel".to_owned(),
+            ..busy(format!(
+                "Downloading PlayDrop {version}: {}",
+                megabytes_of(*done, *total)
+            ))
+        },
+        UpdateState::Verifying { version } => {
+            busy(format!("Checking the download of PlayDrop {version}..."))
+        }
+        UpdateState::Installing { version } if windows => busy(format!(
+            "Installing PlayDrop {version}. Windows asks for permission, then PlayDrop starts again."
+        )),
+        UpdateState::Installing { version } => busy(format!(
+            "Installing PlayDrop {version}. Enter your password in the system prompt."
+        )),
+        UpdateState::Restarting { version } => UpdateBannerView {
+            visible: true,
+            text: reopen_text(version),
+            ..UpdateBannerView::default()
+        },
+        UpdateState::Failed {
+            stage,
+            message,
+            offer: Some(offer),
+        } if *stage != UpdateStage::Check => UpdateBannerView {
+            visible: true,
+            text: message.clone(),
+            detail: String::new(),
+            error: true,
+            primary: if offer.can_install {
+                "Try again".to_owned()
+            } else {
+                "Open release page".to_owned()
+            },
+            later: true,
+            link: offer.can_install,
+        },
+        _ => UpdateBannerView::default(),
+    }
+}
+
+/// What the banner's main button does in `status`.
+pub fn update_action(status: Option<&UpdateStatus>) -> UpdateAction {
+    if let Some(UpdateState::Downloading { .. }) = status.map(|s| &s.state) {
+        return UpdateAction::Cancel;
+    }
+    let Some(
+        UpdateState::Available { offer }
+        | UpdateState::Failed {
+            offer: Some(offer), ..
+        },
+    ) = status.map(|s| &s.state)
+    else {
+        return UpdateAction::None;
+    };
+    if offer.can_install {
+        UpdateAction::Install
+    } else {
+        UpdateAction::OpenPage
+    }
+}
+
+/// The line beside "Check now": "Last checked: 5 min ago", "Checking...", or why there is
+/// no check at all.
+pub fn update_last_checked(status: Option<&UpdateStatus>, unsupported: bool, now: u64) -> String {
+    if unsupported {
+        return "This PlayDrop service is older and has no update check.".to_owned();
+    }
+    if let Some(why) = status.and_then(|s| s.unavailable.clone()) {
+        return why;
+    }
+    match status {
+        Some(UpdateStatus {
+            state: UpdateState::Checking,
+            ..
+        }) => "Checking...".to_owned(),
+        Some(UpdateStatus {
+            last_checked_ms: Some(ms),
+            ..
+        }) => format!("Last checked: {}", format_ago(ms / 1000, now)),
+        _ => "Last checked: never".to_owned(),
+    }
+}
+
+/// The failure line under it, empty when the last check answered.
+pub fn update_failure_text(status: Option<&UpdateStatus>) -> String {
+    match status {
+        Some(UpdateStatus {
+            last_failure: Some(why),
+            ..
+        }) => format!("The last check failed: {why}"),
+        Some(UpdateStatus {
+            last_failed_ms: Some(_),
+            ..
+        }) => "The last check failed.".to_owned(),
+        _ => String::new(),
+    }
+}
+
+/// The notice after "Check now", when the answer is worth a line of its own (the banner
+/// covers an offer).
+pub fn check_now_notice(status: &UpdateStatus) -> Option<(String, bool)> {
+    if let Some(why) = &status.unavailable {
+        return Some((why.clone(), false));
+    }
+    match &status.state {
+        UpdateState::UpToDate => Some((
+            format!("PlayDrop {} is up to date.", status.running_version),
+            false,
+        )),
+        UpdateState::Off => Some(("Update checks are off.".to_owned(), true)),
+        _ => status.last_failure.clone().map(|why| (why, true)),
+    }
 }
 
 /// Splits a six-digit SAS in two groups for reading aloud: "123 456".
@@ -1659,6 +1896,7 @@ mod tests {
             autostart: false,
             autostart_refused: None,
             notifications: true,
+            update_check: true,
         }
     }
 
@@ -2383,6 +2621,7 @@ mod tests {
                 peer: "aa".into(),
                 direction: TransferDirection::Send,
                 reason: "peer went away".into(),
+                code: playdrop_ipc::types::TransferFailure::default(),
             }),
             0,
         );
@@ -2749,6 +2988,211 @@ mod tests {
             "Clipboard not sent: the connected devices cannot receive this kind of clip"
         );
         assert_eq!(clipboard_sent_text(2), "Clipboard sent to 2 devices");
+    }
+
+    fn update_status(state: UpdateState) -> UpdateStatus {
+        UpdateStatus {
+            state,
+            last_checked_ms: Some(1_000_000),
+            last_failed_ms: None,
+            last_failure: None,
+            running_version: "0.11.0".into(),
+            unavailable: None,
+        }
+    }
+
+    fn offer(can_install: bool) -> playdrop_ipc::UpdateOffer {
+        playdrop_ipc::UpdateOffer {
+            version: "0.12.0".into(),
+            page_url: "https://github.com/QasimBhb/PlayDrop/releases/tag/v0.12.0".into(),
+            can_install,
+            reason: (!can_install)
+                .then(|| "Flatpak updates come from where it was installed.".into()),
+        }
+    }
+
+    #[test]
+    fn an_offer_gets_update_later_and_the_link() {
+        let s = update_status(UpdateState::Available { offer: offer(true) });
+        let b = update_banner(Some(&s), Some("0.11.0"), "0.11.0", false);
+        assert_eq!(
+            b,
+            UpdateBannerView {
+                visible: true,
+                text: "PlayDrop 0.12.0 is available.".into(),
+                detail: String::new(),
+                error: false,
+                primary: "Update".into(),
+                later: true,
+                link: true,
+            }
+        );
+        assert_eq!(update_action(Some(&s)), UpdateAction::Install);
+        // A Flatpak gets the release page and the reason, no install.
+        let s = update_status(UpdateState::Available {
+            offer: offer(false),
+        });
+        let b = update_banner(Some(&s), None, "0.11.0", false);
+        assert_eq!(b.primary, "Open release page");
+        assert_eq!(
+            b.detail,
+            "Flatpak updates come from where it was installed."
+        );
+        assert!(b.later && !b.link);
+        assert_eq!(update_action(Some(&s)), UpdateAction::OpenPage);
+    }
+
+    #[test]
+    fn progress_and_failures_read_as_plain_sentences() {
+        let banner = |state| update_banner(Some(&update_status(state)), None, "0.11.0", false);
+        let b = banner(UpdateState::Downloading {
+            version: "0.12.0".into(),
+            done: 12_000_000,
+            total: 48_000_000,
+        });
+        assert_eq!(b.text, "Downloading PlayDrop 0.12.0: 12 of 48 MB");
+        assert!(b.visible && !b.later && !b.link);
+        // The one button while downloading stops it.
+        assert_eq!(b.primary, "Cancel");
+        let downloading = update_status(UpdateState::Downloading {
+            version: "0.12.0".into(),
+            done: 1,
+            total: 2,
+        });
+        assert_eq!(update_action(Some(&downloading)), UpdateAction::Cancel);
+        let verifying = update_status(UpdateState::Verifying {
+            version: "0.12.0".into(),
+        });
+        assert!(banner(verifying.state.clone()).primary.is_empty());
+        assert_eq!(update_action(Some(&verifying)), UpdateAction::None);
+        assert!(banner(UpdateState::Installing {
+            version: "0.12.0".into()
+        })
+        .text
+        .contains("password"));
+        assert!(update_banner(
+            Some(&update_status(UpdateState::Installing {
+                version: "0.12.0".into()
+            })),
+            None,
+            "0.11.0",
+            true
+        )
+        .text
+        .contains("Windows asks"));
+        let b = banner(UpdateState::Failed {
+            stage: UpdateStage::Verify,
+            message: "The download did not match its signed checksum and was deleted.".into(),
+            offer: Some(offer(true)),
+        });
+        assert!(b.error && b.later && b.link);
+        assert_eq!(b.primary, "Try again");
+        assert_eq!(
+            b.text,
+            "The download did not match its signed checksum and was deleted."
+        );
+        // A failed check is for Settings, not a banner.
+        let failed_check = UpdateStatus {
+            last_failure: Some("Could not reach GitHub.".into()),
+            last_failed_ms: Some(5),
+            ..update_status(UpdateState::Failed {
+                stage: UpdateStage::Check,
+                message: "Could not reach GitHub.".into(),
+                offer: None,
+            })
+        };
+        assert!(!update_banner(Some(&failed_check), None, "0.11.0", false).visible);
+        assert_eq!(
+            update_failure_text(Some(&failed_check)),
+            "The last check failed: Could not reach GitHub."
+        );
+        for quiet in [
+            UpdateState::Off,
+            UpdateState::Idle,
+            UpdateState::UpToDate,
+            UpdateState::Checking,
+            UpdateState::Other,
+        ] {
+            assert!(!banner(quiet).visible);
+        }
+        assert!(!update_banner(None, None, "0.11.0", false).visible);
+        assert_eq!(megabytes_of(0, 0), "0 MB");
+        assert_eq!(megabytes_of(48_000_000, 48_000_000), "48 of 48 MB");
+    }
+
+    #[test]
+    fn a_window_older_than_its_daemon_asks_to_be_reopened() {
+        let b = update_banner(
+            Some(&update_status(UpdateState::Restarting {
+                version: "0.12.0".into(),
+            })),
+            Some("0.11.0"),
+            "0.11.0",
+            false,
+        );
+        assert_eq!(
+            b.text,
+            "Updated to 0.12.0. Close and reopen PlayDrop to finish."
+        );
+        assert!(b.primary.is_empty() && !b.later);
+        // After the new daemon is back, its version says the same.
+        let b = update_banner(
+            Some(&update_status(UpdateState::Idle)),
+            Some("0.12.0"),
+            "0.11.0",
+            false,
+        );
+        assert_eq!(
+            b.text,
+            "Updated to 0.12.0. Close and reopen PlayDrop to finish."
+        );
+        assert!(!daemon_is_newer("0.11.0", "0.12.0"));
+        assert!(!daemon_is_newer("test", "0.12.0"));
+    }
+
+    #[test]
+    fn settings_lines_for_the_update_check() {
+        let now = 1_000 + 300;
+        assert_eq!(
+            update_last_checked(Some(&update_status(UpdateState::UpToDate)), false, now),
+            "Last checked: 5 min ago"
+        );
+        assert_eq!(update_last_checked(None, false, now), "Last checked: never");
+        assert_eq!(
+            update_last_checked(Some(&update_status(UpdateState::Checking)), false, now),
+            "Checking..."
+        );
+        assert!(update_last_checked(None, true, now).contains("no update check"));
+        // A build that is not a release says so instead of a time.
+        let not_release = UpdateStatus {
+            unavailable: Some(playdrop_core::update::NOT_A_RELEASE.into()),
+            ..update_status(UpdateState::Idle)
+        };
+        assert_eq!(
+            update_last_checked(Some(&not_release), false, now),
+            "This is not a release build, so it does not check for updates."
+        );
+        assert_eq!(
+            check_now_notice(&not_release),
+            Some((playdrop_core::update::NOT_A_RELEASE.to_owned(), false))
+        );
+        assert_eq!(
+            check_now_notice(&update_status(UpdateState::UpToDate)),
+            Some(("PlayDrop 0.11.0 is up to date.".to_owned(), false))
+        );
+        assert_eq!(
+            check_now_notice(&update_status(UpdateState::Available {
+                offer: offer(true)
+            })),
+            None
+        );
+        let mut s = Store::default();
+        let status = update_status(UpdateState::UpToDate);
+        assert_eq!(
+            s.apply(Event::Daemon(DaemonEvent::UpdateChanged(status.clone())), 0),
+            vec![Change::Update]
+        );
+        assert_eq!(s.update, Some(status));
     }
 
     #[test]

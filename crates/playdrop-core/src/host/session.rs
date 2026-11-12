@@ -29,7 +29,8 @@ use crate::net::{
 };
 use crate::pin_store::{AnnounceKey as PinAnnounceKey, Grants};
 use crate::session::types::{
-    AnnounceKey, CapabilitiesFrame, Capability, Caps, Frame, GrantKind, Hello, Media, Trust,
+    AnnounceKey, CapabilitiesFrame, Capability, Caps, Frame, GrantKind, Hello, Media, Notification,
+    Trust,
 };
 use crate::session::types::{PresenceState, TransferFrame, TransferState as FrameState};
 use crate::session::{
@@ -40,7 +41,8 @@ use crate::{Error, Result};
 
 /// What every host accepts (`caps.in`, protocol.md section 4; `docs/core-api.md`
 /// section 6). Remote input (`input.*`, [`INPUT_CAPS`]) is added only by a host with a
-/// backend that applies it (`HostConfig::accepts_input`).
+/// backend that applies it (`HostConfig::accepts_input`), and `notifications` only by a
+/// host that takes part in mirroring (`HostConfig::notifications`).
 pub(crate) const LOCAL_IN: &[Capability] = &[
     Capability::Ping,
     Capability::Find,
@@ -54,7 +56,6 @@ pub(crate) const LOCAL_IN: &[Capability] = &[
     Capability::TransferBundle,
     Capability::Outbox,
     Capability::Blobs,
-    Capability::Notifications,
 ];
 
 /// The remote input capabilities (protocol.md 5.12).
@@ -64,8 +65,8 @@ pub(crate) const INPUT_CAPS: &[Capability] = &[
     Capability::InputPresenter,
 ];
 
-/// What this build may send (`caps.out`): [`LOCAL_IN`] plus [`INPUT_CAPS`], since any host
-/// may act as the controller.
+/// What every host may send (`caps.out`): [`LOCAL_IN`] plus [`INPUT_CAPS`], since any host
+/// may act as the controller. `notifications` is added as for [`LOCAL_IN`].
 pub(crate) const LOCAL_OUT: &[Capability] = &[
     Capability::Ping,
     Capability::Find,
@@ -79,7 +80,6 @@ pub(crate) const LOCAL_OUT: &[Capability] = &[
     Capability::TransferBundle,
     Capability::Outbox,
     Capability::Blobs,
-    Capability::Notifications,
     Capability::InputPointer,
     Capability::InputKey,
     Capability::InputPresenter,
@@ -101,8 +101,13 @@ pub(crate) fn local_caps(inner: &Inner) -> Caps {
     if inner.accepts_input {
         incoming.extend_from_slice(INPUT_CAPS);
     }
-    #[allow(unused_mut, reason = "only the iroh feature adds to it")]
     let mut outgoing = LOCAL_OUT.to_vec();
+    // Each role sends one kind of op and handles the other, so both lists carry it
+    // (`NotificationRole`).
+    if inner.notification_role.announces() {
+        incoming.push(Capability::Notifications);
+        outgoing.push(Capability::Notifications);
+    }
     // Listed only with a relay named: no endpoint, nothing to tell or to hear (protocol.md 12).
     #[cfg(feature = "iroh")]
     if inner.reach_link.is_some() {
@@ -125,16 +130,43 @@ enum Out {
 struct State {
     hello: Option<ValidatedHello>,
     peer_in: Vec<Capability>,
+    /// Our own `caps.out` as sent in `hello` on this stream: nothing outside it is sent.
+    local_out: Vec<Capability>,
     forbidden_sent: HashSet<String>,
     /// `(seq, type)` of the last frames we sent, newest last, for `error.re` lookups.
     sent_types: VecDeque<(u64, String)>,
     /// The session this one replaced, still open until the peer has placed this one too
     /// ([`Session::end_replaced`]).
     replaced: Option<Arc<Session>>,
-    /// When the `posted` notification frames of the last minute arrived, oldest first
-    /// (protocol.md 5.16, SR-44).
-    notifications_posted: VecDeque<tokio::time::Instant>,
+    /// When the `posted`, `removed` and `dismiss` notification frames of the last minute
+    /// arrived, oldest first, one queue per op (protocol.md 5.16, SR-44).
+    notifications_seen: [VecDeque<tokio::time::Instant>; 3],
+    /// The last `input` `session`/`start` we queued on this stream, so an answer to an
+    /// older frame cannot end the session it started (protocol.md 5.12).
+    input_start: Option<StartMark>,
+    /// The peer answered one of our `input` frames with `forbidden` on this stream. A
+    /// target older than 0.11.0 says so only once per connection (5.3).
+    input_forbidden: bool,
+    /// When the refused `start` answers of the last minute went out, oldest first (5.12).
+    start_answers: VecDeque<tokio::time::Instant>,
 }
+
+/// Where the last `start` we queued stands: the writer gives it its `seq` when it goes out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartMark {
+    /// Queued, not written yet: the peer cannot have answered it.
+    Queued,
+    /// Written under this `seq`.
+    Sent(u64),
+}
+
+/// Refused `start` answers sent per connection per minute (protocol.md 5.12): as many as a
+/// person can open an input screen, and a bound on what a peer that loops on `start` can
+/// make this host queue.
+const START_ANSWERS_PER_MINUTE: usize = 60;
+
+/// The first release whose input target answers every refused `start` (protocol.md 5.12).
+const INPUT_REASONS_SINCE: (u32, u32, u32) = (0, 11, 0);
 
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -160,13 +192,19 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
-    fn new(conn: Arc<Connection>) -> (Arc<Self>, mpsc::UnboundedReceiver<Out>) {
+    fn new(
+        conn: Arc<Connection>,
+        local_out: Vec<Capability>,
+    ) -> (Arc<Self>, mpsc::UnboundedReceiver<Out>) {
         let (tx, rx) = mpsc::unbounded_channel();
         let s = Arc::new(Self {
             id: NEXT_SESSION.fetch_add(1, Ordering::Relaxed),
             conn,
             tx,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                local_out,
+                ..State::default()
+            }),
             hello_tx: watch::Sender::new(false),
             live: AtomicBool::new(true),
             ended_tx: watch::Sender::new(false),
@@ -201,7 +239,7 @@ impl Session {
     pub(crate) fn send(&self, frame: Frame) {
         let allowed = {
             let st = lock(&self.state);
-            may_send_frame(&frame, LOCAL_OUT, &st.peer_in)
+            may_send_frame(&frame, &st.local_out, &st.peer_in)
         };
         if allowed {
             self.send_raw(frame, None);
@@ -213,9 +251,11 @@ impl Session {
         }
     }
 
-    /// True if the peer accepts `cap` (its `caps.in`) and this build may send it.
+    /// True if the peer accepts `cap` (its `caps.in`) and this host announced it may send
+    /// it (our `caps.out`).
     pub(crate) fn peer_accepts(&self, cap: &Capability) -> bool {
-        crate::session::may_send(LOCAL_OUT, &lock(&self.state).peer_in, cap)
+        let st = lock(&self.state);
+        crate::session::may_send(&st.local_out, &st.peer_in, cap)
     }
 
     /// True if the peer's `caps.in` lists `cap`, for a capability this build adds at run time.
@@ -250,6 +290,16 @@ impl Session {
             .rev()
             .find(|(s, _)| *s == seq)
             .map(|(_, t)| t.clone())
+    }
+
+    /// The `seq` of the last remembered frame of type `t` we sent, for a test hook.
+    pub(crate) fn last_sent_seq(&self, t: &str) -> Option<u64> {
+        lock(&self.state)
+            .sent_types
+            .iter()
+            .rev()
+            .find(|(_, sent)| sent == t)
+            .map(|(seq, _)| *seq)
     }
 
     /// Sends a frame with no capability check (hello, pairing, error, pong, `re` replies).
@@ -310,24 +360,92 @@ impl Session {
         });
     }
 
-    /// Counts one `posted` notification frame against the per-connection limit (protocol.md
-    /// 5.16, SR-44): false once [`notifications::NOTIFICATIONS_POSTED_PER_MINUTE`] arrived
-    /// within the last 60 s. A dropped frame does not count.
-    pub(crate) fn allow_notification_posted(&self) -> bool {
+    /// Counts one notification frame against the per-connection limit for its op
+    /// (protocol.md 5.16, SR-44): false once [`notifications::per_minute_limit`] frames of
+    /// that op arrived within the last 60 s. A dropped frame does not count. Each queue
+    /// holds at most its limit, so the memory is bounded whatever the peer sends.
+    pub(crate) fn allow_notification(&self, n: &Notification) -> bool {
+        let slot = match n {
+            Notification::Posted(_) => 0,
+            Notification::Removed { .. } => 1,
+            Notification::Dismiss { .. } => 2,
+        };
+        let limit = notifications::per_minute_limit(n);
         let now = tokio::time::Instant::now();
         let mut st = lock(&self.state);
-        let q = &mut st.notifications_posted;
+        let q = &mut st.notifications_seen[slot];
         while q
             .front()
             .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
         {
             q.pop_front();
         }
-        if q.len() >= notifications::NOTIFICATIONS_POSTED_PER_MINUTE {
+        if q.len() >= limit {
             return false;
         }
         q.push_back(now);
         true
+    }
+
+    /// Notes that an `input` `start` is queued; [`Self::answers_older_than_start`] then
+    /// treats every answer as older until the writer has given it a `seq`.
+    pub(crate) fn note_start_queued(&self) {
+        lock(&self.state).input_start = Some(StartMark::Queued);
+    }
+
+    /// True if an answer naming `re` is about a frame we sent before our last `start` on
+    /// this stream, so it says nothing about the session that `start` opened. An answer
+    /// with no `re` is about whatever session is open.
+    pub(crate) fn answers_older_than_start(&self, re: Option<u64>) -> bool {
+        let Some(re) = re else { return false };
+        match lock(&self.state).input_start {
+            None => false,
+            Some(StartMark::Queued) => true,
+            Some(StartMark::Sent(start)) => re < start,
+        }
+    }
+
+    /// The peer answered an `input` frame of ours with `forbidden`.
+    pub(crate) fn note_input_forbidden(&self) {
+        lock(&self.state).input_forbidden = true;
+    }
+
+    /// True if a `start` to this peer can be known to be refused before it is sent: the
+    /// peer is older than 0.11.0, which never answers a `start` again once it sent its one
+    /// `forbidden` for `input` on this connection (protocol.md 5.3, 5.12).
+    pub(crate) fn start_known_refused(&self) -> bool {
+        let st = lock(&self.state);
+        st.input_forbidden
+            && st
+                .hello
+                .as_ref()
+                .is_some_and(|h| app_older_than(&h.app, INPUT_REASONS_SINCE))
+    }
+
+    /// Counts one refused `start` answer against [`START_ANSWERS_PER_MINUTE`]: false once
+    /// that many went out within the last 60 s, and the answer is then dropped silently.
+    pub(crate) fn allow_start_answer(&self) -> bool {
+        let now = tokio::time::Instant::now();
+        let mut st = lock(&self.state);
+        let q = &mut st.start_answers;
+        while q
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
+        {
+            q.pop_front();
+        }
+        if q.len() >= START_ANSWERS_PER_MINUTE {
+            return false;
+        }
+        q.push_back(now);
+        true
+    }
+
+    /// Replaces the peer's `hello.app` (tests stand in for an older peer).
+    pub(crate) fn set_peer_app_for_test(&self, app: &str) {
+        if let Some(h) = lock(&self.state).hello.as_mut() {
+            app.clone_into(&mut h.app);
+        }
     }
 
     /// Sends at most one `forbidden` or `not_paired` error per frame type per connection
@@ -342,6 +460,20 @@ impl Session {
             // `re` names the refused frame so the sender can tell which feature to hide.
             self.send_raw(Frame::error(code, Some(&message)), Some(re));
         }
+    }
+}
+
+/// True if `app` (`hello.app`, "name/x.y.z") names a release older than `min`. A string
+/// with no readable version is not older: only builds known to lack a behaviour get the
+/// fallback for it.
+fn app_older_than(app: &str, min: (u32, u32, u32)) -> bool {
+    let version = app.rsplit('/').next().unwrap_or(app);
+    // "0.10.0-rc1" and "0.10.0+build" compare by their release numbers.
+    let core = version.split(['-', '+']).next().unwrap_or(version);
+    let mut parts = core.split('.').map(str::parse::<u32>);
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(Ok(a)), Some(Ok(b)), Some(Ok(c)), None) => (a, b, c) < min,
+        _ => false,
     }
 }
 
@@ -377,7 +509,7 @@ fn start(
     send: SendStream<Bytes>,
     body: RecvStream,
 ) -> Arc<Session> {
-    let (sess, rx) = Session::new(Arc::clone(conn));
+    let (sess, rx) = Session::new(Arc::clone(conn), local_caps(inner).outgoing);
     sess.send_raw(our_hello(inner, conn), None);
     inner.spawn(writer(Arc::clone(&sess), send, rx));
     inner.spawn(reader(Arc::clone(inner), Arc::clone(&sess), body));
@@ -464,7 +596,12 @@ async fn writer(
         let mut push = |m: Out, batch: &mut BytesMut| match m {
             Out::Frame(f, re) => {
                 match enc.encode_into(&f, re, batch) {
-                    Ok(seq) => sess.record_sent(seq, f.type_name()),
+                    Ok(seq) => {
+                        sess.record_sent(seq, f.type_name());
+                        if is_input_start(&f) {
+                            lock(&sess.state).input_start = Some(StartMark::Sent(seq));
+                        }
+                    }
                     Err(e) => {
                         tracing::debug!(error = %e, t = f.type_name(), "frame not encoded");
                     }
@@ -485,6 +622,15 @@ async fn writer(
             return;
         }
     }
+}
+
+fn is_input_start(f: &Frame) -> bool {
+    matches!(
+        f,
+        Frame::Input(crate::session::types::Input::Session {
+            op: crate::session::types::SessionOp::Start
+        })
+    )
 }
 
 async fn reader(inner: Arc<Inner>, sess: Arc<Session>, body: RecvStream) {
@@ -612,6 +758,19 @@ async fn handle_frame(
         if !inner.pins.contains(&peer) {
             return Ok(());
         }
+        // A host acts only on what its `in` list announced (section 4). Checked before the
+        // grant so a controller hears "not accepted" rather than "grant off" from a host
+        // that hides the feature.
+        match &env.frame {
+            Frame::Input(i) if !inner.accepts_input => {
+                input::refuse(sess, env.seq, i, input::InputEndReason::NotAccepted);
+                return Ok(());
+            }
+            Frame::Notification(n) if !notifications::accepts(inner, &peer, n) => {
+                return Ok(());
+            }
+            _ => {}
+        }
         // Authorisation uses the TLS-authenticated Device ID only (SR-13, SR-14).
         if let Some(g) = env.frame.required_grant() {
             let ok = inner
@@ -619,7 +778,17 @@ async fn handle_frame(
                 .get(&peer)
                 .is_some_and(|p| has_grant(p.grants, g));
             if !ok {
-                sess.refuse_once(&t, ErrorCode::Forbidden, env.seq);
+                match &env.frame {
+                    // A refused `start` is answered every time with its reason (5.12), so
+                    // a controller that opens its input screen again on the same
+                    // connection is told again. Other frames get the one `forbidden`.
+                    Frame::Input(
+                        i @ crate::session::types::Input::Session {
+                            op: crate::session::types::SessionOp::Start,
+                        },
+                    ) => input::refuse(sess, env.seq, i, input::InputEndReason::GrantOff),
+                    _ => sess.refuse_once(&t, ErrorCode::Forbidden, env.seq),
+                }
                 return Ok(());
             }
         }
@@ -705,7 +874,7 @@ async fn handle_frame(
             bytes: o.bytes,
             ids: o.ids,
         }),
-        Frame::Input(i) => input::on_frame(inner, peer, i),
+        Frame::Input(i) => input::on_frame(inner, peer, seq, i),
         Frame::Notification(n) => notifications::on_frame(inner, sess, seq, n),
         Frame::Transfer(tf) => send::on_transfer_frame(inner, peer, &tf),
         Frame::PairRequest(_)
@@ -724,17 +893,32 @@ async fn handle_frame(
             }
         }
         Frame::Error(e) if e.code == ErrorCode::InputSessionEnded => {
-            input::on_ended_by_target(inner, peer, e.message);
+            // A late refusal of an earlier `start` must not end the session a newer one
+            // opened (5.12).
+            if sess.answers_older_than_start(env.re) {
+                tracing::debug!(peer = %short(&peer), "input session end for an earlier start; ignored");
+            } else {
+                input::on_ended_by_target(inner, peer, e.message, e.reason.as_deref());
+            }
         }
         Frame::Error(e) => {
             tracing::debug!(peer = %short(&peer), code = %e.code, "peer sent error frame");
             let frame_type = env.re.and_then(|re| sess.sent_type(re));
+            // An older target refuses a `start` only with this (5.3): it ends ours.
+            let input_refused =
+                e.code == ErrorCode::Forbidden && frame_type.as_deref() == Some("input");
             inner.emit(HostEvent::PeerRefused {
                 peer: hex,
                 frame_type,
                 code: e.code.as_str().to_owned(),
                 message: e.message,
             });
+            if input_refused {
+                sess.note_input_forbidden();
+                if !sess.answers_older_than_start(env.re) {
+                    input::on_refused_by_target(inner, peer);
+                }
+            }
         }
         Frame::Pong | Frame::Hello(_) | Frame::Unknown { .. } => {}
     }
@@ -922,6 +1106,11 @@ pub(crate) async fn unpair(inner: &Arc<Inner>, peer: DeviceId, notify: bool) -> 
         d.set_announce_key(key);
     }
     let conns = inner.registry.forget(&peer);
+    // The forget means the closing session will not find itself placed, so its end would
+    // not end input: done here, before `Unpaired`, for both roles. As the target the host
+    // gets its final `stop` and releases what is held (SR-25, T31); as the controller the
+    // UI gets its one end event.
+    input::on_session_end(inner, peer);
     inner.spawn(async move {
         tokio::time::sleep(FLUSH_GRACE).await;
         for c in conns {
@@ -946,4 +1135,23 @@ pub(crate) async fn unpair(inner: &Arc<Inner>, peer: DeviceId, notify: bool) -> 
         short_id: peer.short_id(),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::app_older_than;
+
+    /// Only a readable version below the bound counts as older.
+    #[test]
+    fn app_versions_compare_by_release_numbers() {
+        let min = (0, 11, 0);
+        assert!(app_older_than("playdrop-core/0.10.0", min));
+        assert!(app_older_than("playdrop-core/0.9.12", min));
+        assert!(app_older_than("playdrop-core/0.10.3-rc1", min));
+        assert!(!app_older_than("playdrop-core/0.11.0", min));
+        assert!(!app_older_than("playdrop-core/1.0.0+build", min));
+        assert!(!app_older_than("playdrop-core/0.10", min));
+        assert!(!app_older_than("something else", min));
+        assert!(!app_older_than("", min));
+    }
 }

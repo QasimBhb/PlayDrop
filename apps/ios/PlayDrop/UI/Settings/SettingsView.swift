@@ -15,6 +15,7 @@ struct SettingsView: View {
     @Environment(CoreHost.self) private var core
     @Environment(AppSettings.self) private var settings
     @Environment(MessageCenter.self) private var messages
+    @Environment(UpdateChecker.self) private var updates
     @Environment(\.openURL) private var openURL
     @Environment(\.scenePhase) private var scenePhase
 
@@ -78,6 +79,8 @@ struct SettingsView: View {
 
                 notificationsSection
 
+                updatesSection
+
                 Section {
                     HStack {
                         TextField(L10n.Settings.port, text: $port)
@@ -127,6 +130,50 @@ struct SettingsView: View {
                     Button(L10n.allow) { Task { await allowNotifications() } }
                 }
             }
+        }
+    }
+
+    private var updatesSection: some View {
+        @Bindable var settings = settings
+        return Section {
+            Toggle(L10n.Update.toggle, isOn: $settings.updateCheckEnabled)
+            Button {
+                Task { await updates.checkNow() }
+            } label: {
+                HStack {
+                    Text(L10n.Update.checkNow)
+                    if updates.checking {
+                        Spacer()
+                        ProgressView()
+                    }
+                }
+            }
+            .disabled(!settings.updateCheckEnabled || updates.checking)
+            LabeledContent(L10n.Update.lastChecked) {
+                Text(verbatim: lastCheckedText)
+            }
+            if let line = Self.statusLine(updates.presentation.manualStatus) {
+                Text(line).font(.footnote).foregroundStyle(.secondary)
+            }
+        } header: {
+            Text(L10n.Update.section)
+        } footer: {
+            Text(L10n.Update.hint)
+        }
+    }
+
+    private var lastCheckedText: String {
+        guard let ms = settings.updateLastAnswerMs else { return L10n.Update.never }
+        return UIFormat.date(unixSecs: ms / 1000)
+    }
+
+    /// The line under "Check now" for the result of the last manual check.
+    static func statusLine(_ status: UpdateCheckPresentation.ManualStatus) -> String? {
+        switch status {
+        case .none: return nil
+        case .upToDate: return L10n.Update.upToDate
+        case .updateAvailable(let version): return L10n.Update.available(version)
+        case .failed: return L10n.Update.failed
         }
     }
 

@@ -918,6 +918,14 @@ pub struct ErrorFrame {
     /// Human-readable detail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// A machine-readable reason for codes that have several, so a UI can act on it without
+    /// parsing `message`. Only `input_session_ended` carries one today (protocol.md 5.12:
+    /// `grant_off`, `locked`, `not_accepted`, `stopped_by_user`, `idle_timeout`). A compatible
+    /// addition from
+    /// v0.11.0: older hosts neither send nor read it, and an unknown value is treated as
+    /// absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// `reach`, protocol.md 12: the sender's endpoint and relay, or both null to take them back.
@@ -1105,6 +1113,17 @@ impl Frame {
         Frame::Error(ErrorFrame {
             code,
             message: message.map(str::to_owned),
+            reason: None,
+        })
+    }
+
+    /// Builds an `error` frame body with a machine-readable `reason` next to the message
+    /// (protocol.md 5.12, 5.14).
+    pub fn error_with_reason(code: ErrorCode, message: &str, reason: &str) -> Self {
+        Frame::Error(ErrorFrame {
+            code,
+            message: Some(message.to_owned()),
+            reason: Some(reason.to_owned()),
         })
     }
 
@@ -1262,6 +1281,7 @@ pub(crate) mod tests {
         r#"{"t":"transfer","v":1,"id":"c1d2...f0","state":"accepted"}"#,
         r#"{"t":"transfer","v":1,"id":"c1d2...f0","state":"cancelled","reason":"user"}"#,
         r#"{"t":"error","v":1,"re":45,"code":"forbidden","message":"media control is off for this device"}"#,
+        r#"{"t":"error","v":1,"re":12,"code":"input_session_ended","message":"remote input is off for this device","reason":"grant_off"}"#,
         r#"{"t":"pair_request","v":1,"seq":2,"method":"sas","commit":"5f0c...a2"}"#,
         r#"{"t":"pair_response","v":1,"re":2,"nonce":"q8pZ2mVt4kQ1xR7bN0cWfA"}"#,
         r#"{"t":"pair_reveal","v":1,"nonce":"Hk3sL9eT0pYw2uZq6vMd1g"}"#,

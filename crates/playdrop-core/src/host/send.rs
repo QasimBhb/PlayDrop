@@ -23,7 +23,9 @@ use super::events::{FileRoot, TransferDirection};
 use super::receive::{CHUNK_SIZE_HEADER, ROOT_TRAILER, TOKEN_HEADER};
 use super::send_resume::{self, Claim};
 use super::send_store::{self, FailureKind, RecordState, SendRecord};
-use super::transfers::{ProgressReading, TransferSnapshot, TransferStatus};
+use super::transfers::{
+    Failure, ProgressReading, TransferFailure, TransferSnapshot, TransferStatus,
+};
 use super::{connect, lock, Inner, TransferEnd};
 use crate::constants::DEFAULT_CHUNK_SIZE;
 use crate::identity::DeviceId;
@@ -171,9 +173,13 @@ pub(crate) struct Outgoing {
     /// The transfer ID on the wire, which `transfer` frames name; it differs from the
     /// running-sends key once a send continued under a new ID.
     pub(super) wire_id: String,
-    pub(super) decision: watch::Sender<Option<FrameState>>,
+    pub(super) decision: watch::Sender<Option<Decision>>,
     pub(super) cancel: Arc<watch::Sender<bool>>,
 }
+
+/// The receiver's decision on a pending offer: the `transfer` frame's `state` and
+/// `reason` (protocol.md 5.13).
+pub(crate) type Decision = (FrameState, Option<String>);
 
 /// What a finished send reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
@@ -201,6 +207,8 @@ type Outcome = std::result::Result<TransferSummary, String>;
 struct RunError {
     /// Shown to the user.
     reason: String,
+    /// Why, for the UI.
+    code: TransferFailure,
     /// Set when the record is kept and the send can resume later: the receiver could not
     /// be reached, or kept dropping the upload. Every other end deletes the record.
     resumable: Option<FailureKind>,
@@ -208,8 +216,13 @@ struct RunError {
 
 impl RunError {
     fn fatal(reason: impl Into<String>) -> Self {
+        Self::refused(Failure::other(reason))
+    }
+
+    fn refused(f: Failure) -> Self {
         Self {
-            reason: reason.into(),
+            reason: f.text,
+            code: f.code,
             resumable: None,
         }
     }
@@ -217,6 +230,7 @@ impl RunError {
     fn resumable(kind: FailureKind, reason: impl Into<String>) -> Self {
         Self {
             reason: reason.into(),
+            code: TransferFailure::ConnectionLost,
             resumable: Some(kind),
         }
     }
@@ -283,7 +297,7 @@ struct Job {
     sent: Arc<AtomicU64>,
     chunk_size: AtomicU32,
     cancel: watch::Receiver<bool>,
-    decision: watch::Receiver<Option<FrameState>>,
+    decision: watch::Receiver<Option<Decision>>,
     /// Set when the receiver reported the transfer cancelled (a `410 cancelled`, a
     /// `cancelled` state or a `transfer` frame), so the end is reported as a cancel.
     remote_cancelled: AtomicBool,
@@ -404,17 +418,19 @@ impl DoneFiles {
 
 impl Job {
     /// How a failed run is reported: a cancel by either side, or a failure.
-    fn end_for(&self, reason: String) -> TransferEnd {
+    fn end_for(&self, e: &RunError) -> TransferEnd {
         if *self.cancel.borrow() {
-            TransferEnd::Cancelled("cancelled by you".into())
-        } else if matches!(*self.decision.borrow(), Some(FrameState::Declined)) {
-            TransferEnd::Cancelled("declined by the receiver".into())
-        } else if self.remote_cancelled.load(Ordering::Acquire)
-            || matches!(*self.decision.borrow(), Some(FrameState::Cancelled))
+            TransferEnd::Cancelled(Failure::plain(TransferFailure::CancelledByYou))
+        } else if matches!(*self.decision.borrow(), Some((FrameState::Declined, _)))
+            || e.code == TransferFailure::Declined
         {
-            TransferEnd::Cancelled("cancelled by the receiver".into())
+            TransferEnd::Cancelled(Failure::plain(TransferFailure::Declined))
+        } else if self.remote_cancelled.load(Ordering::Acquire)
+            || matches!(*self.decision.borrow(), Some((FrameState::Cancelled, _)))
+        {
+            TransferEnd::Cancelled(Failure::plain(TransferFailure::CancelledByPeer))
         } else {
-            TransferEnd::Failed(reason)
+            TransferEnd::Failed(Failure::new(e.code, e.reason.clone()))
         }
     }
 
@@ -955,7 +971,7 @@ async fn drive(job: Arc<Job>, done_tx: watch::Sender<Option<Outcome>>) {
             let reason = match &end {
                 TransferEnd::Failed(r)
                 | TransferEnd::FailedResumable(r)
-                | TransferEnd::Cancelled(r) => r.clone(),
+                | TransferEnd::Cancelled(r) => r.text.clone(),
                 TransferEnd::Complete { .. } => String::new(),
             };
             (end, Err(reason))
@@ -1024,7 +1040,7 @@ async fn continue_fresh(job: &Job, done_tx: watch::Sender<Option<Outcome>>) {
             &job.id,
             &job.peer,
             TransferDirection::Send,
-            TransferEnd::Failed(why.clone()),
+            TransferEnd::Failed(Failure::other(why.clone())),
         );
         done_tx.send_replace(Some(Err(why)));
         return;
@@ -1045,15 +1061,18 @@ async fn continue_fresh(job: &Job, done_tx: watch::Sender<Option<Outcome>>) {
 /// lost its receiver keeps its record, marked failed, and says it will resume; a cancel by
 /// either side, a decline or any other failure deletes it.
 async fn finish_failed(job: &Job, e: RunError) -> TransferEnd {
-    let end = job.end_for(e.reason.clone());
-    if let (TransferEnd::Failed(reason), Some(kind)) = (&end, e.resumable) {
-        if job.close(Some((reason, kind))).await {
+    let end = job.end_for(&e);
+    if let (TransferEnd::Failed(f), Some(kind)) = (&end, e.resumable) {
+        if job.close(Some((&f.text, kind))).await {
             let auto = lock(&job.record)
                 .as_ref()
                 .is_some_and(|r| r.summary().resumes_on_return());
             let who = job.inner.label(&job.peer);
             tracing::info!(peer = %short(&job.peer), id = %job.id, "send gave up; its record waits");
-            return TransferEnd::FailedResumable(resume_note(reason, &who, auto));
+            return TransferEnd::FailedResumable(Failure::new(
+                f.code,
+                resume_note(&f.text, &who, auto),
+            ));
         }
     }
     job.close(None).await;
@@ -1101,7 +1120,8 @@ pub(crate) fn on_transfer_frame(inner: &Inner, peer: DeviceId, tf: &TransferFram
         .values()
         .find(|o| o.wire_id == tf.id && o.peer == peer)
     {
-        o.decision.send_replace(Some(tf.state.clone()));
+        o.decision
+            .send_replace(Some((tf.state.clone(), tf.reason.clone())));
     }
 }
 
@@ -1109,8 +1129,10 @@ pub(crate) fn on_transfer_frame(inner: &Inner, peer: DeviceId, tf: &TransferFram
 pub(crate) enum Step {
     /// The connection is gone or unusable: reconnect and resume.
     Conn(String),
-    /// The receiver refused: stop.
+    /// The receiver refused, or something local went wrong: stop.
     Fatal(String),
+    /// The receiver refused for a reason the user can act on: stop and say why.
+    Refused(Failure),
 }
 
 pub(crate) async fn request_json(
@@ -1213,12 +1235,20 @@ async fn post_offer(conn: &Connection, manifest: &Manifest) -> std::result::Resu
         StatusCode::ACCEPTED => Ok(false),
         s => {
             let (code, _, msg) = error_code(&resp);
-            Err(Step::Fatal(
-                format!("offer refused: {s} {code} {msg}")
-                    .trim_end()
-                    .to_owned(),
-            ))
+            Err(Step::Refused(refusal(s, &code, &msg, "offer refused")))
         }
+    }
+}
+
+/// The reason for an HTTP refusal: the plain sentence of a named failure, else the
+/// receiver's answer as it came (`what` says which request it refused).
+fn refusal(status: StatusCode, code: &ErrorCode, msg: &str, what: &str) -> Failure {
+    let failure = TransferFailure::of_refusal(status, code);
+    if failure == TransferFailure::Other {
+        Failure::other(format!("{what}: {status} {code} {msg}").trim_end())
+    } else {
+        tracing::info!(%status, %code, "the receiver refused");
+        Failure::plain(failure)
     }
 }
 
@@ -1241,7 +1271,7 @@ pub(super) async fn delete_remote(conn: &Connection, id: &str, reason: &str) -> 
 }
 
 /// Waits for the receiver's decision on a pending offer (protocol.md 7.3, 5.13).
-async fn wait_decision(job: &Job) -> std::result::Result<(), String> {
+async fn wait_decision(job: &Job) -> std::result::Result<(), Step> {
     let mut decision = job.decision.clone();
     let mut cancel = job.cancel.clone();
     let wait = async {
@@ -1254,12 +1284,17 @@ async fn wait_decision(job: &Job) -> std::result::Result<(), String> {
     };
     tokio::select! {
         d = tokio::time::timeout(super::receive::OFFER_TTL, wait) => match d {
-            Ok(Some(FrameState::Accepted)) => Ok(()),
-            Ok(Some(other)) => Err(format!("offer {other}")),
-            Ok(None) => Err("decision channel closed".into()),
-            Err(_) => Err("offer expired".into()),
+            Ok(Some((FrameState::Accepted, _))) => Ok(()),
+            // The receiver accepted but could not start for lack of space: the user can act
+            // on that, so it is said as such rather than as a plain failure.
+            Ok(Some((FrameState::Failed, Some(r)))) if r == super::receive::DECISION_NO_SPACE => {
+                Err(Step::Refused(Failure::plain(TransferFailure::NoSpace)))
+            }
+            Ok(Some((other, _))) => Err(Step::Fatal(format!("offer {other}"))),
+            Ok(None) => Err(Step::Fatal("decision channel closed".into())),
+            Err(_) => Err(Step::Refused(Failure::plain(TransferFailure::TimedOut))),
         },
-        _ = cancel.wait_for(|c| *c) => Err("cancelled".into()),
+        _ = cancel.wait_for(|c| *c) => Err(Step::Fatal("cancelled".into())),
     }
 }
 
@@ -1290,7 +1325,7 @@ async fn run(job: Arc<Job>) -> std::result::Result<TransferSummary, RunError> {
                     tracing::info!(peer = %short(&job.peer), error = %e, "receiver unreachable; send gives up for now");
                     return Err(RunError::resumable(
                         FailureKind::Unreachable,
-                        "receiver unreachable",
+                        "the receiving device could not be reached",
                     ));
                 }
                 tokio::time::sleep(backoff).await;
@@ -1332,7 +1367,7 @@ async fn run(job: Arc<Job>) -> std::result::Result<TransferSummary, RunError> {
                 tracing::info!(peer = %short(&job.peer), error = %e, "transfer connection lost; resuming");
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            Err(Step::Fatal(e)) => {
+            Err(step @ (Step::Fatal(_) | Step::Refused(_))) => {
                 // A local cancel that landed while waiting for the decision or mid-stream
                 // ends the round as a fatal step; tell the receiver on the connection we
                 // still hold, or it keeps the offer pending (or the transfer active,
@@ -1344,7 +1379,10 @@ async fn run(job: Arc<Job>) -> std::result::Result<TransferSummary, RunError> {
                 {
                     send_resume::leave_tomb(&job.inner, &id, &wire, job.peer).await;
                 }
-                return Err(RunError::fatal(e));
+                return Err(match step {
+                    Step::Refused(f) => RunError::refused(f),
+                    Step::Fatal(e) | Step::Conn(e) => RunError::fatal(e),
+                });
             }
         }
     }
@@ -1367,7 +1405,7 @@ async fn attempt(
         let accepted = post_offer(conn, &job.manifest).await?;
         *offered = true;
         if !accepted {
-            wait_decision(job).await.map_err(Step::Fatal)?;
+            wait_decision(job).await?;
         }
         // The snapshot stays `offered` until the first `PUT` moves bytes (`mark_streaming`).
     }
@@ -1397,7 +1435,7 @@ async fn attempt(
     match view.state {
         TransferState::Complete => return Ok(Some(view.bundle.and_then(|b| b.root))),
         TransferState::Pending => {
-            wait_decision(job).await.map_err(Step::Fatal)?;
+            wait_decision(job).await?;
             return Ok(None);
         }
         TransferState::Cancelled => {
@@ -1406,11 +1444,14 @@ async fn attempt(
                 "receiver reports the transfer cancelled".into(),
             ));
         }
-        TransferState::Declined | TransferState::Failed | TransferState::Expired => {
-            return Err(Step::Fatal(format!(
-                "receiver reports the transfer {}",
-                format!("{:?}", view.state).to_lowercase()
-            )))
+        TransferState::Declined => {
+            return Err(Step::Refused(Failure::plain(TransferFailure::Declined)))
+        }
+        TransferState::Expired => {
+            return Err(Step::Refused(Failure::plain(TransferFailure::TimedOut)))
+        }
+        TransferState::Failed => {
+            return Err(Step::Fatal("receiver reports the transfer failed".into()))
         }
         TransferState::Accepted | TransferState::Active => {}
     }
@@ -1473,13 +1514,25 @@ async fn attempt(
     for r in results {
         match r {
             TargetOutcome::Done => {}
-            TargetOutcome::Failed(e) => failures.push(e),
+            TargetOutcome::Failed(f) => failures.push(f),
             TargetOutcome::Conn(e) => return Err(Step::Conn(e)),
-            TargetOutcome::Fatal(e) => return Err(Step::Fatal(e)),
+            TargetOutcome::Fatal(f) => return Err(Step::Refused(f)),
         }
     }
-    if !failures.is_empty() {
-        return Err(Step::Fatal(failures.join("; ")));
+    if let Some(first) = failures.first() {
+        // One reason for the send: the first stream's code, and its sentence when it has
+        // one; several technical texts are joined.
+        let code = first.code;
+        let text = if code == TransferFailure::Other {
+            failures
+                .iter()
+                .map(|f| f.text.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        } else {
+            first.text.clone()
+        };
+        return Err(Step::Refused(Failure::new(code, text)));
     }
     let Some(view) = get_state(conn, &id).await? else {
         return Ok(forgotten(job, offered).await?.then_some(None));
@@ -1630,9 +1683,11 @@ impl Target {
 
 enum TargetOutcome {
     Done,
-    Failed(String),
+    /// This stream failed; the other streams finish first.
+    Failed(Failure),
     Conn(String),
-    Fatal(String),
+    /// Stop the whole send.
+    Fatal(Failure),
 }
 
 enum PutResult {
@@ -1654,7 +1709,7 @@ async fn stream_target(
     let mut retries = 0u32;
     loop {
         if *job.cancel.borrow() {
-            return TargetOutcome::Fatal("cancelled".into());
+            return TargetOutcome::Fatal(Failure::plain(TransferFailure::CancelledByYou));
         }
         match put_once(job, conn, target, &token, from).await {
             PutResult::Ok(r) if r.state == FileState::Verified => {
@@ -1662,12 +1717,19 @@ async fn stream_target(
                 return TargetOutcome::Done;
             }
             PutResult::Ok(r) => {
-                return TargetOutcome::Failed(format!("{target:?} ended {:?}", r.state));
+                return TargetOutcome::Failed(Failure::other(format!(
+                    "{target:?} ended {:?}",
+                    r.state
+                )));
             }
             PutResult::HashMismatch(offset) => {
                 retries += 1;
                 if retries > MAX_CHUNK_RETRIES {
-                    return TargetOutcome::Failed(format!("{target:?} failed integrity check"));
+                    tracing::info!(
+                        ?target,
+                        "a stream failed its integrity check {MAX_CHUNK_RETRIES} times"
+                    );
+                    return TargetOutcome::Failed(Failure::plain(TransferFailure::Integrity));
                 }
                 from = offset;
             }
@@ -1691,13 +1753,13 @@ async fn stream_target(
                     ErrorCode::RootMismatch | ErrorCode::BundleMismatch | ErrorCode::BadRequest
                 ) =>
             {
-                return TargetOutcome::Failed(format!("{target:?}: {s} {code} {msg}"));
+                return TargetOutcome::Failed(refusal(s, &code, &msg, &format!("{target:?}")));
             }
             PutResult::Refused(s, code, msg) => {
                 if code == ErrorCode::Cancelled {
                     job.mark_remote_cancel();
                 }
-                return TargetOutcome::Fatal(format!("{target:?}: {s} {code} {msg}"));
+                return TargetOutcome::Fatal(refusal(s, &code, &msg, &format!("{target:?}")));
             }
             PutResult::Conn(e) => return TargetOutcome::Conn(e),
         }

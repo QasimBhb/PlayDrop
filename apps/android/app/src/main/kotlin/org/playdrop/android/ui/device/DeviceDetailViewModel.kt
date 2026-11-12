@@ -1,6 +1,7 @@
 package org.playdrop.android.ui.device
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -12,10 +13,13 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.filterIsInstance
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.data.Settings
 import org.playdrop.android.service.NotificationMirror
+import org.playdrop.android.share.ClipImage
+import org.playdrop.android.ui.common.AppScope
 import org.playdrop.android.ui.common.CoreViewModel
 import org.playdrop.android.ui.common.UiMessage
 import org.playdrop.android.ui.common.nowTicker
@@ -97,6 +101,12 @@ data class DeviceDetailUiState(
     val media: List<MediaState> = emptyList(),
     /** How many apps are on the notification mirroring allow list (shared by every device). */
     val mirrorApps: Int = 0,
+    /** Confirmation of the last file send started from this page. */
+    val notice: SendNotice? = null,
+    /** A clipboard send is being delivered. */
+    val sendingClipboard: Boolean = false,
+    /** A clip marked sensitive waits for the user's yes (SR-24). */
+    val askSensitive: Boolean = false,
 ) {
     /** Show the "Remote input" button: online and able to take pointer or key input. */
     val canControl: Boolean get() = row?.online == true && InputSupport.canControl(capabilities)
@@ -108,12 +118,26 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
     private val pendingGrants = MutableStateFlow<Grants?>(null)
     private val ringing = MutableStateFlow(false)
     private val closedFlow = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    private val notice = MutableStateFlow<SendNotice?>(null)
+    private val sendingClipboard = MutableStateFlow(false)
+
+    /** A sensitive clip held until the user answers; kept off the UI state so the text never leaves this class. */
+    private val pendingSensitive = MutableStateFlow<DeviceClip?>(null)
 
     /** Emits once the device was unpaired from here; the screen goes back. */
     val closed: SharedFlow<Unit> = closedFlow
 
     /** The screen state. */
     val state: StateFlow<DeviceDetailUiState> = combine(
+        deviceState(application),
+        notice,
+        sendingClipboard,
+        pendingSensitive,
+    ) { base, sent, busy, ask ->
+        base.copy(notice = sent, sendingClipboard = busy, askSensitive = ask != null)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DeviceDetailUiState())
+
+    private fun deviceState(application: Application): kotlinx.coroutines.flow.Flow<DeviceDetailUiState> = combine(
         combine(CoreHost.peers, CoreHost.peerStatus, CoreHost.media, ::Triple),
         Settings.flow(application),
         pendingGrants,
@@ -135,7 +159,7 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
                 mirrorApps = settings.mirrorApps.size,
             )
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), DeviceDetailUiState())
+    }
 
     init {
         viewModelScope.launch {
@@ -210,6 +234,89 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
         }
     }
 
+    /**
+     * Sends picked or chosen [uris] to this device at once, the same way the share sheet does
+     * (`CoreHost.sendUris` keeps each item readable until the transfer ends). The device may
+     * be offline: the call is the same, only the confirmation says so. Runs in the app scope
+     * so leaving the page does not drop a send that is being prepared.
+     */
+    fun sendFiles(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val label = CoreHost.labelOf(peerId)
+        val offline = state.value.row?.online != true
+        sendUrisFromScreen(peerId, uris) { notice.value = SendNotice(uris.size, label, offline) }
+    }
+
+    /** Acts on what the clipboard held; see [DeviceSend.planClipboard]. */
+    fun sendClipboard(read: ClipRead) {
+        when (val plan = DeviceSend.planClipboard(read, state.value.grants.clipboardOut)) {
+            is ClipboardPlan.Tell -> post(plan.message)
+            is ClipboardPlan.Confirm -> pendingSensitive.value = plan.clip
+            is ClipboardPlan.Send -> pushClipboard(plan.clip, sensitive = false)
+        }
+    }
+
+    /** The user agreed to send the held sensitive clip; it goes out marked sensitive. */
+    fun confirmSensitive() {
+        val clip = pendingSensitive.value ?: return
+        pendingSensitive.value = null
+        pushClipboard(clip, sensitive = true)
+    }
+
+    /** The user backed out; the held clip is dropped. */
+    fun cancelSensitive() {
+        pendingSensitive.value = null
+        post(UiMessage(R.string.toast_cancelled))
+    }
+
+    /** Hides the confirmation card. */
+    fun dismissNotice() {
+        notice.value = null
+    }
+
+    /**
+     * Puts [clip] on this device's clipboard only, dialling first if it is offline (as the
+     * share path does). One `push_clipboard_to` (or `push_clipboard_image_to`) limited to this
+     * device, so text and copied images take the same way and the core's rules apply.
+     */
+    private fun pushClipboard(clip: DeviceClip, sensitive: Boolean) {
+        if (!sendingClipboard.compareAndSet(expect = false, update = true)) return
+        val app = getApplication<Application>()
+        val label = CoreHost.labelOf(peerId)
+        viewModelScope.launch {
+            try {
+                val delivery = core { h ->
+                    if (!h.isOnline(peerId)) {
+                        withTimeoutOrNull(CONNECT_TIMEOUT_MS) { runCatching { h.connect(peerId) } }
+                    }
+                    if (!h.isOnline(peerId)) return@core ClipDelivery.OFFLINE
+                    val peers = listOf(peerId)
+                    val p = when (clip) {
+                        is DeviceClip.Text -> h.pushClipboardTo(peers, clip.text, sensitive)
+                        is DeviceClip.Image -> h.pushClipboardImageTo(
+                            peers,
+                            ClipImage.read(app.contentResolver, Uri.parse(clip.uri)),
+                            clip.mime,
+                            sensitive,
+                        )
+                    }
+                    DeviceSend.delivery(
+                        peerId,
+                        p.sentTo,
+                        p.skippedEcho,
+                        p.skippedNoGrant.toInt(),
+                        p.skippedUnsupported.toInt(),
+                        p.skippedNotPaired,
+                    )
+                }
+                // null: the failure was already posted.
+                if (delivery != null) post(DeviceSend.deliveryMessage(delivery, label))
+            } finally {
+                sendingClipboard.value = false
+            }
+        }
+    }
+
     /** Sends a media command to one of the device's players; [value] is seek ms or volume. */
     fun mediaCommand(player: String, action: MediaAction, value: Long?) {
         launchCore({ it.sendMediaCommand(peerId, player, action, value?.toULong()) })
@@ -231,6 +338,7 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
     }
 
     override fun onCleared() {
+        super.onCleared()
         if (ringing.value) {
             val id = peerId
             org.playdrop.android.ui.common.AppScope.fireAndForget { it.find(id, false) }
@@ -240,5 +348,7 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
     companion object {
         /** Route argument holding the hex Device ID. */
         const val ARG_ID = "id"
+
+        private const val CONNECT_TIMEOUT_MS = 5_000L
     }
 }

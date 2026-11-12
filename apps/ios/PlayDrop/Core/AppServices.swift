@@ -15,6 +15,8 @@ import UIKit
 //   the share extension queued. Until onboarding is done the core is not started: starting
 //   it makes iOS ask for Local Network access, and that question must come after the
 //   onboarding page that explains it. `onboardingDidFinish()` starts it then.
+// - Update check: also on foreground, after onboarding, as its own task (`UpdateChecker`; the
+//   switch and the once-a-day rule decide whether anything is asked).
 // - Remote input: an open input screen stops its session on background and starts it
 //   again once the core runs in the foreground.
 // - Background: presence `asleep` ("background"), stop ringing, drop offer notifications
@@ -64,6 +66,10 @@ public enum AppServices {
             // The Local Network prompt waits for the onboarding page that explains it.
             return
         }
+        // Only here, when the app is in front: the update check never runs from the
+        // background, a timer or a launch without a window (docs/design/update-check.md 2).
+        // It needs no core, so it neither waits for it nor blocks it.
+        Task { await UpdateChecker.shared.checkWhenOpened() }
         do {
             try await CoreHost.shared.start()
         } catch {

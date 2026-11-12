@@ -83,6 +83,11 @@ impl Args {
 
 /// Installs the tracing subscriber. Logs never carry secrets (SR-32): the core redacts them
 /// and the daemon logs file names at debug only.
+///
+/// Linux: standard output, as always. Windows: the daemon has no console of its own (it is
+/// a GUI-subsystem program), so the same lines go to
+/// `%LOCALAPPDATA%\PlayDrop\logs\playdropd.log`, and to the terminal too when it was
+/// started from one.
 pub fn init_logging(args: &Args) {
     let filter = args
         .log
@@ -92,10 +97,26 @@ pub fn init_logging(args: &Args) {
     // SR-40: iroh names the relay at info level.
     #[cfg(feature = "iroh")]
     let filter = playdrop_core::reach::quiet_log_filter(&filter);
-    tracing_subscriber::fmt()
+    let builder = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
-        .with_target(false)
-        .init();
+        .with_target(false);
+    #[cfg(windows)]
+    {
+        use playdrop_platform::startup;
+        use tracing_subscriber::fmt::writer::{BoxMakeWriter, MakeWriterExt as _};
+
+        let file = startup::open_program_log(crate::PROGRAM);
+        let writer = match (file, startup::has_console()) {
+            (Some(f), true) => BoxMakeWriter::new((move || f.clone()).and(std::io::stdout)),
+            (Some(f), false) => BoxMakeWriter::new(move || f.clone()),
+            (None, _) => BoxMakeWriter::new(std::io::stdout),
+        };
+        builder.with_ansi(false).with_writer(writer).init();
+        // One line per start, so a log shows where each run begins.
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), "playdropd starting");
+    }
+    #[cfg(not(windows))]
+    builder.init();
 }
 
 #[cfg(all(test, feature = "iroh"))]

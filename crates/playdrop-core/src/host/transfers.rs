@@ -60,6 +60,108 @@ pub enum TransferStatus {
     Cancelled,
 }
 
+/// Why a transfer did not complete, for a UI to act on and word itself (`docs/core-api.md`
+/// section 16). Set on a `failed` or `cancelled` snapshot and on
+/// [`HostEvent::TransferFailed`](super::HostEvent::TransferFailed), next to the English
+/// text. The serde names are the IPC values; an unknown one reads as [`Self::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferFailure {
+    /// The receiving device does not have enough free space (`507 no_space`, SR-20).
+    NoSpace,
+    /// The receiving user declined the offer (`403 declined`, or a `declined` decision).
+    Declined,
+    /// The offer is over the receiver's manifest limits (`413 too_large`).
+    TooLarge,
+    /// The receiver is busy with its limit of transfers from this device (`429`).
+    RateLimited,
+    /// The other device cancelled it.
+    CancelledByPeer,
+    /// This device's user cancelled it.
+    CancelledByYou,
+    /// Data failed its integrity check (SR-22).
+    Integrity,
+    /// The other device could not be reached, or kept dropping the connection.
+    ConnectionLost,
+    /// Nobody answered in time: the offer expired, or no data came for 24 hours.
+    TimedOut,
+    /// Anything else; the text says what.
+    #[default]
+    #[serde(other)]
+    Other,
+}
+
+impl TransferFailure {
+    /// The plain sentence a sender shows for this failure. It reads after "Sending to
+    /// <device> failed: ", so it names no device, and carries no HTTP status or wire code.
+    pub fn sender_text(self) -> &'static str {
+        match self {
+            Self::NoSpace => "the receiving device does not have enough free space",
+            Self::Declined => "the receiving device declined the files",
+            Self::TooLarge => "the transfer is too large for the receiving device to accept",
+            Self::RateLimited => {
+                "the receiving device is busy with other transfers from this one; try again shortly"
+            }
+            Self::CancelledByPeer => "the receiving device cancelled it",
+            Self::CancelledByYou => "you cancelled it",
+            Self::Integrity => "the files did not arrive intact",
+            Self::ConnectionLost => "the connection to the receiving device was lost",
+            Self::TimedOut => "the receiving device did not answer in time",
+            Self::Other => "something went wrong",
+        }
+    }
+
+    /// The failure behind an HTTP refusal from the receiver (protocol.md section 9), or
+    /// [`Self::Other`] for a refusal that is not one of the named ones.
+    pub(crate) fn of_refusal(status: http::StatusCode, code: &crate::session::ErrorCode) -> Self {
+        use crate::session::ErrorCode as C;
+        match code {
+            C::NoSpace => Self::NoSpace,
+            C::Declined => Self::Declined,
+            C::TooLarge => Self::TooLarge,
+            C::RateLimited => Self::RateLimited,
+            C::Cancelled => Self::CancelledByPeer,
+            C::ChunkHashMismatch | C::RootMismatch | C::BundleMismatch => Self::Integrity,
+            C::Expired => Self::TimedOut,
+            // A receiver that answered with an unknown code still said what the status
+            // means.
+            _ => match status.as_u16() {
+                507 => Self::NoSpace,
+                413 => Self::TooLarge,
+                429 => Self::RateLimited,
+                _ => Self::Other,
+            },
+        }
+    }
+}
+
+/// A failed or cancelled transfer's reason: the code and the text shown with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Failure {
+    pub(crate) code: TransferFailure,
+    pub(crate) text: String,
+}
+
+impl Failure {
+    /// A reason with its own text.
+    pub(crate) fn new(code: TransferFailure, text: impl Into<String>) -> Self {
+        Self {
+            code,
+            text: text.into(),
+        }
+    }
+
+    /// A reason told in the code's own sender sentence.
+    pub(crate) fn plain(code: TransferFailure) -> Self {
+        Self::new(code, code.sender_text())
+    }
+
+    /// A reason with no named code.
+    pub(crate) fn other(text: impl Into<String>) -> Self {
+        Self::new(TransferFailure::Other, text)
+    }
+}
+
 impl TransferStatus {
     /// True for `complete`, `failed` and `cancelled`.
     pub fn is_finished(self) -> bool {
@@ -125,6 +227,10 @@ pub struct TransferSnapshot {
     /// 12; `note` says which). False once it is cancelled, resumed or complete.
     #[serde(default)]
     pub resumable: bool,
+    /// Why it did not complete, on a `failed` or `cancelled` snapshot (`note` holds the
+    /// words). `None` otherwise, and in snapshots from a host before 0.11.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<TransferFailure>,
 }
 
 impl TransferSnapshot {
@@ -157,6 +263,7 @@ impl TransferSnapshot {
             folder: None,
             delivered: Vec::new(),
             resumable: false,
+            failure: None,
         }
     }
 
@@ -277,9 +384,26 @@ impl TransferBook {
         folder: Option<PathBuf>,
         delivered: Vec<DeliveredFile>,
     ) {
+        self.finish_failed(id, dir, state, note, None, saved, folder, delivered);
+    }
+
+    /// [`finish_with_files`](Self::finish_with_files) that also records why it failed.
+    #[allow(clippy::too_many_arguments, reason = "one snapshot's final fields")]
+    pub(crate) fn finish_failed(
+        &mut self,
+        id: &str,
+        dir: TransferDirection,
+        state: TransferStatus,
+        note: Option<String>,
+        failure: Option<TransferFailure>,
+        saved: Vec<PathBuf>,
+        folder: Option<PathBuf>,
+        delivered: Vec<DeliveredFile>,
+    ) {
         let Some(mut s) = self.live.remove(&(id.to_owned(), dir)) else {
             return;
         };
+        s.failure = failure;
         s.saved = saved;
         s.folder = folder;
         s.delivered = delivered;
@@ -415,6 +539,65 @@ impl TransferBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every named refusal becomes its code; texts carry no status or wire code.
+    #[test]
+    fn refusals_map_to_failures_in_plain_words() {
+        use crate::session::ErrorCode as C;
+        use http::StatusCode as S;
+        for (status, code, want) in [
+            (
+                S::INSUFFICIENT_STORAGE,
+                C::NoSpace,
+                TransferFailure::NoSpace,
+            ),
+            (S::FORBIDDEN, C::Declined, TransferFailure::Declined),
+            (S::PAYLOAD_TOO_LARGE, C::TooLarge, TransferFailure::TooLarge),
+            (
+                S::TOO_MANY_REQUESTS,
+                C::RateLimited,
+                TransferFailure::RateLimited,
+            ),
+            (S::GONE, C::Cancelled, TransferFailure::CancelledByPeer),
+            (
+                S::UNPROCESSABLE_ENTITY,
+                C::RootMismatch,
+                TransferFailure::Integrity,
+            ),
+            (S::GONE, C::Expired, TransferFailure::TimedOut),
+            (
+                S::INSUFFICIENT_STORAGE,
+                C::Internal,
+                TransferFailure::NoSpace,
+            ),
+            (S::BAD_REQUEST, C::BadRequest, TransferFailure::Other),
+        ] {
+            assert_eq!(
+                TransferFailure::of_refusal(status, &code),
+                want,
+                "{status} {code}"
+            );
+        }
+        for f in [
+            TransferFailure::NoSpace,
+            TransferFailure::Declined,
+            TransferFailure::TooLarge,
+            TransferFailure::RateLimited,
+            TransferFailure::CancelledByPeer,
+            TransferFailure::CancelledByYou,
+            TransferFailure::Integrity,
+            TransferFailure::ConnectionLost,
+            TransferFailure::TimedOut,
+        ] {
+            let t = f.sender_text();
+            assert!(
+                !t.chars().any(|c| c.is_ascii_digit()) && !t.contains('_'),
+                "{t}"
+            );
+        }
+        let back: TransferFailure = serde_json::from_str("\"future\"").unwrap();
+        assert_eq!(back, TransferFailure::Other);
+    }
 
     fn snap(n: usize) -> TransferSnapshot {
         let peer: DeviceId = "ab".repeat(32).parse().unwrap();

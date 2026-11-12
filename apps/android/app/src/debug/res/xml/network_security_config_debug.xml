@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug build type only (src/debug): plain HTTP to the update stand-in server on this
+     phone's loopback, which `adb reverse` forwards to the laptop
+     (docs/design/update-check.md section 8). Everything else stays HTTPS-only, as in the
+     release build, which has no network security config and keeps
+     usesCleartextTraffic="false". -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>

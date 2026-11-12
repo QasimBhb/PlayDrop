@@ -58,12 +58,17 @@ import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import org.playdrop.android.R
+import org.playdrop.android.ui.common.Ago
 import org.playdrop.android.ui.common.CollectMessages
+import org.playdrop.android.ui.common.Format
+import org.playdrop.android.ui.common.agoText
 import org.playdrop.android.ui.common.Samples
 import org.playdrop.android.ui.common.SectionTitle
 import org.playdrop.android.ui.common.ShortIdText
 import org.playdrop.android.ui.theme.MonoStyle
 import org.playdrop.android.ui.theme.PlayDropTheme
+import org.playdrop.android.update.UpdateState
+import org.playdrop.android.update.UpdateViewModel
 
 /** What the platform reports, refreshed every time the screen resumes. */
 data class PlatformState(
@@ -73,10 +78,31 @@ data class PlatformState(
     val notificationsAllowed: Boolean = true,
 )
 
-/** The Settings tab wired to its view model and the system settings screens. */
+/** What the "Updates" rows show. */
+data class UpdateRows(
+    /** The switch. */
+    val enabled: Boolean = true,
+    /** Last check that got an answer, Unix ms. */
+    val lastCheckedMs: Long? = null,
+    /** A check is running. */
+    val checking: Boolean = false,
+    /** "Check now" found nothing newer. */
+    val upToDate: Boolean = false,
+    /** False for a build that is not a plain release: no switch, no "Check now". */
+    val available: Boolean = true,
+)
+
+/** The Settings tab wired to its view model, the update check and the system settings screens. */
 @Composable
-fun SettingsRoute(onOpenDiagnostics: () -> Unit, showMessage: (String) -> Unit, vm: SettingsViewModel = viewModel()) {
+fun SettingsRoute(
+    onOpenDiagnostics: () -> Unit,
+    showMessage: (String) -> Unit,
+    updateVm: UpdateViewModel,
+    vm: SettingsViewModel = viewModel(),
+) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val updateSettings by updateVm.settings.collectAsStateWithLifecycle()
+    val updateState by updateVm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     CollectMessages(vm.messages, showMessage)
     var platform by rememberSaveable(stateSaver = PlatformSaver) { mutableStateOf(readPlatform(context)) }
@@ -90,6 +116,13 @@ fun SettingsRoute(onOpenDiagnostics: () -> Unit, showMessage: (String) -> Unit, 
     SettingsScreen(
         state = state,
         platform = platform,
+        update = UpdateRows(
+            enabled = updateSettings.enabled,
+            lastCheckedMs = updateSettings.lastCheckedMs,
+            checking = updateState is UpdateState.Checking,
+            upToDate = updateState is UpdateState.UpToDate,
+            available = updateSettings.available,
+        ),
         actions = SettingsActions(
             onSaveName = vm::saveName,
             onSavePort = vm::savePort,
@@ -105,6 +138,8 @@ fun SettingsRoute(onOpenDiagnostics: () -> Unit, showMessage: (String) -> Unit, 
                 }
             },
             onDiagnostics = onOpenDiagnostics,
+            onUpdateCheck = updateVm::setEnabled,
+            onCheckNow = updateVm::checkNow,
         ),
     )
 }
@@ -125,12 +160,16 @@ data class SettingsActions(
     val onNotifications: () -> Unit = {},
     /** Open Diagnostics. */
     val onDiagnostics: () -> Unit = {},
+    /** Toggle the update check. */
+    val onUpdateCheck: (Boolean) -> Unit = {},
+    /** "Check now". */
+    val onCheckNow: () -> Unit = {},
 )
 
 /** Device name, default device, port, clipboard, battery, notifications, diagnostics and about. */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SettingsScreen(state: SettingsUiState, platform: PlatformState, actions: SettingsActions) {
+fun SettingsScreen(state: SettingsUiState, platform: PlatformState, actions: SettingsActions, update: UpdateRows = UpdateRows()) {
     val values = state.values
     Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.ui_settings_title)) }) }) { padding ->
         if (values == null) return@Scaffold
@@ -229,6 +268,9 @@ fun SettingsScreen(state: SettingsUiState, platform: PlatformState, actions: Set
             )
 
             HorizontalDivider()
+            UpdateSection(update, actions)
+
+            HorizontalDivider()
             SectionTitle(stringResource(R.string.ui_settings_about))
             val id = state.identity
             if (id != null) {
@@ -278,6 +320,36 @@ fun SettingsScreen(state: SettingsUiState, platform: PlatformState, actions: Set
                     }
                 },
             )
+        }
+    }
+}
+
+/** The update check switch, "Check now" and when it last got an answer. */
+@Composable
+private fun UpdateSection(update: UpdateRows, actions: SettingsActions) {
+    SectionTitle(stringResource(R.string.update_settings_title))
+    if (!update.available) {
+        ListItem(headlineContent = { Text(stringResource(R.string.update_settings_not_release)) })
+        return
+    }
+    ListItem(
+        headlineContent = { Text(stringResource(R.string.update_settings_switch)) },
+        supportingContent = { Text(stringResource(R.string.update_settings_hint)) },
+        trailingContent = { Switch(checked = update.enabled, onCheckedChange = actions.onUpdateCheck) },
+    )
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            val last = update.lastCheckedMs?.let { ms ->
+                stringResource(R.string.update_settings_last_checked, agoText(Ago.of(ms / 1000, Format.nowSecs())))
+            } ?: stringResource(R.string.update_settings_never_checked)
+            Hint(last)
+            when {
+                update.checking -> Hint(stringResource(R.string.update_settings_checking))
+                update.upToDate -> Hint(stringResource(R.string.update_settings_up_to_date))
+            }
+        }
+        FilledTonalButton(onClick = actions.onCheckNow, enabled = update.enabled && !update.checking) {
+            Text(stringResource(R.string.update_settings_check_now))
         }
     }
 }

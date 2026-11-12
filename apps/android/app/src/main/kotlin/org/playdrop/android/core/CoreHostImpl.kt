@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import androidx.core.content.ContextCompat
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +39,7 @@ import org.playdrop.core.HostListener
 import org.playdrop.core.KeepAliveProfile
 import org.playdrop.core.LogLevel
 import org.playdrop.core.MediaState
+import org.playdrop.core.NotificationRole
 import org.playdrop.core.PeerSummary
 import org.playdrop.core.PlayDropHost
 import org.playdrop.core.ReceiveTarget
@@ -139,6 +141,9 @@ internal object CoreHostImpl {
                 discovery = true,
                 interfaces = AndroidInterfaces(),
                 secretStore = KeystoreSecretStore(),
+                // The phone is a notification source (protocol.md 5.16): without the role the
+                // core neither announces `notifications` nor sends a mirrored notification.
+                notifications = NotificationRole.SOURCE,
             )
             val channel = Channel<HostEvent>(Channel.UNLIMITED)
             eventQueue = channel
@@ -309,7 +314,15 @@ internal object CoreHostImpl {
 
     /** See [CoreHost.sendUris]. */
     suspend fun sendUris(context: Context, peer: String, uris: List<Uri>): String {
-        val prepared = withContext(Dispatchers.IO) { UriSource.prepare(context, uris) }
+        // Kept outside the IO block: a cancellation as it returns must not lose the descriptors.
+        var held: UriSource.PreparedSend? = null
+        try {
+            withContext(Dispatchers.IO) { held = UriSource.prepareOne(context, uris) }
+        } catch (e: CancellationException) {
+            held?.release()
+            throw e
+        }
+        val prepared = checkNotNull(held)
         val id = try {
             withHost { it.send(peer, prepared.sources, null) }
         } catch (e: Exception) {
@@ -373,7 +386,7 @@ internal object CoreHostImpl {
         }
         eventsFlow.emit(ev)
         try {
-            Notifications.onEvent(app, ev, ::labelOf, deferReceived = moving)
+            Notifications.onEvent(app, ev, ::labelOf, deferReceived = moving, failedForGood = ended)
         } catch (e: Exception) {
             HostLog.w("events", "notification for ${ev.javaClass.simpleName} failed", e)
         }

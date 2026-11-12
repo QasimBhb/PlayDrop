@@ -458,7 +458,7 @@ enum CoreHostImpl {
             transferEnded(id)
             await refreshTransfers()
 
-        case let .transferFailed(id, _, _, _):
+        case let .transferFailed(id, _, _, _, _):
             transferEnded(id)
             await refreshTransfers()
 

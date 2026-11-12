@@ -8,37 +8,58 @@ import android.os.Build
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
+import org.playdrop.android.core.CoreHostImpl
 import org.playdrop.android.core.HostLog
+import org.playdrop.android.data.Settings
 import org.playdrop.android.service.ClipboardApplier
-import org.playdrop.core.ClipboardPush
-import java.io.ByteArrayOutputStream
+import kotlin.coroutines.resume
 
 /**
  * The "Send clipboard" notification action. Android 10+ lets only the focused app read the
- * clipboard, so this invisible activity takes focus, reads the clip in
- * [onWindowFocusChanged], pushes it to every eligible device, shows the result as a toast
- * and finishes. A clip marked sensitive asks first and goes out with `sensitive = true`
- * (SR-24). Not exported.
+ * clipboard, so this activity takes focus and reads the clip in [onWindowFocusChanged].
+ *
+ * Only devices that would receive it count (online, "Receive this phone's clipboard" on and,
+ * for an image, able to take one). One such device: sent at once. More than one: the device
+ * chooser, the others listed greyed out with their reason. None: the plain reason. The toast
+ * names the devices. A clip marked sensitive asks once first and goes to every chosen device
+ * with `sensitive = true` (SR-24). The clip is never logged (SR-32). Not exported.
  */
 class ClipboardSendActivity : ComponentActivity() {
     private var handled = false
+    private val sheet = SendSheet(onMakeDefault = { id -> storeDefaultDevice(id) })
 
-    /** Restores the handled flag so a rotation does not send twice. */
+    /** A recreation after the clip was read ends quietly, so nothing is sent twice. */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         handled = savedInstanceState?.getBoolean(KEY_HANDLED) ?: false
+        if (handled) {
+            finish()
+            return
+        }
+        setContent { SendSheetContent(sheet) }
     }
 
     /** Saves the handled flag. */
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         outState.putBoolean(KEY_HANDLED, handled)
+    }
+
+    /** The chooser left the screen before "Send": nothing is sent. */
+    override fun onStop() {
+        super.onStop()
+        if (sheet.state != SheetState.Hidden && !isChangingConfigurations && !isFinishing) {
+            sheet.leave()
+            finish()
+        }
     }
 
     /** Reads the clipboard the first time the window has focus. */
@@ -56,70 +77,61 @@ class ClipboardSendActivity : ComponentActivity() {
         } ?: false
         val item = clip.getItemAt(0)
         val imageUri = item.uri?.takeIf { desc.mimeTypeCount > 0 && desc.getMimeType(0).startsWith("image/") }
-        val text = if (imageUri == null) item.coerceToText(this)?.toString()?.takeIf { it.isNotEmpty() } else null
+        // The item's own text only: a link to other content is never opened on the main thread
+        // (no size limit there); an image is read later, off the main thread, by ClipImage.
+        val text = if (imageUri == null) item.text?.toString()?.takeIf { it.isNotEmpty() } else null
         if (imageUri == null && text == null) return done(getString(R.string.toast_nothing_to_send))
-        val send = { push(text, imageUri, imageUri?.let { desc.getMimeType(0) }, sensitive) }
-        if (sensitive) confirmSensitive(send) else send()
+        val mime = imageUri?.let { desc.getMimeType(0) }
+        lifecycleScope.launch { run(text, imageUri, mime, sensitive) }
     }
 
-    private fun confirmSensitive(send: () -> Unit) {
-        AlertDialog.Builder(this)
+    private suspend fun run(text: String?, imageUri: Uri?, mime: String?, sensitive: Boolean) {
+        // SR-24: ask once, before any device is chosen, not once per device.
+        if (sensitive && !confirmSensitive()) return done(getString(R.string.toast_cancelled))
+        if (!CoreHost.awaitRunning(this)) return done(getString(R.string.toast_not_running))
+        val clip = try {
+            if (imageUri != null) ShareSender.Clip.Image(readImage(imageUri), mime ?: "image/png") else ShareSender.Clip.Text(text.orEmpty())
+        } catch (e: Exception) {
+            HostLog.w("clipboard", "reading the copied image failed", e)
+            return done(getString(R.string.toast_send_failed, ShareSender.reason(e)))
+        }
+        val kind = if (clip is ShareSender.Clip.Image) SendKind.CLIPBOARD_IMAGE else SendKind.CLIPBOARD_TEXT
+        val peers = CoreHost.peers.value
+        val defaultId = Settings.read(this).defaultPeer?.takeIf { id -> peers.any { it.deviceId == id } }
+        val chosen = when (val launch = Launch.forClipboard(peers.map(Candidate::of), defaultId, kind)) {
+            Launch.NoDevices -> return done(getString(R.string.toast_no_paired_devices))
+            is Launch.NoneEligible -> return done(noneText(launch.reason))
+            is Launch.Direct -> listOf(launch.id)
+            is Launch.Choose -> sheet.choose(launch.selection, kind, 1) ?: return done(getString(R.string.toast_cancelled))
+        }
+        val app = applicationContext
+        CoreHostImpl.scope.launch {
+            val results = ShareSender.deliverClip(chosen, clip, sensitive, dialFirst = false)
+            ShareSender.toast(app, SendReport.sentence(results, SharePhrases.clipboard(app)))
+        }
+        finish()
+    }
+
+    /** The sensitive-clip question (SR-24); true for Send. */
+    private suspend fun confirmSensitive(): Boolean = suspendCancellableCoroutine { cont ->
+        val dialog = AlertDialog.Builder(this)
             .setTitle(R.string.sensitive_title)
             .setMessage(R.string.sensitive_text)
-            .setPositiveButton(R.string.sensitive_send) { _, _ -> send() }
-            .setNegativeButton(R.string.cancel) { _, _ -> done(getString(R.string.toast_cancelled)) }
-            .setOnCancelListener { done(getString(R.string.toast_cancelled)) }
+            .setPositiveButton(R.string.sensitive_send) { _, _ -> if (cont.isActive) cont.resume(true) }
+            .setNegativeButton(R.string.cancel) { _, _ -> if (cont.isActive) cont.resume(false) }
+            .setOnCancelListener { if (cont.isActive) cont.resume(false) }
             .show()
+        cont.invokeOnCancellation { dialog.dismiss() }
     }
 
-    private fun push(text: String?, imageUri: Uri?, mime: String?, sensitive: Boolean) {
-        lifecycleScope.launch {
-            if (!CoreHost.awaitRunning(this@ClipboardSendActivity)) return@launch done(getString(R.string.toast_not_running))
-            val message = try {
-                val bytes = imageUri?.let { readImage(it) }
-                val result: ClipboardPush = CoreHost.withHost { h ->
-                    if (bytes != null) h.pushClipboardImage(bytes, mime ?: "image/png", sensitive) else h.pushClipboard(text.orEmpty(), sensitive)
-                }
-                outcomeText(result)
-            } catch (e: Exception) {
-                HostLog.w("clipboard", "manual clipboard push failed", e)
-                getString(R.string.toast_send_failed, ShareSender.reason(e))
-            }
-            done(message)
-        }
-    }
+    private suspend fun readImage(uri: Uri): ByteArray = withContext(Dispatchers.IO) { ClipImage.read(contentResolver, uri) }
 
-    private suspend fun readImage(uri: Uri): ByteArray = withContext(Dispatchers.IO) {
-        contentResolver.openInputStream(uri)?.use { input ->
-            val out = ByteArrayOutputStream()
-            val buf = ByteArray(64 * 1024)
-            var total = 0
-            while (true) {
-                val n = input.read(buf)
-                if (n < 0) break
-                total += n
-                if (total > MAX_IMAGE_BYTES) throw IllegalArgumentException("the image is larger than 16 MiB")
-                out.write(buf, 0, n)
-            }
-            out.toByteArray()
-        } ?: throw IllegalArgumentException("the copied image could not be read")
-    }
-
-    private fun outcomeText(p: ClipboardPush): String {
-        val outcome = ClipboardOutcome.of(
-            sentTo = p.sentTo.size,
-            skippedEcho = p.skippedEcho,
-            skippedOffline = p.skippedOffline.toInt(),
-            skippedNoGrant = p.skippedNoGrant.toInt(),
-            pairedCount = CoreHost.peers.value.size,
-        )
-        return when (outcome) {
-            is ClipboardOutcome.Sent -> resources.getQuantityString(R.plurals.toast_sent_to, outcome.count, outcome.count)
-            ClipboardOutcome.AlreadySent -> getString(R.string.toast_clipboard_unchanged)
-            ClipboardOutcome.NoPairedDevice -> getString(R.string.toast_no_paired_devices)
-            ClipboardOutcome.NoGrant -> getString(R.string.toast_no_clipboard_grant)
-            ClipboardOutcome.NoDeviceOnline -> getString(R.string.toast_no_device_online)
-        }
+    private fun noneText(outcome: ClipboardOutcome): String = when (outcome) {
+        is ClipboardOutcome.Sent, ClipboardOutcome.AlreadySent -> getString(R.string.toast_clipboard_unchanged)
+        ClipboardOutcome.NoPairedDevice -> getString(R.string.toast_no_paired_devices)
+        ClipboardOutcome.NoGrant -> getString(R.string.toast_no_clipboard_grant)
+        ClipboardOutcome.NoDeviceOnline -> getString(R.string.toast_no_device_online)
+        ClipboardOutcome.NoImageSupport -> getString(R.string.share_no_image_device)
     }
 
     private fun done(message: String) {
@@ -129,6 +141,5 @@ class ClipboardSendActivity : ComponentActivity() {
 
     private companion object {
         const val KEY_HANDLED = "handled"
-        const val MAX_IMAGE_BYTES = 16 * 1024 * 1024
     }
 }

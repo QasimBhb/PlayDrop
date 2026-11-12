@@ -8,6 +8,9 @@
 //!   (SR-28).
 //! - `free_space` (Windows): free space of the receive volume for the SR-20 reserve.
 //! - `listener` (Windows): `SO_EXCLUSIVEADDRUSE` on the listening port (SR-31).
+//! - `startup` (all platforms, real work on Windows): the log file, the fatal error box and
+//!   the panic hook that keep a start-up failure of the GUI-subsystem daemon and window from
+//!   being silent.
 //!
 //! On Linux the core does all three itself (`statvfs`, mode 0700 and 0600, no
 //! `SO_REUSEPORT`), so [`apply_hooks`] changes nothing there.
@@ -23,6 +26,7 @@ pub mod at_rest;
 pub mod free_space;
 #[cfg(windows)]
 pub mod listener;
+pub mod startup;
 
 /// Plugs this platform's free space, secret store and listener hooks into `config`.
 #[cfg_attr(not(windows), allow(clippy::needless_pass_by_ref_mut))]

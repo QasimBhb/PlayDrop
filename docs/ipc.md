@@ -238,6 +238,72 @@ What the daemon does with a mirrored notification (section 5 has the rest of its
 - None of the content or keys is logged at any level, and none is in the `diagnose`
   report (SR-43).
 
+### 1.9 The update check, added in 0.11.0
+
+`IPC_VERSION` stays 1 (additions only). The design is `docs/design/update-check.md` (SR-45 to
+SR-48); the daemon does every request, the UIs only ask and show.
+
+| Request (`op`) | Fields | Answer (`kind`) | Meaning |
+|---|---|---|---|
+| `update_check` | `force` (default `false`) | `update` | A UI opened (`force: false`) or "Check now" (`force: true`). Answers once the check is over. Without `force` the daemon asks GitHub at most once per 24 h, counted from the last check that got an answer, and one hour after a failed one; `force` skips that wait. With the `update_check` setting off it answers phase `off` and makes no request at all. While an update runs it answers the current state without checking |
+| `update_install` | `window` (default `false`) | `update` | The user pressed "Update". Answers at once with phase `downloading`; progress and the outcome follow as `update_changed` events. `window: true` says the window asked: the Windows installer then starts the window again with the daemon (`/RELAUNCH=1`); without it only the daemon (`/RELAUNCH=daemon`). Ignored on Linux. `invalid_state` (with a sentence) when the setting is off, this build is not a release, nothing is offered, the offer has `can_install: false`, or an update already runs |
+| `update_cancel` | none | `update` | The user pressed "Cancel" (or Ctrl-C in `playdrop update --install`) during the download: it stops within one read, its files are removed, and the answer is phase `available` with the offer again. `invalid_state` when no download runs, including once the files were handed to the system's prompt or installer (phase `installing`), which cannot be stopped from here |
+| `update_later` | none | `update` | The user pressed "Later": the offer is hidden (phase `idle`) until the next check that runs, also across a daemon restart. Does nothing when nothing is offered |
+| `update_state` | none | `update` | The state now, without contacting anyone |
+| `update_open_page` | none | `done` | Opens the offered release's page in the browser. The daemon opens only the page of the release it offers, never a URL a client names. `invalid_state` without an offer |
+
+The daemon never checks on its own: not from a timer, not at start, not at login. A UI sends
+`update_check` with `force: false` when it opens; the desktop window does so on its first
+connection only, and sends `update_state` when it reconnects.
+
+`update` answer and `update_changed` event payload (`UpdateStatus`):
+
+```json
+{"state": {"phase": "available", "offer": {"version": "0.12.0",
+  "page_url": "https://github.com/QasimBhb/PlayDrop/releases/tag/v0.12.0", "can_install": true}},
+ "last_checked_ms": 1794000000000, "running_version": "0.11.0"}
+```
+
+| Field | Meaning |
+|---|---|
+| `state.phase` | `off` (setting off), `idle` (no check yet in this daemon's life, put off with "Later", or a build that is not a release), `checking`, `up_to_date`, `available` `{offer}`, `downloading` `{version, done, total}` (bytes over all files; `total` 0 while unknown), `verifying` `{version}`, `installing` `{version}` (the system prompt and the package install; on Windows the daemon waits for the installer here: a successful one stops the daemon, and one that ends while the daemon runs is reported as `failed` with stage `install`, from its exit code), `restarting` `{version}` (`.deb` installed, the daemon is starting its new version), `failed` `{stage, message, offer?}`. A phase this client does not know decodes as `other` (serde `other`), so the answer still decodes |
+| `offer` | `version`, `page_url`, `can_install`, and with `can_install: false` a `reason` sentence: a Flatpak ("updates come from where it was installed"), a copy not installed from a PlayDrop package, a release without this computer's file, or an installed COSMIC applet the release has no package for (installing the main package alone would remove it) |
+| `failed.stage` | `check`, `download`, `verify` or `install` (unknown values read as `other`). `message` is one plain sentence for the user, for example "The download did not match its signed checksum and was deleted." or "The password prompt was closed; nothing was changed." After a failed download or install `offer` is still there, so the UI can offer "Update" again |
+| `last_checked_ms` | When a check last got an answer (Unix ms); absent before the first |
+| `last_failed_ms`, `last_failure` | When the last check failed and why, present only while that failure is newer than the last answer. A failed check keeps an offer that verified earlier on screen (phase `available`), so Settings reads the failure here. `last_failure` is not kept across a daemon restart; `last_failed_ms` is |
+| `running_version` | The daemon's version, exactly as built (a pre-release keeps its suffix) |
+| `unavailable` | Present only when this build has no update check: its version is not a plain release (`0.11.0-rc.1`, a test build). One sentence for Settings, "This is not a release build, so it does not check for updates." No request is ever made, the phase stays `idle` (or `off`), and `update_install` is refused |
+
+Settings field `update_check` (default `true`): ask when a UI opens. Missing from an older
+daemon's answer reads as `true`; a `set_settings` patch without it (any older client) leaves it
+as it is. Turning it off answers `off` from then on and hides any offer at once (an update
+already downloading finishes, since the user asked for it); a `settings_changed` event and an
+`update_changed` event follow.
+
+What clients rely on:
+
+- **No banner for a failed check.** The window shows `available`, the progress phases,
+  `restarting` and a `failed` with stage other than `check` in its banner; a failed check only in
+  Settings, so an offline computer is not nagged. During `downloading` the banner's one button is
+  "Cancel" (`update_cancel`).
+- **A check never writes over an update.** While an update runs, `update_check` answers the
+  current state without asking anyone, and the answer of a check that was already under way is
+  remembered without changing the phase.
+- **Slow downloads end.** A download stops as `failed` (stage `download`) when it brings under
+  64 KiB in any 60 s or runs past 30 minutes in all (`docs/design/update-check.md` section 3).
+- **Waiting for `update_check`.** A check makes two requests of up to 15 s each, so a client
+  waits about 40 s for its answer (the COSMIC applet does) rather than its usual request limit.
+- **After `restarting` on Linux** the daemon releases its bus name and the new version takes it
+  (`crates/playdropd/src/update/restart.rs`): `shutting_down` follows, and clients follow the name
+  back without starting a daemon, as after any restart. A window that is still the old program
+  says "Updated to <version>. Close and reopen PlayDrop to finish."; it also says so whenever
+  `Status.daemon_version` is newer than its own version.
+- **An older daemon** cannot decode the `update_*` requests and answers `bad_request`; a client
+  then treats the update check as absent.
+- **An older client** never sends the requests and skips the `update_changed` event like any
+  event it cannot decode (section 1).
+- **Logging (SR-32):** the daemon logs URLs, versions and stage names; never a response header.
+
 ## 2. Linux: D-Bus on the session bus (SR-26)
 
 - Well-known name `org.playdrop.PlayDrop.Daemon1`, object `/org/playdrop/PlayDrop/Daemon1`, interface

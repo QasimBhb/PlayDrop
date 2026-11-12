@@ -1,6 +1,11 @@
 //! Not-connected screen: connecting, "daemon is not running" with Start, other errors
 //! with Try again.
+//!
+//! After "Start" the screen says why the daemon did not come up when it can: the binary is
+//! missing, it could not be run, it exited at once (with its exit code and, on Windows,
+//! the path of its log), or it never answered.
 
+use std::cell::RefCell;
 use std::time::Duration;
 
 use slint::{ComponentHandle, TimerMode};
@@ -17,6 +22,27 @@ const STOPPING_PATIENCE: Duration = Duration::from_secs(15);
 const START_RETRY_EVERY: Duration = Duration::from_secs(1);
 /// After "Start", how many tries before giving up (10 s).
 const START_RETRIES: u32 = 10;
+
+thread_local! {
+    /// The daemon "Start" ran, until it answers or the screen gives up on it. Slint thread
+    /// only, like the controller.
+    static LAUNCH: RefCell<Option<daemon::Launch>> = const { RefCell::new(None) };
+    /// Why the last "Start" did not lead to a connection. Shown with "not running" until a
+    /// new "Start", or until a connection made since is lost (the reason is stale by then).
+    static REASON: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn remember_reason(reason: Option<String>) {
+    REASON.with(|r| *r.borrow_mut() = reason);
+}
+
+/// The text under "not running": the last "Start" failure, else where a daemon that stopped
+/// by itself leaves its reason (Windows), else nothing.
+fn not_running_message() -> String {
+    REASON
+        .with(|r| r.borrow().clone())
+        .unwrap_or_else(|| daemon::not_running_hint(daemon::daemon_log().as_deref()))
+}
 
 pub(super) fn install(app: &App) {
     let conn = app.global::<ConnState>();
@@ -46,34 +72,72 @@ fn set_starting(c: &Controller, on: bool) {
 }
 
 fn start_daemon(c: &Controller) {
-    if let Err(message) = daemon::spawn() {
-        set_phase(c, ConnPhase::Failed, &message);
-        return;
-    }
+    remember_reason(None);
+    let launch = match daemon::spawn() {
+        Ok(launch) => launch,
+        Err(e) => {
+            set_phase(c, ConnPhase::Failed, &e.to_string());
+            return;
+        }
+    };
+    LAUNCH.with(|l| *l.borrow_mut() = Some(launch));
     set_starting(c, true);
     c.start_attempts.set(0);
     c.start_timer
         .start(TimerMode::Repeated, START_RETRY_EVERY, || {
-            with(|c| {
-                if c.ipc.is_connected() {
-                    c.start_timer.stop();
-                    return;
-                }
-                let n = c.start_attempts.get() + 1;
-                c.start_attempts.set(n);
-                if n > START_RETRIES {
-                    c.start_timer.stop();
-                    set_starting(c, false);
-                    set_phase(
-                        c,
-                        ConnPhase::Failed,
-                        "The daemon was started but did not answer within 10 seconds. Run playdropd in a terminal to see why.",
-                    );
-                    return;
-                }
-                c.ipc.connect();
-            });
+            with(start_tick);
         });
+}
+
+/// One "Start" retry: done once connected, stops early when the new daemon has already
+/// failed, and gives up after [`START_RETRIES`].
+fn start_tick(c: &Controller) {
+    if c.ipc.is_connected() {
+        c.start_timer.stop();
+        LAUNCH.with(|l| l.borrow_mut().take());
+        return;
+    }
+    // A clean exit (code 0) is not a failure yet: that is what a second daemon does when
+    // another one already owns the bus name or pipe, and the next attempt reaches that one.
+    let failed_code = LAUNCH.with(|l| {
+        l.borrow()
+            .as_ref()
+            .and_then(daemon::Launch::exited)
+            .filter(|status| !status.success())
+            .map(|status| status.code())
+    });
+    if let Some(code) = failed_code {
+        give_up(
+            c,
+            ConnPhase::NotRunning,
+            daemon::exit_reason(code, daemon::daemon_log().as_deref()),
+        );
+        return;
+    }
+    let n = c.start_attempts.get() + 1;
+    c.start_attempts.set(n);
+    if n > START_RETRIES {
+        give_up(
+            c,
+            ConnPhase::Failed,
+            daemon::no_answer_reason(daemon::daemon_log().as_deref()),
+        );
+        return;
+    }
+    c.ipc.connect();
+}
+
+/// Ends a "Start" that did not connect and shows `reason`. A reason that goes with "not
+/// running" is kept for later reports of that state, so a connect attempt still in flight
+/// cannot blank it.
+fn give_up(c: &Controller, phase: ConnPhase, reason: String) {
+    c.start_timer.stop();
+    LAUNCH.with(|l| l.borrow_mut().take());
+    set_starting(c, false);
+    set_phase(c, phase, &reason);
+    if phase == ConnPhase::NotRunning {
+        remember_reason(Some(reason));
+    }
 }
 
 pub(super) fn on_connect_failed(c: &Controller, f: &ConnectFailure) {
@@ -82,13 +146,14 @@ pub(super) fn on_connect_failed(c: &Controller, f: &ConnectFailure) {
         return;
     }
     if f.not_running {
-        set_phase(c, ConnPhase::NotRunning, "");
+        set_phase(c, ConnPhase::NotRunning, &not_running_message());
     } else {
         set_phase(c, ConnPhase::Failed, &f.message);
     }
 }
 
 pub(super) fn on_disconnected(c: &Controller) {
+    remember_reason(None);
     set_phase(
         c,
         ConnPhase::Connecting,
@@ -106,6 +171,7 @@ pub(super) fn on_disconnected(c: &Controller) {
 /// the connection bridge reports "not running", which shows the button, and it picks up the
 /// next daemon by itself.
 pub(super) fn on_shutting_down(c: &Controller) {
+    remember_reason(None);
     c.ipc.disconnect();
     set_phase(c, ConnPhase::Connecting, "PlayDrop is stopping...");
     forget_daemon_state(c);

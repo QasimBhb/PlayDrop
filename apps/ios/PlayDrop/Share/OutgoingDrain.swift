@@ -200,7 +200,9 @@ public final class OutgoingDrain {
             case .complete:
                 finishTransfer(transferId, peer: snapshot.peer, failure: nil)
             case .failed, .cancelled:
-                finishTransfer(transferId, peer: snapshot.peer, failure: snapshot.note ?? "The transfer stopped")
+                finishTransfer(transferId, peer: snapshot.peer, failure: TransferFailureText.sentence(
+                    failure: snapshot.failure, text: snapshot.note, receive: false
+                ) ?? "The transfer stopped")
             }
         }
     }
@@ -241,9 +243,12 @@ public final class OutgoingDrain {
         case .transferComplete(let id, let peer, let direction, _, _, _, _, _):
             guard direction == .send else { return }
             routeOutcome(transferId: id, peer: peer, failure: nil)
-        case .transferFailed(let id, let peer, let direction, let reason):
+        case .transferFailed(let id, let peer, let direction, let reason, let code):
             guard direction == .send else { return }
-            routeOutcome(transferId: id, peer: peer, failure: reason)
+            routeOutcome(
+                transferId: id, peer: peer,
+                failure: TransferFailureText.message(failure: code, reason: reason, direction: direction)
+            )
         case .peerOnline(let peer, _, _, _):
             let waiting = pendingBatches.contains { batch in
                 sending[batch.id] == nil && !failedThisRun.contains(batch.id) && intendedPeer(for: batch) == peer

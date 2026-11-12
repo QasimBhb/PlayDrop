@@ -1,5 +1,5 @@
 //! The daemon client commands: `send`, `peers`, `status`, `transfers`, `cancel`, `clip`,
-//! `ping`, `outbox` and `diagnose`.
+//! `ping`, `outbox`, `diagnose` and `update`.
 //!
 //! Each one connects to the running `playdropd` through `playdrop-ipc` (D-Bus on Linux,
 //! the per-user named pipe on Windows), asks one or two questions and prints the answer.
@@ -13,6 +13,7 @@ mod commands;
 pub mod output;
 pub mod peer;
 mod send;
+pub mod update;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -229,6 +230,8 @@ pub enum DaemonCommand {
     Outbox(OutboxArgs),
     /// `playdrop diagnose`.
     Diagnose(JsonArgs),
+    /// `playdrop update`.
+    Update(update::UpdateArgs),
 }
 
 /// Runs one daemon command and turns its outcome into the exit code.
@@ -245,6 +248,7 @@ pub async fn run(cmd: DaemonCommand) -> ExitCode {
         DaemonCommand::Ping(a) => commands::ping(a).await,
         DaemonCommand::Outbox(a) => commands::outbox(a).await,
         DaemonCommand::Diagnose(a) => commands::diagnose(a).await,
+        DaemonCommand::Update(a) => update::run(a).await,
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

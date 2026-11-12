@@ -3,7 +3,7 @@ name = "playdrop-ffi"
 description = "UniFFI surface over playdrop-core for the Android and iOS hosts"
 # Own version: bumped on every change to the frozen surface (docs/core-api.md). 0.5.0 is
 # the Phase 15 surface: notification mirroring (core-api section 15).
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -27,6 +27,12 @@ module_name_repetitions = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
+
+[features]
+# `update_offer_with_test_key`: trusts one more update-signing key so a debug app can be
+# tested against a stand-in server (docs/design/update-check.md section 8). Off by default,
+# so a library built without it, as every release build is, has no such function at all.
+update-test-key = []
 
 [dependencies]
 playdrop-core = { path = "../playdrop-core" }

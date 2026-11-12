@@ -1,8 +1,10 @@
 package org.playdrop.android.ui.common
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -11,6 +13,8 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.playdrop.android.core.CoreHost
+import org.playdrop.android.core.HostLog
+import org.playdrop.android.service.Notifications
 import org.playdrop.core.PlayDropHost
 
 /**
@@ -19,6 +23,43 @@ import org.playdrop.core.PlayDropHost
  */
 abstract class CoreViewModel(application: Application) : AndroidViewModel(application) {
     private val messageFlow = MutableSharedFlow<UiMessage>(extraBufferCapacity = 16)
+
+    @Volatile
+    private var gone = false
+
+    /** True once the screen is gone for good: nobody reads [messages] any more. */
+    protected val screenGone: Boolean get() = gone
+
+    override fun onCleared() {
+        gone = true
+        super.onCleared()
+    }
+
+    /**
+     * Sends picked [uris] to [peer] in the process scope, so leaving the screen does not drop
+     * a send that is still being prepared (the items are opened at once, while the activity
+     * that holds the picker's grant is alive). [onStarted] runs once the send started. A
+     * failure is a message on this screen, or a notification when the screen is gone.
+     */
+    protected fun sendUrisFromScreen(peer: String, uris: List<Uri>, onStarted: () -> Unit) {
+        val app = getApplication<Application>()
+        AppScope.launch {
+            try {
+                CoreHost.sendUris(app, peer, uris)
+                onStarted()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                HostLog.wNoDetail("send", "a send from the app did not start", e)
+                val message = UiMessage.from(e)
+                if (screenGone) {
+                    Notifications.sendDidNotStart(app, peer, CoreHost.labelOf(peer), message.resolve(app))
+                } else {
+                    post(message)
+                }
+            }
+        }
+    }
 
     /** One-off texts for the snackbar. */
     val messages: SharedFlow<UiMessage> = messageFlow

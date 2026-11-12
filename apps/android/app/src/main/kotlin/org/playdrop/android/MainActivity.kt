@@ -2,6 +2,8 @@ package org.playdrop.android
 
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.core.HostLog
@@ -23,6 +25,8 @@ import org.playdrop.android.ui.AppViewModel
 import org.playdrop.android.ui.PlayDropRoot
 import org.playdrop.android.ui.input.VolumeKeys
 import org.playdrop.android.ui.theme.PlayDropTheme
+import org.playdrop.android.update.UpdateInstallBus
+import org.playdrop.android.update.UpdateViewModel
 
 /**
  * The single activity. Hosts the Compose UI and, while resumed with auto clipboard on, pushes
@@ -31,6 +35,7 @@ import org.playdrop.android.ui.theme.PlayDropTheme
  */
 class MainActivity : ComponentActivity() {
     private val appVm: AppViewModel by viewModels()
+    private val updateVm: UpdateViewModel by viewModels()
     private var openTab by mutableStateOf<String?>(null)
     private val clipboard by lazy { getSystemService(ClipboardManager::class.java) }
     private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { readClipboard() }
@@ -41,7 +46,21 @@ class MainActivity : ComponentActivity() {
         if (savedInstanceState == null) openTab = intent?.getStringExtra(EXTRA_OPEN_TAB)
         setContent {
             PlayDropTheme {
-                PlayDropRoot(appVm = appVm, openTab = openTab, onTabOpened = { openTab = null })
+                PlayDropRoot(appVm = appVm, updateVm = updateVm, openTab = openTab, onTabOpened = { openTab = null })
+            }
+        }
+        // Android's own "Do you want to update this app?" screen, shown once this window is
+        // in front (an install session asks for it through UpdateInstallReceiver).
+        lifecycleScope.launch {
+            repeatOnLifecycle(Lifecycle.State.STARTED) {
+                UpdateInstallBus.confirm.filterNotNull().collect { confirm ->
+                    UpdateInstallBus.confirm.value = null
+                    try {
+                        startActivity(confirm)
+                    } catch (e: Exception) {
+                        HostLog.w("update", "the installer's confirmation could not be shown: ${e.javaClass.simpleName}")
+                    }
+                }
             }
         }
     }
@@ -50,6 +69,9 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         intent.getStringExtra(EXTRA_OPEN_TAB)?.let { openTab = it }
+        // A new intent while in front is also "the app came to the foreground" for the update
+        // check (and, in a debug build, carries its test extras).
+        lifecycleScope.launch { if (Settings.read(applicationContext).onboarded) updateVm.onForeground(intent) }
     }
 
     override fun onStart() {
@@ -67,6 +89,9 @@ class MainActivity : ComponentActivity() {
             } catch (e: Exception) {
                 HostLog.w("app", "starting the service from the window failed: ${e.javaClass.simpleName}")
             }
+            // The only automatic trigger of the update check (docs/design/update-check.md 2):
+            // this window coming to the front, after onboarding, at most once a day.
+            updateVm.onForeground(intent)
         }
     }
 

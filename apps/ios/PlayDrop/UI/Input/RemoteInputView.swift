@@ -6,8 +6,9 @@ import UIKit
 // The remote input screen: trackpad, keyboard and presenter tabs for one computer, shown
 // only for tabs the computer accepts (its `input.*` capabilities). The session opens when
 // the screen appears and closes when it goes away (`RemoteInputModel`). The screen keeps the
-// iPhone awake while open, and closes itself with a message when the computer refuses input
-// from this phone.
+// iPhone awake while open. When the session ends for good (the computer refuses input from
+// this phone, is locked, was stopped, went idle...) the panes give way to a sentence saying
+// why and what to do; it stays until the user goes back, so it cannot be missed.
 
 /// Remote input for one peer.
 struct RemoteInputView: View {
@@ -40,26 +41,10 @@ struct RemoteInputView: View {
         // Offline peers report no capabilities: keep the tabs the screen already had.
         let tabs = available.isEmpty ? lastTabs : available
         VStack(spacing: 12) {
-            if tabs.count > 1 {
-                Picker(L10n.Input.title, selection: $tab) {
-                    ForEach(tabs, id: \.self) { t in
-                        Text(Self.title(of: t)).tag(t)
-                    }
-                }
-                .pickerStyle(.segmented)
-            }
-            if !model.sessionReady {
-                Label(L10n.Input.connecting, systemImage: "antenna.radiowaves.left.and.right")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-            }
-            switch tabs.contains(tab) ? tab : (tabs.first ?? .trackpad) {
-            case .trackpad:
-                TrackpadPane(model: model)
-            case .keyboard:
-                KeyboardPane(model: model)
-            case .presenter:
-                PresenterPane(model: model, volumeKeys: caps.contains(PeerCapability.inputKey) || lastTabs.contains(.keyboard))
+            if let ended = model.ended {
+                endedContent(ended)
+            } else {
+                panes(tabs: tabs, caps: caps)
             }
         }
         .padding()
@@ -92,21 +77,63 @@ struct RemoteInputView: View {
         .onChange(of: available) { _, new in
             if !new.isEmpty { lastTabs = new }
         }
-        .onChange(of: model.refused) { _, refused in
-            guard refused else { return }
-            messages.show(.error(L10n.Input.refused(core.labelOf(peer: peerId))))
-            dismiss()
-        }
-        .onChange(of: model.endedReason) { _, reason in
-            guard let reason else { return }
-            messages.show(.info(L10n.Input.ended(core.labelOf(peer: peerId), reason: reason)))
-            dismiss()
+        .onChange(of: model.ended) { _, ended in
+            guard let ended else { return }
+            // VoiceOver hears the reason when the panes are replaced.
+            AccessibilityNotification.Announcement(
+                L10n.Input.endNotice(ended, label: core.labelOf(peer: peerId))
+            ).post()
         }
         .onChange(of: model.failure) { _, failure in
             guard let failure else { return }
             messages.show(failure)
             model.failureShown()
         }
+    }
+
+    /// The tabs and the pane of the open session.
+    @ViewBuilder
+    private func panes(tabs: [RemoteInputTab], caps: [String]) -> some View {
+        if tabs.count > 1 {
+            Picker(L10n.Input.title, selection: $tab) {
+                ForEach(tabs, id: \.self) { t in
+                    Text(Self.title(of: t)).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+        }
+        if !model.sessionReady {
+            Label(L10n.Input.connecting, systemImage: "antenna.radiowaves.left.and.right")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        switch tabs.contains(tab) ? tab : (tabs.first ?? .trackpad) {
+        case .trackpad:
+            TrackpadPane(model: model)
+        case .keyboard:
+            KeyboardPane(model: model)
+        case .presenter:
+            PresenterPane(model: model, volumeKeys: caps.contains(PeerCapability.inputKey) || lastTabs.contains(.keyboard))
+        }
+    }
+
+    /// The reason the session is over, with the way back.
+    private func endedContent(_ ended: InputEndNotice) -> some View {
+        VStack(spacing: 16) {
+            Spacer(minLength: 0)
+            Image(systemName: ended.isRefusal ? "hand.raised" : "cursorarrow.slash")
+                .font(.largeTitle)
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text(L10n.Input.endedTitle).font(.headline)
+            Text(L10n.Input.endNotice(ended, label: core.labelOf(peer: peerId)))
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.secondary)
+            Button(L10n.back) { dismiss() }
+                .buttonStyle(.borderedProminent)
+            Spacer(minLength: 0)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     private var optionsPopover: some View {

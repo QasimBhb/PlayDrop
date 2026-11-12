@@ -11,11 +11,13 @@ import PlayDropShared
 // The session follows `InputSessionController`: start when the screen appears, stop when it
 // goes away, when the app goes to the background (the core stops there) and when the peer
 // goes offline; start again on the way back. A refusal from the computer (remote input off
-// for this phone there) sets `refused`, and the computer ending the session itself (lock,
-// 10 idle minutes, its Stop button) sets `endedReason`; the view then says so and closes,
-// and nothing restarts until the user opens the screen again. The model
-// watches the core's events for `peerOnline`, `peerOffline` and `peerRefused`, and the scene
-// hooks reach the open screen through `RemoteInputModel.current`.
+// for this phone there) or the computer ending the session itself (lock, 10 idle minutes, its
+// Stop button) sets `ended`; the view then shows the reason until the user goes back, and
+// nothing restarts until the user opens the screen again. What each end code means is
+// decided by `InputEndRules` in PlayDropShared; a lost connection is not an end at all: the
+// session suspends and resumes by itself. The model watches the core's events for
+// `peerOnline`, `peerOffline`, `peerRefused` and `inputSessionEnded`, and the scene hooks
+// reach the open screen through `RemoteInputModel.current`.
 
 /// One remote input screen; see the file comment.
 @MainActor
@@ -26,10 +28,9 @@ final class RemoteInputModel {
 
     /// True once the session start was sent and until it stops; input is sent only then.
     private(set) var sessionReady = false
-    /// The computer refused remote input from this phone; the view shows why and closes.
-    private(set) var refused = false
-    /// The computer ended the session itself, in its words; the view shows it and closes.
-    private(set) var endedReason: String?
+    /// Why the session is over for good (refused, locked, stopped, idle...); the view shows it
+    /// until the user goes back. Nil while the session runs or only paused.
+    private(set) var ended: InputEndNotice?
     /// Modifier chips latched for the next key.
     private(set) var latched: [KeyModifier] = []
     /// The presenter's laser pointer is on.
@@ -84,7 +85,7 @@ final class RemoteInputModel {
         Self.current = self
         await closing?.value
         closing = nil
-        guard !refused, endedReason == nil else { return }
+        guard ended == nil else { return }
         if controller.state == .closed { makePipeline() }
         watchEvents()
         await opened(controller.open())
@@ -145,18 +146,37 @@ final class RemoteInputModel {
         }
     }
 
+    /// The computer answered `forbidden` to our input: it says only that input is refused, so a
+    /// more specific end that already arrived is kept.
     private func markRefused() {
         controller.refused()
         sessionReady = false
-        refused = true
+        ended = InputEndRules.afterRefusalAnswer(existing: ended)
     }
 
-    private func markEnded(_ reason: String) {
-        controller.endedByPeer()
+    /// The session is over for good, for `notice`'s reason.
+    private func markEnded(_ notice: InputEndNotice) {
+        if notice.isRefusal {
+            controller.refused()
+        } else {
+            controller.endedByPeer()
+        }
         sessionReady = false
         // The desktop already released held buttons; only forget the local drag.
         _ = gestures.cancelled()
-        endedReason = reason
+        ended = notice
+    }
+
+    /// The core said a session ended with `code` (`reason` is the computer's own text).
+    private func sessionEnded(code: InputEndCode, reason: String) async {
+        switch InputEndRules.handling(code: code, reason: reason) {
+        case .resumeWhenBack:
+            // The connection is gone, not the permission: pause like `peerOffline` does and
+            // start again on `peerOnline`. Nothing is shown while it resumes.
+            await suspend()
+        case .close(let notice):
+            markEnded(notice)
+        }
     }
 
     private func watchEvents() {
@@ -174,8 +194,8 @@ final class RemoteInputModel {
                 case let .peerRefused(p, frameType, code, _)
                     where p == peer && Self.isInputRefusal(frameType: frameType, code: code):
                     self.markRefused()
-                case let .inputSessionEnded(p, reason) where p == peer:
-                    self.markEnded(reason)
+                case let .inputSessionEnded(p, reason, code) where p == peer:
+                    await self.sessionEnded(code: InputEndCode(code), reason: reason)
                 default:
                     break
                 }
@@ -298,6 +318,22 @@ final class RemoteInputModel {
         guard sessionReady else { return }
         laserOn.toggle()
         sender.post(.presenter(action: laserOn ? .pointerOn : .pointerOff))
+    }
+}
+
+extension InputEndCode {
+    /// The package's code for the core's `InputEndReason`. Exhaustive on purpose: a new core
+    /// reason must be handled here before the app builds.
+    init(_ reason: InputEndReason) {
+        switch reason {
+        case .grantOff: self = .grantOff
+        case .locked: self = .locked
+        case .notAccepted: self = .notAccepted
+        case .stoppedByUser: self = .stoppedByUser
+        case .idleTimeout: self = .idleTimeout
+        case .connectionLost: self = .connectionLost
+        case .other: self = .other
+        }
     }
 }
 

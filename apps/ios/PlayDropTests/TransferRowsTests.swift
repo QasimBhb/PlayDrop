@@ -47,6 +47,30 @@ final class TransferRowsTests: XCTestCase {
         XCTAssertFalse(rows[2].canCancel, "an incoming offer is answered, not cancelled")
     }
 
+    func testAFailedTransferNeverShowsAWireCode() {
+        func note(_ direction: TransferDirection, _ text: String?) -> String? {
+            TransferRows.derive(
+                snapshots: [Fixtures.transfer("x", direction: direction, state: .failed, note: text)],
+                pendingOfferIds: [], label: { $0 }
+            )[0].note
+        }
+        XCTAssertEqual(
+            note(.send, "507 Insufficient Storage no_space"), "The other device does not have enough free space."
+        )
+        XCTAssertEqual(note(.receive, "507 no_space"), "This iPhone does not have enough free space.")
+        XCTAssertEqual(note(.send, "500 internal_error"), "Something went wrong.")
+        XCTAssertEqual(note(.send, "failed integrity check from Desk"), "failed integrity check from Desk")
+        XCTAssertNil(note(.send, nil))
+    }
+
+    func testANoteOnAnActiveTransferIsLeftAlone() {
+        let row = TransferRows.derive(
+            snapshots: [Fixtures.transfer("x", state: .active, note: "from the kitchen")],
+            pendingOfferIds: [], label: { $0 }
+        )[0]
+        XCTAssertEqual(row.note, "from the kitchen")
+    }
+
     func testForgetIsOfferedOnlyForAFailedSendKeptForResume() {
         func row(_ direction: TransferDirection, _ state: TransferStatus, resumable: Bool) -> TransferRow {
             TransferRows.derive(

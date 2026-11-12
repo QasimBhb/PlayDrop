@@ -430,3 +430,135 @@ Protocol.md 5.16, SR-41 to SR-44. Every change is additive; nothing existing cha
 `send_notification_dismiss(peer, key)`, `notification_key(raw)`, the three events, and the
 two `Grants` fields with UniFFI defaults (`notificationsIn = true`, `notificationsOut =
 false`), so existing Kotlin and Swift constructors keep compiling.
+
+## 16. Phase 16 note (`playdrop-ffi` 0.6.0, additive, Swift pattern changes)
+
+Protocol.md sections 4, 5.7, 5.12, 5.14 and 5.16; `docs/design/update-check.md`. Every
+change is additive except that the `InputSessionEnded` and `TransferFailed` events gain a
+field (see the end).
+
+**Notification role** (protocol.md 4, 5.16).
+
+- `HostConfig.notifications: NotificationRole` in `playdrop_core::host`, with `Off` (the
+  default), `Source` (a phone: sends `posted` and `removed`, handles `dismiss`) and `Sink`
+  (a desktop: handles `posted` and `removed`, sends `dismiss`). `Off` leaves
+  `notifications` out of both capability lists and drops every `notification` frame; either
+  role lists it in both. Each role's send methods return `Forbidden` for the other role's
+  ops, and the other role's ops are dropped on arrival without an answer. `playdropd` is a
+  sink, `playdrop host` is off. A host's own `caps.out` now decides what it sends (it was a
+  fixed list).
+- `NOTIFICATIONS_REMOVED_PER_MINUTE` (400) and `NOTIFICATIONS_DISMISS_PER_MINUTE` (60) join
+  `NOTIFICATIONS_POSTED_PER_MINUTE` (30); frames past them on one connection are dropped.
+- ffi: `HostConfig.notifications: NotificationRole?` with the default `None` (no role) and
+  `NotificationRole { Source, Sink }`. Existing Kotlin and Swift constructors keep
+  compiling; the Android app passes `Source`, the iPhone app leaves it out. (UniFFI 0.32
+  proc-macros cannot give an enum field a default value, hence the optional.)
+
+**Why an input session ended** (protocol.md 5.12).
+
+- `InputEndReason` in `playdrop_core::host`: `GrantOff`, `Locked`, `NotAccepted`,
+  `StoppedByUser`, `IdleTimeout`, `ConnectionLost`, `Other` (serde `snake_case`; an
+  unknown value reads as `Other`).
+- `HostEvent::InputSessionEnded` gains `code: InputEndReason` next to `reason: String`
+  (`#[serde(default)]`, so an IPC event from an older daemon reads as `Other`). The
+  controller gets exactly one per `start` it sent or that failed locally (`NotFound` gives
+  `ConnectionLost`, `Forbidden` for a peer without `input.*` gives `NotAccepted`; both calls
+  still return their error), unless it sent `stop` first: from the target's answer, from an
+  older target's `forbidden` (`GrantOff`) or known message, when the connection ends, or
+  when either side unpairs (`ConnectionLost`, raised before `Unpaired`). An answer whose
+  `re` names a frame sent before the current `start` is ignored, so a late refusal of an
+  earlier `start` cannot end a newer session.
+- Against a target older than 0.11.0 the promise is weaker, because such a target answers
+  only its first refusal per connection (one `forbidden` per frame type) and never answers
+  while locked. After that `forbidden`, a later `start` on the same connection ends at once
+  locally with `GrantOff` and is not sent (the call returns `Ok`), until the connection is
+  opened again. A `start` to an older target that is locked gives no event at all: input is
+  simply not applied there. There is no positive answer to a `start` on the wire, so no
+  timer can tell "accepted" from "ignored".
+- The target answers each refused `start` (at most 60 per connection per minute; more are
+  dropped unanswered) and turns `Host::set_grants` with `input` off into the end of that
+  peer's running session (it gets its final `stop` event). The grant is read again under
+  the input lock when a `start` is handled, so a `start` racing the grant change cannot
+  leave a session open. Unpairing a peer ends the session it holds here in the same way
+  (final `stop`, then `Unpaired`).
+- Kotlin and Swift: no change in calls; an app keeps waiting for the one event per `start`
+  and treats `Ok` from `send_input` as "sent or ended", not as "accepted".
+- ffi: `InputEndReason` enum and `HostEvent.InputSessionEnded { peer, reason, code }`.
+
+**Clipboard to chosen peers** (protocol.md 5.7).
+
+- `Host::push_clipboard_to(&self, peers: &[DeviceId], text: &str, sensitive: bool) ->
+  Result<ClipboardPush>` and `Host::push_clipboard_image_to(&self, peers: &[DeviceId],
+  bytes: Vec<u8>, mime: &str, sensitive: bool) -> Result<ClipboardPush>`: `push_clipboard`
+  and `push_clipboard_image` limited to `peers`, with one echo check and one "last sent" for
+  the whole push (calling `send_clipboard` per device skips all but the first as an echo),
+  the same per-peer rules and counters, and an empty list sending nothing. The echo check of
+  a chosen push is only against the last clip applied from a peer (received clips are never
+  forwarded), not the last one sent: the same text sent to one device and then to another
+  goes to both. It still becomes "last sent", so the automatic `push_clipboard` does not
+  send it again. Size and MIME errors fail the whole call as before.
+- `ClipboardPush` gains `skipped_not_paired: Vec<DeviceId>` (serde default): chosen peers
+  that are not paired, reported per device; the rest of the push goes on.
+- ffi: `push_clipboard_to(peers: [String], text, sensitive)` and
+  `push_clipboard_image_to(peers: [String], data, mime, sensitive)` on `PlayDropHost`;
+  `ClipboardPush.skipped_not_paired: [String]` (default empty) also lists entries that are
+  not a Device ID.
+
+**Why a transfer failed** (protocol.md 7.3, 9).
+
+- `TransferFailure` in `playdrop_core::host`: `NoSpace` (`507 no_space`), `Declined`
+  (`403 declined` or a declined decision), `TooLarge` (`413`), `RateLimited` (`429`),
+  `CancelledByPeer`, `CancelledByYou`, `Integrity`, `ConnectionLost` (unreachable, or the
+  upload kept dropping), `TimedOut` (offer expired, no data for 24 h), `Other` (serde
+  `snake_case`; an unknown value reads as `Other`). `TransferFailure::sender_text()` is the
+  plain sentence a sender shows; it reads after "Sending to <device> failed: " and carries
+  no HTTP status or wire code ("the receiving device does not have enough free space").
+  An offer accepted by hand that then finds no space reaches the sender as `NoSpace` too
+  (the decision frame's `reason` `no_space`, protocol.md 5.13); a sender older than 0.11.0
+  shows it as `Other`. On the receiver, a failed transfer with no message of its own is
+  `Integrity` only when a file or the bundle failed its checks, else `Other`.
+- `HostEvent::TransferFailed` gains `code: TransferFailure` (`#[serde(default)]`), and
+  `TransferSnapshot` gains `failure: Option<TransferFailure>` (set on failed and cancelled
+  transfers, `#[serde(default)]`). `reason` and `note` keep the words: on the send side the
+  named failures now use `sender_text()` instead of texts such as "offer refused: 507
+  Insufficient Storage no_space"; `Other` keeps the receiver's answer as it came.
+- ffi: `TransferFailure` enum, `HostEvent.TransferFailed { id, peer, direction, reason,
+  code }`, and `TransferSnapshot.failure: TransferFailure?` (default `None`).
+
+**A transfer refused for lack of space, on the receiver** (protocol.md 6.4, SR-20).
+
+- `HostEvent::ReceiveRefusedNoSpace { peer, offered_bytes, free_bytes, reserve_bytes }`
+  when this host answers `507 no_space`: at the offer, at a local accept, or on a `PUT`
+  that would cross the reserve (`max(2 GiB, 5% of the volume)`). `offered_bytes` is the
+  transfer's total. At most one per peer per minute (unpair clears the peer's minute); it
+  names no file (SR-32).
+- ffi: `HostEvent.ReceiveRefusedNoSpace { peer, offeredBytes, freeBytes, reserveBytes }`.
+
+**Update check** (`docs/design/update-check.md`, SR-45 to SR-48). Free functions over
+`playdrop_core::update`, no network, clock or files:
+
+- `update_sums_url()`, `update_sig_url()`, `update_user_agent()` -> `String`;
+  `update_max_sums_len()`, `update_max_sig_len()`, `update_max_download_len()`,
+  `update_request_timeout_ms()` -> `u64`; `update_max_redirects()` -> `u32`.
+- `update_check_due(last_answer_ms: Option<u64>, last_failure_ms: Option<u64>, now_ms: u64)
+  -> bool`; `update_redirect_allowed(url: String) -> bool`.
+- `update_offer(sums: Vec<u8>, sig: Vec<u8>, current_version: String, kind:
+  UpdateInstallKind) -> Result<Option<UpdateOffer>, UpdateCheckError>`. `current_version`
+  is the app's own `major.minor.patch`; anything else is `BadCurrentVersion`.
+- `update_offer_with_test_key(sums, sig, current_version, kind, test_key_hex: String)`:
+  trusts one more key, for debug builds against a stand-in server only. Release app code
+  must never call it.
+- `update_asset_matches(asset: UpdateAsset, sha256: Vec<u8>) -> bool`: the SHA-256 the app
+  computed over a download against the signed one.
+- `UpdateInstallKind { Deb, Windows, Android, Flatpak, Ios, Other }`, `UpdateOffer {
+  version, page_url, asset: Option<UpdateAsset> }`, `UpdateAsset { name, url, sha256_hex }`,
+  and the flat error `UpdateCheckError { TooLarge, BadSignatureEncoding, NotSigned,
+  Malformed, NoVersion, BadCurrentVersion, BadTestKey }` whose messages are fit to show.
+
+**Swift source change.** Adding `code` to the `inputSessionEnded` and `transferFailed`
+cases changes their associated values, so positional patterns gain a `_`:
+`case let .inputSessionEnded(p, reason, _)` in
+`apps/ios/PlayDrop/UI/Input/RemoteInputModel.swift`, and `.transferFailed(id, peer,
+direction, reason, _)` in `PlayDrop/Core/CoreHostImpl.swift`,
+`PlayDrop/Notifications/LocalNotifications.swift` and `PlayDrop/Share/OutgoingDrain.swift`.
+Kotlin reads the fields by name and keeps compiling.

@@ -39,6 +39,45 @@ release is created.
 | `playdrop-<ver>-windows-x64-setup.exe` | Windows 10 and 11, x64 | Inno Setup installer, not code signed |
 | `playdrop-<ver>-ios-unsigned.ipa` | iPhone, iOS 17 and newer | Unsigned, for SideStore or AltStore to sign and install |
 | `SHA256SUMS` | Everyone | `sha256sum -c SHA256SUMS --ignore-missing` in the download folder |
+| `SHA256SUMS.sig` | Everyone, and the update check inside PlayDrop | Ed25519 signature over `SHA256SUMS`, base64. See "The update-signing key" below |
+
+## The update-signing key
+
+From 0.11.0 PlayDrop checks for a newer release when it is opened and can download and install
+it (`docs/design/update-check.md`). It trusts a release only when `SHA256SUMS.sig` is a valid
+signature over `SHA256SUMS` from a key pinned in the code
+(`crates/playdrop-core/src/update.rs`, `TRUSTED_KEYS`). **Anyone who gets this key, or who
+controls the release run, can ship code to every install that has the check on.** Losing it
+means no install can be updated from inside the app until a release with a new pinned key has
+been installed by hand.
+
+| Where | What |
+|---|---|
+| `~/.local/share/playdrop-release/update-signing-ed25519.pem` | The private key (mode 600), made on 2026-11-12. Back it up offline with the Android keystore |
+| `docs/release/playdrop-update.pub` | The public key, committed. The release run checks its own signature against it before publishing |
+| Actions secret `PLAYDROP_UPDATE_SIGNING_KEY` | The private key's PEM text. The release job stops before publishing when it is missing |
+
+Storing the secret (once, and again after a rotation), from the repo root with `gh` logged in
+as the owner:
+
+```sh
+K=~/.local/share/playdrop-release/update-signing-ed25519.pem &&
+test -s "$K" && gh secret set PLAYDROP_UPDATE_SIGNING_KEY < "$K"
+```
+
+Checking a download by hand, without PlayDrop:
+
+```sh
+openssl pkeyutl -verify -pubin -inkey playdrop-update.pub -rawin \
+    -in SHA256SUMS -sigfile <(base64 -d SHA256SUMS.sig) &&
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Rotation: generate a new key (`openssl genpkey -algorithm ed25519`), add its public half to
+`TRUSTED_KEYS` next to the old one and release with the OLD key still signing; one release
+later switch the secret and `playdrop-update.pub` to the new key; drop the old key from
+`TRUSTED_KEYS` only when no supported install still lacks the new one. A unit test compares
+`TRUSTED_KEYS` with `playdrop-update.pub`, so the two cannot drift apart.
 
 ## Android
 

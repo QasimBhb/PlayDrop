@@ -8,6 +8,59 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.11.0] - Unreleased
+
+### Added
+
+- Update check. When you open PlayDrop it asks GitHub, at most once a day, whether a newer
+  release exists, and offers "Update" or "Later". The `.deb` and the Windows installer
+  download the new version, check it and install it (the system asks for your password or
+  permission); Android downloads the APK and hands it to the system installer; the Flatpak
+  and the iPhone app show a notice with a link. The request carries no name, ID or version;
+  GitHub sees your IP address, as with any download. A release is only trusted through a
+  signature made with a PlayDrop release key (`SHA256SUMS.sig`, new in this release), and a
+  download that does not match its signed checksum is deleted. Settings has a switch to turn
+  the check off, and "Check now". `playdrop update` does the same from a terminal. See
+  `docs/design/update-check.md`.
+- Android: the device page has "Send files", "Send photos and videos" and "Send clipboard"
+  at the top. The "Allow this device to" switches and notification mirroring moved to their
+  own "Permissions" page.
+- Android: sharing with more than one device paired shows a chooser with a tick per device,
+  "Select all" and your default device already ticked; one tap on Send sends to every ticked
+  device. With one device paired sharing is one tap, as before.
+- Android: "Send clipboard" on the notification says which devices got it, and asks which
+  ones when more than one would. A copied image can go to a chosen device.
+- When a computer refuses a file because its disk is nearly full it now shows a notification
+  saying so, with how much is free and how much PlayDrop keeps in reserve.
+
+### Fixed
+
+- Windows: PlayDrop did not open on some PCs and gave no reason. The programs no longer need
+  the Visual C++ runtime to be installed, no longer open a console window, fall back to
+  drawing without the graphics card when it fails, and any start-up failure now shows a
+  message and writes a log under `%LOCALAPPDATA%\PlayDrop\logs`. The window says why when
+  the background program is missing or stopped. Proven by automatic tests on GitHub's
+  Windows machines, not yet on a real PC.
+- A failed send no longer shows raw text such as "offer refused: 507 Insufficient Storage
+  no_space". Every platform says what happened in plain words ("calliope does not have
+  enough free space.").
+- The phone's trackpad screen no longer just closes when the computer refuses remote
+  control. It says why (turned off for this phone, the computer is locked, stopped on the
+  computer) and what to do, and it resumes by itself after a short connection drop.
+- Mirrored phone notifications no longer pop up again on the computer after the phone
+  reconnects. Copies stay for 5 minutes while the phone is away.
+- Unpairing a device during remote input now ends the session at once and releases any held
+  key or button.
+- Android: devices that removed this phone are no longer offered as send targets.
+
+### Changed
+
+- Only devices that handle phone notifications announce that feature (the command-line host
+  and the iPhone no longer do).
+- Removed and dismissed notification messages are now rate limited like new ones.
+- The release files now come with `SHA256SUMS.sig`. `docs/release/distribution.md` shows how
+  to check a download by hand.
+
 ## [0.10.0] - 2026-11-12
 
 ### Added

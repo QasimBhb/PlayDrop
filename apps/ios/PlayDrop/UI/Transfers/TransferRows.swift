@@ -29,7 +29,7 @@ struct TransferRow: Identifiable, Equatable, Sendable {
     let etaSeconds: UInt64?
     /// Files in the transfer.
     let fileCount: UInt64
-    /// Sender's note or failure reason.
+    /// Sender's note, or for a failed transfer a plain sentence saying why (never a wire code).
     let note: String?
     /// Cancel is offered.
     let canCancel: Bool
@@ -90,7 +90,7 @@ enum TransferRows {
                 ? UIFormat.etaSeconds(remaining: s.total > s.bytes ? s.total - s.bytes : 0, bytesPerSec: s.bytesPerSec)
                 : nil,
             fileCount: s.fileCount,
-            note: s.note,
+            note: TransferFailureText.rowNote(s),
             canCancel: !finished && !(receive && s.state == .offered),
             canForget: !receive && s.state == .failed && s.resumable,
             deliveredPaths: receive && s.state == .complete ? s.delivered.map(\.location) : []

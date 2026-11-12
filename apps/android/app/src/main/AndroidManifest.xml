@@ -19,6 +19,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Used only from the Settings battery card after an explicit tap (PLAN.md anti-pattern 14). -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- The update check hands a verified APK to Android's installer only after the person
+         pressed Update; Android asks for "Install unknown apps" and confirms itself (SR-47). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!-- The notification mirroring app picker lists launcher apps only; no QUERY_ALL_PACKAGES. -->
     <queries>
@@ -123,6 +126,11 @@
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
             </intent-filter>
         </receiver>
+
+        <!-- Install session status for an update; reached only by its explicit PendingIntent. -->
+        <receiver
+            android:name=".update.UpdateInstallReceiver"
+            android:exported="false" />
 
         <receiver
             android:name=".service.BootReceiver"

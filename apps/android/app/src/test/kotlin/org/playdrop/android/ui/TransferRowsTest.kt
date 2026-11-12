@@ -5,11 +5,14 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.playdrop.android.R
 import org.playdrop.android.ui.common.Samples
+import org.playdrop.android.ui.common.UiMessage
 import org.playdrop.android.ui.transfers.OfferInfo
 import org.playdrop.android.ui.transfers.TransferRows
 import org.playdrop.core.DeliveredFile
 import org.playdrop.core.TransferDirection
+import org.playdrop.core.TransferFailure
 import org.playdrop.core.TransferStatus
 
 /** Transfer row derivation: order, buttons, offer names and delivered files. */
@@ -131,5 +134,25 @@ class TransferRowsTest {
         // One file, or a finished row, has no "N of M".
         assertFalse(row(TransferStatus.ACTIVE, 1, 1).showFilesDone)
         assertFalse(row(TransferStatus.COMPLETE, 5000, 5000).showFilesDone)
+    }
+
+    @Test
+    fun aFailureCodeShowsThePlainSentenceInsteadOfTheCoreText() {
+        fun row(state: TransferStatus, code: TransferFailure?, note: String?) = TransferRows.derive(
+            listOf(Samples.snapshot("f", TransferDirection.SEND, state, 10, 100, 0, 1, note = note).copy(failure = code)),
+            peers,
+            emptyMap(),
+        ).single()
+        val lost = row(TransferStatus.FAILED, TransferFailure.CONNECTION_LOST, "h2 stream reset: 507")
+        assertEquals(UiMessage(R.string.failure_connection_lost, listOf("Pop laptop")), lost.failure)
+        assertNull(lost.note)
+        val mine = row(TransferStatus.CANCELLED, TransferFailure.CANCELLED_BY_YOU, "cancelled")
+        assertEquals(UiMessage(R.string.failure_cancelled_by_you), mine.failure)
+        assertNull(mine.note)
+        // No code (an older core), or a row still going: the note stays as it was.
+        val old = row(TransferStatus.FAILED, null, "connection lost")
+        assertNull(old.failure)
+        assertEquals("connection lost", old.note)
+        assertNull(row(TransferStatus.ACTIVE, TransferFailure.CONNECTION_LOST, null).failure)
     }
 }

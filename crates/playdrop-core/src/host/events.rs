@@ -14,7 +14,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use crate::session::types::{Input, MediaAction};
 pub use crate::transfer::DeliveredFile;
 
+use super::input::InputEndReason;
 use super::status::MediaState;
+use super::transfers::TransferFailure;
 
 /// A value shown to the user but never logged (SR-32).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +291,25 @@ pub enum HostEvent {
         direction: TransferDirection,
         /// Why, for the user ("failed integrity check from <label>", SR-22).
         reason: String,
+        /// Why, for the UI to act on. Missing in events from a host before 0.11.0, which
+        /// read as [`TransferFailure::Other`].
+        #[serde(default)]
+        code: TransferFailure,
+    },
+    /// This host refused a transfer from `peer` because it would cross the free-space
+    /// reserve (`507 no_space`, protocol.md 6.4, SR-20): at the offer, at accept, or on a
+    /// later write. At most one per peer per minute, so a sender that retries cannot flood
+    /// the UI. Names no file (SR-32). A desktop shows "Refused a file from <label>: not
+    /// enough free space".
+    ReceiveRefusedNoSpace {
+        /// Device ID.
+        peer: String,
+        /// Bytes the transfer needs in total.
+        offered_bytes: u64,
+        /// Bytes free on the receive volume when it was refused.
+        free_bytes: u64,
+        /// Bytes kept free: the larger of 2 GiB and 5% of the volume.
+        reserve_bytes: u64,
     },
     /// A text clipboard push arrived and passed the `clipboardIn` grant (protocol.md 5.7).
     /// Text over 32 KiB was fetched from the sender's blob (5.15) and verified first.
@@ -427,14 +448,21 @@ pub enum HostEvent {
         /// The peer's message, if any.
         message: Option<String>,
     },
-    /// The target of an input session we control ended it (protocol.md 11.1 `error`
-    /// `input_session_ended`): it locked, saw no input for 10 minutes, or its user hit the
-    /// kill switch. The controlling UI leaves its input screen and shows `reason`.
+    /// An input session we control ended, or its `start` was not honoured (protocol.md
+    /// 5.12, 11.1): exactly one per `start` that went out or failed. The target refused it
+    /// (grant off, locked, no `input.*`), locked, saw no input for 10 minutes or its user hit
+    /// the kill switch; or the connection ended. The controlling UI leaves its input screen
+    /// and says why from `code`; `reason` is the target's own text, or ours when the end
+    /// was seen here.
     InputSessionEnded {
         /// Device ID.
         peer: String,
-        /// Why, in the target's words.
+        /// Why, in words: the target's message, or the text of `code`.
         reason: String,
+        /// Why, for the UI to act on. Missing in events from a daemon before 0.11.0, which
+        /// read as [`InputEndReason::Other`].
+        #[serde(default)]
+        code: InputEndReason,
     },
     /// A frame this build parses but does not act on. No frame uses it since Phase 5
     /// (remote input is applied); kept so older IPC clients still decode the tag.
@@ -554,6 +582,20 @@ mod tests {
             HostEvent::InputSessionEnded {
                 peer: "ab".repeat(32),
                 reason: "the desktop is locked".into(),
+                code: InputEndReason::Locked,
+            },
+            HostEvent::TransferFailed {
+                id: "t1".into(),
+                peer: "ab".repeat(32),
+                direction: TransferDirection::Send,
+                reason: TransferFailure::NoSpace.sender_text().into(),
+                code: TransferFailure::NoSpace,
+            },
+            HostEvent::ReceiveRefusedNoSpace {
+                peer: "ab".repeat(32),
+                offered_bytes: 10,
+                free_bytes: 5,
+                reserve_bytes: 2,
             },
             HostEvent::NotificationPosted {
                 peer: "ab".repeat(32),

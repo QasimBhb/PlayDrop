@@ -24,8 +24,10 @@ public struct RootView: View {
             .environment(OutgoingDrain.shared)
             .environment(messages)
             .environment(deviceActions)
+            .environment(UpdateChecker.shared)
             .messageBanner(messages)
             .findRingerAlert()
+            .updateNoticeAlert(UpdateChecker.shared)
     }
 }
 
