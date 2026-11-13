@@ -112,8 +112,8 @@ Up to 0.11.0 the applet was its own package, `playdrop-cosmic-applet`, depending
   packages are then upgraded, nothing removed. With no upper bound on `playdrop`, the
   transitional package never holds a later update back, so it can be removed any time
   (`sudo apt remove playdrop-cosmic-applet`) and releases can stop carrying it.
-- The release keeps the transitional file for two releases after the merge (0.12.0 and 0.13.0)
-  and drops it from 0.14.0 (`docs/release/distribution.md`). A 0.11.0 install that skipped both
+- The release keeps the transitional file in 0.12.0, 0.13.0 and 0.14.0 (three releases in two
+  days) and drops it from 0.15.0 (`docs/release/distribution.md`). A 0.11.0 install that skipped them
   then gets a notice instead of the Update button, and updates by hand.
 - Proven on 2026-11-12 against the real 0.11.0 release files: `apt-get install --simulate
   --no-remove` of the new pair over an installed 0.11.0 pair upgrades both and removes nothing;

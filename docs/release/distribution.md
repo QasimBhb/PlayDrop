@@ -174,8 +174,9 @@ only moves an old applet install over: 0.11.0's Update button, when it finds the
 installed, installs that file together with the main one and refuses any plan that removes a
 package, so the release must carry it under that exact name. It depends on
 `playdrop (>= 0.12.0)` with no upper bound, so it never blocks a later update, and anyone can
-remove it. It is published for two releases after the merge, **0.12.0 and 0.13.0**, and
-dropped from 0.14.0: then remove `build-transitional-deb.sh`'s step and the rename from the
+remove it. It is published in **0.12.0, 0.13.0 and 0.14.0** (the plan was two releases, but all three came
+out within two days, too short a time for a 0.11.0 install to be opened once), and dropped from
+0.15.0: then remove `build-transitional-deb.sh`'s step and the rename from the
 `linux-deb` job in `release.yml`, set the file count check in the release job to 5, and drop
 the asset from the table above. The daemon's updater from 0.12.0 on handles a release without
 it (it updates the main package alone), and a 0.11.0 install that skipped both releases gets a
