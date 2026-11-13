@@ -17,7 +17,8 @@ fn windows_resources(description: &str) {
         return;
     }
     let mut res = winresource::WindowsResource::new();
-    res.set_icon(ICON);
+    // Resource 1: the daemon loads its tray icon by that number.
+    res.set_icon_with_id(ICON, "1");
     res.set("FileDescription", description);
     res.set("ProductName", "PlayDrop");
     res.set("CompanyName", "PlayDrop contributors");

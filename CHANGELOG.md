@@ -18,6 +18,8 @@ Before tagging, give the version's heading its release date in place of "Unrelea
   `playdrop-desktop.exe`), and the Start menu has one "PlayDrop" entry directly in the app
   list in place of a folder with two shortcuts, which is what Start menu search finds best.
   Updating from an older version cleans up the old file and folder.
+- Windows: the icon near the clock showed as an empty slot. It now uses the same built-in
+  PlayDrop icon as the window.
 
 ## [0.14.0] - 2026-11-13
 

@@ -379,6 +379,9 @@ mod platform {
             .map(|thread_id| Handle { thread_id, pending })
     }
 
+    /// The icon resource `build.rs` embeds in the program.
+    const ICON_RESOURCE: u16 = 1;
+
     fn rgba(size: u32) -> Vec<u8> {
         icon_argb(size)
             .as_chunks::<4>()
@@ -470,7 +473,16 @@ mod platform {
         ready: tokio::sync::oneshot::Sender<Option<u32>>,
     ) {
         let built = render(menu_entries(view)).and_then(|(menu, rendered)| {
-            let icon = Icon::from_rgba(rgba(32), 32, 32).map_err(|e| e.to_string())?;
+            // The icon built into this program (`build.rs`, resource 1): the same one the
+            // window and the Start menu show, at the size Windows asks for. On a real PC
+            // the icon drawn in code showed as an empty slot (0.13.0), so that one is only
+            // the fallback for a build with no resource.
+            let icon = Icon::from_resource(ICON_RESOURCE, None)
+                .or_else(|e| {
+                    tracing::info!(error = %e, "no built-in tray icon; drawing one");
+                    Icon::from_rgba(rgba(32), 32, 32)
+                })
+                .map_err(|e| e.to_string())?;
             TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_tooltip(tooltip(view))
