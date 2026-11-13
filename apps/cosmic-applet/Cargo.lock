@@ -4172,7 +4172,7 @@ checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
 
 [[package]]
 name = "playdrop-core"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "base64 0.23.1",
  "blake3",
@@ -4208,7 +4208,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-cosmic-applet"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "futures-util",
  "libcosmic",
@@ -4222,7 +4222,7 @@ dependencies = [
 
 [[package]]
 name = "playdrop-ipc"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "futures-util",
  "playdrop-core",

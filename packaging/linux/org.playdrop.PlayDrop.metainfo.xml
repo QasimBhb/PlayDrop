@@ -57,6 +57,11 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.13.0" date="2026-11-13" type="development">
+      <description>
+        <p>After PlayDrop updates itself on Pop!_OS and Ubuntu, the background service now restarts cleanly, and the window no longer shows a "starting" error right after a restart.</p>
+      </description>
+    </release>
     <release version="0.12.0" date="2026-11-13" type="development">
       <description>
         <p>One package now installs everything on Pop!_OS and Ubuntu, the COSMIC panel applet included, and the new "playdrop restart" command brings up a freshly installed version.</p>

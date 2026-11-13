@@ -1,7 +1,7 @@
 [package]
 name = "playdrop-cosmic-applet"
 description = "PlayDrop panel applet for the COSMIC desktop: a thin client of playdropd over D-Bus"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2021"
 license = "GPL-3.0-or-later"
 repository = "https://github.com/QasimBhb/PlayDrop"
