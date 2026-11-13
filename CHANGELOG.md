@@ -8,7 +8,7 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
-## [0.12.0] - Unreleased
+## [0.12.0] - 2026-11-13
 
 ### Added
 
