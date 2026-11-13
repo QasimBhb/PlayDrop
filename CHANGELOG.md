@@ -8,6 +8,17 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.15.0] - Unreleased
+
+### Fixed
+
+- **Windows: PlayDrop now looks and installs like an app.** The programs carry the PlayDrop
+  icon and name, so the Start menu, the taskbar, Task Manager and the installer no longer show
+  a blank icon or a file name. The window is installed as `PlayDrop.exe` (it was
+  `playdrop-desktop.exe`), and the Start menu has one "PlayDrop" entry directly in the app
+  list in place of a folder with two shortcuts, which is what Start menu search finds best.
+  Updating from an older version cleans up the old file and folder.
+
 ## [0.14.0] - 2026-11-13
 
 ### Added

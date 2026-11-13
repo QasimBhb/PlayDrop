@@ -88,7 +88,10 @@ Output: `packaging\windows\dist\PlayDrop-<version>-x64-setup.exe`. The version c
 
 ## What the installer does
 
-- Installs `playdropd.exe` and `playdrop-desktop.exe` to `C:\Program Files\PlayDrop`.
+- Installs `playdropd.exe` and the window, `PlayDrop.exe` (built as `playdrop-desktop.exe`; an
+  install before 0.15.0 had it under that name, and an upgrade removes it), to
+  `C:\Program Files\PlayDrop`. All three programs carry the icon `playdrop.ico` (made by
+  `make-icon.py`) and the product name PlayDrop, embedded by each crate's `build.rs`.
 - Installs the command line, `playdrop.exe`, to `C:\Program Files\PlayDrop\bin` and adds that
   folder to the system `PATH` (a checked task). It has its own folder so `PATH` gains one
   command, not the daemon and the window. Installing again with the box cleared removes the
@@ -96,7 +99,9 @@ Output: `packaging\windows\dist\PlayDrop-<version>-x64-setup.exe`. The version c
 - Adds `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\PlayDrop` so the daemon starts at
   sign-in (a checked task; the value is removed on uninstall). The daemon uses the same
   value name when the user changes autostart in settings.
-- Start Menu shortcut for the window, optional desktop shortcut. The Start Menu shortcut
+- One Start Menu shortcut, "PlayDrop", directly in the app list (no folder and no "Uninstall"
+  entry; Windows lists the uninstaller under Installed apps), and an optional desktop
+  shortcut. The Start Menu shortcut
   carries the AppUserModelID `org.playdrop.PlayDrop`, the ID the daemon shows its toasts
   under: Windows finds a classic app's toast identity through such a shortcut. Nothing else
   is registered for toasts (no COM activator, no CLSID): the experimental toast buttons

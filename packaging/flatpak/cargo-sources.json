@@ -11143,6 +11143,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/winresource/winresource-0.1.34.crate",
+        "sha256": "a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b",
+        "dest": "cargo/vendor/winresource-0.1.34"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"a2bc6d36480b829272a5bdabf08e6dca8004761c1da7e35efef800540c66221b\", \"files\": {}}",
+        "dest": "cargo/vendor/winresource-0.1.34",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/winx/winx-0.36.4.crate",
         "sha256": "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d",
         "dest": "cargo/vendor/winx-0.36.4"

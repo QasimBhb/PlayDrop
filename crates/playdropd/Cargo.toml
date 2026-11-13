@@ -85,3 +85,8 @@ windows = { version = "0.62.2", features = [
 
 [dev-dependencies]
 tempfile = "3.27.0"
+
+# The icon and version resource of the Windows program (build.rs). Only a Windows build
+# machine compiles it.
+[target.'cfg(windows)'.build-dependencies]
+winresource = { version = "0.1.34", default-features = false }

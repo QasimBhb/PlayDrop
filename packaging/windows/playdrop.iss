@@ -3,13 +3,17 @@
 ; and BinDir. Requires Inno Setup 6.3 or newer.
 ;
 ; What it does:
-;   - installs playdropd.exe and playdrop-desktop.exe to Program Files\PlayDrop
+;   - installs playdropd.exe and the window, PlayDrop.exe (built as
+;     playdrop-desktop.exe), to Program Files\PlayDrop, and removes the
+;     playdrop-desktop.exe an install before 0.15.0 left there
 ;   - installs the command line, playdrop.exe, to Program Files\PlayDrop\bin and
 ;     (a checked task) adds that folder to the system PATH; uninstall takes the
 ;     entry out again. The CLI has its own folder so PATH gains one command and
 ;     not the daemon and the window too
 ;   - starts the daemon at login through HKCU\...\Run\PlayDrop
-;   - Start Menu shortcut for the window, carrying the AppUserModelID
+;   - one Start Menu shortcut, "PlayDrop", directly in the programs list (no
+;     folder, no "Uninstall" entry: Windows lists the uninstaller under
+;     Installed apps), for the window, carrying the AppUserModelID
 ;     org.playdrop.PlayDrop that the daemon's toasts name (Windows identifies a
 ;     classic app's toasts through a Start Menu shortcut with that ID)
 ;   - a firewall rule scoped to playdropd.exe for TCP and UDP 42187 (SR-31),
@@ -35,7 +39,11 @@
 
 #define AppName "PlayDrop"
 #define DaemonExe "playdropd.exe"
-#define WindowExe "playdrop-desktop.exe"
+; The window is installed under the name people look for. Cargo builds it as
+; playdrop-desktop.exe, and installs before 0.15.0 had it under that name.
+#define WindowExe "PlayDrop.exe"
+#define WindowBuiltExe "playdrop-desktop.exe"
+#define OldWindowExe "playdrop-desktop.exe"
 #define CliExe "playdrop.exe"
 #define Port "42187"
 #define RuleName "PlayDrop"
@@ -51,7 +59,6 @@ AppPublisher=PlayDrop contributors
 AppPublisherURL=https://github.com/QasimBhb/PlayDrop
 AppSupportURL=https://github.com/QasimBhb/PlayDrop/issues
 DefaultDirName={autopf}\{#AppName}
-DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ; Admin is required to add the firewall rule; per-user installs cannot.
 PrivilegesRequired=admin
@@ -64,6 +71,7 @@ OutputBaseFilename=PlayDrop-{#AppVersion}-x64-setup
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=playdrop.ico
 UninstallDisplayIcon={app}\{#WindowExe}
 UninstallDisplayName={#AppName}
 ; The daemon is stopped explicitly in PrepareToInstall and [UninstallRun];
@@ -88,7 +96,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#BinDir}\{#DaemonExe}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BinDir}\{#WindowExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#BinDir}\{#WindowBuiltExe}"; DestDir: "{app}"; DestName: "{#WindowExe}"; Flags: ignoreversion
 Source: "{#BinDir}\{#CliExe}"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
 Source: "..\..\THIRD_PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
@@ -97,9 +105,14 @@ Source: "..\..\THIRD_PARTY.md"; DestDir: "{app}"; Flags: ignoreversion
 ; The AppUserModelID must match AUMID in crates/playdropd/src/notify.rs: toasts are
 ; shown under it, and Windows looks it up on a Start Menu shortcut. No COM activator or
 ; CLSID is registered: toast buttons reach the running daemon in-process.
-Name: "{group}\{#AppName}"; Filename: "{app}\{#WindowExe}"; WorkingDir: "{app}"; AppUserModelID: "{#AppUserModelID}"
-Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
+Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#WindowExe}"; WorkingDir: "{app}"; AppUserModelID: "{#AppUserModelID}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#WindowExe}"; WorkingDir: "{app}"; Tasks: desktopicon
+
+[InstallDelete]
+; What an install before 0.15.0 left: the window under its old name, and a
+; Start Menu folder with two shortcuts.
+Type: files; Name: "{app}\{#OldWindowExe}"
+Type: filesandordirs; Name: "{autoprograms}\{#AppName}"
 
 [Registry]
 ; Same value name the daemon writes when the user toggles autostart in settings,
@@ -174,7 +187,11 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   DaemonPath := ExpandConstant('{app}\{#DaemonExe}');
   WindowPath := ExpandConstant('{app}\{#WindowExe}');
+  { The window under both names: an install before 0.15.0 runs the old one.
+    Image names ignore case, so this also ends a running playdrop.exe command,
+    whose file is about to be replaced as well. }
   StopProcess('{#WindowExe}');
+  StopProcess('{#OldWindowExe}');
   StopProcess('{#DaemonExe}');
   StoppedRunning := True;
   Result := '';
@@ -208,7 +225,13 @@ begin
     try
       StartAsOriginalUser(DaemonPath);
       if RelaunchWindow then
-        StartAsOriginalUser(WindowPath);
+      begin
+        { An update from before 0.15.0 that got nowhere still has the old name. }
+        if FileExists(WindowPath) then
+          StartAsOriginalUser(WindowPath)
+        else
+          StartAsOriginalUser(ExpandConstant('{app}\{#OldWindowExe}'));
+      end;
     except
       Log('restarting PlayDrop failed: ' + GetExceptionMessage);
     end;

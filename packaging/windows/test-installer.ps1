@@ -58,10 +58,13 @@ $Cli = Join-Path $Bin 'playdrop.exe'
 $RunKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
 $Log = Join-Path ([System.IO.Path]::GetTempPath()) 'playdrop-install.log'
 # The all-users Start Menu (an admin install), and the toast ID from crates/playdropd/src/notify.rs.
-$Shortcut = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'PlayDrop\PlayDrop.lnk'
+$Shortcut = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'PlayDrop.lnk'
+# What an install before 0.15.0 had: a Start Menu folder, and the window under its build name.
+$OldShortcutFolder = Join-Path ([Environment]::GetFolderPath('CommonPrograms')) 'PlayDrop'
 $Aumid = 'org.playdrop.PlayDrop'
 $Daemon = Join-Path $App 'playdropd.exe'
-$Window = Join-Path $App 'playdrop-desktop.exe'
+$Window = Join-Path $App 'PlayDrop.exe'
+$OldWindow = Join-Path $App 'playdrop-desktop.exe'
 # Where both programs log on Windows (crates/playdrop-platform/src/startup.rs).
 $LogDir = Join-Path $env:LOCALAPPDATA 'PlayDrop\logs'
 $DaemonLog = Join-Path $LogDir 'playdropd.log'
@@ -135,6 +138,16 @@ function Get-CliExit([string[]]$Arguments) {
     $ErrorActionPreference = 'Continue'
     & $Cli @Arguments 2>&1 | Out-Null
     return $LASTEXITCODE
+}
+
+# How many icons a program file carries in its own resources (0 for a file Windows would
+# show with the generic program icon). ExtractIconEx with index -1 only counts.
+Add-Type -Namespace PlayDropTest -Name Shell -MemberDefinition @'
+[DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+public static extern uint ExtractIconEx(string file, int index, IntPtr large, IntPtr small, uint count);
+'@
+function Get-IconGroupCount([string]$Path) {
+    return [int][PlayDropTest.Shell]::ExtractIconEx($Path, -1, [IntPtr]::Zero, [IntPtr]::Zero, 0)
 }
 
 # The System.AppUserModel.ID property of a shortcut, read through the Shell, or '' when the
@@ -288,13 +301,23 @@ function Get-Running([string]$Name) {
     return [int]@(Get-Process -Name $Name -ErrorAction SilentlyContinue).Count
 }
 
+# The running installed windows. The window is PlayDrop.exe and the command line is
+# bin\playdrop.exe, and process names ignore case, so the window is told apart by its path.
+function Get-WindowProcesses {
+    return @(Get-Process -Name 'PlayDrop' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -and ($_.Path -ieq $Window) })
+}
+
+function Get-WindowRunning {
+    return [int]@(Get-WindowProcesses).Count
+}
+
 # Stops every installed daemon and window and waits until they are gone.
 function Stop-PlayDrop {
-    foreach ($name in 'playdrop-desktop', 'playdropd') {
-        Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
+    Get-WindowProcesses | Stop-Process -Force -ErrorAction SilentlyContinue
+    Get-Process -Name 'playdropd' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     $deadline = (Get-Date).AddSeconds(15)
-    while ((((Get-Running 'playdropd') + (Get-Running 'playdrop-desktop')) -gt 0) -and
+    while ((((Get-Running 'playdropd') + (Get-WindowRunning)) -gt 0) -and
         ((Get-Date) -lt $deadline)) {
         Start-Sleep -Milliseconds 200
     }
@@ -400,12 +423,13 @@ if ($setupExit -ne 0) {
 $finished = $false
 try {
     Check 'playdropd.exe is installed' (Test-Path $Daemon)
-    Check 'playdrop-desktop.exe is installed' (Test-Path $Window)
+    Check 'the window is installed as PlayDrop.exe' (Test-Path $Window)
+    Check 'no window is left under the old name playdrop-desktop.exe' (-not (Test-Path $OldWindow))
     Check 'bin\playdrop.exe is installed' (Test-Path $Cli)
     Check 'bin is on the system PATH' (Test-OnSystemPath $Bin)
     Check 'the daemon and the window are not on PATH' (-not (Test-OnSystemPath $App))
     Check 'a silent install without /RELAUNCH starts no daemon' ((Get-Running 'playdropd') -eq 0)
-    Check 'a silent install without /RELAUNCH opens no window' ((Get-Running 'playdrop-desktop') -eq 0)
+    Check 'a silent install without /RELAUNCH opens no window' ((Get-WindowRunning) -eq 0)
 
     # The imports and the subsystem of each installed program. Subsystem 2 is a GUI program
     # (no console window; the daemon at sign-in, the window from the Start Menu), 3 a console
@@ -462,7 +486,14 @@ try {
     Check 'two firewall rules are scoped to playdropd.exe' `
         ([regex]::Matches($rules, $daemonPath, 'IgnoreCase').Count -eq 2)
     Check 'the sign-in entry is set' (Test-RunValue)
-    Check 'the Start Menu shortcut exists' (Test-Path $Shortcut)
+    Check 'the Start Menu shortcut exists, directly in the programs list' (Test-Path $Shortcut)
+    Check 'there is no Start Menu folder' (-not (Test-Path $OldShortcutFolder))
+    foreach ($exe in $Daemon, $Window, $Cli) {
+        $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($exe)
+        Check "$(Split-Path -Leaf $exe) names itself (product '$($info.ProductName)', description '$($info.FileDescription)')" `
+            (($info.ProductName -eq 'PlayDrop') -and ($info.FileDescription -like 'PlayDrop*'))
+        Check "$(Split-Path -Leaf $exe) carries its own icon" ((Get-IconGroupCount $exe) -ge 1)
+    }
     $shownAumid = Get-ShortcutAumid $Shortcut
     Check "the Start Menu shortcut carries AppUserModelID $Aumid (got '$shownAumid')" ($shownAumid -eq $Aumid)
 
@@ -512,7 +543,7 @@ try {
             $null = Start-Program $Window @()
             $connected = Wait-ForLog $WindowLog 'connected to the daemon' 30
             Check 'the installed window logs that it connected to the daemon within 30 s' $connected
-            Check 'the installed window is still running after it connected' ((Get-Running 'playdrop-desktop') -ge 1)
+            Check 'the installed window is still running after it connected' ((Get-WindowRunning) -ge 1)
         }
     } finally {
         Stop-PlayDrop
@@ -565,7 +596,7 @@ try {
         Check "after /RELAUNCH=1 the daemon answers playdrop status (last exit $statusExit)" ($statusExit -eq 0)
         $connected = Wait-ForLog $WindowLog 'connected to the daemon' 30
         Check 'after /RELAUNCH=1 the window logs that it connected to the daemon within 30 s' $connected
-        Check 'after /RELAUNCH=1 the window is still running' ((Get-Running 'playdrop-desktop') -ge 1)
+        Check 'after /RELAUNCH=1 the window is still running' ((Get-WindowRunning) -ge 1)
     } finally {
         Stop-PlayDrop
         Show-Log $DaemonLog
@@ -579,7 +610,7 @@ try {
     $daemonOnlyExit = Invoke-AndWait $Installer @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/RELAUNCH=daemon')
     Check "installing again with /RELAUNCH=daemon succeeds (exit $daemonOnlyExit)" ($daemonOnlyExit -eq 0)
     try {
-        Check 'after /RELAUNCH=daemon no window was opened' ((Get-Running 'playdrop-desktop') -eq 0)
+        Check 'after /RELAUNCH=daemon no window was opened' ((Get-WindowRunning) -eq 0)
         $statusExit = Wait-ForStatus 30
         Check "after /RELAUNCH=daemon the daemon answers playdrop status (last exit $statusExit)" ($statusExit -eq 0)
     } finally {

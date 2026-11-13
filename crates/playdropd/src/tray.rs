@@ -122,19 +122,33 @@ pub fn sandboxed() -> bool {
 }
 
 /// Starts the `PlayDrop` window: `playdrop-desktop` next to this binary, then on `PATH`,
-/// then, inside Flatpak, through `flatpak run`. `page` is the window tab to open
+/// then, inside Flatpak, through `flatpak run`. The Windows installer puts the window next
+/// to the daemon as `PlayDrop.exe`; that name is looked for there only, never on `PATH`,
+/// where file names ignore case and it would find the `playdrop.exe` command. `page` is the window tab to open
 /// (`--page` names: `devices`, `add-device`, `transfers`, `settings`, `diagnostics`), or
 /// `None` for the default. The child is reaped in a background task.
 pub fn launch_window(page: Option<&str>) -> anyhow::Result<()> {
+    /// The window's file name in a Windows install (`packaging/windows/playdrop.iss`).
+    const INSTALLED_WINDOW_EXE: &str = "PlayDrop.exe";
     let name = if cfg!(windows) {
         "playdrop-desktop.exe"
     } else {
         "playdrop-desktop"
     };
-    let sibling = std::env::current_exe()
+    let beside = std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|d| d.join(name)))
+        .and_then(|e| e.parent().map(std::path::Path::to_path_buf));
+    let installed = beside
+        .as_ref()
+        .filter(|_| cfg!(windows))
+        .map(|d| d.join(INSTALLED_WINDOW_EXE))
         .filter(|p| p.is_file());
+    let sibling = installed.or_else(|| {
+        beside
+            .as_ref()
+            .map(|d| d.join(name))
+            .filter(|p| p.is_file())
+    });
     let on_path = || {
         let path = std::env::var_os("PATH")?;
         std::env::split_paths(&path)
