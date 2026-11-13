@@ -228,6 +228,13 @@ directories and the `incremental` folders. Rules from now on:
 
 ## 9. Phase 17 kickoff brief
 
+**After this file was written (2026-11-13):** the user had the applet merged into the main `.deb`
+and `playdrop restart` added, released as v0.12.0 the same day (`CHANGELOG.md`,
+`docs/release/distribution.md`). The laptop and the A54 run 0.11.0, so 0.12.0 is the first real
+update offer for both: item 1 below can be done at once, without installing anything by hand.
+An empty transitional `playdrop-cosmic-applet` package ships in 0.12.0 and 0.13.0; drop it from
+0.14.0.
+
 v0.11.0 is the state of `main`.
 
 1. **Prove the update check for real.** Install the 0.11.0 `.deb` and applet on this laptop (the
