@@ -23,6 +23,10 @@
 //!   only on this machine.
 //! - `unsupported.rs`: everything else, always with a sentence saying why (anti-pattern 18).
 //!
+//! On Linux the computer's own output volume is one more entry, the reserved player
+//! `@system` (`system_volume.rs`, protocol.md 5.9): never playing, and `volume` is the only
+//! thing it can do. Windows does not offer it yet.
+//!
 //! Album art is not sent in v1 (`art` is `None`; it needs a blob per track).
 //! Media state goes only to peers with the `media` grant; the core enforces that.
 
@@ -32,6 +36,8 @@ mod gsmtc_model;
 mod latest;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "linux")]
+mod system_volume;
 mod unsupported;
 #[cfg(windows)]
 mod windows;
@@ -66,6 +72,9 @@ pub async fn support() -> MediaSupport {
 /// Watches every local player and applies commands to them.
 pub struct Watcher {
     inner: backend::Watcher,
+    /// The computer's own volume, as the reserved player `@system`.
+    #[cfg(target_os = "linux")]
+    system: system_volume::SystemVolume,
 }
 
 impl std::fmt::Debug for Watcher {
@@ -80,6 +89,8 @@ impl Watcher {
     /// the bus task.
     pub async fn start(tx: mpsc::Sender<MediaState>) -> anyhow::Result<Self> {
         Ok(Self {
+            #[cfg(target_os = "linux")]
+            system: system_volume::SystemVolume::start(tx.clone()),
             inner: backend::Watcher::start(tx).await?,
         })
     }
@@ -93,6 +104,16 @@ impl Watcher {
         action: MediaAction,
         value: Option<u64>,
     ) -> anyhow::Result<()> {
+        #[cfg(target_os = "linux")]
+        if player == system_volume::SYSTEM_PLAYER {
+            anyhow::ensure!(
+                action == MediaAction::Volume,
+                "the computer's volume can only be set to a level"
+            );
+            let level = value
+                .ok_or_else(|| anyhow::anyhow!("a volume change needs a level from 0 to 100"))?;
+            return self.system.set(level);
+        }
         self.inner.command(player, action, value).await
     }
 

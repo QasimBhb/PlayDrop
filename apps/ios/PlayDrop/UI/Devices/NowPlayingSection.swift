@@ -6,12 +6,17 @@ import SwiftUI
 // reports (protocol.md 5.9) with the title, the artist, a progress bar extrapolated once a
 // second while playing, and the controls the player allows. Commands go out through
 // `CoreHost.sendMediaCommand`; the computer's next state frame updates the row.
+//
+// The computer's master volume arrives in the same list as the reserved player
+// `SystemVolume.playerId`. It is never a player block: it gets its own "Computer volume"
+// slider above the players, shown even when nothing plays.
 
-/// One section per peer with players; nothing when it reports none.
+/// The computer volume slider and one section of players; nothing when the peer reports
+/// neither.
 struct NowPlayingSection: View {
     /// Hex Device ID.
     let peerId: String
-    /// The peer's players.
+    /// The peer's players, the system volume entry included.
     let players: [MediaState]
     /// The peer accepts media commands (online and `media.control`).
     let controllable: Bool
@@ -23,15 +28,31 @@ struct NowPlayingSection: View {
     @State private var throttle = RefusalThrottle()
 
     var body: some View {
-        if !players.isEmpty {
+        let split = SystemVolume.split(players) { $0.player }
+        if let system = split.system {
+            Section {
+                SystemVolumeRow(
+                    volume: system.volume,
+                    controllable: controllable && system.can.contains(.volume)
+                ) { value in
+                    command(system.player, .volume, value)
+                }
+            }
+            .task { await watchRefusals() }
+        }
+        if !split.players.isEmpty {
+            // Watches refusals only when the volume section above does not.
+            let watches = split.system == nil
             Section(L10n.Media.title) {
-                ForEach(players, id: \.player) { state in
+                ForEach(split.players, id: \.player) { state in
                     PlayerBlock(state: state, row: MediaRows.row(state, controllable: controllable)) { action, value in
                         command(state.player, action, value)
                     }
                 }
             }
-            .task { await watchRefusals() }
+            .task(id: watches) {
+                if watches { await watchRefusals() }
+            }
         }
     }
 
@@ -62,6 +83,114 @@ struct NowPlayingSection: View {
             } catch {
                 messages.show(error: error)
             }
+        }
+    }
+}
+
+/// The computer's master volume: a labelled slider with the current percentage. While
+/// the finger drags, commands go out at most 5 times a second and the slider ignores
+/// incoming states; after the release it keeps the released value until the computer
+/// echoes it (`VolumeSliderModel`). Disabled when the computer accepts no media commands,
+/// like the player controls.
+private struct SystemVolumeRow: View {
+    /// The reported level, 0 to 100.
+    let volume: UInt8?
+    /// The computer accepts the command.
+    let controllable: Bool
+    let send: (UInt64) -> Void
+
+    @State private var model = VolumeSliderModel()
+    @State private var flushTask: Task<Void, Never>?
+    @State private var expireTask: Task<Void, Never>?
+
+    var body: some View {
+        let shown = model.shown
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label(L10n.Media.computerVolume, systemImage: "hifispeaker")
+                Spacer()
+                Text(shown, format: .percent)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityHidden(true)
+            HStack {
+                Image(systemName: shown == 0 ? "speaker.slash.fill" : "speaker.fill")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Slider(
+                    value: Binding(get: { Double(shown) }, set: { changed(to: $0) }),
+                    in: 0...100,
+                    step: 1
+                ) { editing in
+                    if editing { model.begin() } else { released() }
+                }
+                .disabled(!controllable)
+                .accessibilityLabel(Text(L10n.Media.computerVolume))
+                .accessibilityValue(Text(shown, format: .percent))
+                .accessibilityHint(Text(L10n.Media.computerVolumeHint))
+                Image(systemName: "speaker.wave.3.fill")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
+        }
+        .padding(.vertical, 4)
+        .onChange(of: volume, initial: true) { _, new in
+            model.report(new.map { Int($0) })
+        }
+        .onDisappear {
+            flushTask?.cancel()
+            expireTask?.cancel()
+        }
+    }
+
+    private static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// A new slider value: a throttled send while dragging, else one send (an
+    /// accessibility increment).
+    private func changed(to value: Double) {
+        if model.dragging {
+            if let v = model.drag(to: value, now: Self.now) { send(UInt64(v)) }
+            scheduleFlush()
+        } else {
+            send(UInt64(model.set(to: value, now: Self.now)))
+            scheduleExpire()
+        }
+    }
+
+    private func released() {
+        flushTask?.cancel()
+        flushTask = nil
+        send(UInt64(model.release(now: Self.now)))
+        scheduleExpire()
+    }
+
+    /// Sends a value the throttle held back once its turn comes, so the computer reaches
+    /// the finger's level even when the finger stops moving.
+    private func scheduleFlush() {
+        guard let delay = model.flushDelay(now: Self.now) else { return }
+        flushTask?.cancel()
+        flushTask = Task {
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            if let v = model.flush(now: Self.now) {
+                send(UInt64(v))
+            } else {
+                scheduleFlush()
+            }
+        }
+    }
+
+    /// Lets the slider follow the computer again when no echo of the released value comes.
+    private func scheduleExpire() {
+        guard model.awaitingEcho else { return }
+        expireTask?.cancel()
+        let wait = model.echoWait
+        expireTask = Task {
+            // A little past the wait, so the check below never lands a hair early.
+            try? await Task.sleep(for: .seconds(wait + 0.05))
+            guard !Task.isCancelled else { return }
+            model.expire(now: Self.now)
         }
     }
 }

@@ -158,5 +158,16 @@ extension L10n {
         static var volume: String { String(localized: "ui_media_volume", defaultValue: "Volume") }
         /// "Position".
         static var position: String { String(localized: "ui_media_position", defaultValue: "Position") }
+        /// "Computer volume": the computer's master volume slider.
+        static var computerVolume: String {
+            String(localized: "ui_media_computer_volume", defaultValue: "Computer volume")
+        }
+        /// Accessibility hint of the computer volume slider.
+        static var computerVolumeHint: String {
+            String(
+                localized: "ui_media_computer_volume_hint",
+                defaultValue: "Sets the volume of everything the computer plays."
+            )
+        }
     }
 }

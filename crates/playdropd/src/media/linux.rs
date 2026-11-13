@@ -55,6 +55,12 @@ const NO_TRACK: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
 const IGNORED: &[&str] = &["playerctld"];
 /// Shown when a command names a player that has gone.
 const GONE: &str = "that player is no longer running";
+/// How long a player gets to apply a volume change before it is read back.
+const VOLUME_SETTLE: std::time::Duration = std::time::Duration::from_millis(400);
+/// A requested change smaller than this (MPRIS scale, 0.0 to 1.0) proves nothing either way.
+const VOLUME_STEP: f64 = 0.05;
+/// A volume that moved less than this did not move.
+const VOLUME_SAME: f64 = 0.005;
 
 #[zbus::proxy(
     interface = "org.mpris.MediaPlayer2.Player",
@@ -72,6 +78,8 @@ trait Player {
     fn set_position(&self, track_id: &ObjectPath<'_>, position: i64) -> zbus::Result<()>;
     #[zbus(property(emits_changed_signal = "false"))]
     fn position(&self) -> zbus::Result<i64>;
+    #[zbus(property(emits_changed_signal = "false"))]
+    fn volume(&self) -> zbus::Result<f64>;
     #[zbus(property)]
     fn set_volume(&self, volume: f64) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -112,6 +120,11 @@ struct Slot {
     name: Option<String>,
     track_id: Option<String>,
     can: Vec<MediaAction>,
+    /// The player accepted a volume change and then did not change (browsers do this):
+    /// its volume is no longer offered. Lasts as long as the player runs.
+    volume_ignored: bool,
+    /// The state last queued, to send again without the volume once it proves ignored.
+    last: Option<MediaState>,
 }
 
 /// State shared by the manager, the player tasks and [`Watcher::command`].
@@ -129,11 +142,15 @@ impl Shared {
 
     /// Records and queues a player's state, unless its slot was replaced or removed.
     fn publish(&self, id: &str, generation: u64, snap: &Snapshot) {
-        let state = snap.to_state(id, unix_ms());
+        let mut state = snap.to_state(id, unix_ms());
         let mut players = self.players();
         let Some(slot) = players.get_mut(id).filter(|s| s.generation == generation) else {
             return;
         };
+        if slot.volume_ignored {
+            without_volume(&mut state);
+        }
+        slot.last = Some(state.clone());
         slot.name.clone_from(&state.name);
         slot.track_id.clone_from(&snap.track_id);
         slot.can.clone_from(&state.can);
@@ -147,6 +164,41 @@ impl Shared {
         );
         self.out.push(state);
     }
+}
+
+impl Shared {
+    /// Stops offering `id`'s volume and tells peers so, once.
+    fn volume_is_ignored(&self, id: &str, bus: &str) {
+        let mut players = self.players();
+        let Some(slot) = players.get_mut(id).filter(|s| s.bus == bus) else {
+            return;
+        };
+        if slot.volume_ignored {
+            return;
+        }
+        slot.volume_ignored = true;
+        slot.can.retain(|a| *a != MediaAction::Volume);
+        tracing::info!(
+            player = id,
+            "this player accepts a volume change and ignores it; its volume is no longer offered"
+        );
+        if let Some(state) = slot.last.as_mut() {
+            without_volume(state);
+            self.out.push(state.clone());
+        }
+    }
+}
+
+/// Takes the volume out of a state: no level, and not something the player can do.
+fn without_volume(state: &mut MediaState) {
+    state.volume = None;
+    state.can.retain(|a| *a != MediaAction::Volume);
+}
+
+/// Whether a player that was at `before`, was asked for `asked` and is now at `after`
+/// ignored the request: the request was a real change and nothing moved.
+fn volume_was_ignored(before: f64, asked: f64, after: f64) -> bool {
+    (asked - before).abs() >= VOLUME_STEP && (after - before).abs() < VOLUME_SAME
 }
 
 /// Watches every MPRIS player on the session bus.
@@ -232,7 +284,26 @@ impl Watcher {
             }
             MediaAction::Volume => {
                 let v = value.context("a volume change needs a level from 0 to 100")?;
-                proxy.set_volume(volume_to_mpris(v)).await
+                let asked = volume_to_mpris(v);
+                let before = proxy.volume().await.ok();
+                let set = proxy.set_volume(asked).await;
+                if let (Ok(()), Some(before)) = (&set, before) {
+                    // Browsers answer "done" and stay where they were. Read the volume
+                    // back once it had time to settle, and stop offering one that never
+                    // moves, so the phone does not show a slider that does nothing.
+                    let shared = Arc::clone(&self.shared);
+                    let (player, proxy) = (player.to_owned(), proxy.clone());
+                    tokio::spawn(async move {
+                        tokio::time::sleep(VOLUME_SETTLE).await;
+                        if let Ok(after) = proxy.volume().await {
+                            if volume_was_ignored(before, asked, after) {
+                                let bus = proxy.inner().destination().to_string();
+                                shared.volume_is_ignored(&player, &bus);
+                            }
+                        }
+                    });
+                }
+                set
             }
             MediaAction::Unknown(_) => unreachable!("refused above"),
         };
@@ -327,6 +398,8 @@ fn add_player(conn: &zbus::Connection, shared: &Arc<Shared>, bus: &str) {
                 name: None,
                 track_id: None,
                 can: Vec::new(),
+                volume_ignored: false,
+                last: None,
             },
         );
         generation
@@ -761,6 +834,20 @@ mod tests {
         assert_eq!(us_to_ms(-1), None);
         assert_eq!(ms_to_us(90_000), 90_000_000);
         assert_eq!(ms_to_us(u64::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn a_volume_that_does_not_move_was_ignored() {
+        // Brave: at 1.0, asked for 0.3, still 1.0.
+        assert!(volume_was_ignored(1.0, 0.3, 1.0));
+        // A player that did it, or got near it.
+        assert!(!volume_was_ignored(1.0, 0.3, 0.3));
+        assert!(!volume_was_ignored(1.0, 0.3, 0.33));
+        // A second request arrived before the check: it moved, so it listens.
+        assert!(!volume_was_ignored(1.0, 0.3, 0.4));
+        // Asked for what it already had: proves nothing.
+        assert!(!volume_was_ignored(0.5, 0.5, 0.5));
+        assert!(!volume_was_ignored(0.5, 0.52, 0.5));
     }
 
     #[test]

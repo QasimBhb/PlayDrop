@@ -962,6 +962,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "byteorder"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+
+[[package]]
 name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1903,6 +1909,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.6",
+]
+
+[[package]]
+name = "enum-primitive-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba7795da175654fe16979af73f81f26a8ea27638d8d9823d317016888a63dc4c"
+dependencies = [
+ "num-traits",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -5859,6 +5876,7 @@ dependencies = [
  "playdrop-core",
  "playdrop-ipc",
  "playdrop-platform",
+ "pulseaudio",
  "rustix 1.1.5",
  "serde",
  "serde_json",
@@ -6125,6 +6143,22 @@ dependencies = [
  "bitflags 2.13.2",
  "memchr",
  "unicase",
+]
+
+[[package]]
+name = "pulseaudio"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ba79a4c6904c987cc31fa50e9b750539404511c2dbd9ce95e5e58444177a21e"
+dependencies = [
+ "bitflags 2.13.2",
+ "byteorder",
+ "enum-primitive-derive",
+ "futures",
+ "log",
+ "mio",
+ "num-traits",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

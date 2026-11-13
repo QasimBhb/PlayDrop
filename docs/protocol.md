@@ -200,6 +200,8 @@ Pushed on session start and on change, at most once per 60 s unless `charging` o
 ```
 - `action`: `play`, `pause`, `playPause`, `stop`, `next`, `previous`, `seek` (absolute ms), `volume` (0-100).
 - Position is sent with `positionAt` (Unix ms) and extrapolated, never streamed; state is coalesced to 2 frames per second per player. *Choice:* KDE's MPRIS flood drained batteries.
+- **The computer's own volume (v0.14.0, a compatible addition):** a host MAY report its system output volume as one more player with the reserved ID `@system`: `playing` is always `false`, `volume` is the output level 0-100 (`0` while muted), `can` is exactly `["volume"]`, and there is no track. A `command` with `action: "volume"` for `@system` sets the output level; any other action for it is ignored. No real player has an ID that starts with `@`. A receiver that knows the ID SHOULD show it as a volume control, not as a player; one that does not shows a player with a working volume slider. When the host can no longer change the volume it sends the usual "gone" state (`playing: false`, empty `can`). *Choice:* a player's `volume` changes one player, and browsers accept that change and ignore it; the level a person wants from the phone is the one the volume keys change.
+- **A player that ignores `volume`:** a host that sees a player accept a volume change and not change SHOULD stop listing `volume` in that player's `can` and stop sending its `volume`.
 
 ### 5.10 presence
 

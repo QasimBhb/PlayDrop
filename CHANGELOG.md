@@ -8,6 +8,21 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.14.0] - Unreleased
+
+### Added
+
+- **Computer volume from the phone.** The device page on Android and iPhone has a
+  "Computer volume" slider that changes the computer's own volume, the one the volume keys
+  change, whether or not anything is playing. Linux computers offer it (PipeWire or
+  PulseAudio); Windows does not yet.
+
+### Fixed
+
+- A player's volume slider on the phone did nothing for browsers (Brave, Chrome and others
+  accept a volume change and ignore it). The computer now notices that and stops offering
+  the volume of such a player, so the phone no longer shows a slider that does nothing.
+
 ## [0.13.0] - 2026-11-13
 
 ### Fixed

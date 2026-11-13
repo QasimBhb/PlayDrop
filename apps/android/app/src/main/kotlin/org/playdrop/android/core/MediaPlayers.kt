@@ -8,6 +8,23 @@ import org.playdrop.core.MediaState
  */
 object MediaPlayers {
     /**
+     * Player ID of the reserved entry that carries the computer's master volume (0 to 100, 0
+     * when muted). No real player can have this ID. It only offers a volume command, and a
+     * `volume` command sent to it sets the master volume. It is a control, never a
+     * "Now playing" card.
+     */
+    const val SYSTEM_VOLUME_ID = "@system"
+
+    /** True when [state] is the computer volume entry rather than a real player. */
+    fun isSystemVolume(state: MediaState): Boolean = state.player == SYSTEM_VOLUME_ID
+
+    /** The computer volume entry in [players], or null when the peer does not offer one. */
+    fun systemVolume(players: List<MediaState>): MediaState? = players.firstOrNull(::isSystemVolume)
+
+    /** [players] without the computer volume entry: the ones shown as "Now playing" cards. */
+    fun realPlayers(players: List<MediaState>): List<MediaState> = players.filterNot(::isSystemVolume)
+
+    /**
      * A state that is not playing and offers no action means the player went away (the
      * desktop sends this when an MPRIS or SMTC player closes).
      */

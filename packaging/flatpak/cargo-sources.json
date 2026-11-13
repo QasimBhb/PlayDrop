@@ -1146,6 +1146,19 @@
     {
         "type": "archive",
         "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/byteorder/byteorder-1.5.0.crate",
+        "sha256": "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b",
+        "dest": "cargo/vendor/byteorder-1.5.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b\", \"files\": {}}",
+        "dest": "cargo/vendor/byteorder-1.5.0",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
         "url": "https://static.crates.io/crates/byteorder-lite/byteorder-lite-0.1.0.crate",
         "sha256": "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495",
         "dest": "cargo/vendor/byteorder-lite-0.1.0"
@@ -2441,6 +2454,19 @@
         "type": "inline",
         "contents": "{\"package\": \"0590c4a94da3372e83493b956755a6e2266830b6e4e3b101afe66e3f39477b91\", \"files\": {}}",
         "dest": "cargo/vendor/enum-assoc-1.4.1",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/enum-primitive-derive/enum-primitive-derive-0.3.0.crate",
+        "sha256": "ba7795da175654fe16979af73f81f26a8ea27638d8d9823d317016888a63dc4c",
+        "dest": "cargo/vendor/enum-primitive-derive-0.3.0"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"ba7795da175654fe16979af73f81f26a8ea27638d8d9823d317016888a63dc4c\", \"files\": {}}",
+        "dest": "cargo/vendor/enum-primitive-derive-0.3.0",
         "dest-filename": ".cargo-checksum.json"
     },
     {
@@ -6978,6 +7004,19 @@
         "type": "inline",
         "contents": "{\"package\": \"e9f068eba8e7071c5f9511831b44f32c740d5adf574e990f946ddb53db2f314e\", \"files\": {}}",
         "dest": "cargo/vendor/pulldown-cmark-0.13.4",
+        "dest-filename": ".cargo-checksum.json"
+    },
+    {
+        "type": "archive",
+        "archive-type": "tar-gzip",
+        "url": "https://static.crates.io/crates/pulseaudio/pulseaudio-0.3.2.crate",
+        "sha256": "9ba79a4c6904c987cc31fa50e9b750539404511c2dbd9ce95e5e58444177a21e",
+        "dest": "cargo/vendor/pulseaudio-0.3.2"
+    },
+    {
+        "type": "inline",
+        "contents": "{\"package\": \"9ba79a4c6904c987cc31fa50e9b750539404511c2dbd9ce95e5e58444177a21e\", \"files\": {}}",
+        "dest": "cargo/vendor/pulseaudio-0.3.2",
         "dest-filename": ".cargo-checksum.json"
     },
     {

@@ -53,6 +53,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import org.playdrop.android.R
+import org.playdrop.android.core.MediaPlayers
 import org.playdrop.android.ui.common.BatteryLabel
 import org.playdrop.android.ui.common.CollectMessages
 import org.playdrop.android.ui.common.Samples
@@ -92,6 +93,7 @@ fun DeviceDetailRoute(
             onPairAgain = onPairAgain,
             onOpenInput = onOpenInput,
             onMedia = vm::mediaCommand,
+            onSystemVolume = vm::setSystemVolume,
             onOpenPermissions = onOpenPermissions,
             send = SendCallbacks(
                 onPicked = vm::sendFiles,
@@ -127,6 +129,8 @@ data class DeviceDetailActions(
     val onOpenInput: () -> Unit = {},
     /** Media command: player ID, action, seek ms or volume. */
     val onMedia: (String, MediaAction, Long?) -> Unit = { _, _, _ -> },
+    /** Set the computer's master volume, 0 to 100. */
+    val onSystemVolume: (Long) -> Unit = {},
     /** Open the Permissions page. */
     val onOpenPermissions: () -> Unit = {},
     /** The send buttons and their confirmation. */
@@ -252,11 +256,16 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions)
                 )
             }
 
-            if (state.media.isNotEmpty()) {
+            if (state.systemVolume != null || state.media.isNotEmpty()) {
                 HorizontalDivider()
-                SectionTitle(stringResource(R.string.ui_media_title))
-                state.media.forEach { player ->
-                    NowPlayingCard(player) { action, value -> actions.onMedia(player.player, action, value) }
+                // The computer volume works with or without a running player, so it comes first.
+                state.systemVolume?.let { SystemVolumeCard(it, actions.onSystemVolume) }
+                if (state.media.isNotEmpty()) {
+                    SectionTitle(stringResource(R.string.ui_media_title))
+                    // realPlayers again so the reserved entry can never become a card.
+                    MediaPlayers.realPlayers(state.media).forEach { player ->
+                        NowPlayingCard(player) { action, value -> actions.onMedia(player.player, action, value) }
+                    }
                 }
             }
 

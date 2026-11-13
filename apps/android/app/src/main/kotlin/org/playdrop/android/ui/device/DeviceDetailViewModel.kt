@@ -16,6 +16,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
+import org.playdrop.android.core.MediaPlayers
 import org.playdrop.android.data.Settings
 import org.playdrop.android.service.NotificationMirror
 import org.playdrop.android.share.ClipImage
@@ -97,8 +98,10 @@ data class DeviceDetailUiState(
     val ringing: Boolean = false,
     /** What the device accepts while online (`input.pointer`, `media.control`, ...); empty offline. */
     val capabilities: List<String> = emptyList(),
-    /** Media players the device reports, for the "Now playing" cards. */
+    /** Media players the device reports, for the "Now playing" cards; never the computer volume entry. */
     val media: List<MediaState> = emptyList(),
+    /** The computer's master volume, when the device offers it ([MediaPlayers.SYSTEM_VOLUME_ID]). */
+    val systemVolume: MediaState? = null,
     /** How many apps are on the notification mirroring allow list (shared by every device). */
     val mirrorApps: Int = 0,
     /** Confirmation of the last file send started from this page. */
@@ -155,7 +158,8 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
                 pairedAt = peer.pairedAt.toLong(),
                 ringing = ring,
                 capabilities = if (peer.online) peer.capabilities else emptyList(),
-                media = media[peerId].orEmpty(),
+                media = MediaPlayers.realPlayers(media[peerId].orEmpty()),
+                systemVolume = MediaPlayers.systemVolume(media[peerId].orEmpty()),
                 mirrorApps = settings.mirrorApps.size,
             )
         }
@@ -321,6 +325,9 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
     fun mediaCommand(player: String, action: MediaAction, value: Long?) {
         launchCore({ it.sendMediaCommand(peerId, player, action, value?.toULong()) })
     }
+
+    /** Sets the computer's master volume, 0 to 100, through the reserved player. */
+    fun setSystemVolume(volume: Long) = mediaCommand(MediaPlayers.SYSTEM_VOLUME_ID, MediaAction.VOLUME, volume.coerceIn(0, 100))
 
     /** Unpairs the device, then closes the screen. */
     fun unpair() {

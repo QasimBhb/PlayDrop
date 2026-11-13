@@ -54,12 +54,19 @@ enum Fixtures {
     /// A media player state.
     static func media(
         _ player: String, name: String? = nil, playing: Bool = false, can: [MediaAction] = [],
-        durationMs: UInt64? = nil, positionMs: UInt64? = nil, positionAtMs: UInt64? = nil
+        durationMs: UInt64? = nil, positionMs: UInt64? = nil, positionAtMs: UInt64? = nil,
+        volume: UInt8? = nil
     ) -> MediaState {
         MediaState(
             player: player, name: name, playing: playing, title: nil, artist: nil, album: nil,
-            durationMs: durationMs, positionMs: positionMs, positionAtMs: positionAtMs, volume: nil, can: can
+            durationMs: durationMs, positionMs: positionMs, positionAtMs: positionAtMs, volume: volume, can: can
         )
+    }
+
+    /// The computer's master volume as the desktop reports it: the reserved player ID,
+    /// never playing, no track, only `volume` allowed.
+    static func systemVolume(_ volume: UInt8) -> MediaState {
+        media(SystemVolume.playerId, name: "Computer volume", can: [.volume], volume: volume)
     }
 
     /// A fresh, empty UserDefaults suite; remove it with `removePersistentDomain(forName:)`.

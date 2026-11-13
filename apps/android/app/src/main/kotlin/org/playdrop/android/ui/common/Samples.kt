@@ -1,5 +1,6 @@
 package org.playdrop.android.ui.common
 
+import org.playdrop.android.core.MediaPlayers
 import org.playdrop.android.core.OwnIdentity
 import org.playdrop.android.core.PendingPairing
 import org.playdrop.android.data.Settings
@@ -53,6 +54,21 @@ object Samples {
         can = listOf(MediaAction.PLAY_PAUSE, MediaAction.NEXT, MediaAction.PREVIOUS, MediaAction.SEEK, MediaAction.VOLUME),
     )
 
+    /** The computer's master volume as the desktop reports it (never a "Now playing" card). */
+    val computerVolume = MediaState(
+        player = MediaPlayers.SYSTEM_VOLUME_ID,
+        name = "Computer volume",
+        playing = false,
+        title = null,
+        artist = null,
+        album = null,
+        durationMs = null,
+        positionMs = null,
+        positionAtMs = null,
+        volume = 40u.toUByte(),
+        can = listOf(MediaAction.VOLUME),
+    )
+
     /** A paired laptop, online. */
     val laptop = PeerSummary(
         deviceId = "a1".repeat(32),
@@ -99,6 +115,7 @@ object Samples {
         ringing = false,
         capabilities = laptop.capabilities,
         media = listOf(song),
+        systemVolume = computerVolume,
     )
 
     /** Add device with three adverts collapsing into two rows. */

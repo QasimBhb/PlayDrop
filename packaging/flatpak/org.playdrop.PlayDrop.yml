@@ -45,6 +45,9 @@ finish-args:
   # owns a name under org.mpris.MediaPlayer2.*, so the wildcard is the narrowest
   # rule that reaches them; it grants talking only, never owning.
   - --talk-name=org.mpris.MediaPlayer2.*
+  # The computer's own volume for paired phones ("Computer volume"): the PipeWire or
+  # PulseAudio socket. PlayDrop reads and sets the output level and plays nothing.
+  - --socket=pulseaudio
   # Not listed on purpose: org.freedesktop.portal.Desktop. Portals are reachable
   # from every sandbox by default, so the RemoteDesktop portal (remote input,
   # which asks the user for consent itself), the Background portal (autostart)

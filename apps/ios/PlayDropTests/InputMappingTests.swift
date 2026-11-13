@@ -44,6 +44,27 @@ final class InputMappingTests: XCTestCase {
         XCTAssertFalse(locked.canSeek)
     }
 
+    func testMediaRowVolumeOnlyWhenThePlayerAllowsIt() {
+        let withVolume = Fixtures.media("vlc", can: [.play, .volume], volume: 40)
+        XCTAssertTrue(MediaRows.row(withVolume, controllable: true).canVolume)
+        // A browser ignores volume, so the computer leaves it out of `can`.
+        let browser = Fixtures.media("firefox", can: [.play], volume: 100)
+        XCTAssertFalse(MediaRows.row(browser, controllable: true).canVolume)
+        XCTAssertFalse(MediaRows.row(withVolume, controllable: false).canVolume)
+    }
+
+    func testSystemVolumeIsNeverAPlayerRow() {
+        let list = [Fixtures.media("spotify", playing: true, can: [.pause]), Fixtures.systemVolume(35)]
+        let split = SystemVolume.split(list) { $0.player }
+        XCTAssertEqual(split.system?.volume, 35)
+        XCTAssertEqual(split.players.map(\.player), ["spotify"])
+        let alone = SystemVolume.split([Fixtures.systemVolume(0)]) { $0.player }
+        XCTAssertNotNil(alone.system, "muted is still reported")
+        XCTAssertTrue(alone.players.isEmpty, "no player: no Now playing rows")
+        let entry = Fixtures.systemVolume(50)
+        XCTAssertFalse(MediaPlayback.isGone(playing: entry.playing, canIsEmpty: entry.can.isEmpty))
+    }
+
     func testToggleActionPrefersThePlayersOwnToggle() {
         XCTAssertEqual(MediaRows.toggleAction(playing: true, can: [.playPause, .pause]), .playPause)
         XCTAssertEqual(MediaRows.toggleAction(playing: false, can: [.play, .pause]), .play)
