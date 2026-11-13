@@ -57,6 +57,11 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.15.0" date="2026-11-13" type="development">
+      <description>
+        <p>On Windows, PlayDrop now has its icon and name in the Start menu, the taskbar and near the clock, and installs as one "PlayDrop" entry.</p>
+      </description>
+    </release>
     <release version="0.14.0" date="2026-11-13" type="development">
       <description>
         <p>Paired phones get a "Computer volume" slider that changes this computer's own volume, and no longer show a volume slider for players that ignore it, such as browsers.</p>
