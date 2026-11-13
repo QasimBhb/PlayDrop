@@ -244,7 +244,10 @@ place during systemd's stop (the unit sat in "deactivating" for 90 s, was killed
 again; `update/restart.rs::asked`); and the window showed "PlayDrop is starting; try again" in
 red when it asked the fresh daemon for its state (it now asks again, `Controller::load_failed`).
 The 0.12.0 to 0.13.0 update will still take the 90 s detour, because the old daemon does the
-restart. The phone half of item 1 is still open.
+restart. The phone half ran the same day on the A54 (a test-signed 0.11.0): the check, the download and
+the hand-over to the system installer worked, and Android refused the release-signed APK with the
+"signed with a different key" sentence, as designed. An update that Android accepts (a
+release-signed install updating to a release) is still unproven.
 
 v0.11.0 is the state of `main`.
 
