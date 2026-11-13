@@ -8,6 +8,16 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.13.0] - Unreleased
+
+### Fixed
+
+- Linux `.deb`: after an update installed itself, the background service could sit half
+  stopped for 90 seconds and then be killed and started again by the system. It read the
+  system's own stop signal as a refusal to restart. It now hands the restart over cleanly.
+- The desktop window no longer shows a red "PlayDrop is starting; try again" line when it
+  asks a freshly started PlayDrop for its state. It waits a moment and asks again.
+
 ## [0.12.0] - 2026-11-13
 
 ### Added

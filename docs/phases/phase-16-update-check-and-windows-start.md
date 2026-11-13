@@ -235,6 +235,17 @@ update offer for both: item 1 below can be done at once, without installing anyt
 An empty transitional `playdrop-cosmic-applet` package ships in 0.12.0 and 0.13.0; drop it from
 0.14.0.
 
+**First real `.deb` update (2026-11-13, laptop, 0.11.0 to 0.12.0, by the user):** the offer, the
+download of both files, the pkexec prompt and the install all worked, and the daemon came back as
+0.12.0 with its peers. Two defects showed and are fixed on `main` after the 0.12.0 tag, so they
+reach users with 0.13.0: `systemctl restart` runs in the unit's own cgroup and is signalled by
+the stop it asked for, which 0.11.0 and 0.12.0 read as a refusal and answered by `exec`ing in
+place during systemd's stop (the unit sat in "deactivating" for 90 s, was killed and started
+again; `update/restart.rs::asked`); and the window showed "PlayDrop is starting; try again" in
+red when it asked the fresh daemon for its state (it now asks again, `Controller::load_failed`).
+The 0.12.0 to 0.13.0 update will still take the 90 s detour, because the old daemon does the
+restart. The phone half of item 1 is still open.
+
 v0.11.0 is the state of `main`.
 
 1. **Prove the update check for real.** Install the 0.11.0 `.deb` and applet on this laptop (the

@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-use playdrop_ipc::{ConsentToken, IpcError, Ok, Request};
+use playdrop_ipc::{ConsentToken, ErrorCode, IpcError, Ok, Request};
 use slint::{ComponentHandle, Timer, TimerMode, VecModel};
 
 use crate::ipc::{Ipc, IpcMsg};
@@ -37,6 +37,10 @@ const NOTICE_FOR: Duration = Duration::from_secs(6);
 const CONSENT_NOTICE_FOR: Duration = Duration::from_secs(30);
 /// How often relative times ("5 min ago") are refreshed.
 const CLOCK_TICK: Duration = Duration::from_secs(30);
+/// How long to wait before asking again when the daemon answered that it is still starting.
+const STARTING_RETRY_EVERY: Duration = Duration::from_millis(500);
+/// How many times in a row to ask again (20 s) before the answer is shown as an error.
+const STARTING_RETRIES: u32 = 40;
 
 /// View state and handles, owned by the Slint thread.
 pub struct Controller {
@@ -56,6 +60,10 @@ pub struct Controller {
     start_attempts: Cell<u32>,
     /// Bounds the wait for a daemon that said it is shutting down to really go.
     stopping_timer: Timer,
+    /// Asks for the state again while the daemon says it is still starting (right after
+    /// it came up, for example on the new version after an update).
+    starting_timer: Timer,
+    starting_attempts: Cell<u32>,
     /// The device and consent token behind the notice that asks to send a marked clip
     /// (SR-24). Set only by [`Controller::ask_consent`] and cleared whenever that notice is
     /// replaced, times out or is dismissed, so a press counts as consent only while the
@@ -93,6 +101,8 @@ pub fn install(app: &App, ipc: Arc<Ipc>) {
         start_timer: Timer::default(),
         start_attempts: Cell::new(0),
         stopping_timer: Timer::default(),
+        starting_timer: Timer::default(),
+        starting_attempts: Cell::new(0),
         consent: RefCell::new(None),
         update_asked: Cell::new(false),
     });
@@ -178,13 +188,14 @@ impl Controller {
             self.ipc.request(Request::Status, |r| {
                 with(|c| match r {
                     Result::Ok(Ok::Status(s)) => {
+                        c.starting_attempts.set(0);
                         c.store.borrow_mut().set_status(s);
                         refresh_input_banner(c);
                         settings::refresh(c);
                         update::refresh(c);
                         pairing::refresh_lock(c);
                     }
-                    other => c.report("Could not read the daemon status", other),
+                    other => c.load_failed("Could not read the daemon status", other),
                 });
             });
         }
@@ -195,7 +206,7 @@ impl Controller {
                         c.store.borrow_mut().set_transfers(t);
                         transfers::refresh_all(c);
                     }
-                    other => c.report("Could not list transfers", other),
+                    other => c.load_failed("Could not list transfers", other),
                 });
             });
         }
@@ -211,9 +222,28 @@ impl Controller {
                     devices::refresh_all(c);
                     transfers::refresh_all(c);
                 }
-                other => c.report("Could not list devices", other),
+                other => c.load_failed("Could not list devices", other),
             });
         });
+    }
+
+    /// A state request failed. A daemon that has just come up answers that it is
+    /// starting (`InvalidState`) until its host runs: that is not an error to
+    /// show, so everything is asked for again shortly, a bounded number of times.
+    fn load_failed(&self, what: &str, result: Result<Ok, IpcError>) {
+        let starting = matches!(&result, Result::Err(e) if e.code == ErrorCode::InvalidState);
+        if !starting || self.starting_attempts.get() >= STARTING_RETRIES {
+            self.report(what, result);
+            return;
+        }
+        // One timer for the three requests of a load: starting it again only moves it.
+        if !self.starting_timer.running() {
+            self.starting_attempts.set(self.starting_attempts.get() + 1);
+        }
+        self.starting_timer
+            .start(TimerMode::SingleShot, STARTING_RETRY_EVERY, || {
+                with(|c| c.load(Refetch::All));
+            });
     }
 
     fn apply_changes(&self, changes: Vec<Change>) {

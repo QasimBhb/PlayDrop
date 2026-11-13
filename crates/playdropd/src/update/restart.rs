@@ -58,17 +58,42 @@ pub fn plan() -> Plan {
     std::fs::read_to_string("/proc/self/cgroup").map_or(Plan::Exec, |c| plan_for(&c))
 }
 
+/// What `systemctl` ending means for the restart it was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Asked {
+    /// Systemd took the restart: it stops this process and starts the new binary.
+    Accepted,
+    /// Systemd refused; the caller falls back to [`Plan::Exec`].
+    Refused,
+}
+
+/// Reads how `systemctl restart` ended: `code` is its exit code, `None` when a signal
+/// ended it.
+///
+/// `systemctl` runs as a child of the daemon, so it lives in the unit's own cgroup, and
+/// stopping a unit signals every process in that cgroup. A `systemctl` ended by a signal
+/// is therefore the restart under way, not a refusal: systemd only signals the cgroup
+/// once it has taken the job. Reading it as a refusal made the daemon `exec` itself in
+/// the middle of systemd's stop (seen on the first real update, 0.11.0 to 0.12.0: the unit
+/// sat in "deactivating" until the stop timeout).
+pub fn asked(code: Option<i32>) -> Asked {
+    match code {
+        Some(0) | None => Asked::Accepted,
+        Some(_) => Asked::Refused,
+    }
+}
+
 /// Asks systemd to restart the unit, without waiting for it (systemd stops this process
-/// as part of the restart). Returns `false` when `systemctl` could not be started, so the
-/// caller falls back to [`Plan::Exec`].
+/// as part of the restart). Returns `false` when `systemctl` could not be started or
+/// refused, so the caller falls back to [`Plan::Exec`].
 pub fn ask_systemd() -> bool {
     let started = std::process::Command::new("/usr/bin/systemctl")
         .args(["--user", "--no-block", "restart", SYSTEMD_UNIT])
         .stdin(std::process::Stdio::null())
         .status();
     match started {
-        Ok(status) if status.success() => {
-            tracing::info!("asked systemd to restart {SYSTEMD_UNIT} on the new version");
+        Ok(status) if asked(status.code()) == Asked::Accepted => {
+            tracing::info!(code = ?status.code(), "asked systemd to restart {SYSTEMD_UNIT} on the new version");
             true
         }
         Ok(status) => {
@@ -107,6 +132,14 @@ pub fn exec_new_daemon() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_systemctl_ended_by_the_units_own_stop_is_not_a_refusal() {
+        assert_eq!(asked(Some(0)), Asked::Accepted);
+        assert_eq!(asked(None), Asked::Accepted);
+        assert_eq!(asked(Some(1)), Asked::Refused);
+        assert_eq!(asked(Some(5)), Asked::Refused);
+    }
 
     #[test]
     fn the_systemd_unit_is_recognised_from_its_cgroup() {
