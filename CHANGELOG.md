@@ -8,6 +8,15 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.16.1] - 2026-11-14
+
+### Fixed
+
+- Windows: the PlayDrop window showed the generic program icon in the top left corner of its
+  title bar. It now shows the PlayDrop icon there, taken from the program file like the
+  taskbar and Start menu icons. The same fault kept the icon off the window on Linux desktops
+  that use X11.
+
 ## [0.16.0] - 2026-11-14
 
 ### Added

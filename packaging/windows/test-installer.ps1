@@ -27,7 +27,8 @@
 #     for anyone to close an error box;
 #   - /RELAUNCH=1 (what the update check passes when the window was open) starts the daemon
 #     and the window again after a silent install, and the window connects;
-#     /RELAUNCH=daemon starts the daemon only.
+#     /RELAUNCH=daemon starts the daemon only;
+#   - the open window has its own title bar icon (0.16.0 showed the generic one).
 # What it cannot prove: anything that needs a person at the screen (the wizard pages,
 # SmartScreen, the tray menu, what the window looks like).
 
@@ -148,6 +149,34 @@ public static extern uint ExtractIconEx(string file, int index, IntPtr large, In
 '@
 function Get-IconGroupCount([string]$Path) {
     return [int][PlayDropTest.Shell]::ExtractIconEx($Path, -1, [IntPtr]::Zero, [IntPtr]::Zero, 0)
+}
+
+# Whether an open window of the installed PlayDrop.exe has its own title bar icon. A window
+# without one answers WM_GETICON with 0 and Windows draws the generic program icon there,
+# which is what 0.16.0 showed. The icon is set just after the window is created, so this
+# waits a little for it.
+Add-Type -Namespace PlayDropTest -Name User -MemberDefinition @'
+[DllImport("user32.dll")]
+public static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr w, IntPtr l, uint flags, uint milliseconds, out IntPtr result);
+'@
+function Test-WindowHasIcon([int]$Seconds) {
+    $WM_GETICON = 0x7F
+    $ICON_SMALL = 0
+    $SMTO_ABORTIFHUNG = 0x2
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    do {
+        foreach ($process in Get-WindowProcesses) {
+            $process.Refresh()
+            $handle = $process.MainWindowHandle
+            if ($handle -eq [IntPtr]::Zero) { continue }
+            $icon = [IntPtr]::Zero
+            $sent = [PlayDropTest.User]::SendMessageTimeout($handle, $WM_GETICON,
+                [IntPtr]$ICON_SMALL, [IntPtr]::Zero, $SMTO_ABORTIFHUNG, 2000, [ref]$icon)
+            if (($sent -ne [IntPtr]::Zero) -and ($icon -ne [IntPtr]::Zero)) { return $true }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+    return $false
 }
 
 # The System.AppUserModel.ID property of a shortcut, read through the Shell, or '' when the
@@ -544,6 +573,7 @@ try {
             $connected = Wait-ForLog $WindowLog 'connected to the daemon' 30
             Check 'the installed window logs that it connected to the daemon within 30 s' $connected
             Check 'the installed window is still running after it connected' ((Get-WindowRunning) -ge 1)
+            Check 'the open window has its own title bar icon' (Test-WindowHasIcon 15)
         }
     } finally {
         Stop-PlayDrop

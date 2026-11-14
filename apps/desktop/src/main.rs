@@ -147,7 +147,7 @@ fn run() -> anyhow::Result<()> {
     if let Err(e) = slint::set_xdg_app_id(APP_ID) {
         tracing::warn!("could not set the app ID: {e}");
     }
-    app.set_app_icon(icon::image());
+    icon::install(&app);
     if let Some(page) = page_from_args() {
         app.global::<Nav>().set_page(page);
     }
