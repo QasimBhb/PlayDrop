@@ -72,7 +72,11 @@ abstract class GenerateBindingsTask : CargoTask() {
     @TaskAction
     fun generate() {
         cargo(*(listOf("build", "-p", "playdrop-ffi") + featureArgs(features.get())).toTypedArray())
-        val hostLib = workspace.get().asFile.resolve("target/debug/libplaydrop_ffi.so")
+        // Cargo writes to CARGO_TARGET_DIR when it is set; reading the repo's own `target/`
+        // then would bind a stale library from an earlier build.
+        val targetDir = System.getenv("CARGO_TARGET_DIR")?.takeIf { it.isNotBlank() }?.let { File(it) }
+            ?: workspace.get().asFile.resolve("target")
+        val hostLib = targetDir.resolve("debug/libplaydrop_ffi.so")
         cargo(
             "run", "-p", "uniffi-bindgen", "--", "generate",
             "--library", hostLib.absolutePath,

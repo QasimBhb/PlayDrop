@@ -110,6 +110,9 @@ and offers **Update**. On the `.deb`, Windows and Android that downloads the new
 its signature, installs it (your system asks for your password or permission) and starts
 PlayDrop again. `playdrop update --install` does the same from a terminal
 ([cli.md](cli.md)). The Flatpak and the iPhone app only show a notice with the release page.
+From 0.16.0 the Flatpak's notice also names the file to download and shows the command to run
+in the folder you saved it to, with a **Copy** button:
+`flatpak install --user ./playdrop-<version>-linux-x86_64.flatpak`.
 
 By hand:
 

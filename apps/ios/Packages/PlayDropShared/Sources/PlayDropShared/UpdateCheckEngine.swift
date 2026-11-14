@@ -47,6 +47,15 @@ public final class UpdateCheckEngine {
     private let now: @Sendable () -> UInt64
     private var running = false
 
+    /// Why this version has no update check (the core's sentence), or nil when it has one.
+    /// A version the core does not call a plain release never contacts GitHub. An unknown
+    /// version is not decided here: the check fails as before.
+    public var notAReleaseText: String? {
+        guard let currentVersion, !currentVersion.isEmpty,
+              !rules.checkAvailable(currentVersion) else { return nil }
+        return rules.notAReleaseText
+    }
+
     /// True while a check is on its way.
     public var isRunning: Bool { running }
 
@@ -68,7 +77,7 @@ public final class UpdateCheckEngine {
 
     /// Runs a check for `trigger`; see `UpdateCheckOutcome`.
     public func run(_ trigger: UpdateCheckTrigger) async -> UpdateCheckOutcome {
-        guard storage.isEnabled, !running else { return .skipped }
+        guard storage.isEnabled, !running, notAReleaseText == nil else { return .skipped }
         if trigger == .opened,
            !rules.isDue(storage.lastAnswerMs, storage.lastFailureMs, now()) {
             return .skipped

@@ -54,6 +54,11 @@ public struct UpdateCheckRules: Sendable {
     public var isDue: @Sendable (_ lastAnswerMs: UInt64?, _ lastFailureMs: UInt64?, _ nowMs: UInt64) -> Bool
     /// Whether a redirect may go to this address.
     public var redirectAllowed: @Sendable (_ url: String) -> Bool
+    /// Whether this app version has an update check at all. The core's rule: only a plain
+    /// release version does, so a pre-release or test build never contacts GitHub.
+    public var checkAvailable: @Sendable (_ currentVersion: String) -> Bool
+    /// The sentence Settings shows when `checkAvailable` says no.
+    public var notAReleaseText: String
     /// Verifies the two files and says whether `currentVersion` is older; throws when they do
     /// not verify.
     public var decide: @Sendable (_ sums: Data, _ sig: Data, _ currentVersion: String) throws -> UpdateOfferInfo?
@@ -69,7 +74,9 @@ public struct UpdateCheckRules: Sendable {
         timeout: TimeInterval,
         isDue: @escaping @Sendable (UInt64?, UInt64?, UInt64) -> Bool,
         redirectAllowed: @escaping @Sendable (String) -> Bool,
-        decide: @escaping @Sendable (Data, Data, String) throws -> UpdateOfferInfo?
+        decide: @escaping @Sendable (Data, Data, String) throws -> UpdateOfferInfo?,
+        checkAvailable: @escaping @Sendable (String) -> Bool = { _ in true },
+        notAReleaseText: String = ""
     ) {
         self.sumsURL = sumsURL
         self.sigURL = sigURL
@@ -81,6 +88,8 @@ public struct UpdateCheckRules: Sendable {
         self.isDue = isDue
         self.redirectAllowed = redirectAllowed
         self.decide = decide
+        self.checkAvailable = checkAvailable
+        self.notAReleaseText = notAReleaseText
     }
 }
 

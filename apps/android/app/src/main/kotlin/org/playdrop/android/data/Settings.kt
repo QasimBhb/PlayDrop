@@ -42,6 +42,12 @@ object Settings {
         val updateLaterVersion: String? = null,
         /** When the user answered "Later", Unix milliseconds, or null. */
         val updateLaterAtMs: Long? = null,
+        /**
+         * Keep a list of the last sends from this phone (the "Sent" history on the Transfers
+         * tab). On until the user turns it off, which also clears it. Clipboard sends are
+         * never listed.
+         */
+        val keepSendHistory: Boolean = true,
     )
 
     /** Trackpad speed used until the user picks one. */

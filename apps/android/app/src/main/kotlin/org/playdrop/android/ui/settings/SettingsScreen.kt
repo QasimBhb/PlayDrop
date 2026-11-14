@@ -90,6 +90,7 @@ data class UpdateRows(
     val upToDate: Boolean = false,
     /** False for a build that is not a plain release: no switch, no "Check now". */
     val available: Boolean = true,
+    val notReleaseText: String = "",
 )
 
 /** The Settings tab wired to its view model, the update check and the system settings screens. */
@@ -122,12 +123,14 @@ fun SettingsRoute(
             checking = updateState is UpdateState.Checking,
             upToDate = updateState is UpdateState.UpToDate,
             available = updateSettings.available,
+            notReleaseText = updateSettings.notReleaseText,
         ),
         actions = SettingsActions(
             onSaveName = vm::saveName,
             onSavePort = vm::savePort,
             onSetDefault = vm::setDefault,
             onAutoClipboard = vm::setAutoClipboard,
+            onKeepSendHistory = vm::setKeepSendHistory,
             onBattery = {
                 vm.markBatteryPromptShown()
                 if (!requestBatteryExemption(context)) showMessage(context.getString(R.string.ui_settings_battery_unavailable))
@@ -154,6 +157,7 @@ data class SettingsActions(
     val onSetDefault: (String?) -> Unit = {},
     /** Toggle clipboard auto-push. */
     val onAutoClipboard: (Boolean) -> Unit = {},
+    val onKeepSendHistory: (Boolean) -> Unit = {},
     /** Ask for the battery exemption (only from this tap, anti-pattern 14). */
     val onBattery: () -> Unit = {},
     /** Ask for the notification permission. */
@@ -210,6 +214,14 @@ fun SettingsScreen(state: SettingsUiState, platform: PlatformState, actions: Set
                 headlineContent = { Text(stringResource(R.string.ui_settings_auto_clipboard)) },
                 supportingContent = { Text(stringResource(R.string.ui_settings_auto_clipboard_hint)) },
                 trailingContent = { Switch(checked = values.autoClipboard, onCheckedChange = actions.onAutoClipboard) },
+            )
+
+            HorizontalDivider()
+            SectionTitle(stringResource(R.string.ui_settings_history))
+            ListItem(
+                headlineContent = { Text(stringResource(R.string.ui_settings_keep_history)) },
+                supportingContent = { Text(stringResource(R.string.ui_settings_keep_history_hint)) },
+                trailingContent = { Switch(checked = values.keepSendHistory, onCheckedChange = actions.onKeepSendHistory) },
             )
 
             HorizontalDivider()
@@ -329,7 +341,7 @@ fun SettingsScreen(state: SettingsUiState, platform: PlatformState, actions: Set
 private fun UpdateSection(update: UpdateRows, actions: SettingsActions) {
     SectionTitle(stringResource(R.string.update_settings_title))
     if (!update.available) {
-        ListItem(headlineContent = { Text(stringResource(R.string.update_settings_not_release)) })
+        ListItem(headlineContent = { Text(update.notReleaseText) })
         return
     }
     ListItem(

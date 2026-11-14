@@ -23,6 +23,8 @@ data class UpdateSettingsState(
     val lastCheckedMs: Long? = null,
     /** False for a build that is not a plain release: it never checks. */
     val available: Boolean = true,
+    /** The core's sentence shown when [available] is false. */
+    val notReleaseText: String = "",
 )
 
 /**
@@ -50,7 +52,7 @@ class UpdateViewModel(application: Application) : AndroidViewModel(application) 
 
     /** The Settings rows. */
     val settings: StateFlow<UpdateSettingsState> = Settings.flow(application)
-        .map { UpdateSettingsState(it.updateCheck, it.updateLastAnswerMs, controller.checksAvailable) }
+        .map { UpdateSettingsState(it.updateCheck, it.updateLastAnswerMs, controller.checksAvailable, controller.notReleaseText) }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), UpdateSettingsState())
 
     init {

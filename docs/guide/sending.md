@@ -71,3 +71,11 @@ slow if they land there directly. Version 0.2.0 changes this: PlayDrop first put
 files in its own folder on the phone, then moves them into Downloads in the background. The
 notification shows the progress. Version 0.1.0 does not do this and arrives at about 2 MiB/s
 with 5,000 small files.
+
+## What you sent (Android)
+
+From 0.16.0 the Transfers tab on Android lists the last 50 sends made from the phone: the
+device, the time, the size, the first few file names and whether it arrived, failed or was
+cancelled. A send that failed but will carry on by itself says so. The list stays on the phone,
+is left out of backups, and never holds anything from the clipboard. **Clear history** empties
+it, and **Keep a history of what I send** in Settings turns it off and empties it.

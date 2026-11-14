@@ -1620,6 +1620,7 @@ fn available(version: &str) -> UpdateStatus {
             page_url: "https://example.invalid/r".into(),
             can_install: true,
             reason: None,
+            command: None,
         },
     })
 }

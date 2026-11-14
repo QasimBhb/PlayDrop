@@ -157,7 +157,7 @@ impl Controller {
             IpcMsg::Connected => self.on_connected(),
             IpcMsg::ConnectFailed(f) => connection::on_connect_failed(self, &f),
             IpcMsg::Event(e) => {
-                let changes = self.store.borrow_mut().apply(e, model::unix_now());
+                let changes = self.store.borrow_mut().apply(*e, model::unix_now());
                 self.apply_changes(changes);
             }
             IpcMsg::Lagged => self.load(Refetch::All),

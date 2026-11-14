@@ -114,6 +114,7 @@ pub(super) fn refresh(c: &Controller) {
     u.set_banner_visible(banner.visible);
     u.set_banner_text(banner.text.into());
     u.set_banner_detail(banner.detail.into());
+    u.set_banner_command(banner.command.into());
     u.set_banner_error(banner.error);
     u.set_primary_text(banner.primary.into());
     u.set_show_later(banner.later);

@@ -94,6 +94,7 @@ fun DeviceDetailRoute(
             onOpenInput = onOpenInput,
             onMedia = vm::mediaCommand,
             onSystemVolume = vm::setSystemVolume,
+            onSystemMute = vm::setSystemMuted,
             onOpenPermissions = onOpenPermissions,
             send = SendCallbacks(
                 onPicked = vm::sendFiles,
@@ -131,6 +132,8 @@ data class DeviceDetailActions(
     val onMedia: (String, MediaAction, Long?) -> Unit = { _, _, _ -> },
     /** Set the computer's master volume, 0 to 100. */
     val onSystemVolume: (Long) -> Unit = {},
+    /** Mute (true) or unmute (false) the computer. */
+    val onSystemMute: (Boolean) -> Unit = {},
     /** Open the Permissions page. */
     val onOpenPermissions: () -> Unit = {},
     /** The send buttons and their confirmation. */
@@ -259,7 +262,7 @@ fun DeviceDetailScreen(state: DeviceDetailUiState, actions: DeviceDetailActions)
             if (state.systemVolume != null || state.media.isNotEmpty()) {
                 HorizontalDivider()
                 // The computer volume works with or without a running player, so it comes first.
-                state.systemVolume?.let { SystemVolumeCard(it, actions.onSystemVolume) }
+                state.systemVolume?.let { SystemVolumeCard(it, actions.onSystemVolume, actions.onSystemMute) }
                 if (state.media.isNotEmpty()) {
                     SectionTitle(stringResource(R.string.ui_media_title))
                     // realPlayers again so the reserved entry can never become a card.

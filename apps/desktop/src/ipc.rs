@@ -50,8 +50,8 @@ pub enum IpcMsg {
     Connected,
     /// Connecting failed.
     ConnectFailed(ConnectFailure),
-    /// A daemon event.
-    Event(Event),
+    /// A daemon event, boxed: it is many times larger than the other messages.
+    Event(Box<Event>),
     /// The window fell behind the event stream; reload everything.
     Lagged,
     /// The daemon went away.
@@ -347,7 +347,7 @@ impl Ipc {
         let deliver = self.deliver;
         while let Some(item) = events.next().await {
             match item {
-                Result::Ok(event) => post(move || deliver(IpcMsg::Event(event))),
+                Result::Ok(event) => post(move || deliver(IpcMsg::Event(Box::new(event)))),
                 Result::Err(BroadcastStreamRecvError::Lagged(n)) => {
                     tracing::warn!("window fell {n} events behind; reloading");
                     post(move || deliver(IpcMsg::Lagged));

@@ -1,7 +1,7 @@
 // PlayDrop desktop window. A thin client of playdropd: every screen reads a global that
 // the Rust controller fills from the IPC, and every action is a callback into Rust.
 
-import { TabWidget, Button, Palette } from "std-widgets.slint";
+import { TabWidget, Button, LineEdit, Palette } from "std-widgets.slint";
 import { ConnPhase, HelpFocus } from "types.slint";
 import { Nav, ConnState, NoticeState, InputState, DevicesState, PairingState, TransfersState, SettingsState, DiagnosticsState, HelpState, UpdateUi } from "globals.slint";
 import { ConnectionScreen } from "connection.slint";
@@ -98,6 +98,27 @@ component UpdateBanner inherits Rectangle {
                 opacity: 0.8;
                 font-size: 12px;
                 wrap: word-wrap;
+            }
+
+            // Read-only, so it can be selected; "Copy" puts all of it on the clipboard.
+            if UpdateUi.banner-command != "": HorizontalLayout {
+                spacing: 8px;
+                command-field := LineEdit {
+                    text: UpdateUi.banner-command;
+                    read-only: true;
+                    font-size: 12px;
+                    horizontal-stretch: 1;
+                    accessible-label: "Command to install the update";
+                }
+
+                Button {
+                    text: "Copy";
+                    accessible-label: "Copy the command";
+                    clicked => {
+                        command-field.select-all();
+                        command-field.copy();
+                    }
+                }
             }
 
             if UpdateUi.show-link: Text {

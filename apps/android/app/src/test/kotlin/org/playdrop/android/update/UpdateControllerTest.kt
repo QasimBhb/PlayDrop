@@ -93,6 +93,7 @@ class UpdateControllerTest {
         assertEquals(0, net.requests.size)
         assertTrue(decided.isEmpty())
         assertEquals(false, controller.checksAvailable)
+        assertEquals("not a release", controller.notReleaseText)
         assertEquals(UpdateState.Idle, controller.state.value)
     }
 
@@ -320,6 +321,11 @@ class UpdateControllerTest {
         }
 
         override fun assetMatches(asset: UpdateAsset, sha256: ByteArray) = hex(sha256) == asset.sha256Hex
+
+        /** Stands in for the core's rule: a pre-release name has a dash. */
+        override fun checkAvailable(currentVersion: String) = '-' !in currentVersion
+
+        override fun notReleaseText() = "not a release"
     }
 
     private class FakeInstaller : UpdateInstaller {

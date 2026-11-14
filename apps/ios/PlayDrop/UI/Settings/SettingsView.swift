@@ -148,11 +148,13 @@ struct SettingsView: View {
                     }
                 }
             }
-            .disabled(!settings.updateCheckEnabled || updates.checking)
+            .disabled(!settings.updateCheckEnabled || updates.checking || updates.notAReleaseText != nil)
             LabeledContent(L10n.Update.lastChecked) {
                 Text(verbatim: lastCheckedText)
             }
-            if let line = Self.statusLine(updates.presentation.manualStatus) {
+            if let text = updates.notAReleaseText {
+                Text(text).font(.footnote).foregroundStyle(.secondary)
+            } else if let line = Self.statusLine(updates.presentation.manualStatus) {
                 Text(line).font(.footnote).foregroundStyle(.secondary)
             }
         } header: {

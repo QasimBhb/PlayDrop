@@ -7,7 +7,7 @@
 //! minute; each host sends and handles only its role's ops and announces the capability
 //! only with a role (protocol.md section 4), which still works with a 0.10.0 peer that
 //! listed it in both lists and handled every op; and an over-limit field is answered with
-//! `bad_request`.
+//! `bad_request` while the connection keeps working.
 
 mod common;
 
@@ -522,24 +522,66 @@ async fn removed_and_dismiss_are_rate_limited_per_connection() {
     desk.host.shutdown().await;
 }
 
-/// A field over its limit (5.16) is refused with `error` `bad_request`, which names the
-/// frame, and the notification is not shown.
+/// A field over its limit (5.16: `app` 64 bytes, `title` 256, `text` 1 KiB) sent across a
+/// real loopback session, as an older or hostile phone would, is refused with `error`
+/// `bad_request` that names the frame, reaches nothing on the desktop, and leaves the
+/// connection up: a valid `posted` right after it, with every field exactly at its limit,
+/// still arrives. The limits count bytes, not characters.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_field_over_its_limit_is_refused_with_bad_request() {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scripted exchange, read top to bottom"
+)]
+async fn a_field_over_its_limit_is_refused_and_the_connection_survives() {
+    use playdrop_core::session::types::{
+        NOTIFICATION_APP_MAX, NOTIFICATION_TEXT_MAX, NOTIFICATION_TITLE_MAX,
+    };
+
     common::init_logs();
     let root = temp_root();
     let mut phone = start_role(root.path(), "phone", NotificationRole::Source).await;
     let mut desk = start_role(root.path(), "desk", NotificationRole::Sink).await;
     pair(&mut phone, &mut desk).await;
-    let desk_id = desk.host.device_id();
-    let key = phone.host.notification_key("0|big|1|null|10123");
-    let too_long = [
-        ("a".repeat(65), String::new(), String::new()),
-        ("A".into(), "t".repeat(257), String::new()),
-        ("A".into(), String::new(), "x".repeat(1025)),
+    let (phone_id, desk_id) = (phone.host.device_id(), desk.host.device_id());
+    set(&phone, &desk_id, |g| g.notifications_out = true).await;
+    // Pairing's own online and offline events are not part of what is checked below.
+    barrier(&phone, &mut desk, "paired").await;
+    barrier(&desk, &mut phone, "paired").await;
+    phone.events.clear();
+    desk.events.clear();
+
+    // Each case is one byte over one limit; the last is 129 two-byte characters, which is
+    // under 256 characters but 258 bytes.
+    let cases = [
+        (
+            "app",
+            "a".repeat(NOTIFICATION_APP_MAX + 1),
+            "t".to_owned(),
+            String::new(),
+        ),
+        (
+            "title",
+            "A".to_owned(),
+            "t".repeat(NOTIFICATION_TITLE_MAX + 1),
+            String::new(),
+        ),
+        (
+            "text",
+            "A".to_owned(),
+            "t".to_owned(),
+            "x".repeat(NOTIFICATION_TEXT_MAX + 1),
+        ),
+        (
+            "title in bytes",
+            "A".to_owned(),
+            "\u{e9}".repeat(129),
+            String::new(),
+        ),
     ];
-    for (app, title, text) in too_long {
-        phone.events.clear();
+    for (n, (what, app, title, text)) in cases.into_iter().enumerate() {
+        let key = phone
+            .host
+            .notification_key(&format!("0|big|{n}|null|10123"));
         assert!(phone.host.send_frame_for_test(
             &desk_id,
             Frame::Notification(Notification::Posted(NotificationPosted {
@@ -556,16 +598,72 @@ async fn a_field_over_its_limit_is_refused_with_bad_request() {
             .wait_for(T, |e| matches!(e, HostEvent::PeerRefused { .. }))
             .await;
         let HostEvent::PeerRefused {
-            code, frame_type, ..
+            peer,
+            code,
+            frame_type,
+            message,
         } = ev
         else {
             unreachable!()
         };
-        assert_eq!(code, "bad_request");
-        assert_eq!(frame_type.as_deref(), Some("notification"));
+        assert_eq!(peer, desk_id.to_hex(), "{what}");
+        assert_eq!(code, "bad_request", "{what}");
+        assert_eq!(frame_type.as_deref(), Some("notification"), "{what}");
+        assert_eq!(
+            message.as_deref(),
+            Some("notification field over its limit"),
+            "{what}"
+        );
+
+        // Everything the phone sent before the ping has been handled by the desktop, and
+        // none of it reached the desktop's event stream.
+        barrier(&phone, &mut desk, &format!("after {what}")).await;
+        assert!(
+            !desk.events.seen.iter().any(|e| matches!(
+                e,
+                HostEvent::NotificationPosted { .. }
+                    | HostEvent::NotificationRemoved { .. }
+                    | HostEvent::NotificationDismiss { .. }
+            )),
+            "{what}: an over-limit frame reached the desktop"
+        );
+
+        // The same connection still carries a valid `posted`, every field at its limit.
+        let ok = MirroredNotification {
+            key: key.clone(),
+            app: "a".repeat(NOTIFICATION_APP_MAX),
+            title: format!("ok after {what}")
+                .chars()
+                .chain(std::iter::repeat('t'))
+                .take(NOTIFICATION_TITLE_MAX)
+                .collect(),
+            text: "\u{e9}".repeat(NOTIFICATION_TEXT_MAX / 2),
+            when_ms: 1_762_900_000_000,
+        };
+        phone.host.send_notification(&desk_id, ok.clone()).unwrap();
+        let ev = desk
+            .events
+            .wait_for(T, |e| matches!(e, HostEvent::NotificationPosted { .. }))
+            .await;
+        let HostEvent::NotificationPosted { peer, notification } = ev else {
+            unreachable!()
+        };
+        assert_eq!(peer, phone_id.to_hex(), "{what}");
+        assert_eq!(notification, ok, "{what}: the valid frame was changed");
+
+        // No reconnect happened on either side: it was the same connection throughout.
+        for (side, h) in [("phone", &mut phone), ("desk", &mut desk)] {
+            h.events.drain();
+            assert!(
+                !h.events.seen.iter().any(|e| matches!(
+                    e,
+                    HostEvent::PeerOffline { .. } | HostEvent::PeerOnline { .. }
+                )),
+                "{what}: the {side} saw the connection drop"
+            );
+            h.events.clear();
+        }
     }
-    barrier(&phone, &mut desk, "after-big").await;
-    assert_eq!(posted_titles(&desk), Vec::<String>::new());
 
     phone.host.shutdown().await;
     desk.host.shutdown().await;

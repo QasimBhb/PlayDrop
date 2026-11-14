@@ -706,6 +706,8 @@ pub enum MediaAction {
     Seek,
     /// Set volume to `value` (0 to 100).
     Volume,
+    /// Mute (`value` 1) or unmute (`value` 0). Since ffi 0.7.0.
+    Mute,
     /// An action this build does not know (the wire keeps unknown values, protocol.md 4).
     Other,
 }
@@ -721,6 +723,7 @@ impl From<MediaAction> for wire::MediaAction {
             MediaAction::Previous => Self::Previous,
             MediaAction::Seek => Self::Seek,
             MediaAction::Volume => Self::Volume,
+            MediaAction::Mute => Self::Mute,
             MediaAction::Other => Self::Unknown("other".to_owned()),
         }
     }
@@ -737,6 +740,7 @@ impl From<wire::MediaAction> for MediaAction {
             wire::MediaAction::Previous => Self::Previous,
             wire::MediaAction::Seek => Self::Seek,
             wire::MediaAction::Volume => Self::Volume,
+            wire::MediaAction::Mute => Self::Mute,
             wire::MediaAction::Unknown(_) => Self::Other,
         }
     }
@@ -765,6 +769,8 @@ pub struct MediaState {
     pub position_at_ms: Option<u64>,
     /// Volume 0 to 100.
     pub volume: Option<u8>,
+    /// Whether the output is muted; `None` when the player cannot tell. Since ffi 0.7.0.
+    pub muted: Option<bool>,
     /// Supported actions.
     pub can: Vec<MediaAction>,
 }
@@ -782,6 +788,7 @@ impl From<MediaState> for host::MediaState {
             position_ms: m.position_ms,
             position_at_ms: m.position_at_ms,
             volume: m.volume,
+            muted: m.muted,
             can: m.can.into_iter().map(Into::into).collect(),
         }
     }
@@ -800,6 +807,7 @@ impl From<host::MediaState> for MediaState {
             position_ms: m.position_ms,
             position_at_ms: m.position_at_ms,
             volume: m.volume,
+            muted: m.muted,
             can: m.can.into_iter().map(Into::into).collect(),
         }
     }

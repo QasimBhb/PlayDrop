@@ -229,6 +229,8 @@ wire_enum! {
         Seek => "seek",
         /// `volume`, `value` is 0 to 100.
         Volume => "volume",
+        /// `mute`, `value` is 1 to mute and 0 to unmute (v0.16.0).
+        Mute => "mute",
     }
 }
 
@@ -648,6 +650,9 @@ pub struct MediaStateFrame {
     /// Volume, 0 to 100.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
+    /// Whether the output is muted (v0.16.0). Absent when the sender cannot tell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub muted: Option<bool>,
     /// Actions the player supports.
     #[serde(default)]
     pub can: Vec<MediaAction>,

@@ -8,6 +8,12 @@
         <item quantity="one">Sending %1$d file to %2$s</item>
         <item quantity="other">Sending %1$d files to %2$s</item>
     </plurals>
+    <plurals name="ui_send_done">
+        <item quantity="one">Sent %1$d file to %2$s</item>
+        <item quantity="other">Sent %1$d files to %2$s</item>
+    </plurals>
+    <string name="ui_send_failed">Sending to %1$s failed</string>
+    <string name="ui_send_cancelled">Sending to %1$s was cancelled</string>
     <string name="ui_send_offline">%1$s is offline. PlayDrop keeps trying for 10 minutes.</string>
     <string name="ui_send_progress">See progress</string>
     <string name="ui_send_dismiss">Dismiss</string>

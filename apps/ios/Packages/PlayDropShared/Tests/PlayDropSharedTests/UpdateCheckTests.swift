@@ -40,6 +40,7 @@ private let pageURL = "https://example.test/releases/tag/v0.11.0"
 private func rules(
     due: Bool = true,
     maxRedirects: Int = 2,
+    checkAvailable: @escaping @Sendable (String) -> Bool = { _ in true },
     decide: @escaping @Sendable (Data, Data, String) throws -> UpdateOfferInfo? = { _, _, _ in nil }
 ) -> UpdateCheckRules {
     UpdateCheckRules(
@@ -52,7 +53,9 @@ private func rules(
         timeout: 15,
         isDue: { _, _, _ in due },
         redirectAllowed: { $0.hasPrefix("https://objects.example.test/") },
-        decide: decide
+        decide: decide,
+        checkAvailable: checkAvailable,
+        notAReleaseText: "This is a test build."
     )
 }
 
@@ -204,6 +207,32 @@ final class UpdateCheckEngineTests: XCTestCase {
         UpdateCheckEngine(
             rules: rules, transport: transport, storage: storage, currentVersion: version, now: { now }
         )
+    }
+
+    func testNotAReleaseNeverAsksAndShowsTheCoreSentence() async {
+        let storage = MemoryStorage()
+        let transport = ScriptedTransport(happyScript())
+        let e = engine(
+            rules: rules(checkAvailable: { $0 == "0.10.0" }),
+            transport: transport, storage: storage, version: "0.11.0-dev"
+        )
+        XCTAssertEqual(e.notAReleaseText, "This is a test build.")
+        let manual = await e.run(.manual)
+        let opened = await e.run(.opened)
+        XCTAssertEqual(manual, .skipped)
+        XCTAssertEqual(opened, .skipped)
+        let sent = await transport.requests
+        XCTAssertTrue(sent.isEmpty, "nothing is sent for a pre-release")
+        XCTAssertNil(storage.lastAnswerMs)
+        XCTAssertNil(storage.lastFailureMs)
+    }
+
+    func testAReleaseVersionHasNoNotAReleaseText() {
+        let e = engine(
+            rules: rules(checkAvailable: { $0 == "0.10.0" }),
+            transport: ScriptedTransport([:]), storage: MemoryStorage(), version: "0.10.0"
+        )
+        XCTAssertNil(e.notAReleaseText)
     }
 
     func testAnOfferIsReturnedAndTheAnswerTimeRemembered() async {

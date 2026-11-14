@@ -8,6 +8,7 @@ import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.core.CoreHostImpl
 import org.playdrop.android.core.HostLog
+import org.playdrop.android.core.SendHistoryLog
 import org.playdrop.android.core.UriSource
 import org.playdrop.android.data.Settings
 import org.playdrop.core.HostEvent
@@ -46,6 +47,7 @@ internal fun startFileSends(
             try {
                 val id = CoreHost.withHost { it.send(peer, share.sources, null) }
                 share.attachTo(id)
+                SendHistoryLog.noteSend(app, id, peer, share.names, share.sources.size, share.totalBytes)
                 HostLog.i("share", "transfer ${id.take(8)} started: ${share.sources.size} items, ${share.totalBytes} bytes")
                 id
             } catch (e: Exception) {

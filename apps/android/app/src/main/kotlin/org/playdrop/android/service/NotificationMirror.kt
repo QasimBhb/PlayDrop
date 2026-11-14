@@ -15,6 +15,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.core.HostLog
+import org.playdrop.android.ui.mirror.MirrorAppsPrune
 import org.playdrop.android.data.Settings
 import org.playdrop.core.MirroredNotification
 
@@ -61,12 +62,28 @@ internal object NotificationMirror {
     fun hasAccess(context: Context): Boolean =
         NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
 
+    /** Packages with a notification on screen now; empty while access is off or the list cannot be read. */
+    fun activePackages(): Set<String> = try {
+        listener?.activeNotifications?.mapTo(HashSet()) { it.packageName }.orEmpty()
+    } catch (e: SecurityException) {
+        emptySet()
+    }
+
     /** The listener is bound: notifications start flowing, and online peers get the current set. */
     fun connected(service: MirrorListener) {
         listener = service
         HostLog.i("mirror", "notification access on")
         val app = service.applicationContext
         queue.trySend {
+            // Uninstalled apps leave the allow list before anything is sent.
+            // It must never stop the queue that carries every mirrored notification.
+            try {
+                MirrorAppsPrune.run(app)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                HostLog.w("mirror", "pruning the allow list failed: ${e.javaClass.simpleName}")
+            }
             for (peer in eligiblePeers()) resync(app, peer)
         }
     }

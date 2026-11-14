@@ -38,6 +38,8 @@ import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import org.playdrop.android.R
+import org.playdrop.android.service.FailureText
+import org.playdrop.core.TransferDirection
 import org.playdrop.android.service.ClipboardApplier
 
 /** Callbacks of [SendActions]. */
@@ -124,12 +126,37 @@ private fun SendNoticeCard(notice: SendNotice, callbacks: SendCallbacks) {
         modifier = Modifier.fillMaxWidth().semantics { liveRegion = LiveRegionMode.Polite },
     ) {
         Column(Modifier.padding(start = 16.dp, top = 12.dp, end = 8.dp, bottom = 4.dp)) {
+            val context = LocalContext.current
             Text(
-                pluralStringResource(R.plurals.ui_send_started, notice.count, notice.count, notice.label),
+                when (notice.phase) {
+                    SendPhase.Sending -> pluralStringResource(R.plurals.ui_send_started, notice.count, notice.count, notice.label)
+                    SendPhase.Sent -> pluralStringResource(R.plurals.ui_send_done, notice.count, notice.count, notice.label)
+                    is SendPhase.Failed, is SendPhase.FailedResumable -> stringResource(R.string.ui_send_failed, notice.label)
+                    SendPhase.Cancelled -> stringResource(R.string.ui_send_cancelled, notice.label)
+                },
                 color = MaterialTheme.colorScheme.onSecondaryContainer,
                 style = MaterialTheme.typography.bodyLarge,
             )
-            if (notice.offline) {
+            val why = when (val p = notice.phase) {
+                is SendPhase.Failed -> p.code to p.detail
+                is SendPhase.FailedResumable -> p.code to p.detail
+                else -> null
+            }
+            why?.let { (code, detail) ->
+                Text(
+                    FailureText.failureSentence(code, detail.orEmpty(), notice.label, TransferDirection.SEND).resolve(context),
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            if (notice.phase is SendPhase.FailedResumable) {
+                Text(
+                    stringResource(R.string.ui_history_resumes),
+                    color = MaterialTheme.colorScheme.onSecondaryContainer,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            if (notice.offline && notice.phase == SendPhase.Sending) {
                 Text(
                     stringResource(R.string.ui_send_offline, notice.label),
                     color = MaterialTheme.colorScheme.onSecondaryContainer,

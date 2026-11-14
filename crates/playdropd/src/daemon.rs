@@ -414,6 +414,9 @@ struct Shared {
     drain: Mutex<Option<JoinHandle<()>>>,
     /// Serialises host start, restart and shutdown.
     lifecycle: tokio::sync::Mutex<()>,
+    /// Serialises `set_grants`: a merge reads the stored grants, applies the fields it
+    /// carries and writes the result, so two merges of different grants never lose either.
+    grants_update: tokio::sync::Mutex<()>,
     events: broadcast::Sender<Event>,
     clip_tx: mpsc::Sender<LocalClip>,
     watcher: tokio::sync::Mutex<Option<clipboard::Watcher>>,
@@ -486,6 +489,7 @@ impl Daemon {
             host: RwLock::new(None),
             drain: Mutex::new(None),
             lifecycle: tokio::sync::Mutex::new(()),
+            grants_update: tokio::sync::Mutex::new(()),
             events,
             clip_tx,
             watcher: tokio::sync::Mutex::new(None),
@@ -846,21 +850,18 @@ impl Shared {
         s
     }
 
-    /// Starts the media watcher when the platform has one; its states reach whichever
-    /// host is running (a restart keeps the watcher).
+    /// Starts the media watcher when the platform has players to watch or a volume of its
+    /// own to offer; its states reach whichever host is running (a restart keeps the
+    /// watcher).
     async fn start_media_watcher(self: &Arc<Self>) {
-        if !self.media_support.supported {
+        if !self.media_support.supported && !media::volume_supported() {
             return;
         }
         let (tx, rx) = mpsc::channel(64);
-        match media::Watcher::start(tx).await {
-            Ok(w) => {
-                *self.media.lock().await = Some(w);
-                let host = control::weak_host(&Arc::downgrade(self), Shared::host);
-                tokio::spawn(control::media_feed(rx, host));
-            }
-            Err(e) => tracing::warn!(error = %e, "media watcher did not start"),
-        }
+        let w = media::Watcher::start(tx).await;
+        *self.media.lock().await = Some(w);
+        let host = control::weak_host(&Arc::downgrade(self), Shared::host);
+        tokio::spawn(control::media_feed(rx, host));
     }
 
     /// Starts a host and its drain. Caller holds `lifecycle`.
@@ -874,6 +875,11 @@ impl Shared {
         let task = tokio::spawn(drain(Arc::downgrade(self), rx));
         *self.host.write().unwrap_or_else(PoisonError::into_inner) = Some(Arc::new(host));
         *lock_std(&self.drain) = Some(task);
+        // A new host has no media states either: without this, phones would see no players
+        // and no computer volume until something changed.
+        if let Some(w) = self.media.lock().await.as_ref() {
+            w.republish();
+        }
         self.tray_dirty.notify_one();
         Ok(())
     }
@@ -1537,8 +1543,44 @@ impl Shared {
                 let id = resolve(&host, &peer)?;
                 done(host.connect(&id).await)
             }
-            Request::SetGrants { peer, grants } => {
+            Request::SetGrants {
+                peer,
+                grants: update,
+                merge,
+            } => {
+                // ipc.md 1.10. Without `merge`: the whole set, read as 0.15.0 read it. With
+                // it: only the carried grants change, and a request that carries none is a
+                // mistake (a misspelled field), not a success.
+                let full = if merge {
+                    if update.is_empty() {
+                        return Err(err(
+                            ErrorCode::BadRequest,
+                            "set_grants with merge carries no grant",
+                        ));
+                    }
+                    None
+                } else {
+                    Some(update.into_full().map_err(|missing| {
+                        err(
+                            ErrorCode::BadRequest,
+                            format!(
+                                "set_grants without merge needs every grant; {missing} is missing"
+                            ),
+                        )
+                    })?)
+                };
                 let id = resolve(&host, &peer)?;
+                // Read, apply and write as one step, so two merges of different grants
+                // never lose each other.
+                let _one_at_a_time = self.grants_update.lock().await;
+                let grants = if let Some(g) = full {
+                    g
+                } else {
+                    let Some(current) = host.grants(&id) else {
+                        return Err(err(ErrorCode::NotFound, "that device is not paired"));
+                    };
+                    update.apply(current)
+                };
                 let r = host.set_grants(&id, grants).await;
                 if r.is_ok() && !grants.notifications_in {
                     // SR-42: turning the grant off removes every copy at once.
@@ -2169,19 +2211,175 @@ mod tests {
             clipboard_out: false,
             ..Grants::default()
         };
-        call(
-            &h,
-            Request::SetGrants {
-                peer: id.clone(),
-                grants,
-            },
-        )
-        .await
-        .unwrap();
+        call(&h, Request::set_grants(id.clone(), grants))
+            .await
+            .unwrap();
         let reads = SECRET_READS.load(Ordering::SeqCst);
         let e = send_local(&h, Some(&id), true, None).await.unwrap_err();
         assert_eq!(e.code, ErrorCode::Forbidden);
         assert_eq!(SECRET_READS.load(Ordering::SeqCst), reads);
+
+        bravo.shutdown().await;
+        d.shutdown().await;
+    }
+
+    /// Sends `body` (the `grants` object and any extra fields) as raw JSON, through the
+    /// same parser the transports use.
+    async fn set_grants_json(
+        h: &Arc<dyn RequestHandler>,
+        id: &str,
+        body: &str,
+    ) -> Result<IpcOk, IpcError> {
+        let req: Request =
+            serde_json::from_str(&format!(r#"{{"op":"set_grants","peer":"{id}",{body}}}"#))
+                .unwrap();
+        call(h, req).await
+    }
+
+    /// `set_grants` both ways (ipc.md 1.10). Without `merge` it is the whole set exactly as
+    /// 0.15.0 read it: the regression case (a 0.15.0 window turning `notificationsIn` back
+    /// on by leaving it out) works, and a missing notification grant is its default. With
+    /// `merge: true` only the carried grants change, a request with no known grant is
+    /// `bad_request`, and a misspelled field next to a known one is ignored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one scripted exchange, read top to bottom"
+    )]
+    async fn set_grants_legacy_and_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = test_daemon(tmp.path());
+        d.start_host().await.unwrap();
+        let h = d.handler();
+        let (bravo, _bravo_next) = pair_bravo(&d, tmp.path()).await;
+        let alpha = d.shared.host().unwrap();
+        let bravo_id = bravo.device_id();
+        let id = bravo_id.to_hex();
+        let stored = || alpha.grants(&bravo_id).unwrap();
+
+        // A new client turns both newer grants away from their defaults.
+        let away = Grants {
+            notifications_in: false,
+            notifications_out: true,
+            ..stored()
+        };
+        call(&h, Request::set_grants(id.clone(), away))
+            .await
+            .unwrap();
+        assert_eq!(stored(), away);
+        assert!(!d.shared.notifications_in(&id));
+
+        // The regression case: what a 0.15.0 window sends to turn "show notifications" back
+        // on. Core `Grants` leaves `notificationsIn: true` out; there is no `merge`.
+        let back_on = Grants {
+            notifications_in: true,
+            ..away
+        };
+        let grants = serde_json::to_string(&back_on).unwrap();
+        assert!(!grants.contains("notificationsIn"), "{grants}");
+        set_grants_json(&h, &id, &format!(r#""grants":{grants}"#))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(),
+            back_on,
+            "a 0.15.0 window could not turn it back on"
+        );
+        assert!(d.shared.notifications_in(&id));
+
+        // The legacy meaning on purpose: with `notificationsIn` stored off, a request without
+        // `merge` that leaves it out turns it on (and `notificationsOut` off), as in 0.15.0.
+        call(&h, Request::set_grants(id.clone(), away))
+            .await
+            .unwrap();
+        set_grants_json(
+            &h,
+            &id,
+            r#""grants":{"files":false,"clipboardIn":true,"clipboardOut":false,
+                "input":false,"media":false,"find":true}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored(),
+            Grants {
+                files: false,
+                clipboard_in: true,
+                clipboard_out: false,
+                input: false,
+                media: false,
+                find: true,
+                notifications_in: true,
+                notifications_out: false,
+            }
+        );
+        // Without `merge` the six original grants are required, as before.
+        let e = set_grants_json(&h, &id, r#""grants":{"files":true}"#)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::BadRequest);
+
+        // A merge changes only what it carries.
+        call(&h, Request::set_grants(id.clone(), away))
+            .await
+            .unwrap();
+        set_grants_json(&h, &id, r#""merge":true,"grants":{"find":false}"#)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored(),
+            Grants {
+                find: false,
+                ..away
+            }
+        );
+        // Two merges of different grants keep each other.
+        let (media, clip) = tokio::join!(
+            set_grants_json(&h, &id, r#""merge":true,"grants":{"media":true}"#),
+            set_grants_json(&h, &id, r#""merge":true,"grants":{"clipboardIn":false}"#),
+        );
+        media.unwrap();
+        clip.unwrap();
+        let got = stored();
+        assert!(got.media && !got.clipboard_in && !got.find && !got.notifications_in);
+
+        // A merge with no known grant is a mistake, not a success; nothing changes.
+        let before = stored();
+        for body in [
+            r#""merge":true,"grants":{}"#,
+            r#""merge":true,"grants":{"notificationIn":true}"#,
+            r#""merge":true,"grants":{"files":null}"#,
+        ] {
+            let e = set_grants_json(&h, &id, body).await.unwrap_err();
+            assert_eq!(e.code, ErrorCode::BadRequest, "{body}");
+        }
+        assert_eq!(stored(), before);
+        // A misspelled field next to a known one: the known one applies, the other is
+        // ignored.
+        set_grants_json(
+            &h,
+            &id,
+            r#""merge":true,"grants":{"notificationIn":true,"files":true}"#,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stored(),
+            Grants {
+                files: true,
+                ..before
+            }
+        );
+
+        // A full request still overwrites everything, defaults included.
+        call(&h, Request::set_grants(id.clone(), Grants::default()))
+            .await
+            .unwrap();
+        assert_eq!(stored(), Grants::default());
+        let e = call(&h, Request::set_grants("nobody", Grants::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
 
         bravo.shutdown().await;
         d.shutdown().await;
@@ -2278,13 +2476,13 @@ mod tests {
         // Grant off on the desktop: saved, and the core drops what the phone sends next.
         call(
             &h,
-            Request::SetGrants {
-                peer: id.clone(),
-                grants: Grants {
+            Request::set_grants(
+                id.clone(),
+                Grants {
                     notifications_in: false,
                     ..alpha.grants(&bravo.device_id()).unwrap()
                 },
-            },
+            ),
         )
         .await
         .unwrap();

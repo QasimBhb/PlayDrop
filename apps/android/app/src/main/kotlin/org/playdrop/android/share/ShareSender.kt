@@ -13,6 +13,7 @@ import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.core.CoreHostImpl
 import org.playdrop.android.core.HostLog
+import org.playdrop.android.core.SendHistoryLog
 import org.playdrop.android.core.UriSource
 import org.playdrop.core.PlayDropException
 
@@ -42,6 +43,7 @@ internal object ShareSender {
                 send = one
                 val id = CoreHost.withHost { it.send(peer, one.sources, null) }
                 one.attachTo(id)
+                SendHistoryLog.noteSend(app, id, peer, one.names, one.sources.size, one.totalBytes)
                 HostLog.i("share", "transfer ${id.take(8)} started: ${one.sources.size} items, ${one.totalBytes} bytes")
                 val n = one.sources.size
                 toast(app, app.resources.getQuantityString(R.plurals.toast_sending_items, n, n, label))

@@ -22,6 +22,8 @@ import org.playdrop.core.updateMaxDownloadLen
 import org.playdrop.core.updateMaxRedirects
 import org.playdrop.core.updateMaxSigLen
 import org.playdrop.core.updateMaxSumsLen
+import org.playdrop.core.updateCheckAvailable
+import org.playdrop.core.updateNotAReleaseText
 import org.playdrop.core.updateOffer
 import org.playdrop.core.updateRequestTimeoutMs
 import org.playdrop.core.updateUserAgent
@@ -73,6 +75,10 @@ internal object CoreUpdateRules : UpdateRules {
         updateCheckDue(lastAnswerMs?.toULong(), lastFailureMs?.toULong(), nowMs.toULong())
 
     override fun assetMatches(asset: UpdateAsset, sha256: ByteArray): Boolean = updateAssetMatches(asset, sha256)
+
+    override fun checkAvailable(currentVersion: String): Boolean = updateCheckAvailable(currentVersion)
+
+    override fun notReleaseText(): String = updateNotAReleaseText()
 }
 
 /** The release decision: only the release keys built into the core are trusted (SR-46). */

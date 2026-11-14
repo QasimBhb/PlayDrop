@@ -311,28 +311,18 @@ fn set_grant(c: &Controller, peer: &str, grant: &str, on: bool) {
         refresh_row(c, i);
         return;
     };
-    // Show the change at once; snap back if the daemon refuses.
+    // Show the change at once. Whatever the answer, read back what the daemon stored: a
+    // refusal must not restore a whole older set that could undo a later toggle that went
+    // through, and an older daemon may store something else than asked.
     c.store.borrow_mut().set_peer_grants(i, grants);
     refresh_row(c, i);
-    let peer_id = peer.to_owned();
-    c.ipc().request(
-        Request::SetGrants {
-            peer: peer.to_owned(),
-            grants,
-        },
-        move |r| {
+    c.ipc()
+        .request(Request::set_grants(peer, grants), move |r| {
             with(|c| {
-                if r.is_err() {
-                    let idx = c.store.borrow().peer_index(&peer_id);
-                    if let Some(i) = idx {
-                        c.store.borrow_mut().set_peer_grants(i, old);
-                        refresh_row(c, i);
-                    }
-                }
+                c.load(model::Refetch::Peers);
                 c.done_or_report("", "Could not change permissions", r);
             });
-        },
-    );
+        });
 }
 
 fn unpair(c: &Controller, peer: &str) {

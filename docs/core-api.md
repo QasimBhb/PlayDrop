@@ -562,3 +562,17 @@ cases changes their associated values, so positional patterns gain a `_`:
 direction, reason, _)` in `PlayDrop/Core/CoreHostImpl.swift`,
 `PlayDrop/Notifications/LocalNotifications.swift` and `PlayDrop/Share/OutgoingDrain.swift`.
 Kotlin reads the fields by name and keeps compiling.
+
+## 17. Phase 17 note (`playdrop-ffi` 0.7.0, additive)
+
+Protocol.md 5.9 ("Mute"). Two additions, both to existing types:
+
+- `session::types::MediaAction::Mute` (wire `mute`). A command carries `value` `1` to mute
+  and `0` to unmute. A player lists it in `can` only when it can be muted; today that is the
+  computer's own volume (`@system`) on Linux and Windows.
+- `MediaState.muted: Option<bool>` (`#[serde(default)]`, so a state from an older daemon over
+  IPC reads as `None`). `None` means the player cannot tell. For `@system`, `volume` is now
+  the level the output is set to also while muted; before 0.16.0 it was `0` while muted.
+- ffi: `MediaAction.Mute` and `MediaState.muted`. A Kotlin `when` or Swift `switch` over
+  `MediaAction` without a default branch needs the new case, and the `MediaState`
+  constructor gains the argument.

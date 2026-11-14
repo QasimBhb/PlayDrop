@@ -27,10 +27,12 @@ import kotlinx.coroutines.withTimeoutOrNull
 import org.playdrop.android.BuildConfig
 import org.playdrop.android.data.Settings
 import org.playdrop.android.service.CoreService
+import org.playdrop.android.service.FailureText
 import org.playdrop.android.service.MulticastPolicy
 import org.playdrop.android.service.NotificationMirror
 import org.playdrop.android.service.Notifications
 import org.playdrop.android.service.ServiceStart
+import org.playdrop.android.ui.device.SendNotices
 import org.playdrop.core.AddDeviceCandidate
 import org.playdrop.core.DeviceType
 import org.playdrop.core.HostConfig
@@ -330,6 +332,7 @@ internal object CoreHostImpl {
             throw e
         }
         prepared.attachTo(id)
+        SendHistoryLog.noteSend(context, id, peer, prepared.names, prepared.sources.size, prepared.totalBytes)
         HostLog.i("send", "transfer ${id.take(8)}: ${uris.size} items, ${prepared.totalBytes} bytes")
         return id
     }
@@ -367,9 +370,20 @@ internal object CoreHostImpl {
         return TransferEnds.isTerminal(status)
     }
 
+    /** True when the core keeps the record of a failed send, so it resumes by itself. */
+    private fun resumableOf(id: String): Boolean = try {
+        host?.transfers()?.firstOrNull { it.id == id }?.resumable == true
+    } catch (e: Exception) {
+        false
+    }
+
     /** File count and size of a live transfer, from the core's transfer list. */
-    private fun shapeOf(id: String): TransferShape? =
+    private fun shapeOf(id: String): TransferShape? = try {
         host?.transfers()?.firstOrNull { it.id == id }?.let { TransferShape(it.fileCount.toLong(), it.total.toLong()) }
+    } catch (e: Exception) {
+        HostLog.w("events", "reading the transfer list failed; the size of a transfer is unknown", e)
+        null
+    }
 
     /** Handles one event, in order. Never throws: one bad event must not stop the stream. */
     private suspend fun handle(app: Context, ev: HostEvent) {
@@ -385,6 +399,16 @@ internal object CoreHostImpl {
             HostLog.w("events", "updating state for ${ev.javaClass.simpleName} failed", e)
         }
         eventsFlow.emit(ev)
+        try {
+            SendNotices.onEvent(ev, ::resumableOf) { FailureText.plainOrNull(it) }
+        } catch (e: Exception) {
+            HostLog.w("events", "updating the send card failed", e)
+        }
+        try {
+            SendHistoryLog.onEnd(app, ev, ::labelOf, ::shapeOf, ::resumableOf)
+        } catch (e: Exception) {
+            HostLog.w("events", "recording the send history failed", e)
+        }
         try {
             Notifications.onEvent(app, ev, ::labelOf, deferReceived = moving, failedForGood = ended)
         } catch (e: Exception) {

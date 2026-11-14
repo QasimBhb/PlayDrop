@@ -105,6 +105,16 @@ jobs:
         timeout-minutes: 25
         run: cargo test --workspace --exclude playdrop-ffi --locked --no-fail-fast
 
+      # The computer's own volume (Core Audio) cannot run on a Linux machine, so this is
+      # its proof. With output shown, the log says whether the runner had a sound device
+      # (level and mute are then moved and put back) or none (only the quiet path ran).
+      - name: Computer volume on this runner
+        if: ${{ format('{0}', inputs.run-checks) != 'false' }}
+        timeout-minutes: 10
+        env:
+          PLAYDROP_AUDIO_TEST: "1"
+        run: cargo test -p playdropd --locked computer_volume -- --nocapture --test-threads=1
+
       - name: Clippy
         if: ${{ format('{0}', inputs.run-checks) != 'false' }}
         run: cargo clippy --workspace --exclude playdrop-ffi --all-targets --locked -- -D warnings

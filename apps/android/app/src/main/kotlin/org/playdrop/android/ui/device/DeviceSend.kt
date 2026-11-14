@@ -62,9 +62,6 @@ enum class ClipDelivery {
     NOT_PAIRED,
 }
 
-/** The confirmation card shown after a pick: [count] files on their way to [label]. */
-data class SendNotice(val count: Int, val label: String, val offline: Boolean)
-
 /** Pure rules of the send actions and the permissions summary, so they are unit-tested. */
 object DeviceSend {
     /** The switches counted in the "Permissions" row summary, in screen order. */

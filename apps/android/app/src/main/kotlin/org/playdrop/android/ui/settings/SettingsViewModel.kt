@@ -13,6 +13,7 @@ import kotlinx.coroutines.withContext
 import org.playdrop.android.R
 import org.playdrop.android.core.CoreHost
 import org.playdrop.android.core.OwnIdentity
+import org.playdrop.android.data.SendHistoryStore
 import org.playdrop.android.data.Settings
 import org.playdrop.android.ui.common.CoreViewModel
 import org.playdrop.android.ui.common.UiMessage
@@ -123,6 +124,20 @@ class SettingsViewModel(application: Application) : CoreViewModel(application) {
 
     /** Turns foreground clipboard auto-push on or off. */
     fun setAutoClipboard(on: Boolean) = update(null) { it.copy(autoClipboard = on) }
+
+    /** Turns the "Sent" history on or off; turning it off clears what was kept. */
+    fun setKeepSendHistory(on: Boolean) {
+        viewModelScope.launch {
+            try {
+                Settings.update(getApplication()) { it.copy(keepSendHistory = on) }
+                // After the switch is stored: a write still in flight sees "off" under the
+                // store's lock, so nothing can be left behind.
+                if (!on) SendHistoryStore.clear(getApplication())
+            } catch (e: Throwable) {
+                post(UiMessage.fromOrRethrow(e))
+            }
+        }
+    }
 
     /** Remembers that the battery request was offered after the user tapped for it. */
     fun markBatteryPromptShown() = update(null) { it.copy(batteryPromptShown = true) }

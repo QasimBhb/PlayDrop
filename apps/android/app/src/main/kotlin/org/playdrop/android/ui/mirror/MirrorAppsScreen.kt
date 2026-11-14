@@ -1,8 +1,6 @@
 package org.playdrop.android.ui.mirror
 
 import android.app.Application
-import android.content.Intent
-import android.content.pm.PackageManager
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -76,6 +74,8 @@ class MirrorAppsViewModel(application: Application) : AndroidViewModel(applicati
             val app = getApplication<Application>()
             val found = withContext(Dispatchers.IO) { launcherApps(app) }
             apps.value = MirrorApps.forPicker(found, app.packageName)
+            // Uninstalled apps leave the allow list (never on a failed or empty query).
+            MirrorAppsPrune.run(app, found.mapTo(HashSet()) { it.packageName })
         }
     }
 
@@ -90,8 +90,7 @@ class MirrorAppsViewModel(application: Application) : AndroidViewModel(applicati
 
     private fun launcherApps(app: Application): List<MirrorApp> {
         val pm = app.packageManager
-        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        return pm.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0)).map {
+        return LauncherQuery.activities(app).map {
             MirrorApp(it.activityInfo.packageName, it.loadLabel(pm).toString())
         }
     }

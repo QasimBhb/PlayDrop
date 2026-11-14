@@ -113,6 +113,7 @@ impl Sample {
             position_at_ms: position_ms
                 .map(|_| datetime_to_unix_ms(self.updated_ticks).unwrap_or(now_ms)),
             volume: None,
+            muted: None,
             can: self.controls.actions(),
         }
     }

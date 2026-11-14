@@ -55,6 +55,9 @@ impl Watcher {
     }
 
     #[allow(clippy::unused_self, reason = "same signature as the real backends")]
+    pub(super) fn republish(&self) {}
+
+    #[allow(clippy::unused_self, reason = "same signature as the real backends")]
     pub(super) fn stop(self) {}
 }
 

@@ -210,15 +210,25 @@ pub fn update_state_line(state: &UpdateState) -> String {
 
 /// `playdrop update` without `--json`. `now` is Unix seconds.
 pub fn update(s: &UpdateStatus, now: u64) -> String {
-    let mut rows = vec![
-        ("running", s.running_version.clone()),
-        ("state", update_state_line(&s.state)),
-    ];
+    // An offer with a command to run by hand (the Flatpak) gets that command on a row of
+    // its own, ready to copy, and the sentence without it.
+    let state = match &s.state {
+        UpdateState::Available { offer } if offer.command.is_some() => format!(
+            "PlayDrop {} is available. {}",
+            offer.version,
+            offer.reason_before_command().unwrap_or_default()
+        ),
+        other => update_state_line(other),
+    };
+    let mut rows = vec![("running", s.running_version.clone()), ("state", state)];
     if let UpdateState::Available { offer }
     | UpdateState::Failed {
         offer: Some(offer), ..
     } = &s.state
     {
+        if let Some(command) = &offer.command {
+            rows.push(("run", command.clone()));
+        }
         rows.push(("release page", offer.page_url.clone()));
     }
     rows.push((
@@ -756,6 +766,7 @@ mod tests {
             page_url: "https://github.com/QasimBhb/PlayDrop/releases/tag/v0.12.0".into(),
             can_install: true,
             reason: None,
+            command: None,
         };
         let status = UpdateStatus {
             state: UpdateState::Available {
@@ -792,6 +803,36 @@ mod tests {
             }),
             "PlayDrop 0.12.0 is available. Flatpak updates come from where it was installed."
         );
+        // A Flatpak offer from 0.16.0 on: the sentence, then the command on its own row.
+        let command = "flatpak install --user ./playdrop-0.16.0-linux-x86_64.flatpak";
+        let flatpak = UpdateStatus {
+            state: UpdateState::Available {
+                offer: UpdateOffer {
+                    version: "0.16.0".into(),
+                    page_url: "https://github.com/QasimBhb/PlayDrop/releases/tag/v0.16.0".into(),
+                    can_install: false,
+                    reason: Some(format!(
+                        "A Flatpak cannot update itself. Download \
+                         playdrop-0.16.0-linux-x86_64.flatpak from the release page, then run \
+                         this in the folder you saved it to: {command}"
+                    )),
+                    command: Some(command.into()),
+                },
+            },
+            ..status.clone()
+        };
+        assert_eq!(
+            update(&flatpak, 1_000 + 300),
+            "running       0.11.0\n\
+             state         PlayDrop 0.16.0 is available. A Flatpak cannot update itself. \
+             Download playdrop-0.16.0-linux-x86_64.flatpak from the release page, then run \
+             this in the folder you saved it to:\n\
+             run           flatpak install --user ./playdrop-0.16.0-linux-x86_64.flatpak\n\
+             release page  https://github.com/QasimBhb/PlayDrop/releases/tag/v0.16.0\n\
+             last check    5 min ago\n"
+        );
+        // The one-line form (progress, refusals) keeps the whole sentence, command included.
+        assert!(update_state_line(&flatpak.state).ends_with(command));
         let failed = UpdateStatus {
             state: UpdateState::Failed {
                 stage: UpdateStage::Check,

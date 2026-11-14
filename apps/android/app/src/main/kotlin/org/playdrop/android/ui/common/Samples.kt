@@ -52,6 +52,7 @@ object Samples {
         positionAtMs = (NOW * 1000).toULong(),
         volume = 70u.toUByte(),
         can = listOf(MediaAction.PLAY_PAUSE, MediaAction.NEXT, MediaAction.PREVIOUS, MediaAction.SEEK, MediaAction.VOLUME),
+        muted = null,
     )
 
     /** The computer's master volume as the desktop reports it (never a "Now playing" card). */
@@ -67,6 +68,7 @@ object Samples {
         positionAtMs = null,
         volume = 40u.toUByte(),
         can = listOf(MediaAction.VOLUME),
+        muted = null,
     )
 
     /** A paired laptop, online. */

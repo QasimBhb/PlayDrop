@@ -33,10 +33,12 @@ struct NowPlayingSection: View {
             Section {
                 SystemVolumeRow(
                     volume: system.volume,
-                    controllable: controllable && system.can.contains(.volume)
-                ) { value in
-                    command(system.player, .volume, value)
-                }
+                    muted: system.muted,
+                    controllable: controllable && system.can.contains(.volume),
+                    canMute: controllable && system.can.contains(.mute),
+                    send: { value in command(system.player, .volume, value) },
+                    sendMute: { value in command(system.player, .mute, value) }
+                )
             }
             .task { await watchRefusals() }
         }
@@ -91,13 +93,20 @@ struct NowPlayingSection: View {
 /// the finger drags, commands go out at most 5 times a second and the slider ignores
 /// incoming states; after the release it keeps the released value until the computer
 /// echoes it (`VolumeSliderModel`). Disabled when the computer accepts no media commands,
-/// like the player controls.
+/// like the player controls. When the computer lists `mute`, a button next to the slider
+/// mutes and unmutes; it shows the new state at once and settles on the computer's `muted`.
+/// Muted, the slider still shows the real level but looks dimmed.
 private struct SystemVolumeRow: View {
     /// The reported level, 0 to 100.
     let volume: UInt8?
+    /// The reported mute state; nil when the computer does not say (an older version).
+    let muted: Bool?
     /// The computer accepts the command.
     let controllable: Bool
+    /// The computer accepts `mute` (it lists it) and media commands.
+    let canMute: Bool
     let send: (UInt64) -> Void
+    let sendMute: (UInt64) -> Void
 
     @State private var model = VolumeSliderModel()
     @State private var flushTask: Task<Void, Never>?
@@ -115,9 +124,21 @@ private struct SystemVolumeRow: View {
             }
             .accessibilityHidden(true)
             HStack {
-                Image(systemName: shown == 0 ? "speaker.slash.fill" : "speaker.fill")
+                if VolumeSliderModel.canShowMute(canMute: canMute, muted: muted) {
+                    Button {
+                        sendMute(UInt64(model.toggleMute(now: Self.now)))
+                        scheduleExpire()
+                    } label: {
+                        Image(systemName: model.shownMuted ? "speaker.slash.fill" : "speaker.fill")
+                    }
+                    .buttonStyle(.borderless)
                     .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
+                    .accessibilityLabel(Text(model.shownMuted ? L10n.Media.unmuteComputer : L10n.Media.muteComputer))
+                } else {
+                    Image(systemName: shown == 0 ? "speaker.slash.fill" : "speaker.fill")
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                }
                 Slider(
                     value: Binding(get: { Double(shown) }, set: { changed(to: $0) }),
                     in: 0...100,
@@ -129,19 +150,24 @@ private struct SystemVolumeRow: View {
                 .accessibilityLabel(Text(L10n.Media.computerVolume))
                 .accessibilityValue(Text(shown, format: .percent))
                 .accessibilityHint(Text(L10n.Media.computerVolumeHint))
+                .opacity(model.shownMuted ? 0.5 : 1)
                 Image(systemName: "speaker.wave.3.fill")
                     .foregroundStyle(.secondary)
                     .accessibilityHidden(true)
             }
         }
         .padding(.vertical, 4)
-        .onChange(of: volume, initial: true) { _, new in
-            model.report(new.map { Int($0) })
-        }
+        .onChange(of: volume, initial: true) { _, _ in reportState() }
+        .onChange(of: muted) { _, _ in reportState() }
         .onDisappear {
             flushTask?.cancel()
             expireTask?.cancel()
         }
+    }
+
+    /// Hands the computer's latest level and mute state to the model.
+    private func reportState() {
+        model.report(volume.map { Int($0) }, muted: muted)
     }
 
     private static var now: TimeInterval { ProcessInfo.processInfo.systemUptime }

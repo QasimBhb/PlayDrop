@@ -223,6 +223,25 @@ impl Watcher {
         Ok(())
     }
 
+    /// Queues every session's last state again (a new host knows none of them).
+    pub(super) fn republish(&self) {
+        let now = unix_ms();
+        let states: Vec<MediaState> = self
+            .shared
+            .sessions()
+            .iter()
+            .filter_map(|(id, entry)| {
+                entry
+                    .last
+                    .as_ref()
+                    .map(|sample| sample.to_state(id, &entry.name, now))
+            })
+            .collect();
+        for state in states {
+            self.shared.out.push(state);
+        }
+    }
+
     pub(super) fn stop(self) {
         // `Drop` aborts the tasks and removes every event registration.
         drop(self);
@@ -265,7 +284,9 @@ async fn send(
             let ticks = last.start_ticks.saturating_add(ms_to_ticks(ms));
             session.TryChangePlaybackPositionAsync(ticks)?
         }
-        MediaAction::Volume | MediaAction::Unknown(_) => unreachable!("refused by the caller"),
+        MediaAction::Volume | MediaAction::Mute | MediaAction::Unknown(_) => {
+            unreachable!("refused by the caller")
+        }
     };
     Ok(op.await?)
 }
@@ -459,6 +480,7 @@ fn gone_state(id: &str, name: &str) -> MediaState {
         position_ms: None,
         position_at_ms: None,
         volume: None,
+        muted: None,
         can: Vec::new(),
     }
 }

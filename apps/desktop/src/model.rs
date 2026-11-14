@@ -1123,6 +1123,9 @@ pub struct UpdateBannerView {
     pub text: String,
     /// A second sentence: why "Update" is not offered here.
     pub detail: String,
+    /// The command that installs the update by hand (the Flatpak), shown where it can be
+    /// selected and copied; empty for none. `detail` then leads up to it.
+    pub command: String,
     /// The text is a failure.
     pub error: bool,
     /// The main button's label; empty for none.
@@ -1206,7 +1209,15 @@ pub fn update_banner(
             detail: if offer.can_install {
                 String::new()
             } else {
-                offer.reason.clone().unwrap_or_default()
+                offer
+                    .reason_before_command()
+                    .unwrap_or_default()
+                    .to_owned()
+            },
+            command: if offer.can_install {
+                String::new()
+            } else {
+                offer.command.clone().unwrap_or_default()
             },
             error: false,
             primary: if offer.can_install {
@@ -1250,6 +1261,7 @@ pub fn update_banner(
             visible: true,
             text: message.clone(),
             detail: String::new(),
+            command: String::new(),
             error: true,
             primary: if offer.can_install {
                 "Try again".to_owned()
@@ -1912,6 +1924,7 @@ mod tests {
             position_ms: None,
             position_at_ms: None,
             volume: None,
+            muted: None,
             can,
         }
     }
@@ -3008,7 +3021,46 @@ mod tests {
             can_install,
             reason: (!can_install)
                 .then(|| "Flatpak updates come from where it was installed.".into()),
+            command: None,
         }
+    }
+
+    /// A Flatpak offer from a 0.16.0 daemon: the sentence leads up to the command, which
+    /// the banner shows on its own, ready to copy.
+    #[test]
+    fn a_flatpak_offer_shows_the_command_to_copy() {
+        let command = "flatpak install --user ./playdrop-0.12.0-linux-x86_64.flatpak";
+        let s = update_status(UpdateState::Available {
+            offer: playdrop_ipc::UpdateOffer {
+                reason: Some(format!(
+                    "A Flatpak cannot update itself. Download \
+                     playdrop-0.12.0-linux-x86_64.flatpak from the release page, then run this \
+                     in the folder you saved it to: {command}"
+                )),
+                command: Some(command.into()),
+                ..offer(false)
+            },
+        });
+        let b = update_banner(Some(&s), None, "0.11.0", false);
+        assert_eq!(b.text, "PlayDrop 0.12.0 is available.");
+        assert_eq!(
+            b.detail,
+            "A Flatpak cannot update itself. Download playdrop-0.12.0-linux-x86_64.flatpak \
+             from the release page, then run this in the folder you saved it to:"
+        );
+        assert_eq!(b.command, command);
+        assert_eq!(b.primary, "Open release page");
+        assert_eq!(update_action(Some(&s)), UpdateAction::OpenPage);
+
+        // An installable offer never shows a command, even if one were sent.
+        let s = update_status(UpdateState::Available {
+            offer: playdrop_ipc::UpdateOffer {
+                command: Some(command.into()),
+                ..offer(true)
+            },
+        });
+        let b = update_banner(Some(&s), None, "0.11.0", false);
+        assert_eq!((b.detail.as_str(), b.command.as_str()), ("", ""));
     }
 
     #[test]
@@ -3021,6 +3073,7 @@ mod tests {
                 visible: true,
                 text: "PlayDrop 0.12.0 is available.".into(),
                 detail: String::new(),
+                command: String::new(),
                 error: false,
                 primary: "Update".into(),
                 later: true,

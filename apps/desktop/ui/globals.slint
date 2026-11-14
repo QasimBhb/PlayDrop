@@ -145,6 +145,9 @@ export global UpdateUi {
     in property <string> banner-text;
     // Why "Update" is not offered here (a Flatpak, a source build); empty otherwise.
     in property <string> banner-detail;
+    // The command that installs the update by hand (the Flatpak), selectable and copyable;
+    // empty for none. The daemon builds it (docs/ipc.md 1.11).
+    in property <string> banner-command;
     in property <bool> banner-error;
     // "Update", "Try again" or "Open release page"; empty for no button.
     in property <string> primary-text;

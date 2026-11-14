@@ -38,15 +38,15 @@ abstract class CoreViewModel(application: Application) : AndroidViewModel(applic
     /**
      * Sends picked [uris] to [peer] in the process scope, so leaving the screen does not drop
      * a send that is still being prepared (the items are opened at once, while the activity
-     * that holds the picker's grant is alive). [onStarted] runs once the send started. A
+     * that holds the picker's grant is alive). [onStarted] runs once the send started, with its transfer ID. A
      * failure is a message on this screen, or a notification when the screen is gone.
      */
-    protected fun sendUrisFromScreen(peer: String, uris: List<Uri>, onStarted: () -> Unit) {
+    protected fun sendUrisFromScreen(peer: String, uris: List<Uri>, onStarted: (String) -> Unit) {
         val app = getApplication<Application>()
         AppScope.launch {
             try {
-                CoreHost.sendUris(app, peer, uris)
-                onStarted()
+                val id = CoreHost.sendUris(app, peer, uris)
+                onStarted(id)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {

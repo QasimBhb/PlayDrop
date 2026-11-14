@@ -7,6 +7,7 @@
 //!
 //! - [`fetch`]: the anonymous HTTPS client, two GETs per check, redirects by hand.
 //! - [`kind`]: how this copy was installed (`.deb`, Windows installer, Flatpak, other).
+//! - [`flatpak`]: the sentence and the command a Flatpak is shown instead of "Update".
 //! - [`store`]: `update.json`, the times, "Later" and the last signed answer.
 //! - [`install`]: `pkexec apt-get` or the Windows installer, behind a trait for tests.
 //! - [`restart`]: putting the new daemon in place after a `.deb` install.
@@ -18,6 +19,7 @@
 //! the setting off no request is made at all.
 
 pub mod fetch;
+pub mod flatpak;
 #[cfg(any(debug_assertions, test))]
 mod hooks;
 /// Release builds: no test hooks at all, so neither the code that reads them nor the
@@ -65,9 +67,6 @@ use self::store::Remembered;
 /// Where every release lives; the core's URLs all start with it.
 pub const RELEASES: &str = "https://github.com/QasimBhb/PlayDrop/releases";
 
-/// The note under an offer a Flatpak cannot install.
-pub const FLATPAK_REASON: &str =
-    "Flatpak updates come from where it was installed (a software centre or `flatpak update`).";
 /// The note under an offer an unpackaged copy cannot install.
 pub const OTHER_REASON: &str =
     "This copy was not installed from a PlayDrop package, so it cannot update itself; get the new version from the release page.";
@@ -544,13 +543,27 @@ impl Updater {
         } else {
             None
         };
-        let reason = match install.kind {
-            InstallKind::Flatpak => Some(FLATPAK_REASON),
-            InstallKind::Deb | InstallKind::Windows if found.asset.is_none() => {
-                Some(NO_FILE_REASON)
+        // The note under an offer this copy cannot install, and for the Flatpak the one
+        // command that installs the new bundle by hand.
+        let (reason, command) = match install.kind {
+            InstallKind::Flatpak => {
+                let version = found.version.to_string();
+                if signed.asset(&flatpak::bundle_name(&version)).is_some() {
+                    (
+                        Some(flatpak::reason(&version)),
+                        Some(flatpak::install_command(&version)),
+                    )
+                } else {
+                    (Some(NO_FILE_REASON.to_owned()), None)
+                }
             }
-            InstallKind::Deb | InstallKind::Windows => None,
-            InstallKind::Android | InstallKind::Ios | InstallKind::Other => Some(OTHER_REASON),
+            InstallKind::Deb | InstallKind::Windows if found.asset.is_none() => {
+                (Some(NO_FILE_REASON.to_owned()), None)
+            }
+            InstallKind::Deb | InstallKind::Windows => (None, None),
+            InstallKind::Android | InstallKind::Ios | InstallKind::Other => {
+                (Some(OTHER_REASON.to_owned()), None)
+            }
         };
         let rebased = |a: Asset| Asset {
             url: self.rebase(&a.url),
@@ -561,7 +574,8 @@ impl Updater {
                 version: found.version.to_string(),
                 page_url: self.rebase(&found.page_url),
                 can_install: reason.is_none(),
-                reason: reason.map(str::to_owned),
+                reason,
+                command,
             },
             asset: found.asset.map(rebased),
             applet: applet.map(rebased),

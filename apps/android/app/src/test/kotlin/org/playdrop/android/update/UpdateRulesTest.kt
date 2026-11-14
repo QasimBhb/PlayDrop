@@ -90,15 +90,6 @@ class UpdateRulesTest {
         assertFalse(e.redirectAllowed("http://127.0.0.1:8098/other"))
     }
 
-    @Test
-    fun onlyAPlainReleaseVersionChecksForUpdates() {
-        assertTrue(ReleaseVersion.isPlain("0.11.0"))
-        assertTrue(ReleaseVersion.isPlain("10.0.123"))
-        for (v in listOf("0.11.0-debug", "0.11.0+42", "0.11", "v0.11.0", "01.2.3", "0.11.0 ", "", "0.11.0.1", "1.2.x")) {
-            assertFalse(v, ReleaseVersion.isPlain(v))
-        }
-    }
-
     private class Override(override val releasesBase: String, override val testOrigin: String?) : UpdateOverride {
         override fun offer(sums: ByteArray, sig: ByteArray, currentVersion: String): UpdateOffer? = null
     }

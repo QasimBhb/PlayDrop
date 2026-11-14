@@ -8,6 +8,42 @@ the desktop daemon and window, the Android app and the iOS app.
 The release workflow uses the section for the tagged version as the text of the GitHub release.
 Before tagging, give the version's heading its release date in place of "Unreleased".
 
+## [0.16.0] - 2026-11-14
+
+### Added
+
+- **Computer volume on Windows.** The "Computer volume" slider on Android and iPhone now also
+  appears for Windows computers, not only Linux ones. It changes the volume of the default
+  output, the one the volume keys change.
+- **Mute from the phone.** A mute button sits next to the "Computer volume" slider. While the
+  computer is muted the slider keeps showing the level it will come back to. Both the
+  computer and the phone need 0.16.0.
+- **Android: a list of what you sent.** The Transfers tab shows the last 50 sends from this
+  phone: the device, the time, the size, the first few file names and whether it arrived.
+  Nothing from the clipboard is listed. "Keep a history of what I send" in Settings turns it
+  off and clears it.
+- **Flatpak: the update notice shows the command.** A Flatpak cannot update itself, so the
+  notice now names the file to download and the exact command to run, with a Copy button.
+
+### Changed
+
+- The computer's volume is offered even when PlayDrop cannot see any media player on that
+  computer.
+- Android: an app that was removed from the phone is taken off the list of apps whose
+  notifications are mirrored.
+- Android and iPhone: whether a build checks for updates is decided in one place, the shared
+  core. An iPhone test build no longer contacts GitHub.
+
+### Fixed
+
+- Android: after "Send files" on a device page, the banner kept saying "Sending" when the
+  send had failed or finished. It now follows the real outcome and says when a send will
+  carry on by itself.
+- Android: the list of apps to mirror could crash PlayDrop on Android 8 to 12.
+- After the daemon restarted its network side (for example on a settings change), phones
+  showed no players and no volume slider until something changed on the computer.
+- Dragging the volume slider up and back to zero on a muted computer could leave it muted.
+
 ## [0.15.0] - 2026-11-13
 
 ### Fixed

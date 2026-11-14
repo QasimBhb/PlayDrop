@@ -11,6 +11,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.filterIsInstance
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -121,7 +122,6 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
     private val pendingGrants = MutableStateFlow<Grants?>(null)
     private val ringing = MutableStateFlow(false)
     private val closedFlow = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    private val notice = MutableStateFlow<SendNotice?>(null)
     private val sendingClipboard = MutableStateFlow(false)
 
     /** A sensitive clip held until the user answers; kept off the UI state so the text never leaves this class. */
@@ -133,7 +133,7 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
     /** The screen state. */
     val state: StateFlow<DeviceDetailUiState> = combine(
         deviceState(application),
-        notice,
+        SendNotices.book.map { it.notices[peerId] },
         sendingClipboard,
         pendingSensitive,
     ) { base, sent, busy, ask ->
@@ -248,7 +248,7 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
         if (uris.isEmpty()) return
         val label = CoreHost.labelOf(peerId)
         val offline = state.value.row?.online != true
-        sendUrisFromScreen(peerId, uris) { notice.value = SendNotice(uris.size, label, offline) }
+        sendUrisFromScreen(peerId, uris) { id -> SendNotices.begin(peerId, SendNotice(uris.size, label, offline, id)) }
     }
 
     /** Acts on what the clipboard held; see [DeviceSend.planClipboard]. */
@@ -275,7 +275,7 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
 
     /** Hides the confirmation card. */
     fun dismissNotice() {
-        notice.value = null
+        SendNotices.dismiss(peerId)
     }
 
     /**
@@ -328,6 +328,10 @@ class DeviceDetailViewModel(application: Application, savedState: SavedStateHand
 
     /** Sets the computer's master volume, 0 to 100, through the reserved player. */
     fun setSystemVolume(volume: Long) = mediaCommand(MediaPlayers.SYSTEM_VOLUME_ID, MediaAction.VOLUME, volume.coerceIn(0, 100))
+
+    /** Mutes or unmutes the computer's output through the reserved player (`mute` command, 1 or 0). */
+    fun setSystemMuted(muted: Boolean) =
+        mediaCommand(MediaPlayers.SYSTEM_VOLUME_ID, MediaAction.MUTE, if (muted) 1L else 0L)
 
     /** Unpairs the device, then closes the screen. */
     fun unpair() {

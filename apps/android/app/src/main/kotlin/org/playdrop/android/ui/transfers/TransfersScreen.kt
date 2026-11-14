@@ -5,6 +5,7 @@ import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.text.format.DateUtils
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -44,20 +45,28 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import org.playdrop.android.R
 import org.playdrop.android.core.FileNames
+import org.playdrop.android.data.SendHistoryEntry
+import org.playdrop.android.data.SendOutcome
+import org.playdrop.android.service.FailureText
 import org.playdrop.android.ui.common.CollectMessages
 import org.playdrop.android.ui.common.Format
 import org.playdrop.android.ui.common.Samples
 import org.playdrop.android.ui.theme.PlayDropTheme
+import org.playdrop.core.TransferDirection
+import org.playdrop.core.TransferFailure
 import org.playdrop.core.TransferStatus
 
 /** The Transfers tab wired to the activity-scoped view model and the system viewers. */
 @Composable
 fun TransfersRoute(vm: TransfersViewModel, showMessage: (String) -> Unit) {
     val rows by vm.rows.collectAsStateWithLifecycle()
+    val history by vm.history.collectAsStateWithLifecycle()
     val context = LocalContext.current
     CollectMessages(vm.messages, showMessage)
     TransfersScreen(
         rows = rows,
+        history = history,
+        onClearHistory = vm::clearHistory,
         onCancel = vm::cancel,
         onRespond = vm::respond,
         onOpen = { row ->
@@ -85,9 +94,11 @@ fun TransfersScreen(
     onRespond: (String, Boolean) -> Unit,
     onOpen: (TransferRow) -> Unit,
     onOpenFolder: () -> Unit,
+    history: List<SendHistoryEntry> = emptyList(),
+    onClearHistory: () -> Unit = {},
 ) {
     Scaffold(topBar = { TopAppBar(title = { Text(stringResource(R.string.ui_transfers_title)) }) }) { padding ->
-        if (rows.isEmpty()) {
+        if (rows.isEmpty() && history.isEmpty()) {
             Column(
                 Modifier.padding(padding).fillMaxSize().padding(32.dp),
                 verticalArrangement = Arrangement.Center,
@@ -109,6 +120,22 @@ fun TransfersScreen(
             ) {
                 items(rows, key = { it.id }) { row ->
                     TransferCard(row, onCancel, onRespond, onOpen, onOpenFolder)
+                }
+                if (history.isNotEmpty()) {
+                    item(key = "history-header") {
+                        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 8.dp)) {
+                            Text(
+                                stringResource(R.string.ui_history_title),
+                                style = MaterialTheme.typography.titleSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.weight(1f),
+                            )
+                            TextButton(onClick = onClearHistory) { Text(stringResource(R.string.ui_history_clear)) }
+                        }
+                    }
+                    items(history, key = { "history-${it.transferId}" }) { entry ->
+                        HistoryCard(entry)
+                    }
                 }
             }
         }
@@ -189,6 +216,64 @@ private fun TransferCard(
                 }
                 if (row.showFolder) {
                     TextButton(onClick = onOpenFolder) { Text(stringResource(R.string.ui_transfers_open_folder)) }
+                }
+            }
+        }
+    }
+}
+
+/** One finished send from the "Sent" history. */
+@Composable
+private fun HistoryCard(entry: SendHistoryEntry) {
+    val context = LocalContext.current
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Filled.Upload,
+                    contentDescription = stringResource(R.string.ui_transfers_outgoing),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+                Text(
+                    stringResource(R.string.ui_transfers_to, entry.peerLabel),
+                    style = MaterialTheme.typography.titleMedium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(start = 8.dp).weight(1f),
+                )
+                val (label, color) = when (entry.outcome) {
+                    SendOutcome.SENT -> R.string.ui_history_sent to MaterialTheme.colorScheme.onSurfaceVariant
+                    SendOutcome.FAILED -> R.string.ui_state_failed to MaterialTheme.colorScheme.error
+                    SendOutcome.CANCELLED -> R.string.ui_state_cancelled to MaterialTheme.colorScheme.onSurfaceVariant
+                }
+                Text(stringResource(label), style = MaterialTheme.typography.labelLarge, color = color)
+            }
+            Text(
+                DateUtils.formatDateTime(
+                    context,
+                    entry.atMs,
+                    DateUtils.FORMAT_SHOW_DATE or DateUtils.FORMAT_SHOW_TIME or DateUtils.FORMAT_ABBREV_MONTH,
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            val size = if (entry.itemCount > 0) {
+                pluralStringResource(R.plurals.ui_files, entry.itemCount.toInt(), Format.count(entry.itemCount)) + ", " + Format.bytes(entry.totalBytes)
+            } else {
+                Format.bytes(entry.totalBytes)
+            }
+            Text(size, style = MaterialTheme.typography.bodyMedium)
+            if (entry.names.isNotEmpty()) {
+                val more = (entry.itemCount - entry.names.size).toInt()
+                    .takeIf { it > 0 }?.let { " " + stringResource(R.string.ui_transfers_more, it) }.orEmpty()
+                Text(entry.names.joinToString(", ") + more, style = MaterialTheme.typography.bodySmall, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            }
+            if (entry.outcome == SendOutcome.FAILED) {
+                val code = entry.failure?.let { name -> TransferFailure.entries.firstOrNull { it.name == name } } ?: TransferFailure.OTHER
+                val reason = FailureText.failureSentence(code, entry.detail.orEmpty(), entry.peerLabel, TransferDirection.SEND).resolve(context)
+                Text(reason, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (entry.resumable) {
+                    Text(stringResource(R.string.ui_history_resumes), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }

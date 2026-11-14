@@ -47,6 +47,12 @@ interface UpdateRules {
 
     /** `update_asset_matches`. */
     fun assetMatches(asset: org.playdrop.core.UpdateAsset, sha256: ByteArray): Boolean
+
+    /** `update_check_available`: false for a build that is not a plain release. */
+    fun checkAvailable(currentVersion: String): Boolean
+
+    /** `update_not_a_release_text`: the Settings sentence for when [checkAvailable] is false. */
+    fun notReleaseText(): String
 }
 
 /**
@@ -162,19 +168,6 @@ sealed interface UpdateState {
  *   failed "Check now" or update says why.
  * - [close] (the activity is finishing) cancels a running download and deletes its file.
  */
-/**
- * Whether a version name is a plain release, `major.minor.patch` with no leading zeros and
- * nothing after it: the only kind of build that checks for updates. A pre-release or test
- * build (`0.11.0-debug`) never contacts GitHub, since it cannot tell whether a release is
- * newer. The same rule as the core's `Version::parse`; decided here, before any request.
- */
-object ReleaseVersion {
-    private val PLAIN = Regex("""(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)""")
-
-    /** True for `0.11.0`, false for `0.11.0-debug`, `0.11`, `v0.11.0` or `01.2.3`. */
-    fun isPlain(versionName: String): Boolean = PLAIN.matches(versionName)
-}
-
 class UpdateController(
     private val scope: CoroutineScope,
     private val store: UpdateStore,
@@ -190,10 +183,13 @@ class UpdateController(
     private var job: Job? = null
 
     /**
-     * False for a build whose version is not a plain release ([ReleaseVersion]): it makes
-     * no request at all, and Settings says so.
+     * False for a build whose version is not a plain release (the core's rule, `update_check_available`):
+     * it makes no request at all, and Settings says so with [notReleaseText].
      */
-    val checksAvailable: Boolean = ReleaseVersion.isPlain(currentVersion)
+    val checksAvailable: Boolean = rules.checkAvailable(currentVersion)
+
+    /** The core's sentence for Settings when [checksAvailable] is false. */
+    val notReleaseText: String get() = rules.notReleaseText()
 
     /** The offer whose APK Android is installing now, until it answers. */
     @Volatile

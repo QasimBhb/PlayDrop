@@ -36,6 +36,41 @@ object MirrorApps {
         return allowed.filter { it !in listed }.sorted()
     }
 
+    /** What the system said when asked about one allow-listed package by name. */
+    enum class Lookup {
+        /** It answered: the package is there. */
+        FOUND,
+
+        /** "No such package": uninstalled, or just not visible to PlayDrop (the system does not say which). */
+        NOT_FOUND,
+
+        /** The question itself failed. */
+        FAILED,
+    }
+
+    /**
+     * The packages safe to take off [allowed], decided only on positive grounds. A package
+     * goes only when ALL of these hold: it is in neither [launcher] (the picker's query) nor
+     * [wider] (the same query including disabled and archived apps), the system answered
+     * [Lookup.NOT_FOUND] for it by name, and it has no notification on screen ([active]).
+     * "Not found" is the system's answer for an uninstalled package and also for one that is
+     * installed but not visible to us, so the extra conditions cover the ways an installed app
+     * can drop out of sight (a disabled or archived app, a failed lookup, a query that came
+     * back empty). When either query is empty nothing is pruned.
+     */
+    fun prunable(
+        allowed: Set<String>,
+        launcher: Set<String>,
+        wider: Set<String>,
+        lookup: (String) -> Lookup,
+        active: Set<String>,
+    ): Set<String> {
+        if (launcher.isEmpty() || wider.isEmpty()) return emptySet()
+        return allowed.filterTo(HashSet()) {
+            it !in launcher && it !in wider && it !in active && lookup(it) == Lookup.NOT_FOUND
+        }
+    }
+
     /** [allowed] with [packageName] added when [on], removed otherwise. */
     fun toggled(allowed: Set<String>, packageName: String, on: Boolean): Set<String> =
         if (on) allowed + packageName else allowed - packageName

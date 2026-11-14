@@ -45,6 +45,7 @@ internal object SettingsImpl {
     private val UPDATE_LAST_FAILURE = longPreferencesKey("update_last_failure_ms")
     private val UPDATE_LATER_VERSION = stringPreferencesKey("update_later_version")
     private val UPDATE_LATER_AT = longPreferencesKey("update_later_at_ms")
+    private val KEEP_SEND_HISTORY = booleanPreferencesKey("keep_send_history")
 
     /** Live settings; a read error logs and falls back to the defaults instead of crashing. */
     fun flow(context: Context): Flow<Settings.Values> =
@@ -81,6 +82,7 @@ internal object SettingsImpl {
             prefs.putOrRemove(UPDATE_LAST_FAILURE, after.updateLastFailureMs)
             prefs.putOrRemove(UPDATE_LATER_VERSION, after.updateLaterVersion)
             prefs.putOrRemove(UPDATE_LATER_AT, after.updateLaterAtMs)
+            prefs[KEEP_SEND_HISTORY] = after.keepSendHistory
         }
     }
 
@@ -104,6 +106,8 @@ internal object SettingsImpl {
         updateLastFailureMs = prefs[UPDATE_LAST_FAILURE]?.takeIf { it > 0 },
         updateLaterVersion = prefs[UPDATE_LATER_VERSION]?.takeIf { it.isNotBlank() },
         updateLaterAtMs = prefs[UPDATE_LATER_AT]?.takeIf { it > 0 },
+        // The "Sent" history starts on (the user's decision for Phase 17).
+        keepSendHistory = prefs[KEEP_SEND_HISTORY] ?: true,
     )
 
     /** Stores [value], or removes the key for null. */

@@ -23,9 +23,14 @@
 //!   only on this machine.
 //! - `unsupported.rs`: everything else, always with a sentence saying why (anti-pattern 18).
 //!
-//! On Linux the computer's own output volume is one more entry, the reserved player
-//! `@system` (`system_volume.rs`, protocol.md 5.9): never playing, and `volume` is the only
-//! thing it can do. Windows does not offer it yet.
+//! On Linux and Windows the computer's own output volume is one more entry, the reserved
+//! player `@system` (protocol.md 5.9): never playing, it can do `volume` and `mute`, and it
+//! reports the level also while muted. `system_volume_model.rs` holds what both share (the
+//! entry, the worker loop, folding a drag into one change); `system_volume.rs` reads the
+//! default sink through the `PulseAudio` protocol (`PipeWire` or `PulseAudio`), and
+//! `system_volume_windows.rs` the default render endpoint through Core Audio
+//! (`IAudioEndpointVolume`, with change and default-device notices), type-checked only on
+//! this machine.
 //!
 //! Album art is not sent in v1 (`art` is `None`; it needs a blob per track).
 //! Media state goes only to peers with the `media` grant; the core enforces that.
@@ -38,6 +43,10 @@ mod latest;
 mod linux;
 #[cfg(target_os = "linux")]
 mod system_volume;
+#[cfg(any(target_os = "linux", windows))]
+mod system_volume_model;
+#[cfg(windows)]
+mod system_volume_windows;
 mod unsupported;
 #[cfg(windows)]
 mod windows;
@@ -48,6 +57,11 @@ use self::linux as backend;
 use self::unsupported as backend;
 #[cfg(windows)]
 use self::windows as backend;
+
+#[cfg(target_os = "linux")]
+use self::system_volume as system_backend;
+#[cfg(windows)]
+use self::system_volume_windows as system_backend;
 
 use playdrop_core::host::MediaState;
 use playdrop_core::session::types::MediaAction;
@@ -69,12 +83,20 @@ pub async fn support() -> MediaSupport {
     backend::support().await
 }
 
-/// Watches every local player and applies commands to them.
+/// Whether this desktop offers the computer's own volume (`@system`). It does not depend
+/// on the player backend: the daemon starts a [`Watcher`] when either this or
+/// [`MediaSupport::supported`] is true.
+pub const fn volume_supported() -> bool {
+    cfg!(any(target_os = "linux", windows))
+}
+
+/// Watches every local player and the computer's volume, and applies commands to them.
 pub struct Watcher {
-    inner: backend::Watcher,
+    /// The player backend, or the sentence saying why players cannot be watched.
+    inner: Result<backend::Watcher, String>,
     /// The computer's own volume, as the reserved player `@system`.
-    #[cfg(target_os = "linux")]
-    system: system_volume::SystemVolume,
+    #[cfg(any(target_os = "linux", windows))]
+    system: system_volume_model::SystemVolume,
 }
 
 impl std::fmt::Debug for Watcher {
@@ -86,39 +108,55 @@ impl std::fmt::Debug for Watcher {
 impl Watcher {
     /// Starts watching. The current state of every player is sent first, then changes.
     /// A full channel drops the oldest pending state for that player rather than blocking
-    /// the bus task.
-    pub async fn start(tx: mpsc::Sender<MediaState>) -> anyhow::Result<Self> {
-        Ok(Self {
-            #[cfg(target_os = "linux")]
-            system: system_volume::SystemVolume::start(tx.clone()),
-            inner: backend::Watcher::start(tx).await?,
-        })
+    /// the bus task. Never fails: when the player backend cannot start, the computer's
+    /// volume still works and player commands answer with the backend's reason.
+    pub async fn start(tx: mpsc::Sender<MediaState>) -> Self {
+        #[cfg(any(target_os = "linux", windows))]
+        let system = system_backend::start(tx.clone());
+        let inner = backend::Watcher::start(tx).await.map_err(|e| {
+            tracing::warn!(error = %e, "media players are not watched");
+            e.to_string()
+        });
+        Self {
+            inner,
+            #[cfg(any(target_os = "linux", windows))]
+            system,
+        }
+    }
+
+    /// Sends the current state of every player and of the computer's volume again, also
+    /// when nothing changed: a host started after the watcher knows none of them.
+    pub fn republish(&self) {
+        #[cfg(any(target_os = "linux", windows))]
+        self.system.republish();
+        if let Ok(inner) = &self.inner {
+            inner.republish();
+        }
     }
 
     /// Applies a command to `player` (the ID from its [`MediaState`]). `value` is the seek
-    /// position in ms or the volume 0 to 100. Fails with a user-facing sentence when the
-    /// player is gone or cannot do it.
+    /// position in ms, the volume 0 to 100, or for `mute` `1` (mute) or `0` (unmute). Fails
+    /// with a user-facing sentence when the player is gone or cannot do it.
     pub async fn command(
         &self,
         player: &str,
         action: MediaAction,
         value: Option<u64>,
     ) -> anyhow::Result<()> {
-        #[cfg(target_os = "linux")]
-        if player == system_volume::SYSTEM_PLAYER {
-            anyhow::ensure!(
-                action == MediaAction::Volume,
-                "the computer's volume can only be set to a level"
-            );
-            let level = value
-                .ok_or_else(|| anyhow::anyhow!("a volume change needs a level from 0 to 100"))?;
-            return self.system.set(level);
+        #[cfg(any(target_os = "linux", windows))]
+        if player == system_volume_model::SYSTEM_PLAYER {
+            return self.system.command(&action, value);
         }
-        self.inner.command(player, action, value).await
+        match &self.inner {
+            Ok(inner) => inner.command(player, action, value).await,
+            Err(reason) => Err(anyhow::anyhow!("{reason}")),
+        }
     }
 
     /// Stops watching.
     pub fn stop(self) {
-        self.inner.stop();
+        if let Ok(inner) = self.inner {
+            inner.stop();
+        }
     }
 }

@@ -73,6 +73,10 @@ pub struct MediaState {
     pub position_at_ms: Option<u64>,
     /// Volume, 0 to 100.
     pub volume: Option<u8>,
+    /// Whether the output is muted. `None` when the player cannot tell (every player
+    /// but the computer's own volume, and every host older than 0.16.0).
+    #[serde(default)]
+    pub muted: Option<bool>,
     /// Actions the player supports.
     pub can: Vec<MediaAction>,
 }
@@ -90,6 +94,7 @@ impl From<MediaStateFrame> for MediaState {
             position_ms: f.position_ms,
             position_at_ms: f.position_at,
             volume: f.volume,
+            muted: f.muted,
             can: f.can,
         }
     }
@@ -108,6 +113,7 @@ impl From<MediaState> for MediaStateFrame {
             position_ms: s.position_ms,
             position_at: s.position_at_ms,
             volume: s.volume,
+            muted: s.muted,
             can: s.can,
             // Album art needs a blob per track; not sent in v1.
             art: None,
@@ -463,6 +469,7 @@ mod tests {
             position_ms: None,
             position_at_ms: None,
             volume: None,
+            muted: None,
             can: vec![MediaAction::Play],
         };
         let mut st = StatusState::default();
@@ -503,6 +510,7 @@ mod tests {
             position_ms: None,
             position_at_ms: None,
             volume: None,
+            muted: None,
             can: vec![MediaAction::Play],
         };
         st.media_remember(&a);

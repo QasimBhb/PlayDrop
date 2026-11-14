@@ -305,7 +305,8 @@ impl Watcher {
                 }
                 set
             }
-            MediaAction::Unknown(_) => unreachable!("refused above"),
+            // MPRIS players have no mute: `mute` is never in `can`.
+            MediaAction::Mute | MediaAction::Unknown(_) => unreachable!("refused above"),
         };
         result.map_err(|e| {
             tracing::debug!(player, error = %e, "media command failed");
@@ -318,6 +319,19 @@ impl Watcher {
                 _ => anyhow::anyhow!("the player did not accept the command"),
             }
         })
+    }
+
+    /// Queues every player's last state again (a new host knows none of them).
+    pub(super) fn republish(&self) {
+        let states: Vec<MediaState> = self
+            .shared
+            .players()
+            .values()
+            .filter_map(|slot| slot.last.clone())
+            .collect();
+        for state in states {
+            self.shared.out.push(state);
+        }
     }
 
     pub(super) fn stop(self) {
@@ -537,6 +551,7 @@ fn gone(id: &str, name: Option<String>) -> MediaState {
         position_ms: None,
         position_at_ms: None,
         volume: None,
+        muted: None,
         can: Vec::new(),
     }
 }
@@ -680,6 +695,7 @@ impl Snapshot {
             position_ms,
             position_at_ms: position_ms.map(|_| now_ms),
             volume: self.volume.map(volume_to_percent),
+            muted: None,
             can: self.flags.actions(self.volume.is_some()),
         }
     }

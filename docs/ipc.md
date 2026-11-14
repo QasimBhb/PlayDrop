@@ -214,10 +214,11 @@ change.
 | Host events `notification_posted`, `notification_removed`, `notification_dismiss` | Never sent to clients. The daemon shows and closes the desktop copies itself, and the D-Bus `Event` signal is a broadcast other programs on the session bus can match, so the app names, titles, text and keys stay in the daemon (SR-43) |
 
 Both grant fields have serde defaults both ways. An older daemon ignores them in `set_grants`
-and leaves them out of `peers`; a client then reads the defaults. An older client that sends
-`set_grants` with grants it read from a newer daemon drops both fields, so `notificationsIn`
-goes back to `true` and `notificationsOut` to `false`: a client that offers the toggle must be
-built against this version. `playdrop_ipc::types` also re-exports `MirroredNotification`.
+and leaves them out of `peers`; a client then reads the defaults. A `set_grants` without
+`merge` (every client up to 0.15.0) is the whole set, and a missing notification grant in it
+reads as its default, so a client older than 0.10.0 resets both whenever it changes any grant.
+From 0.16.0 clients send `merge: true`, which leaves every grant they do not carry as stored
+(section 1.10). `playdrop_ipc::types` also re-exports `MirroredNotification`.
 
 What the daemon does with a mirrored notification (section 5 has the rest of its behaviour):
 
@@ -267,7 +268,7 @@ connection only, and sends `update_state` when it reconnects.
 | Field | Meaning |
 |---|---|
 | `state.phase` | `off` (setting off), `idle` (no check yet in this daemon's life, put off with "Later", or a build that is not a release), `checking`, `up_to_date`, `available` `{offer}`, `downloading` `{version, done, total}` (bytes over all files; `total` 0 while unknown), `verifying` `{version}`, `installing` `{version}` (the system prompt and the package install; on Windows the daemon waits for the installer here: a successful one stops the daemon, and one that ends while the daemon runs is reported as `failed` with stage `install`, from its exit code), `restarting` `{version}` (`.deb` installed, the daemon is starting its new version), `failed` `{stage, message, offer?}`. A phase this client does not know decodes as `other` (serde `other`), so the answer still decodes |
-| `offer` | `version`, `page_url`, `can_install`, and with `can_install: false` a `reason` sentence: a Flatpak ("updates come from where it was installed"), a copy not installed from a PlayDrop package, a release without this computer's file, or an installed COSMIC applet the release has no package for (installing the main package alone would remove it) |
+| `offer` | `version`, `page_url`, `can_install`, and with `can_install: false` a `reason` sentence: a Flatpak (from 0.16.0 the file to download and the command that installs it, with `command`, section 1.11), a copy not installed from a PlayDrop package, a release without this computer's file, or an installed COSMIC applet the release has no package for (installing the main package alone would remove it) |
 | `failed.stage` | `check`, `download`, `verify` or `install` (unknown values read as `other`). `message` is one plain sentence for the user, for example "The download did not match its signed checksum and was deleted." or "The password prompt was closed; nothing was changed." After a failed download or install `offer` is still there, so the UI can offer "Update" again |
 | `last_checked_ms` | When a check last got an answer (Unix ms); absent before the first |
 | `last_failed_ms`, `last_failure` | When the last check failed and why, present only while that failure is newer than the last answer. A failed check keeps an offer that verified earlier on screen (phase `available`), so Settings reads the failure here. `last_failure` is not kept across a daemon restart; `last_failed_ms` is |
@@ -303,6 +304,70 @@ What clients rely on:
 - **An older client** never sends the requests and skips the `update_changed` event like any
   event it cannot decode (section 1).
 - **Logging (SR-32):** the daemon logs URLs, versions and stage names; never a response header.
+
+### 1.10 `set_grants` with `merge`, added in 0.16.0
+
+`IPC_VERSION` stays 1 (an addition with a default). `set_grants` gains an optional boolean
+field `merge` beside `peer` and `grants` (default `false`, left out when `false`). The `grants`
+object holds grant fields: `files`, `clipboardIn`, `clipboardOut`, `input`, `media`, `find`,
+`notificationsIn`, `notificationsOut`.
+
+```json
+{"op": "set_grants", "peer": "k3qd", "merge": true,
+ "grants": {"files": true, "clipboardIn": true, "clipboardOut": true, "input": false,
+            "media": true, "find": true, "notificationsIn": false, "notificationsOut": false}}
+```
+
+| `merge` | Meaning |
+|---|---|
+| absent or `false` | The legacy meaning, exactly as 0.15.0 read the request: `grants` is the whole set. The six original grants are required (a request missing one answers `bad_request`, as it did when it failed to parse); a missing `notificationsIn` reads as `true` and a missing `notificationsOut` as `false`. Every released client sends this, and behaves exactly as before |
+| `true` | A partial update: a grant that is missing or `null` keeps its stored value, a grant that is present is set. A request that carries no known grant answers `bad_request` and changes nothing, so a misspelled field does not look like success; an unknown field next to at least one known one is ignored |
+
+What is guaranteed:
+
+- A `merge` request never changes a grant it does not carry, for every grant field, including
+  any added later. (In Rust the request carries `playdrop_ipc::GrantsUpdate`, every field an
+  `Option<bool>`, which fails to compile when the core gains a grant it does not list.)
+- Two `merge` requests for different grants never lose each other: the daemon reads the stored
+  grants, applies one request and writes the result as one step, one request at a time.
+- A request without `merge` still overwrites every grant, as before, including one that a
+  concurrent request just changed.
+- An unpaired peer answers `not_found`.
+
+From 0.16.0 every client must send `merge: true`. The in-tree clients (the window; the applet
+and the CLI do not set grants over IPC) build the request with `Request::set_grants`, which
+sends `merge: true` **and** every grant written out: a daemon older than 0.16.0 ignores the
+unknown `merge` field (its `Request` does not deny unknown fields) and reads the same whole set,
+so the request works on both. A partial request must never go to an older daemon: it would
+refuse one missing an original grant, and read a missing notification grant as its default.
+
+A client older than 0.10.0 does not know the notification grants, so its requests (no `merge`)
+reset `notificationsIn` to `true` and `notificationsOut` to `false`. That cannot be told apart
+on the wire from a 0.10.0 to 0.15.0 client, which leaves a notification grant out while it sits
+at its default, so the legacy meaning is kept for both.
+
+After any `set_grants` answer, ok or error, the window reloads `peers` and shows what the daemon
+stored, instead of trusting its own copy or restoring the set it had before the toggle.
+
+### 1.11 The Flatpak update command, added in 0.16.0
+
+`IPC_VERSION` stays 1 (an addition with a default). A Flatpak bundle installed from a file never
+updates itself, and PlayDrop is not on Flathub: every release carries
+`playdrop-<version>-linux-x86_64.flatpak`, and the next bundle installs over the old one with the
+same command as the first install, keeping settings and pairings
+(`docs/release/distribution.md`, "Flatpak"). The daemon builds the sentence and the command in
+one place (`crates/playdropd/src/update/flatpak.rs`) and sends both in the offer:
+
+| Field | Meaning |
+|---|---|
+| `offer.command` | With `can_install: false`, when one command installs the new version by hand: that command, exactly as typed, for a UI to show where it can be selected and copied. Today only a Flatpak whose release lists the bundle: `flatpak install --user ./playdrop-<version>-linux-x86_64.flatpak`, run in the folder the bundle was saved to. Absent otherwise, and from a daemon older than 0.16.0 |
+| `offer.reason` | For that Flatpak: "A Flatpak cannot update itself. Download playdrop-<version>-linux-x86_64.flatpak from the release page, then run this in the folder you saved it to: <command>". It **ends with `command`**, so a client that does not know `command` still shows it whole. A release without the bundle gets the "no file for this computer" sentence and no `command` |
+
+The window shows `reason` up to the command (`UpdateOffer::reason_before_command`) and the
+command in a read-only field with **Copy**; `playdrop update` prints it on a row of its own
+(`run`); the one-line forms (`playdrop update` progress, the refusal of `update_install`) keep
+the whole `reason`. The COSMIC applet ships only in the `.deb`, never beside a Flatpak, and
+says only "PlayDrop <version> is available" with a button to the window.
 
 ## 2. Linux: D-Bus on the session bus (SR-26)
 

@@ -47,7 +47,9 @@ extension UpdateCheckRules {
             decide: { sums, sig, currentVersion in
                 let offer = try updateOffer(sums: sums, sig: sig, currentVersion: currentVersion, kind: .ios)
                 return offer.map { UpdateOfferInfo(version: $0.version, pageURL: $0.pageUrl) }
-            }
+            },
+            checkAvailable: { updateCheckAvailable(currentVersion: $0) },
+            notAReleaseText: updateNotAReleaseText()
         )
     }
 }
@@ -63,6 +65,9 @@ final class UpdateChecker {
     private(set) var presentation = UpdateCheckPresentation()
     /// A check is on its way.
     private(set) var checking = false
+    /// The core's sentence for a version that has no update check (a pre-release or test
+    /// build); nil for a plain release.
+    var notAReleaseText: String? { engine.notAReleaseText }
 
     @ObservationIgnored private let engine: UpdateCheckEngine
 

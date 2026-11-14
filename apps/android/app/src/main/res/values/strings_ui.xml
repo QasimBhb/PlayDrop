@@ -187,6 +187,13 @@
     <string name="ui_transfers_to">To %1$s</string>
     <string name="ui_transfers_of">%1$s of %2$s</string>
     <string name="ui_transfers_left">%1$s left</string>
+    <string name="ui_history_title">Sent from this phone</string>
+    <string name="ui_history_clear">Clear history</string>
+    <string name="ui_history_resumes">PlayDrop will carry on when the device is back, or when you send the same files again.</string>
+    <string name="ui_history_sent">Sent</string>
+    <string name="ui_settings_history">Sent history</string>
+    <string name="ui_settings_keep_history">Keep a history of what I send</string>
+    <string name="ui_settings_keep_history_hint">Lists the last 50 sends on the Transfers tab, with the device, the size and the first file names. It stays on this phone. Clipboard sends are never listed. Turning this off clears the list.</string>
     <string name="ui_transfers_more">and %1$d more</string>
     <string name="ui_transfers_accept">Accept</string>
     <string name="ui_transfers_decline">Decline</string>
@@ -333,6 +340,9 @@
     <string name="ui_media_next">Next track</string>
     <string name="ui_media_volume">Volume</string>
     <string name="ui_media_system_volume">Computer volume</string>
+    <string name="ui_media_mute_computer">Mute computer</string>
+    <string name="ui_media_unmute_computer">Unmute computer</string>
+    <string name="ui_media_muted">Muted</string>
     <string name="ui_media_volume_percent">%1$d%%</string>
 
     <!-- Remote input screen -->

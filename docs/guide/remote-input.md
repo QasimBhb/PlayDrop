@@ -45,3 +45,9 @@ With the media permission (on by default), the phone shows what the computer is 
 play, pause, next, previous and volume. On Linux this works with players that follow MPRIS. On
 Windows it uses the system media controls and is untested by a person. A refused command names
 the device and the permission to turn on.
+
+**Computer volume.** The phone's device page also has a "Computer volume" slider. It changes
+the computer's own volume, the one the volume keys change, whether or not anything is playing.
+Linux computers offer it from 0.14.0 (PipeWire or PulseAudio) and Windows computers from
+0.16.0. From 0.16.0 a mute button sits next to it; the slider keeps showing the level the
+computer comes back to when unmuted. Both sides need 0.16.0 for the mute button.

@@ -16,7 +16,7 @@ it offers **Update** or **Later**.
 | `.deb` (Pop!_OS, Ubuntu) | Downloads the new `.deb` (and the `playdrop-cosmic-applet` package, when that package is installed and the release lists it; section 6), verifies it, installs it through `pkexec` (the system password prompt) and restarts the daemon |
 | Windows installer | Downloads the new installer, verifies it, runs it (Windows asks for permission) and waits for it; the installer starts PlayDrop again |
 | Android | Downloads the APK, verifies it, hands it to the system installer. Android itself refuses an APK signed with another key |
-| Flatpak | Notice only, with the release page link. A Flatpak cannot replace itself |
+| Flatpak | Notice only, with the release page link and, from 0.16.0, the exact command: download `playdrop-<version>-linux-x86_64.flatpak` and run `flatpak install --user ./playdrop-<version>-linux-x86_64.flatpak` (shown only when the signed checksum file lists that bundle; `UpdateOffer.command` in `docs/ipc.md` 1.11). A Flatpak cannot replace itself |
 | iPhone | Notice only, with the release page link. iOS installs go through SideStore, AltStore or xtool |
 | Anything else (a `cargo build`, another distro) | Notice only |
 

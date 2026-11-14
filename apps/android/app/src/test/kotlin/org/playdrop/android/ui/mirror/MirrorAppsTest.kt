@@ -35,4 +35,34 @@ class MirrorAppsTest {
         // A failed query (nothing listed) reports nothing.
         assertEquals(emptyList<String>(), MirrorApps.notFound(allowed, emptySet()))
     }
+
+    private val notFound = { _: String -> MirrorApps.Lookup.NOT_FOUND }
+
+    @Test
+    fun onlyAnAppEveryCheckMissesIsPrunable() {
+        val allowed = setOf("chat", "gone", "disabled", "archived", "shown", "failed", "visible")
+        val lookup = { p: String ->
+            when (p) {
+                "visible" -> MirrorApps.Lookup.FOUND
+                "failed" -> MirrorApps.Lookup.FAILED
+                else -> MirrorApps.Lookup.NOT_FOUND
+            }
+        }
+        val gone = MirrorApps.prunable(
+            allowed = allowed,
+            launcher = setOf("chat", "maps"),
+            wider = setOf("chat", "maps", "disabled", "archived"),
+            lookup = lookup,
+            active = setOf("shown"),
+        )
+        assertEquals(setOf("gone"), gone)
+    }
+
+    @Test
+    fun aFailedOrEmptyQueryPrunesNothing() {
+        val allowed = setOf("chat", "gone")
+        assertEquals(emptySet<String>(), MirrorApps.prunable(allowed, emptySet(), setOf("maps"), notFound, emptySet()))
+        assertEquals(emptySet<String>(), MirrorApps.prunable(allowed, setOf("maps"), emptySet(), notFound, emptySet()))
+        assertEquals(emptySet<String>(), MirrorApps.prunable(emptySet(), setOf("maps"), setOf("maps"), notFound, emptySet()))
+    }
 }

@@ -88,6 +88,7 @@ mod tests {
             position_ms: None,
             position_at_ms: None,
             volume: None,
+            muted: None,
             can: Vec::new(),
         }
     }

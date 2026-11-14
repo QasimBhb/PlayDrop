@@ -26,7 +26,7 @@ use tokio::sync::mpsc;
 use super::fetch::{FetchConfig, MinProgress, ProxyChoice, RedirectRule};
 use super::install::{InstallFailure, Installer, Relaunch, DISMISSED};
 use super::kind::Install;
-use super::{Setup, Updater, FLATPAK_REASON};
+use super::{flatpak, Setup, Updater, NO_FILE_REASON};
 use playdrop_core::update::InstallKind;
 
 /// Public half of the throwaway key.
@@ -67,6 +67,18 @@ const SIG_D: &str =
     "xDilYY8NHkM+512YblL1zkNdGL8mIlaNZYNCJ8ydOfIfVZPCY3yjThxC20PKFXy9/c76enSYCVBSd4k2QUUVCA==";
 /// Public half of the second throwaway key, which signed only [`SUMS_D`].
 const TEST_KEY_D: &str = "64e01fd69ed8c8b2eafcc86e1423b7bf4268842448d0f5a0b26af01bf66e3a75";
+
+/// Release 1.2.3 with the `.deb`, the Windows installer and the Flatpak bundle, signed with
+/// a third throwaway key, made the same way.
+const SUMS_F: &str = "\
+7de919f3f0a0592205ad23c3c8a687deea32ed8791072b5ae8a36c6512e694dd  playdrop-1.2.3-linux-amd64.deb
+65ee7c114a378fbca6bf345e1cb6b02519ad160edddcff8d0ce1f2a36a4e83c3  playdrop-1.2.3-windows-x64-setup.exe
+ad5d463e1c28aed1ecf054b55619a7ac5806cc6a9fb4d70c57339032aa1e5f1f  playdrop-1.2.3-linux-x86_64.flatpak
+";
+const SIG_F: &str =
+    "3LtGnmABBEAbsKRFF1eT+IZ2Gokkw+zzoOOjPxq/dwYcRb0AwNFT+f8FTpSNyfL1pIIay5Gnm4+i+MS2XeXBBg==";
+/// Public half of the third throwaway key, which signed only [`SUMS_F`].
+const TEST_KEY_F: &str = "23de7fef205085e60626fe590dab5cbc0ca386ad6aef8a7f62b5e98ba434d5c4";
 
 const PATH_BASE: &str = "/QasimBhb/PlayDrop/releases";
 const SUMS_PATH: &str = "/QasimBhb/PlayDrop/releases/latest/download/SHA256SUMS";
@@ -338,6 +350,7 @@ impl Rig {
             keys: vec![
                 key_from_hex(TEST_KEY).unwrap(),
                 key_from_hex(TEST_KEY_D).unwrap(),
+                key_from_hex(TEST_KEY_F).unwrap(),
             ],
             fetch: FetchConfig {
                 timeout: o.timeout,
@@ -952,9 +965,41 @@ fn a_file_changed_after_verifying_is_not_installed() {
     super::remove_dir(&dir);
 }
 
-/// A Flatpak gets the notice and the release page, never an install.
+/// A Flatpak gets the notice, the release page and the exact command that installs the new
+/// bundle, never an install.
 #[tokio::test]
-async fn a_flatpak_is_told_where_updates_come_from() {
+async fn a_flatpak_is_told_the_command_that_installs_the_new_bundle() {
+    let rig = Rig::new(Options {
+        install: Install {
+            kind: InstallKind::Flatpak,
+            applet: false,
+        },
+        ..Options::default()
+    });
+    rig.server.release(SUMS_F, SIG_F);
+    let UpdateState::Available { offer } = rig.check(false).await else {
+        panic!("no offer");
+    };
+    assert!(!offer.can_install);
+    let command = "flatpak install --user ./playdrop-1.2.3-linux-x86_64.flatpak";
+    assert_eq!(offer.command.as_deref(), Some(command));
+    assert_eq!(offer.reason, Some(flatpak::reason("1.2.3")));
+    assert!(offer.reason.as_deref().unwrap().ends_with(command));
+    assert_eq!(
+        offer.page_url,
+        format!("{}{PATH_BASE}/tag/v1.2.3", rig.server.origin())
+    );
+    assert_eq!(
+        rig.updater.start_install(Relaunch::Window).unwrap_err().0,
+        flatpak::reason("1.2.3")
+    );
+    assert_eq!(rig.updater.page_url(), Some(offer.page_url));
+}
+
+/// A release without the Flatpak bundle names no file and no command: the notice points at
+/// the release page only.
+#[tokio::test]
+async fn a_flatpak_offer_without_the_bundle_names_no_command() {
     let rig = Rig::new(Options {
         install: Install {
             kind: InstallKind::Flatpak,
@@ -967,16 +1012,26 @@ async fn a_flatpak_is_told_where_updates_come_from() {
         panic!("no offer");
     };
     assert!(!offer.can_install);
-    assert_eq!(offer.reason.as_deref(), Some(FLATPAK_REASON));
-    assert_eq!(
-        offer.page_url,
-        format!("{}{PATH_BASE}/tag/v1.2.3", rig.server.origin())
-    );
-    assert_eq!(
-        rig.updater.start_install(Relaunch::Window).unwrap_err().0,
-        FLATPAK_REASON
-    );
-    assert_eq!(rig.updater.page_url(), Some(offer.page_url));
+    assert_eq!(offer.reason.as_deref(), Some(NO_FILE_REASON));
+    assert_eq!(offer.command, None);
+}
+
+/// Every other install kind carries no command: a `.deb` installs by itself.
+#[tokio::test]
+async fn only_the_flatpak_offer_carries_a_command() {
+    let rig = Rig::new(Options {
+        install: Install {
+            kind: InstallKind::Deb,
+            applet: false,
+        },
+        ..Options::default()
+    });
+    rig.server.release(SUMS_F, SIG_F);
+    let UpdateState::Available { offer } = rig.check(false).await else {
+        panic!("no offer");
+    };
+    assert!(offer.can_install);
+    assert_eq!((offer.reason, offer.command), (None, None));
 }
 
 /// The applet package installed but missing from the release (a release after the

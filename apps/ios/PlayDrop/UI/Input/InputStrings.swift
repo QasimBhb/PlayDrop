@@ -162,6 +162,14 @@ extension L10n {
         static var computerVolume: String {
             String(localized: "ui_media_computer_volume", defaultValue: "Computer volume")
         }
+        /// "Mute computer": VoiceOver label of the mute button.
+        static var muteComputer: String {
+            String(localized: "ui_media_mute_computer", defaultValue: "Mute computer")
+        }
+        /// "Unmute computer": VoiceOver label of the mute button while muted.
+        static var unmuteComputer: String {
+            String(localized: "ui_media_unmute_computer", defaultValue: "Unmute computer")
+        }
         /// Accessibility hint of the computer volume slider.
         static var computerVolumeHint: String {
             String(

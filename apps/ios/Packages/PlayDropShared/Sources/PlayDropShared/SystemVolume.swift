@@ -1,14 +1,18 @@
 // The computer's master volume. The desktop reports it as a reserved pseudo-player in the
 // same `MediaState` list as the real players: player ID "@system", never playing, no track,
-// `volume` 0 to 100 (0 when muted) and `can` holding only `volume`. A `volume` command to
-// that ID sets the master volume. It is never a "Now playing" row: the app splits it off
+// `volume` 0 to 100 and `can` holding `volume` (and `mute` from desktop 0.16.0, with a
+// `muted` flag; older desktops report 0 while muted and no flag). A `volume` command to
+// that ID sets the master volume; a `mute` command with value 1 mutes and 0 unmutes, and a
+// `volume` command above 0 unmutes too. It is never a "Now playing" row: the app splits it off
 // with `SystemVolume.split` and shows it as its own slider.
 //
 // `VolumeSliderModel` holds the slider rules: while the finger drags, commands go out at
 // most every `minInterval` seconds (about 5 per second), the slider follows the finger and
 // ignores incoming states, and the release always sends the final value. After the release
 // the slider keeps the released value until the computer echoes it (or `echoWait` passes),
-// so it does not jump back to an older reported level.
+// so it does not jump back to an older reported level. The mute toggle works the same way:
+// it shows the new state at once and keeps it until the computer's `muted` agrees (or
+// `echoWait` passes).
 //
 // Works on plain values so it builds without the generated core types.
 import Foundation
@@ -73,6 +77,8 @@ public struct VolumeSliderModel: Equatable, Sendable {
 
     /// The latest level the computer reported, 0 to 100.
     public private(set) var reported: Int = 0
+    /// The latest `muted` the computer reported; nil when it does not say.
+    public private(set) var reportedMuted: Bool?
     /// A finger is on the slider.
     public private(set) var dragging = false
 
@@ -80,6 +86,9 @@ public struct VolumeSliderModel: Equatable, Sendable {
     /// The released value, kept until the echo arrives or `echoWait` passes.
     private var held: Int?
     private var heldSince: TimeInterval = 0
+    /// The mute state the user asked for, kept until the echo arrives or `echoWait` passes.
+    private var heldMute: Bool?
+    private var heldMuteSince: TimeInterval = 0
     private var lastSent: Int?
     private var lastSentAt: TimeInterval?
     /// A drag value held back by the throttle, sent by `flush` or the release.
@@ -101,15 +110,38 @@ public struct VolumeSliderModel: Equatable, Sendable {
         return held ?? reported
     }
 
-    /// A released value is waiting for its echo.
-    public var awaitingEcho: Bool { held != nil }
+    /// Whether the mute button is offered: the computer lists `mute` and says whether it is
+    /// muted. Without a `muted` flag a tap could not be told from its echo (the computer
+    /// might stay silent about it), so no button is shown.
+    public static func canShowMute(canMute: Bool, muted: Bool?) -> Bool {
+        canMute && muted != nil
+    }
 
-    /// A new level from the computer (nil: not reported, read as 0). Recorded always; it
-    /// shows only when no finger is on the slider and no released value waits for its echo.
-    /// The echo of the released value ends the wait.
-    public mutating func report(_ volume: Int?) {
+    /// Whether the computer is shown as muted: the asked-for state until its echo arrives,
+    /// else the reported one. The slider still shows `shown`, the real level.
+    public var shownMuted: Bool { heldMute ?? reportedMuted ?? false }
+
+    /// A released value or a mute change is waiting for its echo.
+    public var awaitingEcho: Bool { held != nil || heldMute != nil }
+
+    /// A new level from the computer (nil: not reported, read as 0) and its `muted` flag
+    /// (nil: not reported). Recorded always; the level shows only when no finger is on the
+    /// slider and no released value waits for its echo. The echo of the released value or of
+    /// a mute change ends its wait.
+    public mutating func report(_ volume: Int?, muted: Bool? = nil) {
         reported = SystemVolume.percent(volume)
+        reportedMuted = muted
         if let held, held == reported { self.held = nil }
+        if let heldMute, heldMute == muted { self.heldMute = nil }
+    }
+
+    /// The mute button was pressed. Returns the `mute` command value (1 mutes, 0 unmutes)
+    /// and shows the new state until the computer's echo arrives.
+    public mutating func toggleMute(now: TimeInterval) -> Int {
+        let target = !shownMuted
+        heldMute = target
+        heldMuteSince = now
+        return target ? 1 : 0
     }
 
     /// The finger went down on the slider.
@@ -171,6 +203,7 @@ public struct VolumeSliderModel: Equatable, Sendable {
     /// slider follows the computer again.
     public mutating func expire(now: TimeInterval) {
         if held != nil, now - heldSince >= echoWait { held = nil }
+        if heldMute != nil, now - heldMuteSince >= echoWait { heldMute = nil }
     }
 
     /// `minInterval` has passed since `at`, with a millisecond of slack so a timer that
@@ -180,6 +213,11 @@ public struct VolumeSliderModel: Equatable, Sendable {
     }
 
     private mutating func markSent(_ value: Int, now: TimeInterval) -> Int {
+        // A level above 0 unmutes the computer, so show it unmuted at once.
+        if value > 0, shownMuted {
+            heldMute = false
+            heldMuteSince = now
+        }
         lastSent = value
         lastSentAt = now
         unsent = nil

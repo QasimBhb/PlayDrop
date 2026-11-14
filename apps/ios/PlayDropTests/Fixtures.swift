@@ -55,11 +55,11 @@ enum Fixtures {
     static func media(
         _ player: String, name: String? = nil, playing: Bool = false, can: [MediaAction] = [],
         durationMs: UInt64? = nil, positionMs: UInt64? = nil, positionAtMs: UInt64? = nil,
-        volume: UInt8? = nil
+        volume: UInt8? = nil, muted: Bool? = nil
     ) -> MediaState {
         MediaState(
             player: player, name: name, playing: playing, title: nil, artist: nil, album: nil,
-            durationMs: durationMs, positionMs: positionMs, positionAtMs: positionAtMs, volume: volume, can: can
+            durationMs: durationMs, positionMs: positionMs, positionAtMs: positionAtMs, volume: volume, muted: muted, can: can
         )
     }
 

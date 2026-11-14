@@ -21,6 +21,7 @@
 #![forbid(clippy::unwrap_used)]
 
 pub mod client;
+mod grants;
 pub mod server;
 pub mod wire;
 
@@ -59,6 +60,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::grants::GrantsUpdate;
 use crate::types::{
     AddDeviceCandidate, Diagnostics, Grants, HostEvent, MediaAction, OutboxItem, PeerSummary,
     TransferSnapshot,
@@ -134,12 +136,19 @@ pub enum Request {
         peer: String,
     },
     /// Change a peer's grants. Only a local UI may do this (SR-14); the transport enforces
-    /// that the caller is the same user.
+    /// that the caller is the same user. Build it with [`Request::set_grants`].
+    /// `docs/ipc.md` 1.10 has both meanings.
     SetGrants {
         /// Peer query.
         peer: String,
-        /// New grants.
-        grants: Grants,
+        /// The grants. With `merge` only the carried ones change; without it this is the
+        /// whole set, read as 0.15.0 read it ([`GrantsUpdate::into_full`]).
+        grants: GrantsUpdate,
+        /// A partial update: a grant `grants` does not carry keeps its stored value. Left
+        /// out when false, the legacy meaning of every client up to 0.15.0. A daemon older
+        /// than 0.16.0 ignores the field and reads `grants` as the whole set.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        merge: bool,
     },
     /// Turn a peer's `remote` grant on or off (protocol.md 12). Only a local UI may do this
     /// (SR-14). A daemon built without reach answers `invalid_state`.
@@ -366,6 +375,18 @@ pub enum Request {
 }
 
 impl Request {
+    /// `set_grants` as every in-tree client sends it: `merge: true` with every grant written
+    /// out, so a 0.16.0 daemon changes exactly these and an older one, which ignores `merge`,
+    /// reads the same whole set.
+    #[must_use]
+    pub fn set_grants(peer: impl Into<String>, grants: Grants) -> Self {
+        Self::SetGrants {
+            peer: peer.into(),
+            grants: grants.into(),
+            merge: true,
+        }
+    }
+
     /// The `op` tag of this request, as it appears on the wire. Transports log this and
     /// nothing else about a request (SR-32).
     pub fn op(&self) -> &'static str {
@@ -782,6 +803,28 @@ pub struct UpdateOffer {
     /// With `can_install: false`: one sentence saying why, for the UI to show.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// With `can_install: false`, when one command installs the new version by hand (the
+    /// Flatpak bundle): that command, exactly as the user types it, for a UI to show where
+    /// it can be selected and copied. `reason` ends with the same command, so a client from
+    /// before this field still shows it (`docs/ipc.md` 1.11).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+}
+
+impl UpdateOffer {
+    /// `reason` without the [`UpdateOffer::command`] it ends with, for a UI that shows the
+    /// command on its own line; the whole `reason` when there is no command or it is not at
+    /// the end.
+    #[must_use]
+    pub fn reason_before_command(&self) -> Option<&str> {
+        let reason = self.reason.as_deref()?;
+        let lead = self
+            .command
+            .as_deref()
+            .and_then(|c| reason.strip_suffix(c))
+            .map_or(reason, str::trim_end);
+        Some(lead)
+    }
 }
 
 /// The step an update failed at.
@@ -1041,6 +1084,71 @@ mod tests {
         assert!(json.contains(r#""op":"set_label""#));
         let back: Request = serde_json::from_str(&json).expect("parse");
         assert_eq!(back, r);
+    }
+
+    /// The request shape exactly as 0.15.0 declared it, to check what an older daemon makes
+    /// of what a new client sends. `Grants` is the core type, unchanged since then.
+    #[derive(Debug, Deserialize)]
+    #[serde(tag = "op", rename_all = "snake_case")]
+    enum Request015 {
+        SetGrants { peer: String, grants: Grants },
+    }
+
+    /// The regression case at parse level: a 0.15.0 window turning "show notifications" back
+    /// on leaves `notificationsIn` out (it is `true`). That request has no `merge`, so it is
+    /// the whole set and reads with `notificationsIn: true`.
+    #[test]
+    fn set_grants_from_0_15_is_the_whole_set() {
+        let on = Grants::default();
+        let body = serde_json::json!({"op": "set_grants", "peer": "k3qd", "grants": on});
+        assert!(!body["grants"]
+            .as_object()
+            .expect("object")
+            .contains_key("notificationsIn"));
+        let Request::SetGrants {
+            peer,
+            grants,
+            merge,
+        } = serde_json::from_value(body).expect("parse")
+        else {
+            panic!("not set_grants");
+        };
+        assert_eq!(peer, "k3qd");
+        assert!(!merge, "no merge on a 0.15.0 request");
+        assert_eq!(grants.into_full(), Ok(on));
+    }
+
+    /// What a new client sends: `merge: true` and every grant written out. It round-trips,
+    /// and the 0.15.0 parser accepts it (unknown `merge` ignored) and reads the same set.
+    #[test]
+    fn set_grants_from_a_new_client_reads_on_0_15() {
+        let want = Grants {
+            notifications_in: true,
+            notifications_out: false,
+            input: true,
+            ..Grants::default()
+        };
+        let r = Request::set_grants("k3qd", want);
+        let json = serde_json::to_string(&r).expect("serialise");
+        assert!(json.contains(r#""merge":true"#), "{json}");
+        assert!(json.contains(r#""notificationsIn":true"#), "{json}");
+        assert!(json.contains(r#""notificationsOut":false"#), "{json}");
+        assert_eq!(serde_json::from_str::<Request>(&json).expect("parse"), r);
+
+        let Request015::SetGrants { peer, grants } =
+            serde_json::from_str(&json).expect("0.15.0 parses it");
+        assert_eq!(peer, "k3qd");
+        assert_eq!(grants, want);
+
+        // `merge: false` is left out, so a legacy request looks exactly like 0.15.0's.
+        let legacy = Request::SetGrants {
+            peer: "k3qd".into(),
+            grants: want.into(),
+            merge: false,
+        };
+        assert!(!serde_json::to_string(&legacy)
+            .expect("serialise")
+            .contains("merge"));
     }
 
     #[test]
@@ -1491,7 +1599,48 @@ mod tests {
             page_url: "https://github.com/QasimBhb/PlayDrop/releases/tag/v0.11.0".into(),
             can_install: true,
             reason: None,
+            command: None,
         }
+    }
+
+    /// A Flatpak offer carries the command on its own and at the end of `reason`; an offer
+    /// from an older daemon (no `command`) still reads, and its `reason` is shown whole.
+    #[test]
+    fn an_offer_command_is_optional_and_ends_the_reason() {
+        let flatpak = UpdateOffer {
+            version: "0.16.0".into(),
+            page_url: "https://example.invalid/v0.16.0".into(),
+            can_install: false,
+            reason: Some("Download it, then run: flatpak install --user ./x.flatpak".into()),
+            command: Some("flatpak install --user ./x.flatpak".into()),
+        };
+        let json = serde_json::to_string(&flatpak).expect("serialise");
+        assert!(json.contains(r#""command":"flatpak install --user ./x.flatpak""#));
+        assert_eq!(
+            serde_json::from_str::<UpdateOffer>(&json).expect("parse"),
+            flatpak
+        );
+        assert_eq!(
+            flatpak.reason_before_command(),
+            Some("Download it, then run:")
+        );
+
+        let old: UpdateOffer = serde_json::from_str(
+            r#"{"version":"0.15.0","page_url":"p","can_install":false,"reason":"Get it."}"#,
+        )
+        .expect("old shape");
+        assert_eq!(old.command, None);
+        assert_eq!(old.reason_before_command(), Some("Get it."));
+        assert!(!serde_json::to_string(&offer())
+            .expect("serialise")
+            .contains("command"));
+
+        // A command that is not at the end leaves the reason whole.
+        let odd = UpdateOffer {
+            command: Some("other".into()),
+            ..flatpak
+        };
+        assert_eq!(odd.reason_before_command(), odd.reason.as_deref());
     }
 
     #[test]

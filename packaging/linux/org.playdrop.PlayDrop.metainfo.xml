@@ -57,6 +57,11 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.16.0" date="2026-11-14" type="development">
+      <description>
+        <p>The "Computer volume" slider on the phone now also works with Windows computers and has a mute button. The Android app keeps a list of what you sent, and a Flatpak install shows the exact command for an update.</p>
+      </description>
+    </release>
     <release version="0.15.0" date="2026-11-13" type="development">
       <description>
         <p>On Windows, PlayDrop now has its icon and name in the Start menu, the taskbar and near the clock, and installs as one "PlayDrop" entry.</p>

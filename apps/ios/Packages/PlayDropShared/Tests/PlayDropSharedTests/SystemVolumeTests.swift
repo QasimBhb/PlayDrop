@@ -152,6 +152,69 @@ final class SystemVolumeTests: XCTestCase {
         XCTAssertFalse(m.awaitingEcho)
     }
 
+    func testMuteFlagIsShownAndOldDesktopReadsUnmuted() {
+        var m = VolumeSliderModel()
+        m.report(40, muted: true)
+        XCTAssertTrue(m.shownMuted)
+        XCTAssertEqual(m.shown, 40, "the slider keeps the real level while muted")
+        m.report(40, muted: nil)
+        XCTAssertFalse(m.shownMuted, "an older desktop sends no flag")
+    }
+
+    func testMuteButtonNeedsMuteInCanAndAReportedFlag() {
+        XCTAssertTrue(VolumeSliderModel.canShowMute(canMute: true, muted: false))
+        XCTAssertTrue(VolumeSliderModel.canShowMute(canMute: true, muted: true))
+        XCTAssertFalse(VolumeSliderModel.canShowMute(canMute: true, muted: nil), "no flag, no button")
+        XCTAssertFalse(VolumeSliderModel.canShowMute(canMute: false, muted: false))
+        XCTAssertFalse(VolumeSliderModel.canShowMute(canMute: false, muted: nil))
+    }
+
+    func testToggleMuteShowsAtOnceAndSettlesOnTheEcho() {
+        var m = VolumeSliderModel()
+        m.report(40, muted: false)
+        XCTAssertEqual(m.toggleMute(now: 1), 1)
+        XCTAssertTrue(m.shownMuted)
+        XCTAssertTrue(m.awaitingEcho)
+        m.report(40, muted: false)
+        XCTAssertTrue(m.shownMuted, "a late stale state does not flicker it back")
+        m.report(40, muted: true)
+        XCTAssertFalse(m.awaitingEcho)
+        XCTAssertTrue(m.shownMuted)
+        XCTAssertEqual(m.toggleMute(now: 2), 0)
+        XCTAssertFalse(m.shownMuted)
+    }
+
+    func testMuteHoldExpiresWithoutEcho() {
+        var m = VolumeSliderModel(echoWait: 1.5)
+        m.report(40, muted: false)
+        _ = m.toggleMute(now: 10)
+        m.expire(now: 11)
+        XCTAssertTrue(m.shownMuted)
+        m.expire(now: 11.5)
+        XCTAssertFalse(m.shownMuted, "follows the computer again")
+        XCTAssertFalse(m.awaitingEcho)
+    }
+
+    func testVolumeAboveZeroUnmutes() {
+        var m = VolumeSliderModel()
+        m.report(40, muted: true)
+        XCTAssertEqual(m.release(now: 1), 40, "release sends the level")
+        XCTAssertFalse(m.shownMuted)
+        m.report(40, muted: true)
+        XCTAssertFalse(m.shownMuted, "a stale muted state waits for the echo")
+        m.report(60, muted: false)
+        XCTAssertFalse(m.shownMuted)
+        XCTAssertFalse(m.awaitingEcho)
+    }
+
+    func testDragToZeroKeepsMuteAsItWas() {
+        var m = VolumeSliderModel()
+        m.report(40, muted: true)
+        m.begin()
+        XCTAssertEqual(m.drag(to: 0, now: 1), 0)
+        XCTAssertTrue(m.shownMuted)
+    }
+
     func testNewDragDropsTheHold() {
         var m = VolumeSliderModel()
         m.report(10)
