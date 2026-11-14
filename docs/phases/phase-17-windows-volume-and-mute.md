@@ -218,7 +218,20 @@ ticked; notification access off.
 
 ## 8. Release
 
-Filled in after the release run: the tag, the run, the Windows volume step's branch.
+v0.16.0 was tagged at `69cb9b9` on 2026-11-14 after CI was green on all four platforms, and its
+release run passed first time: six files plus `SHA256SUMS` and `SHA256SUMS.sig`. The published
+signature was fetched from the "latest" URLs and verified with `openssl` against
+`docs/release/playdrop-update.pub`.
+
+**The Windows volume step ran only its quiet branch.** The runner's log for both tests says "no
+default output device on this machine (Element not found. (0x80070490))": COM starts, the
+enumerator is created, "no device" is read as no output, nothing is reported and the worker
+stops. Reading and setting the level and mute, and the change notices, have not run anywhere.
+A step that installs a virtual sound card on the runner (VB-CABLE through
+`LABSN/sound-ci-helpers`, then starting `Audiosrv`) was written and then refused by the
+session's permission rules before it was saved; it needs the user's yes. The non-test Windows
+code has no `unwrap`, `expect` or `panic!`, so a failure there shows as a missing slider, not a
+crash.
 
 ---
 
