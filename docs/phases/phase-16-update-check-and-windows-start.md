@@ -228,46 +228,61 @@ directories and the `incremental` folders. Rules from now on:
 
 ## 9. Phase 17 kickoff brief
 
-**After this file was written (2026-11-13):** the user had the applet merged into the main `.deb`
-and `playdrop restart` added, released as v0.12.0 the same day (`CHANGELOG.md`,
-`docs/release/distribution.md`). The laptop and the A54 run 0.11.0, so 0.12.0 is the first real
-update offer for both: item 1 below can be done at once, without installing anything by hand.
-An empty transitional `playdrop-cosmic-applet` package ships in 0.12.0 and 0.13.0; drop it from
-0.14.0.
+**State on 2026-11-14: v0.15.0 is `main` and the latest release.** Four releases followed this
+file's first version, all by the user's word in the Phase 16 session (`CHANGELOG.md` has each):
 
-**First real `.deb` update (2026-11-13, laptop, 0.11.0 to 0.12.0, by the user):** the offer, the
-download of both files, the pkexec prompt and the install all worked, and the daemon came back as
-0.12.0 with its peers. Two defects showed and are fixed on `main` after the 0.12.0 tag, so they
-reach users with 0.13.0: `systemctl restart` runs in the unit's own cgroup and is signalled by
-the stop it asked for, which 0.11.0 and 0.12.0 read as a refusal and answered by `exec`ing in
-place during systemd's stop (the unit sat in "deactivating" for 90 s, was killed and started
-again; `update/restart.rs::asked`); and the window showed "PlayDrop is starting; try again" in
-red when it asked the fresh daemon for its state (it now asks again, `Controller::load_failed`).
-The 0.12.0 to 0.13.0 update will still take the 90 s detour, because the old daemon does the
-restart. The phone half ran the same day on the A54 (a test-signed 0.11.0): the check, the download and
-the hand-over to the system installer worked, and Android refused the release-signed APK with the
-"signed with a different key" sentence, as designed. An update that Android accepts (a
-release-signed install updating to a release) is still unproven.
+- **0.12.0** one `.deb` that holds the COSMIC applet, an empty transitional
+  `playdrop-cosmic-applet` package, `playdrop restart`.
+- **0.13.0** two defects the first real update found: `systemctl restart` runs in the unit's own
+  cgroup and is signalled by the stop it asked for, which was read as a refusal
+  (`update/restart.rs::asked`); the window showed "PlayDrop is starting; try again" in red
+  (`Controller::load_failed`).
+- **0.14.0** the computer's own volume as the reserved media player `@system` (protocol 5.9,
+  `crates/playdropd/src/media/system_volume.rs`, pure Rust `pulseaudio` crate, Linux only), a
+  "Computer volume" slider on Android and iPhone, and a player that ignores volume changes
+  (browsers) loses its `volume` (`media/linux.rs::volume_was_ignored`).
+- **0.15.0** Windows looks like an app: `packaging/windows/playdrop.ico` (from `make-icon.py`)
+  embedded in the three programs by `build.rs` through `winresource`, the window installed as
+  `PlayDrop.exe` (built as `playdrop-desktop.exe`), one Start Menu shortcut directly in the
+  programs list, the tray icon from resource 1.
 
-v0.11.0 is the state of `main`.
+**Proven since:** the `.deb` updates itself (0.11.0 to 0.12.0, to 0.13.0, to 0.15.0 on the
+laptop); the A54 now runs the release-signed app and updated itself 0.13.0 to 0.15.0 through the
+system installer; the computer volume slider works phone to laptop (the user's word); Windows
+0.13.0 on a real PC opens, pairs, transfers and has a working tray menu (a one-off by someone
+the user knows, no PC on offer).
 
-1. **Prove the update check for real.** Install the 0.11.0 `.deb` and applet on this laptop (the
-   user's install is 0.9.0; ask before replacing it), then the next release is the first real
-   update: watch `pkexec`, apt, the restart on both start paths, and the applet coming along.
-   On the phone the same release shows the real dialog (the phone's debug-key build will get the
-   "signed with a different key" sentence at the last step, which is the expected result).
-2. **Replace the app-side release-build rule** with `update_check_available` on Android and iOS.
-3. **Look at mirroring and the no-space notification on real COSMIC** once 0.11.0 is installed.
-4. **Trackpad reasons on the phone** against the real desktop with the grant off, then locked.
-5. If a Windows PC is on offer: the click-through in section 6 and Phase 14 section 6.
-6. Candidates the user may want: icons and replies for mirrored notifications; an update notice
-   on the Flatpak that names the exact command; a "Send to" history on the phone.
+**Not proven:** the fixed systemd restart path (the laptop's daemon runs from autostart, so every
+update took the `exec` path); the Windows tray icon and the 0.15.0 look on a real PC (only
+`test-installer.ps1` on CI); a Windows self-update on a real PC; the iPhone slider on a device.
+
+1. **Drop the transitional applet package** in the first release after 2026-11-27: the steps are
+   in `docs/release/distribution.md` ("The transitional applet package").
+2. **Computer volume on Windows** (`IAudioEndpointVolume`), as the same `@system` entry, and a
+   mute button on the phones if the user wants one (needs a `muted` field and an action:
+   protocol 5.9, core, ffi bump).
+3. **Replace the app-side release-build rule** with `update_check_available` on Android and iOS.
+4. **Look at mirroring and the no-space notification on real COSMIC**; the laptop runs 0.15.0.
+5. **Trackpad reasons on the phone** against the real desktop with the grant off, then locked.
+6. **The systemd restart path for real:** start the installed daemon through
+   `systemctl --user start playdropd` (ask the user first: it is their daemon), then the next
+   release is the test.
+7. If a Windows PC is on offer: the look of 0.15.0, the tray icon, a self-update, then the
+   click-through in section 6 and Phase 14 section 6.
+8. Candidates the user may want: a macOS version (asked about on 2026-11-13; needs a paid Apple
+   account to avoid the "unidentified developer" block); icons and replies for mirrored
+   notifications; an update notice on the Flatpak that names the exact command; a "Send to"
+   history on the phone.
 
 Build with `CARGO_TARGET_DIR=$HOME/.cache/playdrop-target CARGO_INCREMENTAL=0`, the applet with
-`CARGO_TARGET_DIR=$HOME/.cache/playdrop-applet-target`. On a version bump set the applet's
-version and its lock's three version lines by hand, run `apps/ios/scripts/sync-version.py`, add
-the AppStream release entry, and run `packaging/flatpak/update-sources.sh` if `Cargo.lock`
-changed.
+`CARGO_TARGET_DIR=$HOME/.cache/playdrop-applet-target`; the caches were emptied on 2026-11-14, so
+the first build is a full one. On a version bump set the applet's version and its lock's three
+version lines by hand, run `apps/ios/scripts/sync-version.py`, add the AppStream release entry,
+and run `packaging/flatpak/update-sources.sh` if `Cargo.lock` changed. A push to `main` cancels
+the CI runs of the commit before it: wait for a release tag to exist before pushing again. Watch
+CI runs by their run numbers (`gh run list -c <short sha>` finds nothing). GitHub sometimes has
+no macOS runner: a job cancelled unstarted is rerun with `gh run rerun <id> --failed` under the
+QasimBhb token.
 
 ---
 
